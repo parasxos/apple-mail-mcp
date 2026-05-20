@@ -4,21 +4,24 @@ Local MCP server that gives Claude Code read-only access to every email Apple Ma
 
 ## Install
 
+Each MCP server gets its own venv (same pattern as the sibling `*-mcp` repos):
+
 ```bash
-cd tools/email-mcp
-python3 -m pip install -e ".[dev]"          # or: uv pip install -e ".[dev]"
+cd ~/code/parasxos/email-mcp
+python3 -m venv .venv
+.venv/bin/pip install -e ".[dev]"
 ```
 
 ## Register with Claude Code
 
-Add to `~/.claude.json` (merge with whatever is already there):
+Add to `~/.claude.json` (merge with whatever is already there) — point at the venv's installed entry point:
 
 ```json
 {
   "mcpServers": {
     "apple-mail": {
-      "command": "python3",
-      "args": ["-m", "email_mcp.server"]
+      "type": "stdio",
+      "command": "/Users/<you>/code/parasxos/email-mcp/.venv/bin/email-mcp"
     }
   }
 }
