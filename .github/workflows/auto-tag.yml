@@ -48,7 +48,7 @@ jobs:
   auto-tag:
     name: Create Tag
     needs: determine-release-type
-    uses: parasxos/cernvironment/.github/workflows/auto-tag-reusable.yml@master
+    uses: parasxos/auto-tag/.github/workflows/auto-tag-reusable.yml@main
     with:
       is_public_release: ${{ needs.determine-release-type.outputs.is_public == 'true' }}
       runs_on: ubuntu-latest
