@@ -1,0 +1,54 @@
+name: Auto Tag on Push
+
+on:
+  push:
+    branches:
+      - main
+      - master
+  workflow_dispatch:
+    inputs:
+      public_release:
+        description: 'Create a public release (increment PUBLIC version)'
+        required: true
+        default: 'true'
+        type: boolean
+
+permissions:
+  contents: write
+
+jobs:
+  determine-release-type:
+    name: Check Release Type
+    runs-on: ubuntu-latest
+    if: "!contains(github.event.head_commit.message, '[skip tag]')"
+    outputs:
+      is_public: ${{ steps.check.outputs.is_public }}
+
+    steps:
+      - name: Checkout for commit message
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Determine if public release
+        id: check
+        run: |
+          IS_PUBLIC="false"
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ] && [ "${{ inputs.public_release }}" = "true" ]; then
+            IS_PUBLIC="true"
+          fi
+          if [ "${{ github.event_name }}" = "push" ]; then
+            COMMIT_MSG=$(git log -1 --pretty=%B)
+            if echo "$COMMIT_MSG" | grep -qi '\[release\]'; then
+              IS_PUBLIC="true"
+            fi
+          fi
+          echo "is_public=$IS_PUBLIC" >> $GITHUB_OUTPUT
+
+  auto-tag:
+    name: Create Tag
+    needs: determine-release-type
+    uses: parasxos/cernvironment/.github/workflows/auto-tag-reusable.yml@master
+    with:
+      is_public_release: ${{ needs.determine-release-type.outputs.is_public == 'true' }}
+      runs_on: ubuntu-latest
