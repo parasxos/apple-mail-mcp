@@ -10,7 +10,9 @@ from __future__ import annotations
 
 import argparse
 import json
+import subprocess
 import sys
+import time
 from dataclasses import asdict, is_dataclass
 from datetime import datetime, timezone
 from typing import Any
@@ -116,6 +118,118 @@ def tool_get_attachment(id: str, attachment_id: str) -> dict:
 
 
 # ---------------------------------------------------------------------- #
+# refresh_mail — nudge Mail.app to fetch                                 #
+# ---------------------------------------------------------------------- #
+
+
+# AppleScript / osascript error codes we map to friendly diagnostics.
+# Mail.app not installed (or AppleScript can't reach it).
+_OSA_ERR_NO_APP = -1728
+# Sending app is not authorised in Privacy & Security → Automation.
+_OSA_ERR_NOT_AUTHORIZED = -1743
+
+
+def _run_mail_check_for_new(timeout_seconds: float) -> dict:
+    """Invoke `tell application "Mail" to check for new mail` via osascript.
+
+    Returns a dict with at minimum {ok: bool, duration_ms: int, error?: str,
+    error_code?: int}. Pure function over subprocess — mocked in tests.
+    """
+    started = time.monotonic()
+    try:
+        proc = subprocess.run(
+            [
+                "osascript",
+                "-e",
+                'tell application "Mail" to check for new mail',
+            ],
+            capture_output=True,
+            text=True,
+            timeout=timeout_seconds,
+        )
+    except FileNotFoundError:
+        return {
+            "ok": False,
+            "duration_ms": int((time.monotonic() - started) * 1000),
+            "error": "osascript not found — this tool only works on macOS.",
+        }
+    except subprocess.TimeoutExpired:
+        return {
+            "ok": False,
+            "duration_ms": int((time.monotonic() - started) * 1000),
+            "error": f"osascript timed out after {timeout_seconds:g}s.",
+        }
+
+    duration_ms = int((time.monotonic() - started) * 1000)
+    if proc.returncode == 0:
+        return {"ok": True, "duration_ms": duration_ms}
+
+    stderr = (proc.stderr or "").strip()
+    code: int | None = None
+    # osascript stderr looks like: "...: execution error: ... (-1743)"
+    if "(-" in stderr and stderr.rstrip().endswith(")"):
+        try:
+            code = int(stderr.rsplit("(", 1)[1].rstrip(")"))
+        except ValueError:
+            code = None
+
+    if code == _OSA_ERR_NOT_AUTHORIZED:
+        msg = (
+            "Mail.app automation is not authorised for this terminal. Grant it "
+            "in System Settings → Privacy & Security → Automation, then retry."
+        )
+    elif code == _OSA_ERR_NO_APP:
+        msg = "Mail.app is not installed or not reachable via AppleScript."
+    else:
+        msg = stderr or f"osascript failed with exit code {proc.returncode}."
+
+    out: dict = {"ok": False, "duration_ms": duration_ms, "error": msg}
+    if code is not None:
+        out["error_code"] = code
+    return out
+
+
+def tool_refresh_mail(wait_seconds: float = 5.0, timeout_seconds: float = 30.0) -> dict:
+    """Ask Mail.app to fetch new mail, then report what changed.
+
+    Mail.app does the IMAP/OAuth work; we just nudge it. Returns a snapshot
+    of the Envelope Index before and after so the caller can see how many
+    new messages landed.
+    """
+    # Clamp into sane ranges so a misbehaving caller can't pin us forever.
+    wait_seconds = max(0.0, min(60.0, float(wait_seconds)))
+    timeout_seconds = max(1.0, min(120.0, float(timeout_seconds)))
+
+    src = _source()
+    snap_before = getattr(src, "freshness_snapshot", lambda: {})()
+
+    result = _run_mail_check_for_new(timeout_seconds)
+
+    if result["ok"] and wait_seconds > 0:
+        time.sleep(wait_seconds)
+
+    snap_after = getattr(src, "freshness_snapshot", lambda: {})()
+
+    new_messages: int | None = None
+    if snap_before and snap_after:
+        b = snap_before.get("total")
+        a = snap_after.get("total")
+        if isinstance(a, int) and isinstance(b, int):
+            new_messages = max(0, a - b)
+
+    return {
+        "ok": result["ok"],
+        "applescript_duration_ms": result.get("duration_ms"),
+        "waited_seconds": wait_seconds if result["ok"] else 0,
+        "before": snap_before or None,
+        "after": snap_after or None,
+        "new_messages": new_messages,
+        "error": result.get("error"),
+        "error_code": result.get("error_code"),
+    }
+
+
+# ---------------------------------------------------------------------- #
 # MCP wiring                                                             #
 # ---------------------------------------------------------------------- #
 
@@ -180,6 +294,25 @@ def _build_mcp_server():  # pragma: no cover — exercised by integration only
         caller (Claude) can then `Read` the file. Bytes are never inlined."""
         return tool_get_attachment(id, attachment_id)
 
+    @mcp.tool()
+    def refresh_mail(wait_seconds: float = 5.0, timeout_seconds: float = 30.0) -> dict:
+        """Nudge Mail.app to fetch new mail, then report what changed.
+
+        Call this when freshness matters — before answering "anything new from
+        X?" or before pulling recent context. Returns before/after snapshots
+        of the Envelope Index (total + newest message) so the caller can see
+        how many messages arrived. The MCP itself stays read-only on disk;
+        Mail.app does the IMAP work.
+
+        Requires Automation permission for the terminal app running Claude
+        Code: System Settings → Privacy & Security → Automation → <terminal>
+        → Mail. On first call you'll see the macOS permission prompt; until
+        granted, `ok` is false with a clear error.
+        """
+        return tool_refresh_mail(
+            wait_seconds=wait_seconds, timeout_seconds=timeout_seconds
+        )
+
     return mcp
 
 
@@ -198,6 +331,14 @@ def _selftest() -> int:
     return 0
 
 
+def _refresh_test(wait_seconds: float = 5.0) -> int:
+    """End-to-end exercise of refresh_mail against the real Mail.app."""
+    result = tool_refresh_mail(wait_seconds=wait_seconds)
+    json.dump(result, sys.stdout, indent=2, default=str)
+    sys.stdout.write("\n")
+    return 0 if result.get("ok") else 1
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(prog="email_mcp.server")
     parser.add_argument(
@@ -205,9 +346,22 @@ def main() -> int:
         action="store_true",
         help="Print a smoke-check summary against the real Mail dir and exit.",
     )
+    parser.add_argument(
+        "--refresh-test",
+        action="store_true",
+        help="Call refresh_mail() against the real Mail.app and print the result.",
+    )
+    parser.add_argument(
+        "--refresh-wait",
+        type=float,
+        default=5.0,
+        help="Seconds to wait after nudging Mail.app (default 5).",
+    )
     args = parser.parse_args()
     if args.selftest:
         return _selftest()
+    if args.refresh_test:
+        return _refresh_test(wait_seconds=args.refresh_wait)
     # MCP stdio server — blocks until the client disconnects.
     mcp = _build_mcp_server()
     mcp.run()

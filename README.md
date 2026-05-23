@@ -27,7 +27,7 @@ Add to `~/.claude.json` (merge with whatever is already there) — point at the 
 }
 ```
 
-Restart Claude Code. Run `/mcp` — `apple-mail` should appear with six tools: `search_emails`, `get_email`, `get_thread`, `list_mailboxes`, `list_recent`, `get_attachment`.
+Restart Claude Code. Run `/mcp` — `apple-mail` should appear with seven tools: `search_emails`, `get_email`, `get_thread`, `list_mailboxes`, `list_recent`, `get_attachment`, `refresh_mail`.
 
 ## macOS Full-Disk-Access
 
@@ -39,6 +39,14 @@ You'll likely need to fully quit and relaunch the terminal app after toggling.
 
 Without FDA the server returns a clear error from `list_mailboxes` on first call, so the failure mode is obvious.
 
+## macOS Automation (needed only for `refresh_mail`)
+
+`refresh_mail` nudges Mail.app to fetch new messages via AppleScript. This requires a second permission, separate from Full Disk Access:
+
+System Settings → Privacy & Security → Automation → *your terminal app* → toggle **Mail** on.
+
+The first call surfaces the macOS prompt; until granted, `refresh_mail` returns `ok: false` with `error_code: -1743` and a clear message pointing at Privacy & Security. The other six tools don't need this permission.
+
 ## Smoke test
 
 ```bash
@@ -46,6 +54,14 @@ python3 -m email_mcp.server --selftest
 ```
 
 Prints a small JSON summary (number of mailboxes, newest subject/from/date). If this works, the MCP server will work.
+
+To exercise `refresh_mail` end-to-end against the live Mail.app:
+
+```bash
+python3 -m email_mcp.server --refresh-test --refresh-wait 5
+```
+
+Prints `{ok, applescript_duration_ms, before, after, new_messages, ...}`. Exit code is non-zero on failure (permission denied, Mail.app missing, timeout).
 
 ## Run the test suite
 
@@ -67,7 +83,7 @@ The tests build a fake `~/Library/Mail/V10` tree in `tmp_path` — they don't re
 
 ## Tool reference
 
-All tools are **read-only**. All return JSON-friendly objects.
+All read tools are **read-only on disk**. `refresh_mail` nudges Mail.app via AppleScript but writes nothing to `~/Library/Mail` itself. All return JSON-friendly objects.
 
 | Tool | Purpose |
 |---|---|
@@ -77,6 +93,7 @@ All tools are **read-only**. All return JSON-friendly objects.
 | `list_mailboxes()` | Every mailbox across every account, with counts. |
 | `list_recent(mailbox?, account?, limit?)` | Newest messages first. |
 | `get_attachment(id, attachment_id)` | Materialises the attachment to a tmp file; returns the path. |
+| `refresh_mail(wait_seconds=5, timeout_seconds=30)` | Asks Mail.app to fetch new mail, waits, returns before/after snapshot + delta count. Launches Mail.app if it isn't running. Needs Automation permission (see above). |
 
 ## Phase-2 hooks (not implemented yet)
 

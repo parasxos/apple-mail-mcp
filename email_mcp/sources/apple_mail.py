@@ -82,13 +82,15 @@ def _html_to_text(s: str) -> str:
 
 
 def _connect_readonly(db_path: Path) -> sqlite3.Connection:
-    """Open the Envelope Index read-only + immutable.
+    """Open the Envelope Index read-only, honoring WAL.
 
-    `immutable=1` lets us coexist with the running Mail.app process by
-    bypassing WAL locking — we read a consistent snapshot ignoring any
-    pending writes in the -shm/-wal sidecars.
+    Plain `mode=ro` takes a shared lock and reads the latest committed
+    snapshot via the -wal sidecar — standard SQLite concurrent-reader
+    pattern, safe alongside Mail.app's writer. (Previously used
+    `immutable=1`, which bypasses WAL entirely and produces "database
+    disk image is malformed" whenever Mail.app has pending WAL frames.)
     """
-    uri = "file:" + urllib.parse.quote(str(db_path)) + "?mode=ro&immutable=1"
+    uri = "file:" + urllib.parse.quote(str(db_path)) + "?mode=ro"
     conn = sqlite3.connect(uri, uri=True)
     conn.row_factory = sqlite3.Row
     return conn
@@ -142,6 +144,48 @@ class AppleMailSource:
 
     def _have(self, table: str, column: str) -> bool:
         return column in self._columns.get(table, set())
+
+    # ------------------------------------------------------------------ #
+    # unified-inbox helpers                                              #
+    # ------------------------------------------------------------------ #
+
+    # URL-path tails that Mail.app treats as "Inbox" in the All Inboxes view.
+    # `All%20Mail` is included because Gmail accounts in Mail.app store
+    # everything in [Gmail]/All Mail and surface the Inbox-labeled subset via
+    # the unified view — there is no separate IMAP folder for the label.
+    _INBOX_TAILS = frozenset({"Inbox", "INBOX", "All%20Mail"})
+
+    def _inbox_equivalent_ids(self) -> list[int]:
+        """Mailbox ROWIDs that participate in the All Inboxes unified view."""
+        rows = self._conn.execute(
+            "SELECT ROWID, url FROM mailboxes WHERE url IS NOT NULL"
+        ).fetchall()
+        out: list[int] = []
+        for r in rows:
+            tail = r["url"].rsplit("/", 1)[-1]
+            if tail in self._INBOX_TAILS:
+                out.append(r["ROWID"])
+        return out
+
+    def _local_archive_ids(self) -> list[int]:
+        """Mailbox ROWIDs for local-only folders that Mail.app rules file
+        messages into (SaneBox-style, mailing-list folders, etc.).
+
+        A message that appears in BOTH an inbox-equivalent folder AND one
+        of these local folders has been auto-filed out of the inbox view —
+        Mail.app hides it from All Inboxes. We mirror that behaviour.
+
+        Local mailboxes named Inbox/INBOX/Outbox/Drafts are NOT archives;
+        they are primary stores (rare but legal — see test fixture)."""
+        rows = self._conn.execute(
+            "SELECT ROWID, url FROM mailboxes "
+            "WHERE url IS NOT NULL AND url LIKE 'local://%'"
+        ).fetchall()
+        primary = {"Inbox", "INBOX", "Outbox", "Drafts", "Sent", "Trash"}
+        return [
+            r["ROWID"] for r in rows
+            if r["url"].rsplit("/", 1)[-1] not in primary
+        ]
 
     # ------------------------------------------------------------------ #
     # row → EmailRef                                                     #
@@ -311,7 +355,7 @@ class AppleMailSource:
         if where:
             sql += " WHERE " + " AND ".join(where)
         sql += f" ORDER BY m.{date_col} DESC LIMIT ? OFFSET ?"
-        limit = max(1, min(int(q.limit), 200))
+        limit = max(1, int(q.limit))
         offset = max(0, int(q.offset))
         params.extend([limit, offset])
 
@@ -325,9 +369,45 @@ class AppleMailSource:
         account: str | None,
         limit: int,
     ) -> list[EmailRef]:
-        return self.search(
-            SearchQuery(mailbox=mailbox, account=account, limit=limit, offset=0)
+        # Scoped call → delegate to search (existing per-mailbox semantics).
+        if mailbox or account:
+            return self.search(
+                SearchQuery(mailbox=mailbox, account=account, limit=limit, offset=0)
+            )
+
+        # Unscoped → return Mail.app's "All Inboxes" unified view: union of
+        # native Inbox folders + Gmail All Mail, minus messages auto-filed
+        # into a local archive folder by Mail.app rules (see
+        # _local_archive_ids docstring).
+        inbox_ids = self._inbox_equivalent_ids()
+        if not inbox_ids:
+            return []
+        local_ids = self._local_archive_ids()
+        has_gmid = self._have("messages", "global_message_id")
+        date_col = "date_sent" if self._have("messages", "date_sent") else "date_received"
+
+        sql = self._base_select() + (
+            f" WHERE m.mailbox IN ({','.join('?' * len(inbox_ids))})"
         )
+        params: list[object] = list(inbox_ids)
+        if self._have("messages", "deleted"):
+            sql += " AND m.deleted = 0"
+        if local_ids and has_gmid:
+            sql += (
+                " AND NOT EXISTS ("
+                "   SELECT 1 FROM messages m2"
+                "    WHERE m2.global_message_id = m.global_message_id"
+                f"      AND m2.mailbox IN ({','.join('?' * len(local_ids))})"
+                " )"
+            )
+            params.extend(local_ids)
+        sql += f" ORDER BY m.{date_col} DESC LIMIT ?"
+        params.append(max(1, int(limit)))
+
+        return [
+            self._row_to_ref(r)
+            for r in self._conn.execute(sql, params).fetchall()
+        ]
 
     def thread(self, thread_id: str) -> list[EmailRef]:
         try:
@@ -432,6 +512,70 @@ class AppleMailSource:
             size=len(part["bytes"]),
             path=str(out),
         )
+
+    # ------------------------------------------------------------------ #
+    # freshness probe (used by refresh_mail to detect before/after delta) #
+    # ------------------------------------------------------------------ #
+
+    def freshness_snapshot(self) -> dict:
+        """Cheap probe of the Envelope Index — newest message + total count.
+
+        Returns a dict shaped for JSON: {total, newest_date, newest_subject,
+        newest_from}. `newest_date` is an ISO-8601 string in UTC, or None
+        if the DB has no messages.
+
+        Opens a fresh read-only connection so the result reflects the
+        latest committed snapshot — important after `refresh_mail` because
+        Mail.app's writer commits new rows on a different connection.
+        """
+        index = self._mail_dir / "MailData" / "Envelope Index"
+        conn = _connect_readonly(index)
+        try:
+            date_col = "date_sent" if self._have("messages", "date_sent") else "date_received"
+            deleted = "WHERE m.deleted = 0" if self._have("messages", "deleted") else ""
+            total_row = conn.execute(
+                f"SELECT COUNT(*) AS c FROM messages m {deleted}"
+            ).fetchone()
+            total = int(total_row["c"]) if total_row else 0
+            newest = conn.execute(
+                f"""
+                SELECT m.{date_col} AS ts,
+                       s.subject AS subject,
+                       a.address AS addr,
+                       a.comment AS name
+                  FROM messages m
+                  JOIN subjects s ON s.ROWID = m.subject
+                  LEFT JOIN addresses a ON a.ROWID = m.sender
+                  {deleted}
+                  ORDER BY m.{date_col} DESC
+                  LIMIT 1
+                """
+            ).fetchone()
+        finally:
+            conn.close()
+
+        if newest is None or not newest["ts"]:
+            return {
+                "total": total,
+                "newest_date": None,
+                "newest_subject": None,
+                "newest_from": None,
+            }
+
+        ts = datetime.fromtimestamp(int(newest["ts"]), tz=timezone.utc)
+        sender = newest["addr"] or ""
+        sender_name = newest["name"] or ""
+        from_addr = (
+            f"{sender_name} <{sender}>"
+            if sender_name and sender
+            else (sender or sender_name)
+        )
+        return {
+            "total": total,
+            "newest_date": ts.isoformat(),
+            "newest_subject": newest["subject"] or "",
+            "newest_from": from_addr,
+        }
 
 
 # ---------------------------------------------------------------------- #
