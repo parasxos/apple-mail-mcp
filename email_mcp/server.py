@@ -18,6 +18,7 @@ from datetime import datetime, timezone
 from typing import Any
 
 from .config import source_name
+from .sender import SendError, reply_email, send_email
 from .sources import get_source
 from .sources.base import EmailSource, SearchQuery
 
@@ -230,12 +231,49 @@ def tool_refresh_mail(wait_seconds: float = 5.0, timeout_seconds: float = 30.0) 
 
 
 # ---------------------------------------------------------------------- #
+# send_email / reply_email — the only write path                        #
+# ---------------------------------------------------------------------- #
+
+
+def tool_send_email(
+    to: str,
+    subject: str,
+    body: str,
+    cc: str | None = None,
+    bcc: str | None = None,
+) -> dict:
+    """Compose + send. Returns {ok, message_id, to, cc, bcc, ...} or a
+    structured {ok: false, error} for caller-fixable failures."""
+    try:
+        res = send_email(to=to, subject=subject, body=body, cc=cc, bcc=bcc)
+        return _to_jsonable(res)
+    except SendError as e:
+        return {"ok": False, "error": str(e)}
+
+
+def tool_reply_email(
+    id: str,
+    body: str,
+    reply_all: bool = False,
+    cc: str | None = None,
+    bcc: str | None = None,
+) -> dict:
+    try:
+        res = reply_email(
+            _source(), id=id, body=body, reply_all=reply_all, cc=cc, bcc=bcc
+        )
+        return _to_jsonable(res)
+    except SendError as e:
+        return {"ok": False, "error": str(e)}
+
+
+# ---------------------------------------------------------------------- #
 # MCP wiring                                                             #
 # ---------------------------------------------------------------------- #
 
 
 def _build_mcp_server():  # pragma: no cover — exercised by integration only
-    """Build the FastMCP Server with all six tools registered."""
+    """Build the FastMCP Server with all nine tools registered."""
     from mcp.server.fastmcp import FastMCP  # type: ignore
 
     mcp = FastMCP("apple-mail")
@@ -313,6 +351,49 @@ def _build_mcp_server():  # pragma: no cover — exercised by integration only
             wait_seconds=wait_seconds, timeout_seconds=timeout_seconds
         )
 
+    @mcp.tool()
+    def send_email(
+        to: str,
+        subject: str,
+        body: str,
+        cc: str | None = None,
+        bcc: str | None = None,
+    ) -> dict:
+        """Send an email, composed as clean MIME (plain + HTML) and delivered
+        via `sendmail` on lxplus — NOT through Mail.app, whose scripted
+        compose corrupts the body into a collapsed quote.
+
+        `to`/`cc`/`bcc` are comma-separated address strings ("Name <a@b>" or
+        "a@b"). `body` is plain text; blank lines become paragraphs. Replies
+        should use `reply_email` instead so threading headers are set.
+
+        Safety: while the allowlist guard is active (default), recipients are
+        restricted to Paris's own address — a returned {ok: false, error}
+        naming a blocked address means the guard fired, not a transport
+        failure. A Bcc-to-self is added automatically for a Sent record.
+        Returns {ok, message_id, to, cc, bcc, subject} on success.
+        """
+        return tool_send_email(to=to, subject=subject, body=body, cc=cc, bcc=bcc)
+
+    @mcp.tool()
+    def reply_email(
+        id: str,
+        body: str,
+        reply_all: bool = False,
+        cc: str | None = None,
+        bcc: str | None = None,
+    ) -> dict:
+        """Reply to message `id` (an envelope id from search/get), threading
+        correctly via In-Reply-To / References and an "Re:" subject.
+
+        Defaults to replying to the original sender only; set reply_all=True
+        to also Cc the original To+Cc (minus your own address). Same clean-MIME
+        transport and allowlist safety as send_email. Returns the same shape.
+        """
+        return tool_reply_email(
+            id=id, body=body, reply_all=reply_all, cc=cc, bcc=bcc
+        )
+
     return mcp
 
 
@@ -339,6 +420,14 @@ def _refresh_test(wait_seconds: float = 5.0) -> int:
     return 0 if result.get("ok") else 1
 
 
+def _send_test(to: str, subject: str, body: str) -> int:
+    """End-to-end exercise of send_email against the real transport."""
+    result = tool_send_email(to=to, subject=subject, body=body)
+    json.dump(result, sys.stdout, indent=2, default=str)
+    sys.stdout.write("\n")
+    return 0 if result.get("ok") else 1
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(prog="email_mcp.server")
     parser.add_argument(
@@ -357,11 +446,24 @@ def main() -> int:
         default=5.0,
         help="Seconds to wait after nudging Mail.app (default 5).",
     )
+    parser.add_argument(
+        "--send-test",
+        metavar="TO",
+        help="Send a test email to TO via the real transport and print the "
+             "result. Subject/body are canned unless --subject/--body given.",
+    )
+    parser.add_argument("--subject", default="email-mcp send self-test")
+    parser.add_argument(
+        "--body",
+        default="This is a send_email self-test.\n\nSecond paragraph.\n\nParis",
+    )
     args = parser.parse_args()
     if args.selftest:
         return _selftest()
     if args.refresh_test:
         return _refresh_test(wait_seconds=args.refresh_wait)
+    if args.send_test:
+        return _send_test(args.send_test, args.subject, args.body)
     # MCP stdio server — blocks until the client disconnects.
     mcp = _build_mcp_server()
     mcp.run()
