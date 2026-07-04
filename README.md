@@ -29,6 +29,18 @@ Add to `~/.claude.json` (merge with whatever is already there) — point at the 
 
 Restart Claude Code. Run `/mcp` — `apple-mail` should appear with nine tools: `search_emails`, `get_email`, `get_thread`, `list_mailboxes`, `list_recent`, `get_attachment`, `refresh_mail`, `send_email`, `reply_email`.
 
+To disable the self-only send guard (after you've trusted it — see [Sending mail](#sending-mail-send_email--reply_email)), add the flag to that server's `env` block:
+
+```json
+    "apple-mail": {
+      "type": "stdio",
+      "command": "/Users/<you>/code/parasxos/email-mcp/.venv/bin/email-mcp",
+      "env": { "EMAIL_MCP_SEND_ALLOW_ALL": "1" }
+    }
+```
+
+`~/.claude.json` is machine-local and untracked (it holds per-server secrets) — this snippet is the reproducible record of that setting.
+
 ## macOS Full-Disk-Access
 
 `~/Library/Mail` is gated by macOS. Grant **Full Disk Access** to whichever terminal app starts Claude Code (Terminal / iTerm / VS Code / Cursor):
