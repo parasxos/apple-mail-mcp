@@ -26,6 +26,10 @@ if ssh -O check -o ControlPath="$SOCK" "$USER_@$HOST" >/dev/null 2>&1; then
     exit 0
 fi
 
+# A dead socket FILE left over from an expired master blocks a fresh bind
+# ("ControlSocket ... already exists, disabling multiplexing"). Clear it.
+[ -S "$SOCK" ] && rm -f "$SOCK"
+
 [ -f "$SECRETS" ] && source "$SECRETS"
 : "${CERN_PASSWORD:?CERN_PASSWORD not set (checked $SECRETS)}"
 
