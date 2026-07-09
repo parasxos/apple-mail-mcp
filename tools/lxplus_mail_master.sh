@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 #
 # lxplus_mail_master.sh — headlessly (re)establish the SSH ControlMaster
-# socket that email_mcp/sender.py pipes `sendmail` through.
+# socket that email_mcp/sender.py delivers outgoing mail through.
 #
 # Reads CERN_PASSWORD from ~/.secrets/cern_secrets.sh and generates a fresh
 # TOTP via the cernvironment helper, so it needs no interactive input. Safe

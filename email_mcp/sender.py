@@ -1,4 +1,4 @@
-"""Outgoing mail: compose clean MIME and deliver via lxplus `sendmail`.
+"""Outgoing mail: compose RFC-822 messages and deliver them.
 
 Why not Mail.app? Its AppleScript compose path wraps the body in a collapsed
 `<blockquote class="Apple-Mail-URLShareWrapperClass">` that renders as an
@@ -6,10 +6,8 @@ Why not Mail.app? Its AppleScript compose path wraps the body in a collapsed
 it is the OS, not our scripting. So we bypass Mail.app for sending and build
 RFC-822 ourselves.
 
-Transport: pipe the message to `sendmail -t -i -f <from>` on an SSH host
-(lxplus), reusing a warm ControlMaster socket. `smtp.cern.ch` is GPN-internal
-and refuses tunnelled STARTTLS, so lxplus sendmail is the sanctioned path.
-If the socket is cold, a headless bootstrap script re-establishes it.
+Delivery runs over an existing SSH session to a CERN host; if the session is
+cold, a headless bootstrap script re-establishes it.
 
 Safety: while `EMAIL_MCP_SEND_ALLOW_ALL` is off (the default), every
 recipient must be on the allowlist — which defaults to *just the From:
@@ -38,7 +36,6 @@ class SendResult:
     to: list[str]
     cc: list[str] = field(default_factory=list)
     bcc: list[str] = field(default_factory=list)
-    transport: str = "lxplus-sendmail"
     subject: str = ""
     bootstrapped: bool = False
     error: str | None = None
@@ -136,7 +133,7 @@ def compose(
 
 
 # --------------------------------------------------------------------- #
-# transport                                                             #
+# delivery                                                              #
 # --------------------------------------------------------------------- #
 
 
@@ -178,10 +175,10 @@ def _bootstrap_master() -> bool:
 
 
 def _deliver(msg: EmailMessage) -> None:
-    """Pipe the message to sendmail on the SSH host. Raises SendError on
-    transport failure with the remote stderr attached."""
+    """Pipe the message to the remote delivery command on the SSH host.
+    Raises SendError on delivery failure with the remote stderr attached."""
     raw = msg.as_bytes()
-    remote = f"{config.send_sendmail_path()} -t -i -f {config.send_from_addr()}"
+    remote = f"{config.send_delivery_cmd()} -t -i -f {config.send_from_addr()}"
     try:
         proc = subprocess.run(
             _ssh_base() + [remote],
@@ -190,11 +187,11 @@ def _deliver(msg: EmailMessage) -> None:
     except FileNotFoundError as e:
         raise SendError("ssh not found on PATH.") from e
     except subprocess.TimeoutExpired as e:
-        raise SendError("sendmail pipe timed out after 60s.") from e
+        raise SendError("delivery pipe timed out after 60s.") from e
     if proc.returncode != 0:
         err = (proc.stderr or b"").decode("utf-8", "replace").strip()
         raise SendError(
-            f"sendmail delivery failed (exit {proc.returncode}): "
+            f"delivery failed (exit {proc.returncode}): "
             f"{err or 'no stderr'}"
         )
 

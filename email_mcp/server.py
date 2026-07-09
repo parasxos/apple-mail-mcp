@@ -359,9 +359,9 @@ def _build_mcp_server():  # pragma: no cover — exercised by integration only
         cc: str | None = None,
         bcc: str | None = None,
     ) -> dict:
-        """Send an email, composed as clean MIME (plain + HTML) and delivered
-        via `sendmail` on lxplus — NOT through Mail.app, whose scripted
-        compose corrupts the body into a collapsed quote.
+        """Send an email. Composition and delivery are handled internally —
+        never send mail any other way (Mail.app's scripted compose corrupts
+        the body into a collapsed quote).
 
         `to`/`cc`/`bcc` are comma-separated address strings ("Name <a@b>" or
         "a@b"). `body` is plain text; blank lines become paragraphs. Replies
@@ -369,7 +369,7 @@ def _build_mcp_server():  # pragma: no cover — exercised by integration only
 
         Safety: while the allowlist guard is active (default), recipients are
         restricted to Paris's own address — a returned {ok: false, error}
-        naming a blocked address means the guard fired, not a transport
+        naming a blocked address means the guard fired, not a delivery
         failure. A Bcc-to-self is added automatically for a Sent record.
         Returns {ok, message_id, to, cc, bcc, subject} on success.
         """
@@ -387,8 +387,8 @@ def _build_mcp_server():  # pragma: no cover — exercised by integration only
         correctly via In-Reply-To / References and an "Re:" subject.
 
         Defaults to replying to the original sender only; set reply_all=True
-        to also Cc the original To+Cc (minus your own address). Same clean-MIME
-        transport and allowlist safety as send_email. Returns the same shape.
+        to also Cc the original To+Cc (minus your own address). Same delivery
+        and allowlist safety as send_email. Returns the same shape.
         """
         return tool_reply_email(
             id=id, body=body, reply_all=reply_all, cc=cc, bcc=bcc
@@ -421,7 +421,7 @@ def _refresh_test(wait_seconds: float = 5.0) -> int:
 
 
 def _send_test(to: str, subject: str, body: str) -> int:
-    """End-to-end exercise of send_email against the real transport."""
+    """End-to-end exercise of send_email against the real delivery path."""
     result = tool_send_email(to=to, subject=subject, body=body)
     json.dump(result, sys.stdout, indent=2, default=str)
     sys.stdout.write("\n")
@@ -449,7 +449,7 @@ def main() -> int:
     parser.add_argument(
         "--send-test",
         metavar="TO",
-        help="Send a test email to TO via the real transport and print the "
+        help="Send a test email to TO via the real delivery path and print the "
              "result. Subject/body are canned unless --subject/--body given.",
     )
     parser.add_argument("--subject", default="email-mcp send self-test")

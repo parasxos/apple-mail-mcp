@@ -57,12 +57,10 @@ def attach_dir() -> Path:
 # Sending (send_email / reply_email). All optional; Paris-flavoured       #
 # defaults, every value overridable via env.                             #
 #                                                                        #
-# Transport rationale: macOS Mail.app's scripted-compose path wraps the  #
-# body in a collapsed blockquote (renders empty in Outlook), so we do    #
-# NOT send through Mail.app. Instead we compose clean MIME here and pipe  #
-# it to `sendmail` on an SSH host (lxplus), reusing a warm ControlMaster  #
-# socket. smtp.cern.ch is GPN-internal and refuses tunneled STARTTLS, so  #
-# lxplus sendmail is the sanctioned path.                                #
+# Rationale: macOS Mail.app's scripted-compose path wraps the body in a  #
+# collapsed blockquote (renders empty in Outlook), so we do NOT send     #
+# through Mail.app. Messages are composed here and delivered over an     #
+# existing SSH session to a CERN host.                                   #
 # ---------------------------------------------------------------------- #
 
 
@@ -100,7 +98,7 @@ def send_allowlist() -> set[str]:
 
 def send_bcc_self() -> bool:
     """Bcc the From: address on every send, so there's a searchable record
-    in Mail (SMTP-via-sendmail does not populate Exchange Sent Items).
+    in Mail (delivery does not populate Exchange Sent Items).
     """
     return os.environ.get("EMAIL_MCP_BCC_SELF", "1").strip() in {
         "1", "true", "True", "yes",
@@ -122,8 +120,8 @@ def send_ssh_socket() -> Path:
     return Path(raw).expanduser()
 
 
-def send_sendmail_path() -> str:
-    return os.environ.get("EMAIL_MCP_SENDMAIL", "/usr/sbin/sendmail").strip()
+def send_delivery_cmd() -> str:
+    return os.environ.get("EMAIL_MCP_DELIVERY_CMD", "/usr/sbin/sendmail").strip()
 
 
 def send_bootstrap_cmd() -> str:
