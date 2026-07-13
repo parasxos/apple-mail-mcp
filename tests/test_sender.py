@@ -161,3 +161,65 @@ def test_reply_all_ccs_original_recipients_minus_self(monkeypatch, mail_fixture,
     # our own address must never appear in To/Cc of the reply
     joined = f"{msg['To']} {msg.get('Cc', '')}"
     assert "paris.moschovakos@cern.ch" not in joined
+
+
+# --------------------------------------------------------------------- #
+# reply history quoting                                                 #
+# --------------------------------------------------------------------- #
+
+
+def _parts(msg):
+    plain = next(
+        p for p in msg.iter_parts() if p.get_content_type() == "text/plain"
+    ).get_content()
+    html = next(
+        p for p in msg.iter_parts() if p.get_content_type() == "text/html"
+    ).get_content()
+    return plain, html
+
+
+def test_reply_quotes_original_below_body(monkeypatch, mail_fixture, capture_delivery):
+    monkeypatch.setenv("EMAIL_MCP_SEND_ALLOW_ALL", "1")
+    from email_mcp.sources.apple_mail import AppleMailSource
+
+    src = AppleMailSource(mail_base=mail_fixture)
+    res = sender.reply_email(src, id="100", body="Understood.")
+    assert res.ok is True
+    plain, html = _parts(capture_delivery[0])
+    # new body first, attribution + '>'-quoted original below
+    assert plain.startswith("Understood.")
+    assert "Stefan Schlenker" in plain and "wrote:" in plain
+    assert "> The I2C disclosure on April 20 should be retracted." in plain
+    assert plain.index("Understood.") < plain.index("wrote:")
+    # HTML mirrors it inside a cite blockquote
+    assert '<blockquote type="cite"' in html
+    assert "retracted" in html and "wrote:" in html
+
+
+def test_reply_html_quote_does_not_nest_documents(monkeypatch, mail_fixture, capture_delivery):
+    monkeypatch.setenv("EMAIL_MCP_SEND_ALLOW_ALL", "1")
+    from email_mcp.sources.apple_mail import AppleMailSource
+
+    src = AppleMailSource(mail_base=mail_fixture)
+    # message 300 is HTML-only: its <html>/<body> wrapper must be unwrapped
+    res = sender.reply_email(src, id="300", body="Noted.")
+    assert res.ok is True
+    plain, html = _parts(capture_delivery[0])
+    assert html.count("<html>") == 1 and html.count("<body>") == 1
+    assert '<blockquote type="cite"' in html and "Paris" in html
+    # plain part still carries a readable quote derived from the HTML
+    assert "wrote:" in plain and "> " in plain
+
+
+def test_reply_include_history_false_is_bare(monkeypatch, mail_fixture, capture_delivery):
+    monkeypatch.setenv("EMAIL_MCP_SEND_ALLOW_ALL", "1")
+    from email_mcp.sources.apple_mail import AppleMailSource
+
+    src = AppleMailSource(mail_base=mail_fixture)
+    res = sender.reply_email(src, id="100", body="Understood.", include_history=False)
+    assert res.ok is True
+    plain, html = _parts(capture_delivery[0])
+    assert "wrote:" not in plain and "retracted" not in plain
+    assert "blockquote" not in html
+    # threading still intact
+    assert capture_delivery[0]["In-Reply-To"] == "<i2c-2026-05-01@cern.ch>"

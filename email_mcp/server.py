@@ -257,10 +257,12 @@ def tool_reply_email(
     reply_all: bool = False,
     cc: str | None = None,
     bcc: str | None = None,
+    include_history: bool = True,
 ) -> dict:
     try:
         res = reply_email(
-            _source(), id=id, body=body, reply_all=reply_all, cc=cc, bcc=bcc
+            _source(), id=id, body=body, reply_all=reply_all, cc=cc, bcc=bcc,
+            include_history=include_history,
         )
         return _to_jsonable(res)
     except SendError as e:
@@ -382,16 +384,22 @@ def _build_mcp_server():  # pragma: no cover — exercised by integration only
         reply_all: bool = False,
         cc: str | None = None,
         bcc: str | None = None,
+        include_history: bool = True,
     ) -> dict:
         """Reply to message `id` (an envelope id from search/get), threading
         correctly via In-Reply-To / References and an "Re:" subject.
+
+        The original message is quoted below `body` (attribution line +
+        `>`-prefixed plain text / HTML blockquote), like a normal client's
+        Reply; set include_history=False for a bare reply.
 
         Defaults to replying to the original sender only; set reply_all=True
         to also Cc the original To+Cc (minus your own address). Same delivery
         and allowlist safety as send_email. Returns the same shape.
         """
         return tool_reply_email(
-            id=id, body=body, reply_all=reply_all, cc=cc, bcc=bcc
+            id=id, body=body, reply_all=reply_all, cc=cc, bcc=bcc,
+            include_history=include_history,
         )
 
     return mcp

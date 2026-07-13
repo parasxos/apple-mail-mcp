@@ -151,13 +151,13 @@ The seven read tools are **read-only on disk**. `refresh_mail` nudges Mail.app v
 | `get_attachment(id, attachment_id)` | Materialises the attachment to a tmp file; returns the path. |
 | `refresh_mail(wait_seconds=5, timeout_seconds=30)` | Asks Mail.app to fetch new mail, waits, returns before/after snapshot + delta count. Launches Mail.app if it isn't running. Needs Automation permission (see above). |
 | `send_email(to, subject, body, cc?, bcc?)` | Compose and send. Comma-separated address strings. Auto Bcc-to-self. Self-only guard applies. Returns `{ok, message_id, to, cc, bcc, subject}` or `{ok: false, error}`. |
-| `reply_email(id, body, reply_all?, cc?, bcc?)` | Reply to message `id`, threading via In-Reply-To / References / `Re:` subject. Defaults to the original sender only; `reply_all=True` also Ccs the original To+Cc minus your own address. |
+| `reply_email(id, body, reply_all?, cc?, bcc?, include_history?)` | Reply to message `id`, threading via In-Reply-To / References / `Re:` subject. Quotes the original below the reply (attribution + `>` block, HTML blockquote) like a normal client; `include_history=False` for a bare reply. Defaults to the original sender only; `reply_all=True` also Ccs the original To+Cc minus your own address. |
 
 ## Phase-2 hooks (not implemented yet)
 
 - **More sources**: implement `EmailSource` in `email_mcp/sources/`, register in `email_mcp/sources/__init__.py::_REGISTRY`, select via `EMAIL_MCP_SOURCE`.
 - **FTS5 sidecar**: a separate adapter that mirrors `.emlx` bodies into a local FTS5 db.
-- **More write tools** (mark-read, move): future. `send_email` / `reply_email` shipped in v0.2.0.
+- **More write tools** (mark-read, move): future. `send_email` / `reply_email` shipped in v0.2.0; reply history-quoting in v0.3.0.
 
 ## Safety notes
 

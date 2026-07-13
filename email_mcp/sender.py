@@ -16,6 +16,7 @@ address*. A mistake during the trial can therefore only reach Paris himself.
 from __future__ import annotations
 
 import html as _html
+import re
 import subprocess
 from dataclasses import dataclass, field
 from email.message import EmailMessage
@@ -88,13 +89,61 @@ def _enforce_allowlist(recipients: list[str]) -> None:
 # --------------------------------------------------------------------- #
 
 
-def _html_body(text: str) -> str:
-    paras = "".join(
+def _html_paras(text: str) -> str:
+    return "".join(
         "<p>" + _html.escape(p).replace("\n", "<br>") + "</p>"
         for p in text.split("\n\n")
         if p.strip()
     )
-    return f"<html><body>{paras}</body></html>"
+
+
+def _html_body(text: str, quote_html: str = "") -> str:
+    return f"<html><body>{_html_paras(text)}{quote_html}</body></html>"
+
+
+# --------------------------------------------------------------------- #
+# reply-history quoting                                                 #
+# --------------------------------------------------------------------- #
+
+_HTML_INNER_RE = re.compile(r"(?is)^.*?<body[^>]*>(.*)</body>.*$")
+_TAG_BLOCK_RE = re.compile(r"(?is)<(script|style)[^>]*>.*?</\1>")
+_TAG_RE = re.compile(r"(?s)<[^>]+>")
+
+
+def _attribution(ref) -> str:
+    """'On Mon, 13 Jul 2026 at 09:24, Name <addr> wrote:' — the original's
+    UTC timestamp rendered in local time, matching what mail clients write."""
+    stamp = ref.date.astimezone().strftime("%a, %d %b %Y at %H:%M")
+    return f"On {stamp}, {ref.from_addr} wrote:"
+
+
+def _strip_tags(html_doc: str) -> str:
+    """Crude HTML→text for quoting when the original has no plain part."""
+    text = _TAG_BLOCK_RE.sub("", html_doc)
+    text = re.sub(r"(?i)<br\s*/?>", "\n", text)
+    text = re.sub(r"(?i)</p>", "\n\n", text)
+    text = _TAG_RE.sub("", text)
+    text = _html.unescape(text)
+    return re.sub(r"\n{3,}", "\n\n", text).strip()
+
+
+def _quote_plain(original_text: str, original_html: str, attribution: str) -> str:
+    source = original_text.strip() or _strip_tags(original_html)
+    quoted = "\n".join("> " + line for line in source.rstrip().splitlines())
+    return f"{attribution}\n{quoted}" if quoted else attribution
+
+
+def _quote_html(original_html: str, original_text: str, attribution: str) -> str:
+    if original_html.strip():
+        m = _HTML_INNER_RE.match(original_html)
+        inner = m.group(1) if m else original_html
+    else:
+        inner = _html_paras(original_text)
+    return (
+        f"<div>{_html.escape(attribution)}</div>"
+        '<blockquote type="cite" style="margin:0 0 0 0.8ex;'
+        f'border-left:2px solid #cccccc;padding-left:1ex">{inner}</blockquote>'
+    )
 
 
 def compose(
@@ -106,11 +155,15 @@ def compose(
     bcc: list[str] | None = None,
     in_reply_to: str = "",
     references: str = "",
+    quote_text: str = "",
+    quote_html: str = "",
 ) -> EmailMessage:
     """Build a multipart/alternative message (plain + minimal HTML).
 
     The HTML part is a plain `<p>`-wrapped rendering — no Apple wrapper class,
-    so it displays as normal body text everywhere.
+    so it displays as normal body text everywhere. `quote_text`/`quote_html`
+    carry an optional quoted-history block appended below the body (plain
+    `>`-prefixed lines / a `<blockquote type="cite">`).
     """
     from_addr = config.send_from_addr()
     msg = EmailMessage()
@@ -127,8 +180,8 @@ def compose(
         msg["In-Reply-To"] = in_reply_to
         refs = (references + " " + in_reply_to).strip()
         msg["References"] = refs
-    msg.set_content(body)
-    msg.add_alternative(_html_body(body), subtype="html")
+    msg.set_content(f"{body}\n\n{quote_text}\n" if quote_text else body)
+    msg.add_alternative(_html_body(body, quote_html), subtype="html")
     return msg
 
 
@@ -210,6 +263,8 @@ def send_email(
     bcc: str | list[str] | None = None,
     in_reply_to: str = "",
     references: str = "",
+    quote_text: str = "",
+    quote_html: str = "",
 ) -> SendResult:
     to_l, cc_l, bcc_l = _split(to), _split(cc), _split(bcc)
     if not to_l:
@@ -229,6 +284,7 @@ def send_email(
     msg = compose(
         to=to_l, subject=subject, body=body, cc=cc_l, bcc=bcc_l,
         in_reply_to=in_reply_to, references=references,
+        quote_text=quote_text, quote_html=quote_html,
     )
 
     bootstrapped = False
@@ -260,10 +316,16 @@ def reply_email(
     reply_all: bool = False,
     cc: str | list[str] | None = None,
     bcc: str | list[str] | None = None,
+    include_history: bool = True,
 ) -> SendResult:
     """Reply to message `id`, threading correctly (In-Reply-To / References /
     Re: subject). Defaults to replying to the original sender only; set
     reply_all=True to include the original To+Cc (minus your own address).
+
+    The original message is quoted below the reply (attribution line +
+    `>`-prefixed plain text; `<blockquote type="cite">` in HTML), the way a
+    normal mail client's Reply does. Pass include_history=False for a bare
+    reply carrying only threading headers.
     """
     original = source.get(id)  # Email dataclass
     headers = original.headers
@@ -283,7 +345,14 @@ def reply_email(
             if _bare(a) != self_bare and _bare(a) not in {_bare(x) for x in to_l + cc_l}:
                 cc_l.append(a)
 
+    quote_text = quote_html = ""
+    if include_history and (original.body_text.strip() or original.body_html.strip()):
+        attribution = _attribution(original.ref)
+        quote_text = _quote_plain(original.body_text, original.body_html, attribution)
+        quote_html = _quote_html(original.body_html, original.body_text, attribution)
+
     return send_email(
         to=to_l, subject=subject, body=body, cc=cc_l, bcc=bcc,
         in_reply_to=orig_msgid, references=orig_refs,
+        quote_text=quote_text, quote_html=quote_html,
     )
