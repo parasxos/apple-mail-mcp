@@ -130,6 +130,7 @@ class AppleMailSource:
             "attachments",
             "summaries",
             "conversations",
+            "message_global_data",
         )
         out: dict[str, set[str]] = {}
         cur = self._conn.cursor()
@@ -576,6 +577,97 @@ class AppleMailSource:
             "newest_subject": newest["subject"] or "",
             "newest_from": from_addr,
         }
+
+    # ------------------------------------------------------------------ #
+    # triage helpers (read-only; off the EmailSource Protocol)           #
+    # ------------------------------------------------------------------ #
+
+    def triage_snapshot(self, rowids: list[int]) -> dict[int, dict]:
+        """Per-message state for triage plan/verify, on a FRESH read-only
+        connection (freshness_snapshot pattern — verify must see Mail's
+        latest commit, not this instance's cached WAL snapshot).
+
+        A missing rowid is simply absent from the result — that absence IS
+        the "row gone" signal the move/delete verifier relies on. The
+        Envelope Index is never opened writable.
+        """
+        if not rowids:
+            return {}
+        have_color = self._have("messages", "flag_color")
+        have_gmid = self._have("messages", "global_message_id")
+        have_mgd = self._have("message_global_data", "message_id_header")
+        gmid_col = "m.global_message_id" if have_gmid else "NULL"
+        color_col = "COALESCE(m.flag_color, -1)" if have_color else "-1"
+        mid_join = (
+            "LEFT JOIN message_global_data g ON g.ROWID = m.global_message_id"
+            if (have_gmid and have_mgd) else ""
+        )
+        mid_col = "g.message_id_header" if (have_gmid and have_mgd) else "NULL"
+        marks = ",".join("?" * len(rowids))
+        index = self._mail_dir / "MailData" / "Envelope Index"
+        conn = _connect_readonly(index)
+        try:
+            rows = conn.execute(
+                f"""
+                SELECT m.ROWID AS rowid, m.mailbox AS mailbox_rowid,
+                       mb.url AS mailbox_url,
+                       m.read AS read, m.flagged AS flagged,
+                       {color_col} AS flag_color, m.deleted AS deleted,
+                       {gmid_col} AS gmid, {mid_col} AS mid_header
+                  FROM messages m
+                  JOIN mailboxes mb ON mb.ROWID = m.mailbox
+                  {mid_join}
+                 WHERE m.ROWID IN ({marks})
+                """,
+                rowids,
+            ).fetchall()
+        finally:
+            conn.close()
+        out: dict[int, dict] = {}
+        for r in rows:
+            mid = (r["mid_header"] or "").strip().strip("<>")
+            out[int(r["rowid"])] = {
+                "mailbox_rowid": int(r["mailbox_rowid"]),
+                "mailbox_url": r["mailbox_url"] or "",
+                "read": int(r["read"]),
+                "flagged": int(r["flagged"]),
+                "flag_color": int(r["flag_color"]),
+                "deleted": int(r["deleted"]),
+                "gmid": int(r["gmid"]) if r["gmid"] is not None else None,
+                "mid_header": mid,
+            }
+        return out
+
+    def resolve_mailbox(self, account: str, name: str) -> tuple[int, str] | None:
+        """(mailbox ROWID, url) for an exact decoded (account, slash-path)
+        match — deliberately NOT search()'s LIKE heuristics. Fresh read-only
+        connection: mailbox_create polls this for a just-created box."""
+        index = self._mail_dir / "MailData" / "Envelope Index"
+        conn = _connect_readonly(index)
+        try:
+            rows = conn.execute("SELECT ROWID, url FROM mailboxes").fetchall()
+        finally:
+            conn.close()
+        for r in rows:
+            url = r["url"] or ""
+            if account_label(url) == account and mailbox_name(url) == name:
+                return int(r["ROWID"]), url
+        return None
+
+    def locate_by_gmid(self, gmid: int, mailbox_rowid: int) -> int | None:
+        """Move-verification outcome (b): find the reinserted row for a
+        moved message in the target mailbox (fresh read-only connection)."""
+        index = self._mail_dir / "MailData" / "Envelope Index"
+        conn = _connect_readonly(index)
+        try:
+            row = conn.execute(
+                "SELECT ROWID FROM messages WHERE global_message_id = ? "
+                "AND mailbox = ? AND deleted = 0 LIMIT 1",
+                (gmid, mailbox_rowid),
+            ).fetchone()
+        finally:
+            conn.close()
+        return int(row["ROWID"]) if row else None
 
 
 # ---------------------------------------------------------------------- #

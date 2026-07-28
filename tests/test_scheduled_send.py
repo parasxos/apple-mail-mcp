@@ -161,7 +161,9 @@ def test_stranded_sending_recovers_then_delivers(delivered):
     summary = dispatcher.run_once(now=later)
     assert summary["results"][entry.id] == "sent"
     got = spool.load("sent", entry.id)
-    assert got.attempts == 1 and "recovered" in got.last_error
+    # attempts carries the retry history; last_error clears on success so a
+    # delivered entry never reads like a failure.
+    assert got.attempts == 1 and got.last_error is None
 
 
 def test_claim_race_single_winner(delivered):

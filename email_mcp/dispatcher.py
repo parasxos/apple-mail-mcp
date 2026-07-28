@@ -136,6 +136,7 @@ def run_once(now: datetime | None = None) -> dict:
             continue
         entry.delivered_at = spool.iso(spool.utcnow())
         entry.next_attempt_at = None
+        entry.last_error = None  # succeeded — a stale error reads as failure
         spool.move(entry.id, "sending", "sent", entry)
         results[entry.id] = "sent"
 

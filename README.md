@@ -27,7 +27,7 @@ Add to `~/.claude.json` (merge with whatever is already there) — point at the 
 }
 ```
 
-Restart Claude Code. Run `/mcp` — `apple-mail` should appear with twelve tools: `search_emails`, `get_email`, `get_thread`, `list_mailboxes`, `list_recent`, `get_attachment`, `refresh_mail`, `send_email`, `reply_email`, `schedule_email`, `list_scheduled`, `cancel_scheduled`.
+Restart Claude Code. Run `/mcp` — `apple-mail` should appear with sixteen tools: `search_emails`, `get_email`, `get_thread`, `list_mailboxes`, `list_recent`, `get_attachment`, `refresh_mail`, `send_email`, `reply_email`, `schedule_email`, `list_scheduled`, `cancel_scheduled`, `triage_plan`, `triage_apply`, `mailbox_create`, `mailbox_delete`.
 
 To disable the self-only send guard (after you've trusted it — see [Sending mail](#sending-mail-send_email--reply_email)), add the flag to that server's `env` block:
 
@@ -142,6 +142,11 @@ The tests build a fake `~/Library/Mail/V10` tree in `tmp_path` — they don't re
 | `EMAIL_MCP_MAX_ATTACH_MB` | `20` | Total attachment budget per outgoing message (file bytes, pre-base64). |
 | `EMAIL_MCP_SPOOL_DIR` | `~/.email-mcp/spool` | Scheduled-send spool root (created 0700). |
 | `EMAIL_MCP_SEND_RETRIES` | `5` | Delivery attempts per scheduled message before parking in `failed/`. |
+| `EMAIL_MCP_PLANS_DIR` | `~/.email-mcp/plans` | Triage plan store (created 0700). |
+| `EMAIL_MCP_TRIAGE_MAX` | `200` | Message cap per triage plan (bigger selections rejected). |
+| `EMAIL_MCP_TRIAGE_TTL` | `600` | Seconds a draft plan stays applicable. |
+| `EMAIL_MCP_TRIAGE_TIMEOUT` | `0` (auto) | Batch AppleScript timeout; 0 = 30 + 0.6×N s, clamped 60–300. |
+| `EMAIL_MCP_TRIAGE_VERIFY_POLLS` / `_INTERVAL` | `3` / `2.0` | Verification polling against the index. |
 | `EMAIL_MCP_SEND_HOST` | `lxplus.cern.ch` | SSH host used for delivery. |
 | `EMAIL_MCP_SEND_USER` | `pmoschov` | SSH user on that host. |
 | `EMAIL_MCP_SSH_SOCKET` | `~/.ssh/sock-lxplus-mail` | ControlMaster socket path. |
@@ -165,6 +170,10 @@ The seven read tools are **read-only on disk**. `refresh_mail` nudges Mail.app v
 | `schedule_email(to, subject, body, send_at, cc?, bcc?, attachments?)` | Compose + freeze now, deliver at `send_at` via the launchd dispatcher. Returns `{ok, id, send_at, message_id, ...}`. |
 | `list_scheduled(state?, limit?)` | The "Send Later mailbox": pending / sending / sent / failed / cancelled, with errors and delivery stamps. |
 | `cancel_scheduled(id)` | Cancel a pending scheduled message (sent/mid-flight cannot be recalled). |
+| `triage_plan(filters..., actions)` | Stage a mailbox operation: same filters as `search_emails` + a list of dispositions. Mutates nothing; returns `{plan_id, count, summary, messages}` for review. |
+| `triage_apply(plan_id)` | Execute a staged plan (one batched AppleScript, by-ROWID addressing) + verify against the index. Per-message failures are data. |
+| `mailbox_create(account, path)` | Create a (nested) mailbox; idempotent. |
+| `mailbox_delete(account, path)` | Delete an EMPTY mailbox; idempotent. Outcome decided by live re-probe (Mail's delete verb lies); escalates to UI scripting when the verb has no effect (needs Accessibility permission). |
 | `reply_email(id, body, reply_all?, cc?, bcc?, include_history?, attachments?)` | Reply to message `id`, threading via In-Reply-To / References / `Re:` subject. Quotes the original below the reply (attribution + `>` block, HTML blockquote) like a normal client; `include_history=False` for a bare reply. Defaults to the original sender only; `reply_all=True` also Ccs the original To+Cc minus your own address. `attachments` as in `send_email`. |
 
 ## Scheduled send (`schedule_email` / `list_scheduled` / `cancel_scheduled`)
@@ -179,7 +188,8 @@ database:
   Naive `send_at` means local time; explicit offsets respected.
 - A **launchd agent** (`com.paris.email-mcp-dispatcher`, every 60 s +
   RunAtLoad) delivers what is due over the same SSH path, bootstrapping the
-  ControlMaster if cold. Mac asleep at send time → the message goes out on
+  ControlMaster if cold. Worst-case delivery lag is ~two ticks (~2 min) past
+  send_at — measured 81 s in fleet testing. Mac asleep at send time → the message goes out on
   the first pass after wake, like Mail.app's "send when opened".
 - Failures retry with backoff (2/5/15/45/120 min, `EMAIL_MCP_SEND_RETRIES`
   attempts, default 5), then park in `failed/` with the error + a macOS
@@ -193,16 +203,48 @@ database:
   (also `--uninstall-launchd`, `--status`; log at
   `~/.email-mcp/dispatcher.log`).
 
+## Triage (`triage_plan` / `triage_apply` / `mailbox_create` / `mailbox_delete`)
+
+Mailbox management as **selection × disposition** (design + measurements:
+`docs/triage-design.md`): SELECT messages via the same SQLite filters as
+`search_emails` → freeze them + the dispositions into a reviewable **plan**
+(nothing mutates) → `triage_apply` runs ONE batched AppleScript addressing
+each message by its Envelope Index ROWID (keyed lookup, 0.16 s in a
+72k-message mailbox — measured, vs 85.6 s for name-based scans) → the same
+index verifies the mutations landed (write-through ≤2 s).
+
+- Dispositions: `move_to` (same-account; target must exist), `mark_read`,
+  `mark_unread`, `flag` (color 0-6), `unflag`, `delete` (Mail's own delete
+  verb → that account's Trash; nothing is erased permanently). No `archive`
+  verb — that's `move_to` with your archive mailbox.
+- **Plan/apply is two calls by design** — review the returned plan before
+  applying. Plans live in `~/.email-mcp/plans/` (0700), expire after 10 min,
+  cap at 200 messages (larger selections are rejected, never truncated).
+  Double-apply and concurrent applies are safe (atomic claim).
+- Before mutating, each message's RFC Message-ID is re-checked against the
+  plan — a message that moved or a recycled database id fails safe.
+- Failures are per-message data (`failures[]`), not call errors; `pending[]`
+  means the local index hasn't confirmed within the poll window (normal for
+  Exchange — it syncs).
+- ⚠ `mailbox_create` on **Exchange (EWS)** accounts: AppleScript-created
+  folders may not persist server-side (observed live: Exchange silently
+  reverted every move into one). Create Exchange folders in Mail.app/OWA;
+  `mailbox_create` is reliable for local and plain-IMAP accounts.
+- Requires Mail.app Automation permission (same as `refresh_mail`). The
+  Envelope Index itself is **never opened writable** — all mutations go
+  through Mail.app, which owns server sync.
+
 ## Phase-2 hooks (not implemented yet)
 
 - **More sources**: implement `EmailSource` in `email_mcp/sources/`, register in `email_mcp/sources/__init__.py::_REGISTRY`, select via `EMAIL_MCP_SOURCE`.
 - **FTS5 sidecar**: a separate adapter that mirrors `.emlx` bodies into a local FTS5 db.
-- **More write tools** (mark-read, move): future. `send_email` / `reply_email` shipped in v0.2.0; reply history-quoting in v0.3.0; outgoing attachments in v0.4.0; scheduled send in v0.5.0.
+- **More write tools** (mark-read, move): future. `send_email` / `reply_email` shipped in v0.2.0; reply history-quoting in v0.3.0; outgoing attachments in v0.4.0; scheduled send in v0.5.0; triage (mailbox management) in v0.6.0.
 
 ## Safety notes
 
 - Opens the Envelope Index with `?mode=ro` (WAL-safe) — safe to run while Mail.app is active.
 - Never writes to `~/Library/Mail`. Sending never touches the Mail store.
+- Triage mutations go through Mail.app's AppleScript interface; the Envelope Index is never opened writable.
 - `get_attachment` writes only to the configurable `EMAIL_MCP_ATTACH_DIR`.
 - Body and attachment size are capped by `EMAIL_MCP_MAX_BODY_BYTES`.
 - Sending is the only outward action: guarded by the self-only allowlist (default), a mandatory non-empty `to`/`subject`/`body`, and Bcc-to-self for an audit trail.

@@ -19,6 +19,9 @@ from typing import Any
 
 from .config import source_name
 from .sender import SendError, reply_email, schedule_email, send_email
+from .triage import (
+    TriageError, apply_plan, build_plan, create_mailbox, delete_mailbox,
+)
 from .sources import get_source
 from .sources.base import EmailSource, SearchQuery
 
@@ -310,6 +313,74 @@ def tool_list_scheduled(state: str | None = None, limit: int = 50) -> dict:
     }
 
 
+def _triage_err(e: TriageError) -> dict:
+    return {"ok": False, "code": e.code, "error": str(e)}
+
+
+def tool_triage_plan(
+    query: str = "",
+    from_addr: str | None = None,
+    to_addr: str | None = None,
+    mailbox: str | None = None,
+    account: str | None = None,
+    before: str | None = None,
+    after: str | None = None,
+    has_attachment: bool | None = None,
+    unread_only: bool = False,
+    limit: int = 0,
+    actions: list[dict] | None = None,
+) -> dict:
+    from .config import triage_max_messages
+
+    cap = triage_max_messages()
+    q = SearchQuery(
+        query=query, from_addr=from_addr, to_addr=to_addr,
+        mailbox=mailbox, account=account,
+        before=_parse_dt(before), after=_parse_dt(after),
+        has_attachment=has_attachment, unread_only=unread_only,
+        limit=limit if 0 < limit <= cap else cap + 1,  # +1 exposes over-cap
+        offset=0,  # plans must be stable selections — no paging
+    )
+    try:
+        plan = build_plan(_source(), q, actions)
+    except TriageError as e:
+        return _triage_err(e)
+    return {
+        "ok": True,
+        "plan_id": plan.id,
+        "count": len(plan.messages),
+        "expires_at": plan.expires_at,
+        "summary": plan.summary,
+        "actions": [_to_jsonable(a) for a in plan.actions],
+        "messages": [
+            {"id": str(m.rowid), "subject": m.subject, "from_addr": m.from_addr,
+             "date": m.date, "mailbox": m.mailbox, "unread": m.unread}
+            for m in plan.messages
+        ],
+    }
+
+
+def tool_triage_apply(plan_id: str) -> dict:
+    try:
+        return apply_plan(_source(), plan_id)
+    except TriageError as e:
+        return _triage_err(e)
+
+
+def tool_mailbox_create(account: str, path: str) -> dict:
+    try:
+        return create_mailbox(_source(), account, path)
+    except TriageError as e:
+        return _triage_err(e)
+
+
+def tool_mailbox_delete(account: str, path: str) -> dict:
+    try:
+        return delete_mailbox(_source(), account, path)
+    except TriageError as e:
+        return _triage_err(e)
+
+
 def tool_cancel_scheduled(id: str) -> dict:
     from . import spool
 
@@ -336,7 +407,7 @@ def tool_cancel_scheduled(id: str) -> dict:
 
 
 def _build_mcp_server():  # pragma: no cover — exercised by integration only
-    """Build the FastMCP Server with all nine tools registered."""
+    """Build the FastMCP Server with all sixteen tools registered."""
     from mcp.server.fastmcp import FastMCP  # type: ignore
 
     mcp = FastMCP("apple-mail")
@@ -532,6 +603,90 @@ def _build_mcp_server():  # pragma: no cover — exercised by integration only
         list_scheduled). Only pending messages can be cancelled — anything
         already sending/sent is past the point of no return."""
         return tool_cancel_scheduled(id=id)
+
+    @mcp.tool()
+    def triage_plan(
+        query: str = "",
+        from_addr: str | None = None,
+        to_addr: str | None = None,
+        mailbox: str | None = None,
+        account: str | None = None,
+        before: str | None = None,
+        after: str | None = None,
+        has_attachment: bool | None = None,
+        unread_only: bool = False,
+        limit: int = 0,
+        actions: list[dict] | None = None,
+    ) -> dict:
+        """Stage a mailbox-management operation: SELECT messages with the
+        same filters as search_emails, and freeze them + `actions` into a
+        reviewable plan. NOTHING is modified — mutation happens only when
+        triage_apply is called with the returned plan_id.
+
+        The two-call plan/apply split is BY DESIGN: show the returned plan
+        (count, summary, messages) to the user before applying. Plans
+        expire after 10 minutes and cap at 200 messages (larger selections
+        are rejected, never truncated — narrow the query).
+
+        `actions` is a list of dispositions applied to every selected
+        message, e.g. [{"action": "mark_read"}, {"action": "move_to",
+        "mailbox": "Archive/JIRA"}]. Vocabulary: move_to (same-account,
+        target must exist — see mailbox_create), mark_read, mark_unread,
+        flag (color 0-6), unflag, delete. `delete` uses Mail.app's own
+        delete verb → the account's Trash; nothing is erased permanently.
+        There is no `archive` action — use move_to with your archive
+        mailbox. Returns {ok, plan_id, count, expires_at, summary,
+        messages} or {ok: false, code, error}.
+        """
+        return tool_triage_plan(
+            query=query, from_addr=from_addr, to_addr=to_addr,
+            mailbox=mailbox, account=account, before=before, after=after,
+            has_attachment=has_attachment, unread_only=unread_only,
+            limit=limit, actions=actions,
+        )
+
+    @mcp.tool()
+    def triage_apply(plan_id: str) -> dict:
+        """Execute a plan staged by triage_plan: one batched AppleScript
+        against Mail.app (messages addressed by database id — fast at any
+        mailbox size), then verification against Mail's own store.
+
+        Large plans take a while (~0.2 s/message + overhead; a 200-message
+        plan can run minutes) — do not re-invoke mid-flight; a second call
+        safely returns plan_claimed. Requires Mail.app Automation
+        permission (same as refresh_mail). Returns {ok, status, planned,
+        acted, verified, failures[], pending[]} — per-message failures are
+        data, not errors; `pending` means Mail's local store hasn't
+        confirmed within the poll window yet, not that the action failed.
+        """
+        return tool_triage_apply(plan_id=plan_id)
+
+    @mcp.tool()
+    def mailbox_create(account: str, path: str) -> dict:
+        """Create a mailbox/folder in an account (account = the UUID shown
+        in search results; path may nest with slashes, e.g. "Archive/JIRA").
+        Idempotent: returns existed=true without touching Mail if it is
+        already there. index_verified=false with applescript="OK" means
+        Mail created it but the local index hasn't caught up yet.
+
+        ⚠ Exchange (EWS) accounts: AppleScript-created folders may not
+        persist server-side — the result carries a warning and moves into
+        such a folder can be silently reverted by the server. For Exchange,
+        create folders in Mail.app/OWA and triage into them once they
+        appear; mailbox_create is reliable for local (On My Mac) and
+        plain-IMAP accounts."""
+        return tool_mailbox_create(account=account, path=path)
+
+    @mcp.tool()
+    def mailbox_delete(account: str, path: str) -> dict:
+        """Delete an EMPTY mailbox (non-empty ones are refused — triage the
+        messages out first). Idempotent: already-absent returns ok with
+        existed=false. The outcome is decided by a live existence re-probe,
+        not by AppleScript's reply — Mail's delete verb often reports a
+        false error (-10000) on success. deleted=false with ok=false means
+        the mailbox genuinely survived (typical for phantom Exchange
+        folders — remove those in Mail.app/OWA)."""
+        return tool_mailbox_delete(account=account, path=path)
 
     return mcp
 

@@ -145,6 +145,46 @@ def send_max_retries() -> int:
     return int(os.environ.get("EMAIL_MCP_SEND_RETRIES", "5"))
 
 
+# ---------------------------------------------------------------------- #
+# Triage (triage_plan / triage_apply / mailbox_create)                    #
+# ---------------------------------------------------------------------- #
+
+
+def plans_dir() -> Path:
+    """Root of the triage plan store (frozen plan JSONs). Created 0700 —
+    plans carry message metadata."""
+    raw = os.environ.get("EMAIL_MCP_PLANS_DIR", "").strip()
+    d = Path(raw).expanduser() if raw else Path.home() / ".email-mcp" / "plans"
+    d.mkdir(parents=True, exist_ok=True)
+    d.parent.chmod(0o700)
+    d.chmod(0o700)
+    return d
+
+
+def triage_max_messages() -> int:
+    """Hard cap on messages per plan; bigger selections are rejected,
+    never silently truncated."""
+    return int(os.environ.get("EMAIL_MCP_TRIAGE_MAX", "200"))
+
+
+def triage_ttl_seconds() -> int:
+    """How long a draft plan stays applicable."""
+    return int(os.environ.get("EMAIL_MCP_TRIAGE_TTL", "600"))
+
+
+def triage_timeout_seconds() -> float:
+    """Batch osascript timeout; 0 (default) = auto from message count."""
+    return float(os.environ.get("EMAIL_MCP_TRIAGE_TIMEOUT", "0"))
+
+
+def triage_verify_polls() -> int:
+    return int(os.environ.get("EMAIL_MCP_TRIAGE_VERIFY_POLLS", "3"))
+
+
+def triage_verify_interval() -> float:
+    return float(os.environ.get("EMAIL_MCP_TRIAGE_VERIFY_INTERVAL", "2.0"))
+
+
 def send_max_attach_mb() -> float:
     """Total attachment budget per message, in MB (pre-base64 file bytes).
 

@@ -45,7 +45,13 @@ def _build_envelope_index(db_path: Path) -> None:
             read INTEGER NOT NULL DEFAULT 0,
             flagged INTEGER NOT NULL DEFAULT 0,
             deleted INTEGER NOT NULL DEFAULT 0,
-            conversation_id INTEGER NOT NULL DEFAULT 0
+            conversation_id INTEGER NOT NULL DEFAULT 0,
+            global_message_id INTEGER,
+            flag_color INTEGER
+        );
+        CREATE TABLE message_global_data (
+            ROWID INTEGER PRIMARY KEY,
+            message_id_header TEXT
         );
         CREATE TABLE subjects (ROWID INTEGER PRIMARY KEY, subject TEXT);
         CREATE TABLE summaries (ROWID INTEGER PRIMARY KEY, summary TEXT);
@@ -120,13 +126,24 @@ def _build_envelope_index(db_path: Path) -> None:
     #           ROWID 200 in Inbox (no .emlx on disk — simulates IMAP-only),
     #           ROWID 300 in [Gmail]/All Mail (HTML-only body).
     cur.executemany(
-        "INSERT INTO messages(ROWID, subject, sender, summary, date_sent, date_received, mailbox, read, flagged, deleted, conversation_id) "
-        "VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+        "INSERT INTO messages(ROWID, subject, sender, summary, date_sent, date_received, mailbox, read, flagged, deleted, conversation_id, global_message_id, flag_color) "
+        "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
         [
-            (100, 1, 1, 1, 1714600000, 1714600100, 1, 0, 0, 0, 7001),
-            (101, 2, 3, 2, 1714700000, 1714700100, 1, 1, 0, 0, 7002),
-            (200, 3, 3, 3, 1714500000, 1714500100, 1, 1, 0, 0, 7001),  # same convo as 100
-            (300, 4, 4, 4, 1714400000, 1714400100, 2, 1, 0, 0, 7003),
+            (100, 1, 1, 1, 1714600000, 1714600100, 1, 0, 0, 0, 7001, 9100, None),
+            (101, 2, 3, 2, 1714700000, 1714700100, 1, 1, 0, 0, 7002, 9101, None),
+            (200, 3, 3, 3, 1714500000, 1714500100, 1, 1, 0, 0, 7001, 9200, None),  # same convo as 100
+            (300, 4, 4, 4, 1714400000, 1714400100, 2, 1, 0, 0, 7003, 9300, None),
+        ],
+    )
+    # Global data: RFC Message-ID headers (9200 has none — exercises the
+    # triage skip-recheck path for the rare header-less rows).
+    cur.executemany(
+        "INSERT INTO message_global_data(ROWID, message_id_header) VALUES (?,?)",
+        [
+            (9100, "<i2c-2026-05-01@cern.ch>"),
+            (9101, "<emci-update@cern.ch>"),
+            (9200, ""),
+            (9300, "<archived@example.com>"),
         ],
     )
     # Recipients: 100 To paris, 101 To paris + Cc ops, 300 To paris
