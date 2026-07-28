@@ -124,6 +124,27 @@ def send_delivery_cmd() -> str:
     return os.environ.get("EMAIL_MCP_DELIVERY_CMD", "/usr/sbin/sendmail").strip()
 
 
+def spool_dir() -> Path:
+    """Root of the scheduled-mail spool (frozen .eml + .json manifests).
+
+    Default ~/.email-mcp/spool, override with EMAIL_MCP_SPOOL_DIR. The tree
+    holds fully-composed outgoing mail (bodies + attachments), so it is
+    created 0700 and kept that way.
+    """
+    raw = os.environ.get("EMAIL_MCP_SPOOL_DIR", "").strip()
+    d = Path(raw).expanduser() if raw else Path.home() / ".email-mcp" / "spool"
+    for sub in ("pending", "sending", "sent", "failed", "cancelled"):
+        (d / sub).mkdir(parents=True, exist_ok=True)
+    d.parent.chmod(0o700)
+    d.chmod(0o700)
+    return d
+
+
+def send_max_retries() -> int:
+    """Delivery attempts per scheduled message before it parks in failed/."""
+    return int(os.environ.get("EMAIL_MCP_SEND_RETRIES", "5"))
+
+
 def send_max_attach_mb() -> float:
     """Total attachment budget per message, in MB (pre-base64 file bytes).
 

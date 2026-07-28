@@ -18,7 +18,7 @@ from datetime import datetime, timezone
 from typing import Any
 
 from .config import source_name
-from .sender import SendError, reply_email, send_email
+from .sender import SendError, reply_email, schedule_email, send_email
 from .sources import get_source
 from .sources.base import EmailSource, SearchQuery
 
@@ -274,6 +274,62 @@ def tool_reply_email(
         return {"ok": False, "error": str(e)}
 
 
+def tool_schedule_email(
+    to: str,
+    subject: str,
+    body: str,
+    send_at: str,
+    cc: str | None = None,
+    bcc: str | None = None,
+    attachments: list[str] | None = None,
+) -> dict:
+    try:
+        entry = schedule_email(
+            to=to, subject=subject, body=body, send_at=send_at,
+            cc=cc, bcc=bcc, attachments=attachments,
+        )
+        return {"ok": True, **_to_jsonable(entry)}
+    except SendError as e:
+        return {"ok": False, "error": str(e)}
+
+
+def tool_list_scheduled(state: str | None = None, limit: int = 50) -> dict:
+    from . import spool
+    from .dispatcher import LAUNCHD_LABEL, _plist_path
+
+    states = [state] if state else list(spool.STATES)
+    if state and state not in spool.STATES:
+        return {"ok": False,
+                "error": f"unknown state {state!r} (want one of {spool.STATES})"}
+    out = {s: [_to_jsonable(e) for e in spool.entries(s)][-limit:] for s in states}
+    return {
+        "ok": True,
+        "dispatcher_installed": _plist_path().exists(),
+        "dispatcher_label": LAUNCHD_LABEL,
+        **out,
+    }
+
+
+def tool_cancel_scheduled(id: str) -> dict:
+    from . import spool
+
+    found = spool.find(id)
+    if found is None:
+        return {"ok": False, "error": f"no scheduled message with id {id!r}"}
+    state, entry = found
+    if state != "pending":
+        return {"ok": False,
+                "error": f"cannot cancel {id}: status is {state!r} "
+                         "(only pending messages can be cancelled)"}
+    if not spool.claim(id, "pending", "cancelled"):
+        return {"ok": False,
+                "error": f"cannot cancel {id}: a dispatcher just claimed it"}
+    entry.status = "cancelled"
+    spool.update("cancelled", entry)
+    return {"ok": True, "id": id, "status": "cancelled",
+            "subject": entry.subject, "was_due": entry.send_at}
+
+
 # ---------------------------------------------------------------------- #
 # MCP wiring                                                             #
 # ---------------------------------------------------------------------- #
@@ -420,6 +476,62 @@ def _build_mcp_server():  # pragma: no cover — exercised by integration only
             id=id, body=body, reply_all=reply_all, cc=cc, bcc=bcc,
             include_history=include_history, attachments=attachments,
         )
+
+    @mcp.tool()
+    def schedule_email(
+        to: str,
+        subject: str,
+        body: str,
+        send_at: str,
+        cc: str | None = None,
+        bcc: str | None = None,
+        attachments: list[str] | None = None,
+    ) -> dict:
+        """Schedule an email for later delivery (the MCP's "Send Later").
+
+        `send_at` is ISO-8601; a naive timestamp ("2026-07-29T09:00") means
+        LOCAL time, an explicit offset is respected. Everything else works
+        exactly like send_email (addresses, body, attachments, allowlist,
+        auto Bcc-to-self).
+
+        The message is composed and FROZEN now — attachments are embedded at
+        schedule time, so later edits to the source files change nothing. A
+        launchd agent checks every 60s and delivers when due; if the Mac is
+        asleep at send_at, the message goes out on the first check after
+        wake (same semantics as Mail.app's Send Later). Manage with
+        list_scheduled / cancel_scheduled.
+
+        Returns {ok, id, send_at (UTC), message_id, ...}. If the result
+        warns the dispatcher is not installed, run:
+        python -m email_mcp.dispatcher --install-launchd
+        """
+        res = tool_schedule_email(
+            to=to, subject=subject, body=body, send_at=send_at,
+            cc=cc, bcc=bcc, attachments=attachments,
+        )
+        if res.get("ok"):
+            from .dispatcher import _plist_path
+            if not _plist_path().exists():
+                res["warning"] = (
+                    "dispatcher launchd agent NOT installed — nothing will "
+                    "send. Run: python -m email_mcp.dispatcher --install-launchd"
+                )
+        return res
+
+    @mcp.tool()
+    def list_scheduled(state: str | None = None, limit: int = 50) -> dict:
+        """List scheduled emails by state: pending (waiting), sending
+        (mid-flight), sent (delivered, with delivered_at), failed (gave up
+        after retries, with last_error), cancelled. Omit `state` for all.
+        This is the equivalent of Mail.app's "Send Later" mailbox."""
+        return tool_list_scheduled(state=state, limit=limit)
+
+    @mcp.tool()
+    def cancel_scheduled(id: str) -> dict:
+        """Cancel a pending scheduled email by id (from schedule_email /
+        list_scheduled). Only pending messages can be cancelled — anything
+        already sending/sent is past the point of no return."""
+        return tool_cancel_scheduled(id=id)
 
     return mcp
 

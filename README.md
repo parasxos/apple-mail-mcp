@@ -27,7 +27,7 @@ Add to `~/.claude.json` (merge with whatever is already there) — point at the 
 }
 ```
 
-Restart Claude Code. Run `/mcp` — `apple-mail` should appear with nine tools: `search_emails`, `get_email`, `get_thread`, `list_mailboxes`, `list_recent`, `get_attachment`, `refresh_mail`, `send_email`, `reply_email`.
+Restart Claude Code. Run `/mcp` — `apple-mail` should appear with twelve tools: `search_emails`, `get_email`, `get_thread`, `list_mailboxes`, `list_recent`, `get_attachment`, `refresh_mail`, `send_email`, `reply_email`, `schedule_email`, `list_scheduled`, `cancel_scheduled`.
 
 To disable the self-only send guard (after you've trusted it — see [Sending mail](#sending-mail-send_email--reply_email)), add the flag to that server's `env` block:
 
@@ -140,6 +140,8 @@ The tests build a fake `~/Library/Mail/V10` tree in `tmp_path` — they don't re
 | `EMAIL_MCP_SEND_ALLOWLIST` | (From: addr) | Comma-separated addresses sending may reach while the guard is on. |
 | `EMAIL_MCP_BCC_SELF` | `1` | Bcc the From: address on every send for a record. |
 | `EMAIL_MCP_MAX_ATTACH_MB` | `20` | Total attachment budget per outgoing message (file bytes, pre-base64). |
+| `EMAIL_MCP_SPOOL_DIR` | `~/.email-mcp/spool` | Scheduled-send spool root (created 0700). |
+| `EMAIL_MCP_SEND_RETRIES` | `5` | Delivery attempts per scheduled message before parking in `failed/`. |
 | `EMAIL_MCP_SEND_HOST` | `lxplus.cern.ch` | SSH host used for delivery. |
 | `EMAIL_MCP_SEND_USER` | `pmoschov` | SSH user on that host. |
 | `EMAIL_MCP_SSH_SOCKET` | `~/.ssh/sock-lxplus-mail` | ControlMaster socket path. |
@@ -160,13 +162,42 @@ The seven read tools are **read-only on disk**. `refresh_mail` nudges Mail.app v
 | `get_attachment(id, attachment_id)` | Materialises the attachment to a tmp file; returns the path. |
 | `refresh_mail(wait_seconds=5, timeout_seconds=30)` | Asks Mail.app to fetch new mail, waits, returns before/after snapshot + delta count. Launches Mail.app if it isn't running. Needs Automation permission (see above). |
 | `send_email(to, subject, body, cc?, bcc?, attachments?)` | Compose and send. Comma-separated address strings. `attachments` = list of local file paths (each entry ONE path), attached with guessed MIME types; total capped at `EMAIL_MCP_MAX_ATTACH_MB` (default 20). Auto Bcc-to-self. Self-only guard applies. Returns `{ok, message_id, to, cc, bcc, subject, attachments}` or `{ok: false, error}`. |
+| `schedule_email(to, subject, body, send_at, cc?, bcc?, attachments?)` | Compose + freeze now, deliver at `send_at` via the launchd dispatcher. Returns `{ok, id, send_at, message_id, ...}`. |
+| `list_scheduled(state?, limit?)` | The "Send Later mailbox": pending / sending / sent / failed / cancelled, with errors and delivery stamps. |
+| `cancel_scheduled(id)` | Cancel a pending scheduled message (sent/mid-flight cannot be recalled). |
 | `reply_email(id, body, reply_all?, cc?, bcc?, include_history?, attachments?)` | Reply to message `id`, threading via In-Reply-To / References / `Re:` subject. Quotes the original below the reply (attribution + `>` block, HTML blockquote) like a normal client; `include_history=False` for a bare reply. Defaults to the original sender only; `reply_all=True` also Ccs the original To+Cc minus your own address. `attachments` as in `send_email`. |
+
+## Scheduled send (`schedule_email` / `list_scheduled` / `cancel_scheduled`)
+
+The MCP's "Send Later" — same semantics as Mail.app's native feature (which
+has no automation API; verified against Mail.sdef), without touching Mail's
+database:
+
+- `schedule_email(..., send_at)` composes and **freezes** the full RFC-822
+  now — recipients validated, allowlist enforced, attachments embedded,
+  Bcc-to-self added — into `~/.email-mcp/spool/pending/` (mode 0700).
+  Naive `send_at` means local time; explicit offsets respected.
+- A **launchd agent** (`com.paris.email-mcp-dispatcher`, every 60 s +
+  RunAtLoad) delivers what is due over the same SSH path, bootstrapping the
+  ControlMaster if cold. Mac asleep at send time → the message goes out on
+  the first pass after wake, like Mail.app's "send when opened".
+- Failures retry with backoff (2/5/15/45/120 min, `EMAIL_MCP_SEND_RETRIES`
+  attempts, default 5), then park in `failed/` with the error + a macOS
+  notification. Overlapping dispatcher runs are double-send-safe (atomic
+  manifest rename claims ownership).
+- Authorization happens at **schedule time** (inside the MCP server, where
+  your config lives); the dispatcher deliberately does not re-check — it
+  runs under launchd's bare environment where the self-only default would
+  block everything.
+- Install once: `python -m email_mcp.dispatcher --install-launchd`
+  (also `--uninstall-launchd`, `--status`; log at
+  `~/.email-mcp/dispatcher.log`).
 
 ## Phase-2 hooks (not implemented yet)
 
 - **More sources**: implement `EmailSource` in `email_mcp/sources/`, register in `email_mcp/sources/__init__.py::_REGISTRY`, select via `EMAIL_MCP_SOURCE`.
 - **FTS5 sidecar**: a separate adapter that mirrors `.emlx` bodies into a local FTS5 db.
-- **More write tools** (mark-read, move): future. `send_email` / `reply_email` shipped in v0.2.0; reply history-quoting in v0.3.0; outgoing attachments in v0.4.0.
+- **More write tools** (mark-read, move): future. `send_email` / `reply_email` shipped in v0.2.0; reply history-quoting in v0.3.0; outgoing attachments in v0.4.0; scheduled send in v0.5.0.
 
 ## Safety notes
 

@@ -343,13 +343,19 @@ def _bootstrap_master() -> bool:
 def _deliver(msg: EmailMessage) -> None:
     """Pipe the message to the remote delivery command on the SSH host.
     Raises SendError on delivery failure with the remote stderr attached."""
-    raw = msg.as_bytes()
+    _deliver_bytes(msg.as_bytes())
+
+
+def _deliver_bytes(raw: bytes) -> None:
+    """Deliver pre-serialised RFC-822 bytes (used directly by the
+    scheduled-send dispatcher, which replays frozen .eml files)."""
+    from email.parser import BytesHeaderParser
+
+    hdr = BytesHeaderParser().parsebytes(raw, headersonly=True)
+    msgid, to = hdr.get("Message-ID", "?"), hdr.get("To", "?")
     remote = f"{config.send_delivery_cmd()} -t -i -f {config.send_from_addr()}"
     t0 = time.monotonic()
-    _log.info(
-        "deliver start: %s, %d bytes, to=%s",
-        msg["Message-ID"], len(raw), msg["To"],
-    )
+    _log.info("deliver start: %s, %d bytes, to=%s", msgid, len(raw), to)
     try:
         proc = subprocess.run(
             _ssh_base() + [remote],
@@ -362,7 +368,7 @@ def _deliver(msg: EmailMessage) -> None:
         _log.error(
             "deliver timed out after %.0fs: %s — master passed check but the "
             "pipe hung; killing the socket so the next send re-bootstraps",
-            time.monotonic() - t0, msg["Message-ID"],
+            time.monotonic() - t0, msgid,
         )
         _kill_master()
         raise SendError(
@@ -381,9 +387,7 @@ def _deliver(msg: EmailMessage) -> None:
             f"delivery failed (exit {proc.returncode}): "
             f"{err or 'no stderr'}"
         )
-    _log.info(
-        "deliver ok: %s (%.1fs)", msg["Message-ID"], time.monotonic() - t0
-    )
+    _log.info("deliver ok: %s (%.1fs)", msgid, time.monotonic() - t0)
 
 
 # --------------------------------------------------------------------- #
@@ -448,6 +452,80 @@ def send_email(
         attachments=[fn for _, _, _, fn in attach_loaded],
         bootstrapped=bootstrapped,
     )
+
+
+def _parse_send_at(send_at: str) -> "datetime":
+    """Parse the user's send_at. Naive timestamps mean LOCAL time (what a
+    human asking for '9am' means); aware ones are respected. Returns UTC."""
+    from datetime import datetime, timezone
+
+    try:
+        dt = datetime.fromisoformat(send_at.replace("Z", "+00:00"))
+    except ValueError as e:
+        raise SendError(f"invalid send_at (want ISO-8601): {send_at!r}") from e
+    if dt.tzinfo is None:
+        dt = dt.astimezone()  # naive → local wall-clock
+    return dt.astimezone(timezone.utc)
+
+
+def schedule_email(
+    *,
+    to: str | list[str],
+    subject: str,
+    body: str,
+    send_at: str,
+    cc: str | list[str] | None = None,
+    bcc: str | list[str] | None = None,
+    attachments: str | list[str] | None = None,
+):
+    """Compose NOW, deliver LATER: the message is validated, attachments
+    embedded, Bcc-to-self added and a Message-ID minted immediately, then
+    the finished RFC-822 is frozen into the spool for the launchd
+    dispatcher to deliver at send_at. Editing/deleting a source file after
+    scheduling does not change what goes out.
+    """
+    from . import spool
+
+    when = _parse_send_at(send_at)
+    now = spool.utcnow()
+    if (now - when).total_seconds() > 120:
+        raise SendError(
+            f"send_at is in the past ({when.isoformat(timespec='seconds')}). "
+            "Use send_email for immediate delivery."
+        )
+
+    to_l, cc_l, bcc_l = _split(to), _split(cc), _split(bcc)
+    if not to_l:
+        raise SendError("`to` is required (no valid recipient address).")
+    if not subject:
+        raise SendError("`subject` is required.")
+    if not body.strip():
+        raise SendError("`body` is empty.")
+
+    attach_loaded = _load_attachments(attachments)
+
+    if config.send_bcc_self():
+        self_addr = config.send_from_addr()
+        if _bare(self_addr) not in {_bare(b) for b in bcc_l}:
+            bcc_l.append(self_addr)
+
+    _enforce_allowlist(to_l + cc_l + bcc_l)
+
+    msg = compose(
+        to=to_l, subject=subject, body=body, cc=cc_l, bcc=bcc_l,
+        attachments=attach_loaded,
+    )
+    entry = spool.Entry(
+        id=spool.new_id(now),
+        send_at=spool.iso(when),
+        created_at=spool.iso(now),
+        to=to_l, cc=cc_l, bcc=bcc_l,
+        subject=subject,
+        attachments=[fn for _, _, _, fn in attach_loaded],
+        message_id=msg["Message-ID"],
+    )
+    spool.save(msg.as_bytes(), entry)
+    return entry
 
 
 def reply_email(
