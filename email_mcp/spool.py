@@ -43,6 +43,7 @@ class Entry:
     next_attempt_at: str | None = None
     last_error: str | None = None
     delivered_at: str | None = None
+    identity: str = "default"    # sending identity; pre-0.7.0 manifests omit it
 
 
 def utcnow() -> datetime:

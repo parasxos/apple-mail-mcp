@@ -28,7 +28,7 @@ import sys
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-from . import config, sender, spool
+from . import config, identities, sender, spool
 
 LAUNCHD_LABEL = "com.paris.email-mcp-dispatcher"
 BACKOFF_MINUTES = (2, 5, 15, 45, 120)
@@ -106,7 +106,22 @@ def run_once(now: datetime | None = None) -> dict:
     if not due:
         return {"checked_at": spool.iso(now), "due": 0, "results": results}
 
-    transport_ok = sender._socket_alive() or sender._bootstrap_master()
+    # Per-run memo: ensure each identity's transport once, however many
+    # messages ride it. An unknown identity at fire time is retried with
+    # backoff — time for the user to fix the identities file.
+    ready: dict[str, tuple[bool, str | None]] = {}
+
+    def _transport_ready(name: str) -> tuple[bool, str | None]:
+        if name not in ready:
+            try:
+                ident = identities.get(name)
+            except identities.IdentityError as e:
+                ready[name] = (False, str(e))
+            else:
+                ok, _ = sender.preflight(ident)
+                ready[name] = (
+                    ok, None if ok else sender._transport_unavailable(ident))
+        return ready[name]
 
     for entry in due:
         if not spool.claim(entry.id):
@@ -114,9 +129,10 @@ def run_once(now: datetime | None = None) -> dict:
             continue
         entry.status = "sending"
 
+        transport_ok, transport_err = _transport_ready(entry.identity)
         if not transport_ok:
             results[entry.id] = _fail_or_retry(
-                entry, "no SSH transport (socket dead, bootstrap failed)", now)
+                entry, transport_err or "transport unavailable", now)
             continue
         try:
             raw = spool.read_eml("sending", entry.id)
@@ -130,7 +146,10 @@ def run_once(now: datetime | None = None) -> dict:
             # schedule time, inside the MCP server where the user's real
             # config lives; this process runs under launchd's bare env,
             # where the guard would wrongly block every non-self message.
-            sender._deliver_bytes(raw)
+            sender.deliver_for(
+                identities.get(entry.identity), raw,
+                rcpt_to=entry.to + entry.cc + entry.bcc,
+            )
         except sender.SendError as e:
             results[entry.id] = _fail_or_retry(entry, str(e), now)
             continue

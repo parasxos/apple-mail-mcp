@@ -2,6 +2,9 @@
 threading. Transport is always mocked; nothing leaves the machine."""
 from __future__ import annotations
 
+import email
+import email.policy
+import textwrap
 from unittest.mock import patch
 
 import pytest
@@ -10,13 +13,14 @@ from email_mcp import sender
 
 
 @pytest.fixture(autouse=True)
-def _clean_send_env(monkeypatch):
+def _clean_send_env(monkeypatch, tmp_path):
     """Start each test from documented defaults, not the caller's shell env."""
     for k in list(__import__("os").environ):
         if k.startswith("EMAIL_MCP_"):
             monkeypatch.delenv(k, raising=False)
     monkeypatch.setenv("EMAIL_MCP_FROM_ADDR", "paris.moschovakos@cern.ch")
     monkeypatch.setenv("EMAIL_MCP_FROM_NAME", "Paris Moschovakos")
+    monkeypatch.setenv("EMAIL_MCP_IDENTITIES", str(tmp_path / "no-identities.toml"))
 
 
 @pytest.fixture
@@ -339,3 +343,98 @@ def test_reply_with_attachment_keeps_quote_and_threading(
     plain = next(p for p in alt.iter_parts()
                  if p.get_content_type() == "text/plain").get_content()
     assert "wrote:" in plain
+
+
+# --------------------------------------------------------------------- #
+# identities (from_identity)                                            #
+# --------------------------------------------------------------------- #
+
+
+def _write_identities(tmp_path, monkeypatch) -> None:
+    """Two identities on different drivers; 'cern' is the file's default."""
+    p = tmp_path / "identities.toml"
+    p.write_text(textwrap.dedent("""\
+        default = "cern"
+
+        [cern]
+        from_addr = "paris.moschovakos@cern.ch"
+        from_name = "Paris Moschovakos"
+        driver = "ssh_sendmail"
+        host = "lxplus.cern.ch"
+        user = "pmoschov"
+        socket = "/tmp/sock-test"
+
+        [gmail]
+        from_addr = "parasxos@gmail.com"
+        from_name = "Paris Moschovakos"
+        driver = "smtp"
+        host = "smtp.gmail.com"
+        port = 587
+        keychain = "email-mcp-gmail"
+    """))
+    monkeypatch.setenv("EMAIL_MCP_IDENTITIES", str(p))
+
+
+class _FakeTransport:
+    """Records deliveries; ensure() always succeeds."""
+
+    name = "fake"
+
+    def __init__(self, ident, log):
+        self.ident = ident
+        self.log = log
+        self.last_ensure_error = None
+
+    def ensure(self):
+        return True
+
+    def deliver(self, raw, mail_from, rcpt_to):
+        self.log.append((self.ident.name, raw, mail_from, rcpt_to))
+
+    def healthcheck(self):
+        return {"ok": True}
+
+
+def test_from_identity_sets_headers_and_routes_transport(tmp_path, monkeypatch):
+    _write_identities(tmp_path, monkeypatch)
+    seen: list = []
+    monkeypatch.setattr(
+        sender.transports, "get_transport", lambda i: _FakeTransport(i, seen))
+    res = sender.send_email(
+        to="parasxos@gmail.com", subject="s", body="b", from_identity="gmail",
+    )
+    assert res.ok is True
+    name, raw, mail_from, rcpt_to = seen[-1]
+    assert name == "gmail"                        # routed to gmail's transport
+    assert mail_from == "parasxos@gmail.com"      # gmail's envelope sender
+    assert "parasxos@gmail.com" in rcpt_to
+    msg = email.message_from_bytes(raw, policy=email.policy.default)
+    assert "parasxos@gmail.com" in msg["From"]    # identity, not env default
+    assert msg["Message-ID"].endswith("@gmail.com>")
+
+
+def test_per_identity_allowlist_blocks_cross_identity_recipient(tmp_path, monkeypatch):
+    _write_identities(tmp_path, monkeypatch)
+    seen: list = []
+    monkeypatch.setattr(
+        sender.transports, "get_transport", lambda i: _FakeTransport(i, seen))
+    with pytest.raises(sender.SendError) as ei:
+        sender.send_email(
+            to="paris.moschovakos@cern.ch",   # cern's self is NOT gmail's self
+            subject="s", body="b", from_identity="gmail",
+        )
+    assert "gmail" in str(ei.value)               # error names the identity
+    assert "paris.moschovakos@cern.ch" in str(ei.value)
+    assert seen == []                             # never reached the transport
+
+
+def test_unknown_identity_is_caller_fixable():
+    # No identities file: only the synthesized "default" exists.
+    with pytest.raises(sender.SendError) as ei:
+        sender.send_email(
+            to="paris.moschovakos@cern.ch", subject="s", body="b",
+            from_identity="gmail",
+        )
+    msg = str(ei.value)
+    assert "gmail" in msg      # names the unknown identity
+    assert "default" in msg    # and lists what IS available

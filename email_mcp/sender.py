@@ -6,34 +6,33 @@ Why not Mail.app? Its AppleScript compose path wraps the body in a collapsed
 it is the OS, not our scripting. So we bypass Mail.app for sending and build
 RFC-822 ourselves.
 
-Delivery runs over an existing SSH session to a CERN host; if the session is
-cold, a headless bootstrap script re-establishes it.
+Delivery is routed by identity (see `email_mcp.identities`): the resolved
+From: address names a `MailTransport` driver — `ssh_sendmail` (the original
+CERN path), `smtp`, or `pipe` (see `email_mcp.transports`). With no
+identities file a single default identity is synthesized from the env
+getters, so the original env-only setup keeps working unchanged.
 
-Safety: while `EMAIL_MCP_SEND_ALLOW_ALL` is off (the default), every
-recipient must be on the allowlist — which defaults to *just the From:
-address*. A mistake during the trial can therefore only reach Paris himself.
+Safety: unless `EMAIL_MCP_SEND_ALLOW_ALL` (or the identity's `allow_all`)
+is set, every recipient must be on the identity's allowlist — which
+defaults to *just its own From: address*. A mistake during the trial can
+therefore only reach the sender himself.
 """
 from __future__ import annotations
 
 import html as _html
 import mimetypes
 import re
-import subprocess
-import time
 from dataclasses import dataclass, field
 from email.message import EmailMessage
+from email.parser import BytesHeaderParser
 from email.utils import formataddr, getaddresses, make_msgid, parseaddr
 from pathlib import Path
 
-from . import config
+from . import config, identities, transports
 from .log import get_logger
+from .transports import SendError  # re-export: same class everywhere
 
 _log = get_logger()
-
-
-class SendError(Exception):
-    """Raised for caller-fixable send failures (blocked recipient, dead
-    transport, empty fields). The message is safe to surface verbatim."""
 
 
 @dataclass
@@ -77,17 +76,18 @@ def _bare(addr: str) -> str:
     return parseaddr(addr)[1].strip().lower()
 
 
-def _enforce_allowlist(recipients: list[str]) -> None:
-    if config.send_allow_all():
+def _enforce_allowlist(recipients: list[str], ident: identities.Identity) -> None:
+    if config.send_allow_all() or ident.allow_all:
         return
-    allowed = config.send_allowlist()
+    allowed = {a.strip().lower() for a in ident.allowlist}
     blocked = sorted({_bare(r) for r in recipients if _bare(r) not in allowed})
     if blocked:
         raise SendError(
-            "Refusing to send: recipient(s) not on the allowlist — "
-            f"{', '.join(blocked)}. Sending is restricted to "
-            f"{', '.join(sorted(allowed))} until EMAIL_MCP_SEND_ALLOW_ALL=1 "
-            "is set. (Trial-safety guard: mistakes can only reach you.)"
+            f"Refusing to send as identity [{ident.name}]: recipient(s) not "
+            f"on its allowlist — {', '.join(blocked)}. Sending is restricted "
+            f"to {', '.join(sorted(allowed))} until EMAIL_MCP_SEND_ALLOW_ALL=1 "
+            f"(or allow_all on [{ident.name}]) is set. (Trial-safety guard: "
+            "mistakes can only reach the identity's own address.)"
         )
 
 
@@ -223,6 +223,7 @@ def compose(
     quote_text: str = "",
     quote_html: str = "",
     attachments: list[tuple[bytes, str, str, str]] | None = None,
+    identity: identities.Identity | None = None,
 ) -> EmailMessage:
     """Build a multipart/alternative message (plain + minimal HTML).
 
@@ -231,13 +232,18 @@ def compose(
     carry an optional quoted-history block appended below the body (plain
     `>`-prefixed lines / a `<blockquote type="cite">`).
 
+    `identity` supplies the From: header and the Message-ID domain; None
+    means the default identity (which, with no identities file, mirrors the
+    env getters exactly as before).
+
     `attachments` are pre-loaded (data, maintype, subtype, filename) tuples
     (see `_load_attachments`); adding one wraps the alternative pair in
     multipart/mixed, which is exactly the structure normal clients emit.
     """
-    from_addr = config.send_from_addr()
+    ident = identity if identity is not None else identities.get(None)
+    from_addr = ident.from_addr
     msg = EmailMessage()
-    msg["From"] = formataddr((config.send_from_name(), from_addr))
+    msg["From"] = formataddr((ident.from_name, from_addr))
     msg["To"] = ", ".join(to)
     if cc:
         msg["Cc"] = ", ".join(cc)
@@ -262,132 +268,141 @@ def compose(
 # --------------------------------------------------------------------- #
 # delivery                                                              #
 # --------------------------------------------------------------------- #
+#
+# The module-level functions below are thin delegates to the DEFAULT
+# identity's transport. They are load-bearing seams: preflight() and
+# deliver_for() route default-identity traffic THROUGH them, so a caller
+# (or a test) replacing them intercepts the real flow. Named non-default
+# identities go straight to their own transport.
 
 
-def _ssh_base() -> list[str]:
-    return [
-        "ssh",
-        "-o", f"ControlPath={config.send_ssh_socket()}",
-        "-o", "BatchMode=yes",
-        f"{config.send_user()}@{config.send_host()}",
-    ]
+def _default_transport():
+    """A fresh transport for the current default identity (late-binding,
+    like the identity loader itself)."""
+    return transports.get_transport(identities.get(None))
+
+
+def _is_default(ident: identities.Identity) -> bool:
+    """True when `ident` is (or names) the file's default identity."""
+    return ident.name == identities.get(None).name
 
 
 def _socket_alive() -> bool:
-    t0 = time.monotonic()
-    try:
-        proc = subprocess.run(
-            ["ssh", "-O", "check",
-             "-o", f"ControlPath={config.send_ssh_socket()}",
-             f"{config.send_user()}@{config.send_host()}"],
-            capture_output=True, text=True, timeout=10,
-        )
-    except (FileNotFoundError, subprocess.TimeoutExpired) as e:
-        _log.warning(
-            "socket check errored (%s) after %.1fs",
-            type(e).__name__, time.monotonic() - t0,
-        )
-        return False
-    alive = proc.returncode == 0
-    _log.info(
-        "socket check: %s (%.2fs)",
-        "alive" if alive else "dead", time.monotonic() - t0,
-    )
-    return alive
+    """Is the default transport's session ready? (Seam; the ssh-flavoured
+    name is kept — drivers without a session fall back to ensure().)"""
+    t = _default_transport()
+    check = getattr(t, "socket_alive", None)
+    return check() if check is not None else t.ensure()
 
 
 def _kill_master() -> None:
-    """Tear down the ControlMaster socket (best-effort). Used after a hung
-    delivery pipe: a wedged master passes `-O check` yet stalls every
-    channel, so killing it lets the next send bootstrap a fresh session."""
-    try:
-        subprocess.run(
-            ["ssh", "-O", "exit",
-             "-o", f"ControlPath={config.send_ssh_socket()}",
-             f"{config.send_user()}@{config.send_host()}"],
-            capture_output=True, text=True, timeout=10,
-        )
-        _log.warning("killed suspect ControlMaster socket after hung delivery")
-    except (FileNotFoundError, subprocess.TimeoutExpired) as e:
-        _log.warning("could not kill ControlMaster: %s", type(e).__name__)
+    """Tear down the default transport's session, best-effort. (Seam.)"""
+    t = _default_transport()
+    kill = getattr(t, "kill_master", None)
+    if kill is not None:
+        kill()
 
 
 def _bootstrap_master() -> bool:
-    """Run the headless bootstrap to (re)establish the master socket."""
-    cmd = config.send_bootstrap_cmd()
-    if not cmd:
-        _log.warning("no bootstrap command configured; cannot re-establish SSH")
-        return False
-    t0 = time.monotonic()
-    _log.info("bootstrapping SSH master: %s", cmd)
-    try:
-        proc = subprocess.run(
-            ["bash", cmd] if cmd.endswith(".sh") else ["bash", "-c", cmd],
-            capture_output=True, text=True, timeout=120,
-        )
-    except (FileNotFoundError, subprocess.TimeoutExpired) as e:
-        _log.error(
-            "bootstrap errored (%s) after %.1fs",
-            type(e).__name__, time.monotonic() - t0,
-        )
-        return False
-    _log.info(
-        "bootstrap exit %d (%.1fs)%s",
-        proc.returncode, time.monotonic() - t0,
-        "" if proc.returncode == 0
-        else f" stderr: {(proc.stderr or '').strip()[:500]}",
-    )
-    return _socket_alive()
+    """(Re)establish the default transport's session headlessly. (Seam.)"""
+    t = _default_transport()
+    boot = getattr(t, "bootstrap_master", None)
+    return boot() if boot is not None else t.ensure()
+
+
+def _raw_mail_from(raw: bytes) -> str:
+    """Envelope sender = the raw message's OWN From: header, frozen at
+    compose time — never re-resolved from mutable config at fire time."""
+    hdr = BytesHeaderParser().parsebytes(raw, headersonly=True)
+    pairs = getaddresses([str(hdr.get("From", ""))])
+    return pairs[0][1].strip() if pairs and pairs[0][1] else ""
+
+
+def _raw_rcpt_to(raw: bytes) -> list[str]:
+    """Envelope recipients = the raw message's To + Cc + Bcc headers."""
+    hdr = BytesHeaderParser().parsebytes(raw, headersonly=True)
+    fields = [str(v) for k in ("To", "Cc", "Bcc") for v in (hdr.get_all(k) or [])]
+    return [a.strip() for _, a in getaddresses(fields) if a.strip()]
 
 
 def _deliver(msg: EmailMessage) -> None:
-    """Pipe the message to the remote delivery command on the SSH host.
-    Raises SendError on delivery failure with the remote stderr attached."""
+    """Deliver a composed message via the default identity's transport.
+    (Seam: default-identity send_email lands here.)"""
     _deliver_bytes(msg.as_bytes())
 
 
 def _deliver_bytes(raw: bytes) -> None:
-    """Deliver pre-serialised RFC-822 bytes (used directly by the
-    scheduled-send dispatcher, which replays frozen .eml files)."""
-    from email.parser import BytesHeaderParser
+    """Deliver pre-serialised RFC-822 bytes via the default identity's
+    transport. (Seam: the dispatcher's default-identity replays land here.)"""
+    ident = identities.get(None)
+    transports.get_transport(ident).deliver(
+        raw,
+        mail_from=_raw_mail_from(raw) or ident.from_addr,
+        rcpt_to=_raw_rcpt_to(raw),
+    )
 
-    hdr = BytesHeaderParser().parsebytes(raw, headersonly=True)
-    msgid, to = hdr.get("Message-ID", "?"), hdr.get("To", "?")
-    remote = f"{config.send_delivery_cmd()} -t -i -f {config.send_from_addr()}"
-    t0 = time.monotonic()
-    _log.info("deliver start: %s, %d bytes, to=%s", msgid, len(raw), to)
-    try:
-        proc = subprocess.run(
-            _ssh_base() + [remote],
-            input=raw, capture_output=True, timeout=60,
+
+_last_preflight_error: str | None = None
+
+
+def preflight(ident: identities.Identity) -> tuple[bool, bool]:
+    """Make `ident`'s transport ready to deliver → (ok, bootstrapped).
+
+    The default identity runs the pre-0.7.0 flow through the seams above
+    (socket check, then bootstrap); other identities use their transport's
+    own ensure(). Failure reasons feed _transport_unavailable()."""
+    global _last_preflight_error
+    _last_preflight_error = None
+    if _is_default(ident):
+        if _socket_alive():
+            return True, False
+        bootstrapped = _bootstrap_master()
+        if _socket_alive():
+            return True, bootstrapped
+        boot = str(ident.params.get("bootstrap", "") or "")
+        _last_preflight_error = (
+            "session dead and bootstrap failed. Establish it (2FA) then "
+            "retry" + (f" — e.g. run {boot}." if boot else ".")
         )
-    except FileNotFoundError as e:
-        _log.error("deliver failed: ssh not found on PATH")
-        raise SendError("ssh not found on PATH.") from e
-    except subprocess.TimeoutExpired as e:
-        _log.error(
-            "deliver timed out after %.0fs: %s — master passed check but the "
-            "pipe hung; killing the socket so the next send re-bootstraps",
-            time.monotonic() - t0, msgid,
-        )
-        _kill_master()
-        raise SendError(
-            "delivery pipe timed out after 60s — the SSH master looked alive "
-            "but the session hung (stale ControlMaster). The socket has been "
-            "reset; retry once and the send will re-bootstrap. Log: "
-            f"{config.log_file() or 'disabled'}."
-        ) from e
-    if proc.returncode != 0:
-        err = (proc.stderr or b"").decode("utf-8", "replace").strip()
-        _log.error(
-            "deliver failed (exit %d, %.1fs): %s",
-            proc.returncode, time.monotonic() - t0, err[:500] or "no stderr",
-        )
-        raise SendError(
-            f"delivery failed (exit {proc.returncode}): "
-            f"{err or 'no stderr'}"
-        )
-    _log.info("deliver ok: %s (%.1fs)", msgid, time.monotonic() - t0)
+        return False, bootstrapped
+    transport = transports.get_transport(ident)
+    if transport.ensure():
+        return True, False
+    _last_preflight_error = transport.last_ensure_error
+    return False, False
+
+
+def _transport_unavailable(ident: identities.Identity) -> str:
+    """The transport-unavailable line: names the lane and carries the
+    ensure error (or a generic hint) so a failed send says what broke."""
+    reason = _last_preflight_error or "transport not ready (see log)"
+    _log.error("transport unavailable for [%s/%s]: %s",
+               ident.name, ident.driver, reason)
+    return f"[{ident.name}/{ident.driver}] transport unavailable: {reason}"
+
+
+def deliver_for(
+    ident: identities.Identity,
+    raw: bytes,
+    rcpt_to: list[str] | None = None,
+) -> None:
+    """Deliver raw RFC-822 bytes as `ident`. Default-identity traffic goes
+    through the _deliver_bytes seam (which re-derives the envelope from the
+    frozen headers); other identities go straight to their transport, with
+    `rcpt_to` (or, if None, the raw To/Cc/Bcc headers) as the envelope."""
+    if _is_default(ident):
+        _deliver_bytes(raw)
+        return
+    envelope = (
+        [b for b in (_bare(r) for r in rcpt_to) if b]
+        if rcpt_to is not None
+        else _raw_rcpt_to(raw)
+    )
+    transports.get_transport(ident).deliver(
+        raw,
+        mail_from=_raw_mail_from(raw) or ident.from_addr,
+        rcpt_to=envelope,
+    )
 
 
 # --------------------------------------------------------------------- #
@@ -407,7 +422,9 @@ def send_email(
     quote_text: str = "",
     quote_html: str = "",
     attachments: str | list[str] | None = None,
+    from_identity: str | None = None,
 ) -> SendResult:
+    ident = identities.get(from_identity)
     to_l, cc_l, bcc_l = _split(to), _split(cc), _split(bcc)
     if not to_l:
         raise SendError("`to` is required (no valid recipient address).")
@@ -418,32 +435,27 @@ def send_email(
 
     attach_loaded = _load_attachments(attachments)
 
-    if config.send_bcc_self():
-        self_addr = config.send_from_addr()
-        if _bare(self_addr) not in {_bare(b) for b in bcc_l}:
-            bcc_l.append(self_addr)
+    if ident.bcc_self:
+        if _bare(ident.from_addr) not in {_bare(b) for b in bcc_l}:
+            bcc_l.append(ident.from_addr)
 
-    _enforce_allowlist(to_l + cc_l + bcc_l)
+    _enforce_allowlist(to_l + cc_l + bcc_l, ident)
 
     msg = compose(
         to=to_l, subject=subject, body=body, cc=cc_l, bcc=bcc_l,
         in_reply_to=in_reply_to, references=references,
         quote_text=quote_text, quote_html=quote_html,
-        attachments=attach_loaded,
+        attachments=attach_loaded, identity=ident,
     )
 
-    bootstrapped = False
-    if not _socket_alive():
-        bootstrapped = _bootstrap_master()
-        if not _socket_alive():
-            raise SendError(
-                "No live SSH ControlMaster to "
-                f"{config.send_user()}@{config.send_host()} and bootstrap "
-                "failed. Establish the socket (2FA) then retry — e.g. run "
-                f"{config.send_bootstrap_cmd()}."
-            )
+    ok, bootstrapped = preflight(ident)
+    if not ok:
+        raise SendError(_transport_unavailable(ident))
 
-    _deliver(msg)
+    if _is_default(ident):
+        _deliver(msg)
+    else:
+        deliver_for(ident, msg.as_bytes(), rcpt_to=to_l + cc_l + bcc_l)
     return SendResult(
         ok=True,
         message_id=msg["Message-ID"],
@@ -477,15 +489,22 @@ def schedule_email(
     cc: str | list[str] | None = None,
     bcc: str | list[str] | None = None,
     attachments: str | list[str] | None = None,
+    from_identity: str | None = None,
 ):
     """Compose NOW, deliver LATER: the message is validated, attachments
     embedded, Bcc-to-self added and a Message-ID minted immediately, then
     the finished RFC-822 is frozen into the spool for the launchd
     dispatcher to deliver at send_at. Editing/deleting a source file after
     scheduling does not change what goes out.
+
+    The manifest records the identity name; the dispatcher resolves it to
+    a transport at fire time, while the envelope sender stays the frozen
+    From: header — config drift between scheduling and firing cannot
+    change who the mail claims to be from.
     """
     from . import spool
 
+    ident = identities.get(from_identity)
     when = _parse_send_at(send_at)
     now = spool.utcnow()
     if (now - when).total_seconds() > 120:
@@ -504,16 +523,15 @@ def schedule_email(
 
     attach_loaded = _load_attachments(attachments)
 
-    if config.send_bcc_self():
-        self_addr = config.send_from_addr()
-        if _bare(self_addr) not in {_bare(b) for b in bcc_l}:
-            bcc_l.append(self_addr)
+    if ident.bcc_self:
+        if _bare(ident.from_addr) not in {_bare(b) for b in bcc_l}:
+            bcc_l.append(ident.from_addr)
 
-    _enforce_allowlist(to_l + cc_l + bcc_l)
+    _enforce_allowlist(to_l + cc_l + bcc_l, ident)
 
     msg = compose(
         to=to_l, subject=subject, body=body, cc=cc_l, bcc=bcc_l,
-        attachments=attach_loaded,
+        attachments=attach_loaded, identity=ident,
     )
     entry = spool.Entry(
         id=spool.new_id(now),
@@ -523,6 +541,7 @@ def schedule_email(
         subject=subject,
         attachments=[fn for _, _, _, fn in attach_loaded],
         message_id=msg["Message-ID"],
+        identity=ident.name,
     )
     spool.save(msg.as_bytes(), entry)
     return entry
@@ -538,16 +557,19 @@ def reply_email(
     bcc: str | list[str] | None = None,
     include_history: bool = True,
     attachments: str | list[str] | None = None,
+    from_identity: str | None = None,
 ) -> SendResult:
     """Reply to message `id`, threading correctly (In-Reply-To / References /
     Re: subject). Defaults to replying to the original sender only; set
-    reply_all=True to include the original To+Cc (minus your own address).
+    reply_all=True to include the original To+Cc (minus the sending
+    identity's own address).
 
     The original message is quoted below the reply (attribution line +
     `>`-prefixed plain text; `<blockquote type="cite">` in HTML), the way a
     normal mail client's Reply does. Pass include_history=False for a bare
     reply carrying only threading headers.
     """
+    ident = identities.get(from_identity)
     original = source.get(id)  # Email dataclass
     headers = original.headers
     orig_msgid = headers.get("Message-ID") or headers.get("Message-Id") or ""
@@ -558,7 +580,7 @@ def reply_email(
     reply_to = headers.get("Reply-To") or original.ref.from_addr
     to_l = _split(reply_to)
 
-    self_bare = _bare(config.send_from_addr())
+    self_bare = _bare(ident.from_addr)
     cc_l = _split(cc)
     if reply_all:
         extra = _split(original.ref.to) + _split(original.ref.cc)
@@ -576,5 +598,5 @@ def reply_email(
         to=to_l, subject=subject, body=body, cc=cc_l, bcc=bcc,
         in_reply_to=orig_msgid, references=orig_refs,
         quote_text=quote_text, quote_html=quote_html,
-        attachments=attachments,
+        attachments=attachments, from_identity=from_identity,
     )

@@ -22,6 +22,7 @@ def _clean_env(monkeypatch, tmp_path):
     monkeypatch.setenv("EMAIL_MCP_FROM_ADDR", "paris.moschovakos@cern.ch")
     monkeypatch.setenv("EMAIL_MCP_FROM_NAME", "Paris Moschovakos")
     monkeypatch.setenv("EMAIL_MCP_SPOOL_DIR", str(tmp_path / "spool"))
+    monkeypatch.setenv("EMAIL_MCP_IDENTITIES", str(tmp_path / "no-identities.toml"))
 
 
 @pytest.fixture
@@ -240,3 +241,77 @@ def test_spool_manifest_is_valid_json_on_disk(tmp_path):
     manifest = config.spool_dir() / "pending" / f"{entry.id}.json"
     data = json.loads(manifest.read_text())
     assert data["id"] == entry.id and data["status"] == "pending"
+
+
+# --------------------------------------------------------------------- #
+# identities at fire time                                               #
+# --------------------------------------------------------------------- #
+
+
+def test_manifest_carries_identity_and_old_manifests_still_load():
+    entry = sender.schedule_email(
+        to="paris.moschovakos@cern.ch", subject="s", body="b",
+        send_at=_future(60),
+    )
+    assert entry.identity == "default"
+    from email_mcp import config
+    manifest = config.spool_dir() / "pending" / f"{entry.id}.json"
+    data = json.loads(manifest.read_text())
+    assert data["identity"] == "default"
+    # pre-0.7.0 manifest: no identity field → must load as the legacy default
+    del data["identity"]
+    manifest.write_text(json.dumps(data))
+    loaded = spool.load("pending", entry.id)
+    assert loaded is not None and loaded.identity == "default"
+
+
+def test_fire_time_envelope_uses_frozen_from_not_current_env(monkeypatch):
+    """The latent-bug fix: the envelope sender at fire time is the message's
+    frozen From: header, not whatever mutable config resolves to by then."""
+    monkeypatch.setenv("EMAIL_MCP_FROM_ADDR", "frozen@example.org")
+    entry = sender.schedule_email(
+        to="frozen@example.org", subject="s", body="b", send_at=_future(-1),
+    )
+    monkeypatch.setenv("EMAIL_MCP_FROM_ADDR", "drifted@example.org")
+
+    seen: list = []
+
+    class FakeTransport:
+        name = "fake"
+        last_ensure_error = None
+
+        def ensure(self):
+            return True
+
+        def deliver(self, raw, mail_from, rcpt_to):
+            seen.append((raw, mail_from, rcpt_to))
+
+        def healthcheck(self):
+            return {"ok": True}
+
+    monkeypatch.setattr(
+        sender.transports, "get_transport", lambda ident: FakeTransport())
+    monkeypatch.setattr(dispatcher, "_notify", lambda *a, **k: None)
+    assert dispatcher.run_once()["results"][entry.id] == "sent"
+    raw, mail_from, rcpt_to = seen[-1]
+    assert mail_from == "frozen@example.org"      # frozen, not drifted
+    assert "frozen@example.org" in rcpt_to
+    wire = email.message_from_bytes(raw, policy=email.policy.default)
+    assert "frozen@example.org" in wire["From"]
+
+
+def test_dispatcher_ensures_transport_once_per_identity(monkeypatch, delivered):
+    """Two due messages riding one identity → exactly one ensure per run."""
+    checks: list = []
+    monkeypatch.setattr(
+        sender, "_socket_alive", lambda: checks.append(1) or True)
+    for i in (1, 2):
+        sender.schedule_email(
+            to="paris.moschovakos@cern.ch", subject=f"s{i}", body="b",
+            send_at=_future(-1),
+        )
+    summary = dispatcher.run_once()
+    assert summary["due"] == 2
+    assert set(summary["results"].values()) == {"sent"}
+    assert len(delivered) == 2
+    assert len(checks) == 1  # memoised: one preflight for both messages
