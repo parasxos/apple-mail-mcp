@@ -1,2 +1,2 @@
 """email-mcp: local MCP server exposing read-only access to Apple Mail."""
-__version__ = "0.1.0"
+__version__ = "0.7.0"

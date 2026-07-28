@@ -66,8 +66,10 @@ deliver it. They deliberately do **not** go through Mail.app: its AppleScript
 compose path wraps the body in a collapsed `Apple-Mail-URLShareWrapperClass`
 blockquote that renders as an *empty* message in Outlook/Exchange (reproduced
 across six compose variants — it's the OS, not the script). Delivery runs over
-an existing SSH session to a CERN host. A `Bcc`-to-self is added automatically
-so there's a searchable record (delivery leaves no Exchange *Sent* copy).
+the sending identity's transport — out of the box, an existing SSH session to
+a CERN host (see [Identities & transports](#identities--transports) for SMTP
+and pipe lanes). A `Bcc`-to-self is added automatically so there's a
+searchable record (delivery leaves no Exchange *Sent* copy).
 
 **Self-only safety guard.** While `EMAIL_MCP_SEND_ALLOW_ALL` is off (the
 default), every recipient must be on the allowlist — which defaults to *just
@@ -100,6 +102,87 @@ python3 -m email_mcp.server --send-test paris.moschovakos@cern.ch
 
 Prints `{ok, message_id, to, cc, bcc, ...}`; a non-self address prints the
 guard refusal instead of sending.
+
+## Identities & transports
+
+Since v0.7.0 outgoing mail is routed by **identity**: the From: address
+decides the transport. `~/.email-mcp/identities.toml` (override:
+`EMAIL_MCP_IDENTITIES`) maps identity names to a From address, a transport
+driver, and that driver's parameters; `send_email` / `reply_email` /
+`schedule_email` take an optional `from_identity` to pick one (omit for the
+file's `default`). Each identity carries its **own allowlist** — the
+self-only guard is per-identity, so each identity's "self" is its own
+address — plus its own Bcc-to-self target and Message-ID domain.
+
+**No file, no change:** with `identities.toml` absent, a single identity
+named `default` is synthesized from the env variables below
+(`EMAIL_MCP_FROM_ADDR`, `EMAIL_MCP_SEND_HOST`, …) — the legacy env-only
+setup keeps working unchanged. The personal env defaults flip to generic
+placeholders in 0.8.0; put your values in the file.
+
+Three drivers ship, all stdlib:
+
+| Driver | What it is |
+|---|---|
+| `ssh_sendmail` | the original production path: `sendmail` over an SSH `ControlMaster` session |
+| `smtp` | `smtplib`, STARTTLS (or implicit TLS on port 465); password read from the macOS Keychain |
+| `pipe` | pipe the raw message to a local command (`/usr/sbin/sendmail -t -i`, msmtp, …) |
+
+A complete `~/.email-mcp/identities.toml` (chmod 600). The known keys
+(`from_addr`, `from_name`, `driver`, `allowlist`, `allow_all`, `bcc_self`)
+configure the identity; every other key in a block is a parameter for its
+driver:
+
+```toml
+default = "cern"
+
+[cern]                                  # ssh_sendmail — the original CERN lane
+from_addr = "paris.moschovakos@cern.ch"
+from_name = "Paris Moschovakos"
+driver    = "ssh_sendmail"
+host      = "lxplus.cern.ch"
+user      = "pmoschov"
+socket    = "~/.ssh/sock-lxplus-mail"
+bootstrap = "~/code/parasxos/email-mcp/tools/lxplus_mail_master.sh"
+# delivery_cmd = "/usr/sbin/sendmail"   # remote delivery command (default)
+
+[gmail]                                 # smtp — app password in the Keychain
+from_addr = "parasxos@gmail.com"
+from_name = "Paris Moschovakos"
+driver    = "smtp"
+host      = "smtp.gmail.com"
+port      = 587                         # 465 = implicit TLS, else STARTTLS
+keychain  = "email-mcp-gmail"           # Keychain item — the secret never enters this file
+# username = "parasxos@gmail.com"       # SMTP AUTH login (default: from_addr)
+
+[local]                                 # pipe — whatever MTA you already run
+from_addr = "you@example.com"
+driver    = "pipe"
+command   = "/usr/sbin/sendmail -t -i"
+```
+
+Store an SMTP password (for Gmail: an app password, which requires 2FA on
+the Google account) in the Keychain once — `-s` must match the identity's
+`keychain` value, `-a` its SMTP username:
+
+```bash
+security add-generic-password -s email-mcp-gmail -a parasxos@gmail.com -w 'your-app-password'
+```
+
+Check every configured lane in one shot:
+
+```bash
+python3 -m email_mcp.server --transport-check
+```
+
+Prints one JSON report — `{default, identities: {name: {ok, ...,
+from_addr}}}` — with an independent healthcheck per identity, so one broken
+lane can't hide the others (`ok: false` on the ssh lane usually just means
+a cold socket). To exercise a specific lane end-to-end:
+
+```bash
+python3 -m email_mcp.server --send-test parasxos@gmail.com --from-identity gmail
+```
 
 ## Smoke test
 
@@ -152,6 +235,7 @@ The tests build a fake `~/Library/Mail/V10` tree in `tmp_path` — they don't re
 | `EMAIL_MCP_SSH_SOCKET` | `~/.ssh/sock-lxplus-mail` | ControlMaster socket path. |
 | `EMAIL_MCP_DELIVERY_CMD` | `/usr/sbin/sendmail` | Remote delivery command. |
 | `EMAIL_MCP_SSH_BOOTSTRAP` | bundled `tools/lxplus_mail_master.sh` | Command that re-establishes a cold socket headlessly. |
+| `EMAIL_MCP_IDENTITIES` | `~/.email-mcp/identities.toml` | Identity routing file (see [Identities & transports](#identities--transports)); absent → one identity synthesized from the env vars above. |
 
 ## Tool reference
 
@@ -166,15 +250,15 @@ The seven read tools are **read-only on disk**. `refresh_mail` nudges Mail.app v
 | `list_recent(mailbox?, account?, limit?)` | Newest messages first. |
 | `get_attachment(id, attachment_id)` | Materialises the attachment to a tmp file; returns the path. |
 | `refresh_mail(wait_seconds=5, timeout_seconds=30)` | Asks Mail.app to fetch new mail, waits, returns before/after snapshot + delta count. Launches Mail.app if it isn't running. Needs Automation permission (see above). |
-| `send_email(to, subject, body, cc?, bcc?, attachments?)` | Compose and send. Comma-separated address strings. `attachments` = list of local file paths (each entry ONE path), attached with guessed MIME types; total capped at `EMAIL_MCP_MAX_ATTACH_MB` (default 20). Auto Bcc-to-self. Self-only guard applies. Returns `{ok, message_id, to, cc, bcc, subject, attachments}` or `{ok: false, error}`. |
-| `schedule_email(to, subject, body, send_at, cc?, bcc?, attachments?)` | Compose + freeze now, deliver at `send_at` via the launchd dispatcher. Returns `{ok, id, send_at, message_id, ...}`. |
+| `send_email(to, subject, body, cc?, bcc?, attachments?, from_identity?)` | Compose and send. Comma-separated address strings. `attachments` = list of local file paths (each entry ONE path), attached with guessed MIME types; total capped at `EMAIL_MCP_MAX_ATTACH_MB` (default 20). `from_identity` picks the sending identity (see [Identities & transports](#identities--transports)). Auto Bcc-to-self. Self-only guard applies per identity. Returns `{ok, message_id, to, cc, bcc, subject, attachments}` or `{ok: false, error}`. |
+| `schedule_email(to, subject, body, send_at, cc?, bcc?, attachments?, from_identity?)` | Compose + freeze now, deliver at `send_at` via the launchd dispatcher on the recorded identity's transport. Returns `{ok, id, send_at, message_id, ...}`. |
 | `list_scheduled(state?, limit?)` | The "Send Later mailbox": pending / sending / sent / failed / cancelled, with errors and delivery stamps. |
 | `cancel_scheduled(id)` | Cancel a pending scheduled message (sent/mid-flight cannot be recalled). |
 | `triage_plan(filters..., actions)` | Stage a mailbox operation: same filters as `search_emails` + a list of dispositions. Mutates nothing; returns `{plan_id, count, summary, messages}` for review. |
 | `triage_apply(plan_id)` | Execute a staged plan (one batched AppleScript, by-ROWID addressing) + verify against the index. Per-message failures are data. |
 | `mailbox_create(account, path)` | Create a (nested) mailbox; idempotent. |
 | `mailbox_delete(account, path)` | Delete an EMPTY mailbox; idempotent. Outcome decided by live re-probe (Mail's delete verb lies); escalates to UI scripting when the verb has no effect (needs Accessibility permission). |
-| `reply_email(id, body, reply_all?, cc?, bcc?, include_history?, attachments?)` | Reply to message `id`, threading via In-Reply-To / References / `Re:` subject. Quotes the original below the reply (attribution + `>` block, HTML blockquote) like a normal client; `include_history=False` for a bare reply. Defaults to the original sender only; `reply_all=True` also Ccs the original To+Cc minus your own address. `attachments` as in `send_email`. |
+| `reply_email(id, body, reply_all?, cc?, bcc?, include_history?, attachments?, from_identity?)` | Reply to message `id`, threading via In-Reply-To / References / `Re:` subject. Quotes the original below the reply (attribution + `>` block, HTML blockquote) like a normal client; `include_history=False` for a bare reply. Defaults to the original sender only; `reply_all=True` also Ccs the original To+Cc minus your own address. `attachments` as in `send_email`. |
 
 ## Scheduled send (`schedule_email` / `list_scheduled` / `cancel_scheduled`)
 
@@ -238,7 +322,7 @@ index verifies the mutations landed (write-through ≤2 s).
 
 - **More sources**: implement `EmailSource` in `email_mcp/sources/`, register in `email_mcp/sources/__init__.py::_REGISTRY`, select via `EMAIL_MCP_SOURCE`.
 - **FTS5 sidecar**: a separate adapter that mirrors `.emlx` bodies into a local FTS5 db.
-- **More write tools** (mark-read, move): future. `send_email` / `reply_email` shipped in v0.2.0; reply history-quoting in v0.3.0; outgoing attachments in v0.4.0; scheduled send in v0.5.0; triage (mailbox management) in v0.6.0.
+- **More write tools** (mark-read, move): future. `send_email` / `reply_email` shipped in v0.2.0; reply history-quoting in v0.3.0; outgoing attachments in v0.4.0; scheduled send in v0.5.0; triage (mailbox management) in v0.6.0; identity transports in v0.7.0.
 
 ## Safety notes
 

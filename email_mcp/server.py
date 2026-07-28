@@ -245,13 +245,14 @@ def tool_send_email(
     cc: str | None = None,
     bcc: str | None = None,
     attachments: list[str] | None = None,
+    from_identity: str | None = None,
 ) -> dict:
     """Compose + send. Returns {ok, message_id, to, cc, bcc, ...} or a
     structured {ok: false, error} for caller-fixable failures."""
     try:
         res = send_email(
             to=to, subject=subject, body=body, cc=cc, bcc=bcc,
-            attachments=attachments,
+            attachments=attachments, from_identity=from_identity,
         )
         return _to_jsonable(res)
     except SendError as e:
@@ -266,11 +267,13 @@ def tool_reply_email(
     bcc: str | None = None,
     include_history: bool = True,
     attachments: list[str] | None = None,
+    from_identity: str | None = None,
 ) -> dict:
     try:
         res = reply_email(
             _source(), id=id, body=body, reply_all=reply_all, cc=cc, bcc=bcc,
             include_history=include_history, attachments=attachments,
+            from_identity=from_identity,
         )
         return _to_jsonable(res)
     except SendError as e:
@@ -285,11 +288,13 @@ def tool_schedule_email(
     cc: str | None = None,
     bcc: str | None = None,
     attachments: list[str] | None = None,
+    from_identity: str | None = None,
 ) -> dict:
     try:
         entry = schedule_email(
             to=to, subject=subject, body=body, send_at=send_at,
             cc=cc, bcc=bcc, attachments=attachments,
+            from_identity=from_identity,
         )
         return {"ok": True, **_to_jsonable(entry)}
     except SendError as e:
@@ -493,6 +498,7 @@ def _build_mcp_server():  # pragma: no cover — exercised by integration only
         cc: str | None = None,
         bcc: str | None = None,
         attachments: list[str] | None = None,
+        from_identity: str | None = None,
     ) -> dict:
         """Send an email. Composition and delivery are handled internally —
         never send mail any other way (Mail.app's scripted compose corrupts
@@ -508,16 +514,22 @@ def _build_mcp_server():  # pragma: no cover — exercised by integration only
         20 MB, EMAIL_MCP_MAX_ATTACH_MB) — over-budget returns {ok: false,
         error} before anything is sent.
 
+        `from_identity` selects the sending identity from
+        ~/.email-mcp/identities.toml (omit for the default). Each identity
+        carries its own From: address, transport (ssh_sendmail / smtp /
+        pipe) and allowlist, so which lane the mail leaves on follows from
+        the name alone.
+
         Safety: while the allowlist guard is active (default), recipients are
-        restricted to Paris's own address — a returned {ok: false, error}
-        naming a blocked address means the guard fired, not a delivery
-        failure. A Bcc-to-self is added automatically for a Sent record.
-        Returns {ok, message_id, to, cc, bcc, subject, attachments} on
-        success.
+        restricted to the sending identity's own address — a returned
+        {ok: false, error} naming a blocked address means the guard fired,
+        not a delivery failure. A Bcc-to-self is added automatically for a
+        Sent record. Returns {ok, message_id, to, cc, bcc, subject,
+        attachments} on success.
         """
         return tool_send_email(
             to=to, subject=subject, body=body, cc=cc, bcc=bcc,
-            attachments=attachments,
+            attachments=attachments, from_identity=from_identity,
         )
 
     @mcp.tool()
@@ -529,6 +541,7 @@ def _build_mcp_server():  # pragma: no cover — exercised by integration only
         bcc: str | None = None,
         include_history: bool = True,
         attachments: list[str] | None = None,
+        from_identity: str | None = None,
     ) -> dict:
         """Reply to message `id` (an envelope id from search/get), threading
         correctly via In-Reply-To / References and an "Re:" subject.
@@ -542,10 +555,16 @@ def _build_mcp_server():  # pragma: no cover — exercised by integration only
         works exactly as in send_email (list of local file paths, size-capped).
         Same delivery and allowlist safety as send_email. Returns the same
         shape.
+
+        `from_identity` selects the sending identity from
+        ~/.email-mcp/identities.toml (omit for the default). Each identity
+        carries its own From: address, transport (ssh_sendmail / smtp /
+        pipe) and allowlist — the reply goes out as that identity.
         """
         return tool_reply_email(
             id=id, body=body, reply_all=reply_all, cc=cc, bcc=bcc,
             include_history=include_history, attachments=attachments,
+            from_identity=from_identity,
         )
 
     @mcp.tool()
@@ -557,6 +576,7 @@ def _build_mcp_server():  # pragma: no cover — exercised by integration only
         cc: str | None = None,
         bcc: str | None = None,
         attachments: list[str] | None = None,
+        from_identity: str | None = None,
     ) -> dict:
         """Schedule an email for later delivery (the MCP's "Send Later").
 
@@ -572,6 +592,12 @@ def _build_mcp_server():  # pragma: no cover — exercised by integration only
         wake (same semantics as Mail.app's Send Later). Manage with
         list_scheduled / cancel_scheduled.
 
+        `from_identity` selects the sending identity from
+        ~/.email-mcp/identities.toml (omit for the default). Each identity
+        carries its own From: address, transport (ssh_sendmail / smtp /
+        pipe) and allowlist; the manifest records the identity so the
+        dispatcher delivers on that identity's transport at fire time.
+
         Returns {ok, id, send_at (UTC), message_id, ...}. If the result
         warns the dispatcher is not installed, run:
         python -m email_mcp.dispatcher --install-launchd
@@ -579,6 +605,7 @@ def _build_mcp_server():  # pragma: no cover — exercised by integration only
         res = tool_schedule_email(
             to=to, subject=subject, body=body, send_at=send_at,
             cc=cc, bcc=bcc, attachments=attachments,
+            from_identity=from_identity,
         )
         if res.get("ok"):
             from .dispatcher import _plist_path
@@ -715,13 +742,55 @@ def _refresh_test(wait_seconds: float = 5.0) -> int:
 
 
 def _send_test(
-    to: str, subject: str, body: str, attach: list[str] | None = None
+    to: str,
+    subject: str,
+    body: str,
+    attach: list[str] | None = None,
+    from_identity: str | None = None,
 ) -> int:
     """End-to-end exercise of send_email against the real delivery path."""
-    result = tool_send_email(to=to, subject=subject, body=body, attachments=attach)
+    result = tool_send_email(
+        to=to, subject=subject, body=body, attachments=attach,
+        from_identity=from_identity,
+    )
     json.dump(result, sys.stdout, indent=2, default=str)
     sys.stdout.write("\n")
     return 0 if result.get("ok") else 1
+
+
+def _transport_check() -> int:
+    """Healthcheck every configured identity's transport and print one JSON
+    report: {default, identities: {name: {...healthcheck, from_addr}}}.
+
+    One broken identity must not hide the others — each is checked
+    independently and failures become {ok: false, error} entries. Exit 0
+    only when every identity checks out; ok:false is a state (e.g. a cold
+    SSH socket), not necessarily a bug.
+    """
+    from . import identities
+    from .transports import get_transport
+
+    try:
+        idents, default = identities.load()
+    except SendError as e:
+        json.dump({"ok": False, "error": str(e)}, sys.stdout, indent=2)
+        sys.stdout.write("\n")
+        return 1
+
+    report: dict = {"default": default, "identities": {}}
+    all_ok = True
+    for name in sorted(idents):
+        ident = idents[name]
+        try:
+            result = get_transport(ident).healthcheck()
+        except SendError as e:
+            result = {"ok": False, "error": str(e)}
+        result["from_addr"] = ident.from_addr
+        all_ok = all_ok and bool(result.get("ok"))
+        report["identities"][name] = result
+    json.dump(report, sys.stdout, indent=2, default=str)
+    sys.stdout.write("\n")
+    return 0 if all_ok else 1
 
 
 def main() -> int:
@@ -760,13 +829,31 @@ def main() -> int:
         metavar="PATH",
         help="Attach a file to the --send-test message (repeatable).",
     )
+    parser.add_argument(
+        "--from-identity",
+        default=None,
+        metavar="NAME",
+        help="Identity to send --send-test as (from ~/.email-mcp/"
+             "identities.toml; default: the file's default identity).",
+    )
+    parser.add_argument(
+        "--transport-check",
+        action="store_true",
+        help="Healthcheck every identity's transport, print one JSON report, "
+             "and exit 0 only if all are ok.",
+    )
     args = parser.parse_args()
     if args.selftest:
         return _selftest()
     if args.refresh_test:
         return _refresh_test(wait_seconds=args.refresh_wait)
+    if args.transport_check:
+        return _transport_check()
     if args.send_test:
-        return _send_test(args.send_test, args.subject, args.body, args.attach)
+        return _send_test(
+            args.send_test, args.subject, args.body, args.attach,
+            from_identity=args.from_identity,
+        )
     # MCP stdio server — blocks until the client disconnects.
     mcp = _build_mcp_server()
     mcp.run()

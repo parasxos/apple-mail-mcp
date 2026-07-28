@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "email-mcp"
-version = "0.6.0"
+version = "0.7.0"
 description = "Local MCP server exposing Apple Mail read access + guarded sending for Claude Code."
 requires-python = ">=3.10"
 dependencies = [
@@ -20,7 +20,7 @@ dev = [
 email-mcp = "email_mcp.server:main"
 
 [tool.setuptools]
-packages = ["email_mcp", "email_mcp.sources"]
+packages = ["email_mcp", "email_mcp.sources", "email_mcp.transports"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
