@@ -19,12 +19,16 @@ import html as _html
 import mimetypes
 import re
 import subprocess
+import time
 from dataclasses import dataclass, field
 from email.message import EmailMessage
 from email.utils import formataddr, getaddresses, make_msgid, parseaddr
 from pathlib import Path
 
 from . import config
+from .log import get_logger
+
+_log = get_logger()
 
 
 class SendError(Exception):
@@ -270,6 +274,7 @@ def _ssh_base() -> list[str]:
 
 
 def _socket_alive() -> bool:
+    t0 = time.monotonic()
     try:
         proc = subprocess.run(
             ["ssh", "-O", "check",
@@ -277,23 +282,61 @@ def _socket_alive() -> bool:
              f"{config.send_user()}@{config.send_host()}"],
             capture_output=True, text=True, timeout=10,
         )
-        return proc.returncode == 0
-    except (FileNotFoundError, subprocess.TimeoutExpired):
+    except (FileNotFoundError, subprocess.TimeoutExpired) as e:
+        _log.warning(
+            "socket check errored (%s) after %.1fs",
+            type(e).__name__, time.monotonic() - t0,
+        )
         return False
+    alive = proc.returncode == 0
+    _log.info(
+        "socket check: %s (%.2fs)",
+        "alive" if alive else "dead", time.monotonic() - t0,
+    )
+    return alive
+
+
+def _kill_master() -> None:
+    """Tear down the ControlMaster socket (best-effort). Used after a hung
+    delivery pipe: a wedged master passes `-O check` yet stalls every
+    channel, so killing it lets the next send bootstrap a fresh session."""
+    try:
+        subprocess.run(
+            ["ssh", "-O", "exit",
+             "-o", f"ControlPath={config.send_ssh_socket()}",
+             f"{config.send_user()}@{config.send_host()}"],
+            capture_output=True, text=True, timeout=10,
+        )
+        _log.warning("killed suspect ControlMaster socket after hung delivery")
+    except (FileNotFoundError, subprocess.TimeoutExpired) as e:
+        _log.warning("could not kill ControlMaster: %s", type(e).__name__)
 
 
 def _bootstrap_master() -> bool:
     """Run the headless bootstrap to (re)establish the master socket."""
     cmd = config.send_bootstrap_cmd()
     if not cmd:
+        _log.warning("no bootstrap command configured; cannot re-establish SSH")
         return False
+    t0 = time.monotonic()
+    _log.info("bootstrapping SSH master: %s", cmd)
     try:
-        subprocess.run(
+        proc = subprocess.run(
             ["bash", cmd] if cmd.endswith(".sh") else ["bash", "-c", cmd],
             capture_output=True, text=True, timeout=120,
         )
-    except (FileNotFoundError, subprocess.TimeoutExpired):
+    except (FileNotFoundError, subprocess.TimeoutExpired) as e:
+        _log.error(
+            "bootstrap errored (%s) after %.1fs",
+            type(e).__name__, time.monotonic() - t0,
+        )
         return False
+    _log.info(
+        "bootstrap exit %d (%.1fs)%s",
+        proc.returncode, time.monotonic() - t0,
+        "" if proc.returncode == 0
+        else f" stderr: {(proc.stderr or '').strip()[:500]}",
+    )
     return _socket_alive()
 
 
@@ -302,21 +345,45 @@ def _deliver(msg: EmailMessage) -> None:
     Raises SendError on delivery failure with the remote stderr attached."""
     raw = msg.as_bytes()
     remote = f"{config.send_delivery_cmd()} -t -i -f {config.send_from_addr()}"
+    t0 = time.monotonic()
+    _log.info(
+        "deliver start: %s, %d bytes, to=%s",
+        msg["Message-ID"], len(raw), msg["To"],
+    )
     try:
         proc = subprocess.run(
             _ssh_base() + [remote],
             input=raw, capture_output=True, timeout=60,
         )
     except FileNotFoundError as e:
+        _log.error("deliver failed: ssh not found on PATH")
         raise SendError("ssh not found on PATH.") from e
     except subprocess.TimeoutExpired as e:
-        raise SendError("delivery pipe timed out after 60s.") from e
+        _log.error(
+            "deliver timed out after %.0fs: %s — master passed check but the "
+            "pipe hung; killing the socket so the next send re-bootstraps",
+            time.monotonic() - t0, msg["Message-ID"],
+        )
+        _kill_master()
+        raise SendError(
+            "delivery pipe timed out after 60s — the SSH master looked alive "
+            "but the session hung (stale ControlMaster). The socket has been "
+            "reset; retry once and the send will re-bootstrap. Log: "
+            f"{config.log_file() or 'disabled'}."
+        ) from e
     if proc.returncode != 0:
         err = (proc.stderr or b"").decode("utf-8", "replace").strip()
+        _log.error(
+            "deliver failed (exit %d, %.1fs): %s",
+            proc.returncode, time.monotonic() - t0, err[:500] or "no stderr",
+        )
         raise SendError(
             f"delivery failed (exit {proc.returncode}): "
             f"{err or 'no stderr'}"
         )
+    _log.info(
+        "deliver ok: %s (%.1fs)", msg["Message-ID"], time.monotonic() - t0
+    )
 
 
 # --------------------------------------------------------------------- #

@@ -133,6 +133,25 @@ def send_max_attach_mb() -> float:
     return float(os.environ.get("EMAIL_MCP_MAX_ATTACH_MB", "20"))
 
 
+def log_file() -> Path | None:
+    """Where the MCP writes its debug log (delivery pipeline, SSH health).
+
+    EMAIL_MCP_LOG_FILE overrides the path; the value 'off' disables file
+    logging. Default is ~/Library/Logs/email-mcp.log (macOS convention,
+    visible in Console.app).
+    """
+    raw = os.environ.get("EMAIL_MCP_LOG_FILE", "").strip()
+    if raw.lower() in {"off", "none", "0"}:
+        return None
+    if raw:
+        return Path(raw).expanduser()
+    return Path.home() / "Library" / "Logs" / "email-mcp.log"
+
+
+def log_level() -> str:
+    return os.environ.get("EMAIL_MCP_LOG_LEVEL", "INFO").strip().upper() or "INFO"
+
+
 def send_bootstrap_cmd() -> str:
     """Shell command that (re)establishes the ControlMaster socket headlessly.
 
