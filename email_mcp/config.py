@@ -226,3 +226,16 @@ def send_bootstrap_cmd() -> str:
     # repo layout: email_mcp/config.py → ../tools/lxplus_mail_master.sh
     script = Path(__file__).resolve().parent.parent / "tools" / "lxplus_mail_master.sh"
     return str(script)
+
+
+def identities_file() -> Path:
+    """The identities TOML routing From: addresses to transports.
+
+    EMAIL_MCP_IDENTITIES overrides the path; default is
+    ~/.email-mcp/identities.toml. Absent file → a single identity is
+    synthesized from the send_* getters above (see email_mcp.identities).
+    """
+    raw = os.environ.get("EMAIL_MCP_IDENTITIES", "").strip()
+    if raw:
+        return Path(raw).expanduser()
+    return Path.home() / ".email-mcp" / "identities.toml"
