@@ -76,6 +76,14 @@ blocked send returns `{ok: false, error}` naming the address; it never leaves
 the machine. Flip `EMAIL_MCP_SEND_ALLOW_ALL=1` (or set an explicit
 `EMAIL_MCP_SEND_ALLOWLIST`) once you trust it.
 
+**Attachments.** Pass `attachments` as a list of local file paths. Each file
+is attached with a MIME type guessed from its name (fallback
+`application/octet-stream`); the plain+HTML body pair is wrapped in
+`multipart/mixed`, exactly what normal clients emit. Directories are refused
+(zip first). The total is capped at `EMAIL_MCP_MAX_ATTACH_MB` (default 20 MB
+of file bytes — base64 adds ~33% on the wire) and an over-budget call fails
+before anything is sent.
+
 **SSH prerequisite.** A live SSH `ControlMaster` socket to the send host.
 If it's cold, the tools run `tools/lxplus_mail_master.sh`, which sources
 `~/.secrets/cern_secrets.sh` for `CERN_PASSWORD` and generates a TOTP via the
@@ -131,6 +139,7 @@ The tests build a fake `~/Library/Mail/V10` tree in `tmp_path` — they don't re
 | `EMAIL_MCP_SEND_ALLOW_ALL` | `0` | `1` disables the allowlist (send to anyone). |
 | `EMAIL_MCP_SEND_ALLOWLIST` | (From: addr) | Comma-separated addresses sending may reach while the guard is on. |
 | `EMAIL_MCP_BCC_SELF` | `1` | Bcc the From: address on every send for a record. |
+| `EMAIL_MCP_MAX_ATTACH_MB` | `20` | Total attachment budget per outgoing message (file bytes, pre-base64). |
 | `EMAIL_MCP_SEND_HOST` | `lxplus.cern.ch` | SSH host used for delivery. |
 | `EMAIL_MCP_SEND_USER` | `pmoschov` | SSH user on that host. |
 | `EMAIL_MCP_SSH_SOCKET` | `~/.ssh/sock-lxplus-mail` | ControlMaster socket path. |
@@ -150,14 +159,14 @@ The seven read tools are **read-only on disk**. `refresh_mail` nudges Mail.app v
 | `list_recent(mailbox?, account?, limit?)` | Newest messages first. |
 | `get_attachment(id, attachment_id)` | Materialises the attachment to a tmp file; returns the path. |
 | `refresh_mail(wait_seconds=5, timeout_seconds=30)` | Asks Mail.app to fetch new mail, waits, returns before/after snapshot + delta count. Launches Mail.app if it isn't running. Needs Automation permission (see above). |
-| `send_email(to, subject, body, cc?, bcc?)` | Compose and send. Comma-separated address strings. Auto Bcc-to-self. Self-only guard applies. Returns `{ok, message_id, to, cc, bcc, subject}` or `{ok: false, error}`. |
-| `reply_email(id, body, reply_all?, cc?, bcc?, include_history?)` | Reply to message `id`, threading via In-Reply-To / References / `Re:` subject. Quotes the original below the reply (attribution + `>` block, HTML blockquote) like a normal client; `include_history=False` for a bare reply. Defaults to the original sender only; `reply_all=True` also Ccs the original To+Cc minus your own address. |
+| `send_email(to, subject, body, cc?, bcc?, attachments?)` | Compose and send. Comma-separated address strings. `attachments` = list of local file paths (each entry ONE path), attached with guessed MIME types; total capped at `EMAIL_MCP_MAX_ATTACH_MB` (default 20). Auto Bcc-to-self. Self-only guard applies. Returns `{ok, message_id, to, cc, bcc, subject, attachments}` or `{ok: false, error}`. |
+| `reply_email(id, body, reply_all?, cc?, bcc?, include_history?, attachments?)` | Reply to message `id`, threading via In-Reply-To / References / `Re:` subject. Quotes the original below the reply (attribution + `>` block, HTML blockquote) like a normal client; `include_history=False` for a bare reply. Defaults to the original sender only; `reply_all=True` also Ccs the original To+Cc minus your own address. `attachments` as in `send_email`. |
 
 ## Phase-2 hooks (not implemented yet)
 
 - **More sources**: implement `EmailSource` in `email_mcp/sources/`, register in `email_mcp/sources/__init__.py::_REGISTRY`, select via `EMAIL_MCP_SOURCE`.
 - **FTS5 sidecar**: a separate adapter that mirrors `.emlx` bodies into a local FTS5 db.
-- **More write tools** (mark-read, move): future. `send_email` / `reply_email` shipped in v0.2.0; reply history-quoting in v0.3.0.
+- **More write tools** (mark-read, move): future. `send_email` / `reply_email` shipped in v0.2.0; reply history-quoting in v0.3.0; outgoing attachments in v0.4.0.
 
 ## Safety notes
 

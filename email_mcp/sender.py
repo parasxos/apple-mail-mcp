@@ -16,11 +16,13 @@ address*. A mistake during the trial can therefore only reach Paris himself.
 from __future__ import annotations
 
 import html as _html
+import mimetypes
 import re
 import subprocess
 from dataclasses import dataclass, field
 from email.message import EmailMessage
 from email.utils import formataddr, getaddresses, make_msgid, parseaddr
+from pathlib import Path
 
 from . import config
 
@@ -38,6 +40,7 @@ class SendResult:
     cc: list[str] = field(default_factory=list)
     bcc: list[str] = field(default_factory=list)
     subject: str = ""
+    attachments: list[str] = field(default_factory=list)
     bootstrapped: bool = False
     error: str | None = None
 
@@ -82,6 +85,64 @@ def _enforce_allowlist(recipients: list[str]) -> None:
             f"{', '.join(sorted(allowed))} until EMAIL_MCP_SEND_ALLOW_ALL=1 "
             "is set. (Trial-safety guard: mistakes can only reach you.)"
         )
+
+
+# --------------------------------------------------------------------- #
+# attachments                                                           #
+# --------------------------------------------------------------------- #
+
+
+def _attachment_paths(attachments: str | list[str] | None) -> list[Path]:
+    """Normalise the attachments argument to a list of Paths.
+
+    A bare string is ONE path — never comma-split (paths may legally
+    contain commas); pass a list for multiple files.
+    """
+    if not attachments:
+        return []
+    items = [attachments] if isinstance(attachments, str) else list(attachments)
+    return [Path(p).expanduser() for p in items if str(p).strip()]
+
+
+def _load_attachments(
+    attachments: str | list[str] | None,
+) -> list[tuple[bytes, str, str, str]]:
+    """Read attachment files, returning (data, maintype, subtype, filename)
+    tuples ready for EmailMessage.add_attachment. Raises SendError with a
+    caller-fixable message for missing files, directories, or a total size
+    over the configured budget."""
+    paths = _attachment_paths(attachments)
+    if not paths:
+        return []
+
+    loaded: list[tuple[bytes, str, str, str]] = []
+    total = 0
+    for p in paths:
+        if not p.exists():
+            raise SendError(f"attachment not found: {p}")
+        if p.is_dir():
+            raise SendError(
+                f"attachment is a directory: {p} — zip it first and attach "
+                "the archive."
+            )
+        try:
+            data = p.read_bytes()
+        except OSError as e:
+            raise SendError(f"cannot read attachment {p}: {e}") from e
+        total += len(data)
+        ctype, _ = mimetypes.guess_type(p.name)
+        maintype, _, subtype = (ctype or "application/octet-stream").partition("/")
+        loaded.append((data, maintype, subtype, p.name))
+
+    budget = config.send_max_attach_mb()
+    if total > budget * 1024 * 1024:
+        raise SendError(
+            f"attachments total {total / (1024 * 1024):.1f} MB, over the "
+            f"{budget:g} MB budget (base64 adds ~33% on top; servers commonly "
+            "reject large mail). Shrink the set, or raise "
+            "EMAIL_MCP_MAX_ATTACH_MB if the recipient's server allows it."
+        )
+    return loaded
 
 
 # --------------------------------------------------------------------- #
@@ -157,6 +218,7 @@ def compose(
     references: str = "",
     quote_text: str = "",
     quote_html: str = "",
+    attachments: list[tuple[bytes, str, str, str]] | None = None,
 ) -> EmailMessage:
     """Build a multipart/alternative message (plain + minimal HTML).
 
@@ -164,6 +226,10 @@ def compose(
     so it displays as normal body text everywhere. `quote_text`/`quote_html`
     carry an optional quoted-history block appended below the body (plain
     `>`-prefixed lines / a `<blockquote type="cite">`).
+
+    `attachments` are pre-loaded (data, maintype, subtype, filename) tuples
+    (see `_load_attachments`); adding one wraps the alternative pair in
+    multipart/mixed, which is exactly the structure normal clients emit.
     """
     from_addr = config.send_from_addr()
     msg = EmailMessage()
@@ -182,6 +248,10 @@ def compose(
         msg["References"] = refs
     msg.set_content(f"{body}\n\n{quote_text}\n" if quote_text else body)
     msg.add_alternative(_html_body(body, quote_html), subtype="html")
+    for data, maintype, subtype, filename in attachments or []:
+        msg.add_attachment(
+            data, maintype=maintype, subtype=subtype, filename=filename
+        )
     return msg
 
 
@@ -265,6 +335,7 @@ def send_email(
     references: str = "",
     quote_text: str = "",
     quote_html: str = "",
+    attachments: str | list[str] | None = None,
 ) -> SendResult:
     to_l, cc_l, bcc_l = _split(to), _split(cc), _split(bcc)
     if not to_l:
@@ -273,6 +344,8 @@ def send_email(
         raise SendError("`subject` is required.")
     if not body.strip():
         raise SendError("`body` is empty.")
+
+    attach_loaded = _load_attachments(attachments)
 
     if config.send_bcc_self():
         self_addr = config.send_from_addr()
@@ -285,6 +358,7 @@ def send_email(
         to=to_l, subject=subject, body=body, cc=cc_l, bcc=bcc_l,
         in_reply_to=in_reply_to, references=references,
         quote_text=quote_text, quote_html=quote_html,
+        attachments=attach_loaded,
     )
 
     bootstrapped = False
@@ -304,6 +378,7 @@ def send_email(
         message_id=msg["Message-ID"],
         to=to_l, cc=cc_l, bcc=bcc_l,
         subject=subject,
+        attachments=[fn for _, _, _, fn in attach_loaded],
         bootstrapped=bootstrapped,
     )
 
@@ -317,6 +392,7 @@ def reply_email(
     cc: str | list[str] | None = None,
     bcc: str | list[str] | None = None,
     include_history: bool = True,
+    attachments: str | list[str] | None = None,
 ) -> SendResult:
     """Reply to message `id`, threading correctly (In-Reply-To / References /
     Re: subject). Defaults to replying to the original sender only; set
@@ -355,4 +431,5 @@ def reply_email(
         to=to_l, subject=subject, body=body, cc=cc_l, bcc=bcc,
         in_reply_to=orig_msgid, references=orig_refs,
         quote_text=quote_text, quote_html=quote_html,
+        attachments=attachments,
     )

@@ -241,11 +241,15 @@ def tool_send_email(
     body: str,
     cc: str | None = None,
     bcc: str | None = None,
+    attachments: list[str] | None = None,
 ) -> dict:
     """Compose + send. Returns {ok, message_id, to, cc, bcc, ...} or a
     structured {ok: false, error} for caller-fixable failures."""
     try:
-        res = send_email(to=to, subject=subject, body=body, cc=cc, bcc=bcc)
+        res = send_email(
+            to=to, subject=subject, body=body, cc=cc, bcc=bcc,
+            attachments=attachments,
+        )
         return _to_jsonable(res)
     except SendError as e:
         return {"ok": False, "error": str(e)}
@@ -258,11 +262,12 @@ def tool_reply_email(
     cc: str | None = None,
     bcc: str | None = None,
     include_history: bool = True,
+    attachments: list[str] | None = None,
 ) -> dict:
     try:
         res = reply_email(
             _source(), id=id, body=body, reply_all=reply_all, cc=cc, bcc=bcc,
-            include_history=include_history,
+            include_history=include_history, attachments=attachments,
         )
         return _to_jsonable(res)
     except SendError as e:
@@ -360,6 +365,7 @@ def _build_mcp_server():  # pragma: no cover — exercised by integration only
         body: str,
         cc: str | None = None,
         bcc: str | None = None,
+        attachments: list[str] | None = None,
     ) -> dict:
         """Send an email. Composition and delivery are handled internally —
         never send mail any other way (Mail.app's scripted compose corrupts
@@ -369,13 +375,23 @@ def _build_mcp_server():  # pragma: no cover — exercised by integration only
         "a@b"). `body` is plain text; blank lines become paragraphs. Replies
         should use `reply_email` instead so threading headers are set.
 
+        `attachments` is a list of local file paths (each entry ONE path —
+        never comma-joined). Files are attached with guessed MIME types;
+        directories are refused (zip first). Total size is capped (default
+        20 MB, EMAIL_MCP_MAX_ATTACH_MB) — over-budget returns {ok: false,
+        error} before anything is sent.
+
         Safety: while the allowlist guard is active (default), recipients are
         restricted to Paris's own address — a returned {ok: false, error}
         naming a blocked address means the guard fired, not a delivery
         failure. A Bcc-to-self is added automatically for a Sent record.
-        Returns {ok, message_id, to, cc, bcc, subject} on success.
+        Returns {ok, message_id, to, cc, bcc, subject, attachments} on
+        success.
         """
-        return tool_send_email(to=to, subject=subject, body=body, cc=cc, bcc=bcc)
+        return tool_send_email(
+            to=to, subject=subject, body=body, cc=cc, bcc=bcc,
+            attachments=attachments,
+        )
 
     @mcp.tool()
     def reply_email(
@@ -385,6 +401,7 @@ def _build_mcp_server():  # pragma: no cover — exercised by integration only
         cc: str | None = None,
         bcc: str | None = None,
         include_history: bool = True,
+        attachments: list[str] | None = None,
     ) -> dict:
         """Reply to message `id` (an envelope id from search/get), threading
         correctly via In-Reply-To / References and an "Re:" subject.
@@ -394,12 +411,14 @@ def _build_mcp_server():  # pragma: no cover — exercised by integration only
         Reply; set include_history=False for a bare reply.
 
         Defaults to replying to the original sender only; set reply_all=True
-        to also Cc the original To+Cc (minus your own address). Same delivery
-        and allowlist safety as send_email. Returns the same shape.
+        to also Cc the original To+Cc (minus your own address). `attachments`
+        works exactly as in send_email (list of local file paths, size-capped).
+        Same delivery and allowlist safety as send_email. Returns the same
+        shape.
         """
         return tool_reply_email(
             id=id, body=body, reply_all=reply_all, cc=cc, bcc=bcc,
-            include_history=include_history,
+            include_history=include_history, attachments=attachments,
         )
 
     return mcp
@@ -428,9 +447,11 @@ def _refresh_test(wait_seconds: float = 5.0) -> int:
     return 0 if result.get("ok") else 1
 
 
-def _send_test(to: str, subject: str, body: str) -> int:
+def _send_test(
+    to: str, subject: str, body: str, attach: list[str] | None = None
+) -> int:
     """End-to-end exercise of send_email against the real delivery path."""
-    result = tool_send_email(to=to, subject=subject, body=body)
+    result = tool_send_email(to=to, subject=subject, body=body, attachments=attach)
     json.dump(result, sys.stdout, indent=2, default=str)
     sys.stdout.write("\n")
     return 0 if result.get("ok") else 1
@@ -465,13 +486,20 @@ def main() -> int:
         "--body",
         default="This is a send_email self-test.\n\nSecond paragraph.\n\nParis",
     )
+    parser.add_argument(
+        "--attach",
+        action="append",
+        default=None,
+        metavar="PATH",
+        help="Attach a file to the --send-test message (repeatable).",
+    )
     args = parser.parse_args()
     if args.selftest:
         return _selftest()
     if args.refresh_test:
         return _refresh_test(wait_seconds=args.refresh_wait)
     if args.send_test:
-        return _send_test(args.send_test, args.subject, args.body)
+        return _send_test(args.send_test, args.subject, args.body, args.attach)
     # MCP stdio server — blocks until the client disconnects.
     mcp = _build_mcp_server()
     mcp.run()

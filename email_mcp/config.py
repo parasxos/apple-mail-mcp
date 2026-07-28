@@ -124,6 +124,15 @@ def send_delivery_cmd() -> str:
     return os.environ.get("EMAIL_MCP_DELIVERY_CMD", "/usr/sbin/sendmail").strip()
 
 
+def send_max_attach_mb() -> float:
+    """Total attachment budget per message, in MB (pre-base64 file bytes).
+
+    Default 20 MB — comfortably under common 25-50 MB server caps once the
+    ~33% base64 overhead is added. Override with EMAIL_MCP_MAX_ATTACH_MB.
+    """
+    return float(os.environ.get("EMAIL_MCP_MAX_ATTACH_MB", "20"))
+
+
 def send_bootstrap_cmd() -> str:
     """Shell command that (re)establishes the ControlMaster socket headlessly.
 

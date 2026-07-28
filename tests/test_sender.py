@@ -131,6 +131,97 @@ def test_bcc_self_can_be_disabled(monkeypatch, capture_delivery):
 
 
 # --------------------------------------------------------------------- #
+# attachments                                                           #
+# --------------------------------------------------------------------- #
+
+
+def test_attachment_wraps_in_mixed_and_roundtrips(tmp_path, capture_delivery):
+    f = tmp_path / "report.pdf"
+    f.write_bytes(b"%PDF-1.4 fake body")
+    res = sender.send_email(
+        to="paris.moschovakos@cern.ch", subject="s", body="b",
+        attachments=[str(f)],
+    )
+    assert res.ok is True
+    assert res.attachments == ["report.pdf"]
+    msg = capture_delivery[0]
+    assert msg.get_content_type() == "multipart/mixed"
+    # the plain+html alternative pair survives as the first part
+    parts = list(msg.iter_parts())
+    assert parts[0].get_content_type() == "multipart/alternative"
+    att = list(msg.iter_attachments())[0]
+    assert att.get_content_type() == "application/pdf"
+    assert att.get_filename() == "report.pdf"
+    assert att.get_content() == b"%PDF-1.4 fake body"
+
+
+def test_attachment_multiple_and_unknown_type(tmp_path, capture_delivery):
+    a = tmp_path / "notes.txt"
+    a.write_text("hello")
+    b = tmp_path / "blob.xyz123"
+    b.write_bytes(b"\x00\x01")
+    sender.send_email(
+        to="paris.moschovakos@cern.ch", subject="s", body="b",
+        attachments=[str(a), str(b)],
+    )
+    atts = {p.get_filename(): p for p in capture_delivery[0].iter_attachments()}
+    assert set(atts) == {"notes.txt", "blob.xyz123"}
+    assert atts["notes.txt"].get_content_type() == "text/plain"
+    assert atts["blob.xyz123"].get_content_type() == "application/octet-stream"
+
+
+def test_attachment_bare_string_is_one_path_not_split(tmp_path, capture_delivery):
+    f = tmp_path / "a, weird, name.txt"
+    f.write_text("x")
+    sender.send_email(
+        to="paris.moschovakos@cern.ch", subject="s", body="b",
+        attachments=str(f),
+    )
+    assert [p.get_filename() for p in capture_delivery[0].iter_attachments()] \
+        == ["a, weird, name.txt"]
+
+
+def test_attachment_missing_file_blocks_send(tmp_path, capture_delivery):
+    with pytest.raises(sender.SendError) as ei:
+        sender.send_email(
+            to="paris.moschovakos@cern.ch", subject="s", body="b",
+            attachments=[str(tmp_path / "nope.pdf")],
+        )
+    assert "not found" in str(ei.value)
+    assert capture_delivery == []
+
+
+def test_attachment_directory_refused(tmp_path, capture_delivery):
+    with pytest.raises(sender.SendError) as ei:
+        sender.send_email(
+            to="paris.moschovakos@cern.ch", subject="s", body="b",
+            attachments=[str(tmp_path)],
+        )
+    assert "zip" in str(ei.value)
+    assert capture_delivery == []
+
+
+def test_attachment_size_budget_enforced(tmp_path, monkeypatch, capture_delivery):
+    monkeypatch.setenv("EMAIL_MCP_MAX_ATTACH_MB", "0.001")  # ~1 KB
+    f = tmp_path / "big.bin"
+    f.write_bytes(b"\x00" * 4096)
+    with pytest.raises(sender.SendError) as ei:
+        sender.send_email(
+            to="paris.moschovakos@cern.ch", subject="s", body="b",
+            attachments=[str(f)],
+        )
+    assert "MB budget" in str(ei.value)
+    assert capture_delivery == []
+
+
+def test_no_attachments_stays_plain_alternative(capture_delivery):
+    sender.send_email(
+        to="paris.moschovakos@cern.ch", subject="s", body="b", attachments=[],
+    )
+    assert capture_delivery[0].get_content_type() == "multipart/alternative"
+
+
+# --------------------------------------------------------------------- #
 # reply threading                                                       #
 # --------------------------------------------------------------------- #
 
@@ -223,3 +314,28 @@ def test_reply_include_history_false_is_bare(monkeypatch, mail_fixture, capture_
     assert "blockquote" not in html
     # threading still intact
     assert capture_delivery[0]["In-Reply-To"] == "<i2c-2026-05-01@cern.ch>"
+
+
+def test_reply_with_attachment_keeps_quote_and_threading(
+    monkeypatch, mail_fixture, tmp_path, capture_delivery
+):
+    monkeypatch.setenv("EMAIL_MCP_SEND_ALLOW_ALL", "1")
+    from email_mcp.sources.apple_mail import AppleMailSource
+
+    f = tmp_path / "minutes.pdf"
+    f.write_bytes(b"%PDF-1.4 x")
+    src = AppleMailSource(mail_base=mail_fixture)
+    res = sender.reply_email(src, id="100", body="See attached.",
+                             attachments=[str(f)])
+    assert res.ok is True
+    assert res.attachments == ["minutes.pdf"]
+    msg = capture_delivery[0]
+    assert msg.get_content_type() == "multipart/mixed"
+    assert msg["In-Reply-To"] == "<i2c-2026-05-01@cern.ch>"
+    assert [p.get_filename() for p in msg.iter_attachments()] == ["minutes.pdf"]
+    # the quoted history still lives in the alternative pair
+    alt = next(p for p in msg.iter_parts()
+               if p.get_content_type() == "multipart/alternative")
+    plain = next(p for p in alt.iter_parts()
+                 if p.get_content_type() == "text/plain").get_content()
+    assert "wrote:" in plain
