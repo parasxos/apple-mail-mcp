@@ -31,6 +31,9 @@ def _env(monkeypatch, tmp_path, mail_fixture):
     monkeypatch.setenv("EMAIL_MCP_FTS_DIR", str(tmp_path / "fts"))
     monkeypatch.setenv("EMAIL_MCP_IDENTITIES",
                        str(tmp_path / "identities.toml"))
+    # Post person-clean flip there is no default from_addr; the all-green
+    # doctor scenario needs a configured sending identity.
+    monkeypatch.setenv("EMAIL_MCP_FROM_ADDR", "you@example.org")
 
 
 class FakeOsa:
