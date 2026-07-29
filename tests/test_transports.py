@@ -317,3 +317,46 @@ def test_pipe_stdin_delivery_and_nonzero_exit(monkeypatch):
     s = str(ei.value)
     assert s.startswith("[local/pipe]")
     assert "exit 78" in s and "config error" in s
+
+
+def test_smtp_op_secret_source_wins_and_keychain_untouched(monkeypatch):
+    """`op` (1Password secret reference) is a first-class secret source;
+    when set it is used and the Keychain path is never consulted."""
+    FakeSMTP = _fake_smtp_cls()
+    monkeypatch.setattr(smtp_mod.smtplib, "SMTP", FakeSMTP)
+    op_reads, kc_reads = [], []
+    monkeypatch.setattr(smtp_mod, "_read_op",
+                        lambda ref: (op_reads.append(ref), "op-pw")[1])
+    monkeypatch.setattr(smtp_mod, "_read_keychain",
+                        lambda item, account: kc_reads.append(item))
+    t = _smtp(op="op://Personal/gmail app pw/password", keychain="ignored")
+    t.deliver(_RAW_WITH_BCC, "g@example.org", ["a@example.org"])
+    assert op_reads == ["op://Personal/gmail app pw/password"]
+    assert kc_reads == []
+    login = [c for c in FakeSMTP.instances[0].calls if c[0] == "login"][0]
+    assert "op-pw" in login[1:]
+
+
+def test_smtp_requires_a_secret_source():
+    with pytest.raises(SendError) as ei:
+        _smtp(keychain="")
+    s = str(ei.value)
+    assert "[gmail/smtp]" in s and "op" in s and "keychain" in s
+
+
+def test_read_op_missing_cli_and_failure_messages(monkeypatch):
+    def no_cli(*a, **k):
+        raise FileNotFoundError("op")
+    monkeypatch.setattr(smtp_mod.subprocess, "run", no_cli)
+    with pytest.raises(SendError) as ei:
+        smtp_mod._read_op("op://v/i/password")
+    assert "1password-cli" in str(ei.value)
+
+    def op_fails(*a, **k):
+        import subprocess as sp
+        return sp.CompletedProcess(a[0], 1, "", "no item found")
+    monkeypatch.setattr(smtp_mod.subprocess, "run", op_fails)
+    with pytest.raises(SendError) as ei:
+        smtp_mod._read_op("op://v/i/password")
+    s = str(ei.value)
+    assert "no item found" in s and "op://v/i/password" in s

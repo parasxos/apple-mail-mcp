@@ -1,8 +1,8 @@
-"""SMTP submission transport — smtplib + STARTTLS/SSL, secrets from Keychain.
+"""SMTP submission transport — smtplib + STARTTLS/SSL, secrets external.
 
 The app password never lives in the repo, the env, or the identities file:
-it sits in the macOS Keychain under a caller-chosen item name and is read
-via the `security` CLI at delivery time. Port 465 means implicit TLS
+it sits in 1Password (an `op://` secret reference, read via the `op` CLI)
+or the macOS Keychain (`security` CLI) and is read at delivery time. Port 465 means implicit TLS
 (SMTP_SSL); anything else connects plain and upgrades with STARTTLS.
 """
 from __future__ import annotations
@@ -54,6 +54,45 @@ def _read_keychain(item: str, account: str) -> str:
     return proc.stdout.rstrip("\n")
 
 
+_OP_TIMEOUT = 45  # generous: the desktop app may pop a Touch ID prompt
+
+
+def _read_op(ref: str) -> str:
+    """Read a secret from 1Password via the `op` CLI secret reference
+    (e.g. "op://Personal/email-mcp gmail app password/password").
+
+    Module-level seam like _read_keychain: tests monkeypatch this. Needs
+    the 1Password CLI signed in (desktop-app integration or a session);
+    a locked app surfaces as a Touch ID prompt — hence the long timeout.
+    """
+    try:
+        proc = subprocess.run(
+            ["op", "read", ref],
+            capture_output=True, text=True, timeout=_OP_TIMEOUT,
+        )
+    except FileNotFoundError as e:
+        raise SendError(
+            "`op` CLI not found — install the 1Password CLI "
+            "(brew install 1password-cli) or use a `keychain` param instead."
+        ) from e
+    except subprocess.TimeoutExpired as e:
+        raise SendError(
+            f"1Password read for {ref!r} timed out after {_OP_TIMEOUT}s — "
+            "the app is probably locked and waiting for Touch ID. Unlock "
+            "1Password and retry. (Headless contexts like the launchd "
+            "dispatcher cannot answer that prompt; keep 1Password unlocked "
+            "or use a `keychain` param for scheduled mail.)"
+        ) from e
+    if proc.returncode != 0:
+        err = (proc.stderr or "").strip()
+        raise SendError(
+            f"1Password read for {ref!r} failed (op exit {proc.returncode}): "
+            f"{err[:200]} — check the secret reference (op read {ref!r}) and "
+            "that the CLI is signed in (Settings → Developer → CLI integration)."
+        )
+    return proc.stdout.rstrip("\n")
+
+
 class SmtpTransport:
     """Deliver via authenticated SMTP submission (Gmail, iCloud, …)."""
 
@@ -63,7 +102,8 @@ class SmtpTransport:
         self,
         *,
         host: str,
-        keychain: str,
+        keychain: str = "",
+        op: str = "",
         port: int = 587,
         username: str = "",
         identity: str = "default",
@@ -71,7 +111,16 @@ class SmtpTransport:
     ) -> None:
         self.host = host
         self.port = int(port)
+        # Secret source: a 1Password secret reference (`op`) or a macOS
+        # Keychain item (`keychain`). `op` wins when both are set.
         self.keychain = keychain
+        self.op = op
+        if not op and not keychain:
+            raise SendError(
+                f"[{identity}/{self.name}] needs a secret source: set "
+                "`op` (1Password secret reference) or `keychain` (macOS "
+                "Keychain item) in identities.toml."
+            )
         # SMTP AUTH login defaults to the identity's own address, which is
         # what Gmail/iCloud app passwords expect.
         self.username = username or from_addr
@@ -79,6 +128,15 @@ class SmtpTransport:
         self.from_addr = from_addr
         self.last_ensure_error: str | None = None
         self._prefix = f"[{identity}/{self.name}]"
+
+    def _secret(self) -> str:
+        if self.op:
+            return _read_op(self.op)
+        return _read_keychain(self.keychain, self.username)
+
+    @property
+    def _secret_ref(self) -> str:
+        return self.op or self.keychain
 
     def _connect(self, timeout: float) -> smtplib.SMTP:
         """Port 465 → implicit TLS; anything else → plain + STARTTLS."""
@@ -100,7 +158,7 @@ class SmtpTransport:
         """
         msg = email.message_from_bytes(raw)
         del msg["Bcc"]
-        password = _read_keychain(self.keychain, self.username)
+        password = self._secret()
         t0 = time.monotonic()
         _log.info(
             "smtp deliver start: %s:%d, %d bytes, %d rcpt",
@@ -116,7 +174,7 @@ class SmtpTransport:
                        self.host, self.port)
             raise SendError(
                 f"{self._prefix} SMTP auth failed for {self.username} at "
-                f"{self.host}:{self.port} — Keychain item {self.keychain!r} "
+                f"{self.host}:{self.port} — secret {self._secret_ref!r} "
                 f"holds a wrong or expired app password: {e}"
             ) from e
         except (smtplib.SMTPException, OSError) as e:
@@ -135,11 +193,11 @@ class SmtpTransport:
         _log.info("smtp deliver ok (%.1fs)", time.monotonic() - t0)
 
     def ensure(self) -> bool:
-        """Cheap readiness: the Keychain item reads and the port answers.
+        """Cheap readiness: the secret source reads and the port answers.
         No AUTH — providers throttle repeated logins."""
         self.last_ensure_error = None
         try:
-            _read_keychain(self.keychain, self.username)
+            self._secret()
         except SendError as e:
             self.last_ensure_error = str(e)
             return False
@@ -158,11 +216,12 @@ class SmtpTransport:
             "host": self.host,
             "port": self.port,
             "username": self.username,
-            "keychain": self.keychain,
+            "secret": self._secret_ref,
+            "secret_source": "op" if self.op else "keychain",
         }
         server = None
         try:
-            password = _read_keychain(self.keychain, self.username)
+            password = self._secret()
             server = self._connect(timeout=30)
             server.ehlo()
             server.login(self.username, password)

@@ -152,7 +152,8 @@ from_name = "Paris Moschovakos"
 driver    = "smtp"
 host      = "smtp.gmail.com"
 port      = 587                         # 465 = implicit TLS, else STARTTLS
-keychain  = "email-mcp-gmail"           # Keychain item — the secret never enters this file
+op        = "op://Personal/email-mcp gmail app password/password"  # 1Password secret ref
+# keychain = "email-mcp-gmail"           # …or a macOS Keychain item; `op` wins if both
 # username = "parasxos@gmail.com"       # SMTP AUTH login (default: from_addr)
 
 [local]                                 # pipe — whatever MTA you already run
