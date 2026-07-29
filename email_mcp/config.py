@@ -157,6 +157,21 @@ def send_max_retries() -> int:
     return int(os.environ.get("EMAIL_MCP_SEND_RETRIES", "5"))
 
 
+def graph_dir() -> Path:
+    """Root of the Graph executor state (per-identity OAuth token caches).
+
+    Default ~/.email-mcp/graph, override with EMAIL_MCP_GRAPH_DIR. Token
+    files grant delegated mailbox access, so the dir is created 0700 and
+    kept that way (same pattern as spool_dir).
+    """
+    raw = os.environ.get("EMAIL_MCP_GRAPH_DIR", "").strip()
+    d = Path(raw).expanduser() if raw else Path.home() / ".email-mcp" / "graph"
+    d.mkdir(parents=True, exist_ok=True)
+    d.parent.chmod(0o700)
+    d.chmod(0o700)
+    return d
+
+
 # ---------------------------------------------------------------------- #
 # Triage (triage_plan / triage_apply / mailbox_create)                    #
 # ---------------------------------------------------------------------- #

@@ -21,7 +21,12 @@ from .transports import DRIVERS, SendError
 # driver parameter and lands in `params`.
 _KNOWN_FIELDS = {
     "from_addr", "from_name", "driver", "allowlist", "allow_all", "bcc_self",
+    "executor", "graph",
 }
+
+# Schedule executors an identity may name: the local launchd spool
+# (default, universal) or Exchange-side deferred send via Microsoft Graph.
+_EXECUTORS = {"launchd", "graph"}
 
 
 class IdentityError(SendError):
@@ -40,6 +45,12 @@ class Identity:
     allowlist: list[str] = field(default_factory=list)
     allow_all: bool = False
     bcc_self: bool = True
+    # Who fires this identity's schedules: the launchd spool (default,
+    # universal) or Exchange-side deferred send. Immediate sends always
+    # use `driver` — the executor is a schedule-time capability only.
+    executor: str = "launchd"
+    # [name.graph] table (tenant + client_id) when executor = "graph".
+    graph: dict = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         # Each identity's "self" is its own address: an empty allowlist
@@ -148,6 +159,32 @@ def load() -> tuple[dict[str, Identity], str]:
             raw_allow = raw_allow.split(",")
         allowlist = [str(a).strip().lower() for a in raw_allow if str(a).strip()]
 
+        executor = str(t.get("executor", "launchd")).strip() or "launchd"
+        if executor not in _EXECUTORS:
+            raise IdentityError(
+                f"{path}: identity [{name}] has unknown executor "
+                f"{executor!r}. Available: {sorted(_EXECUTORS)}"
+            )
+        graph = t.get("graph", {})
+        if not isinstance(graph, dict):
+            raise IdentityError(
+                f"{path}: identity [{name}]: `graph` must be a table — "
+                f"write a [{name}.graph] block with `tenant` and "
+                "`client_id` keys."
+            )
+        if executor == "graph":
+            missing = [
+                k for k in ("tenant", "client_id")
+                if not str(graph.get(k, "")).strip()
+            ]
+            if missing:
+                raise IdentityError(
+                    f'{path}: identity [{name}] has executor = "graph" but '
+                    f"[{name}.graph] is missing {missing} — set the tenant "
+                    "and public-client application id proven by "
+                    "tools/graph_probe.py (see docs/graph-probe.md)."
+                )
+
         identities[name] = Identity(
             name=name,
             from_addr=from_addr,
@@ -157,6 +194,8 @@ def load() -> tuple[dict[str, Identity], str]:
             allowlist=allowlist,
             allow_all=bool(t.get("allow_all", False)),
             bcc_self=bool(t.get("bcc_self", True)),
+            executor=executor,
+            graph=dict(graph),
         )
     return identities, default
 

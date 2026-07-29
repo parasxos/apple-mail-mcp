@@ -246,3 +246,127 @@ def test_identity_error_is_a_send_error():
     assert issubclass(IdentityError, SendError)
     with pytest.raises(SendError):  # existing handlers catch it for free
         raise IdentityError("boom")
+
+
+# --------------------------------------------------------------------- #
+# executor capability (graph deferred send) — additive, inert by default #
+# --------------------------------------------------------------------- #
+
+
+def test_executor_defaults_to_launchd_and_stays_out_of_params(
+    tmp_path, monkeypatch,
+):
+    """F13: an identity that never mentions `executor` is byte-identical
+    to pre-graph behavior — launchd executor, empty graph config, and
+    neither key anywhere near the driver params."""
+    _write_toml(tmp_path, monkeypatch, """\
+        default = "a"
+
+        [a]
+        from_addr = "a@example.org"
+        driver = "pipe"
+        command = "/usr/bin/true"
+    """)
+    ident = identities.get("a")
+    assert ident.executor == "launchd"
+    assert ident.graph == {}
+    assert ident.params == {"command": "/usr/bin/true"}
+
+
+def test_synthesized_identity_uses_launchd_executor(monkeypatch):
+    monkeypatch.setenv("EMAIL_MCP_FROM_ADDR", "someone@example.org")
+    ident = identities.get()
+    assert ident.executor == "launchd"
+    assert ident.graph == {}
+
+
+def test_unknown_executor_errors(tmp_path, monkeypatch):
+    p = _write_toml(tmp_path, monkeypatch, """\
+        default = "a"
+
+        [a]
+        from_addr = "a@example.org"
+        driver = "pipe"
+        executor = "cron"
+    """)
+    with pytest.raises(IdentityError) as ei:
+        identities.load()
+    s = str(ei.value)
+    assert str(p) in s and "cron" in s and "launchd" in s and "graph" in s
+
+
+def test_executor_graph_without_graph_table_errors(tmp_path, monkeypatch):
+    p = _write_toml(tmp_path, monkeypatch, """\
+        default = "a"
+
+        [a]
+        from_addr = "a@example.org"
+        driver = "pipe"
+        executor = "graph"
+    """)
+    with pytest.raises(IdentityError) as ei:
+        identities.load()
+    s = str(ei.value)
+    assert str(p) in s and "tenant" in s and "client_id" in s
+
+
+def test_executor_graph_missing_client_id_errors(tmp_path, monkeypatch):
+    _write_toml(tmp_path, monkeypatch, """\
+        default = "a"
+
+        [a]
+        from_addr = "a@example.org"
+        driver = "pipe"
+        executor = "graph"
+
+        [a.graph]
+        tenant = "example.org"
+    """)
+    with pytest.raises(IdentityError) as ei:
+        identities.load()
+    assert "client_id" in str(ei.value)
+
+
+def test_graph_must_be_a_table_errors(tmp_path, monkeypatch):
+    _write_toml(tmp_path, monkeypatch, """\
+        default = "a"
+
+        [a]
+        from_addr = "a@example.org"
+        driver = "pipe"
+        graph = "example.org"
+    """)
+    with pytest.raises(IdentityError) as ei:
+        identities.load()
+    assert "[a.graph]" in str(ei.value)
+
+
+def test_graph_keys_never_reach_params_and_ssh_transport_constructs(
+    tmp_path, monkeypatch,
+):
+    """The capability lives on the Identity, not in the driver's kwargs:
+    a graph-executor identity must still construct its ssh transport
+    (drivers have no **kwargs — a leak would TypeError)."""
+    from email_mcp.transports import get_transport
+
+    _write_toml(tmp_path, monkeypatch, """\
+        default = "cern"
+
+        [cern]
+        from_addr = "someone@example.org"
+        driver = "ssh_sendmail"
+        executor = "graph"
+        host = "mailhost.example.org"
+        user = "someone"
+        socket = "/tmp/sock-x"
+
+        [cern.graph]
+        tenant = "example.org"
+        client_id = "app-123"
+    """)
+    ident = identities.get("cern")
+    assert ident.executor == "graph"
+    assert ident.graph == {"tenant": "example.org", "client_id": "app-123"}
+    assert "executor" not in ident.params and "graph" not in ident.params
+    transport = get_transport(ident)  # would raise SendError on a leak
+    assert transport.host == "mailhost.example.org"
