@@ -14,10 +14,14 @@ modes) and as ``python -m email_mcp.server --doctor``; the old
 """
 from __future__ import annotations
 
+import json
+import os
 import sqlite3
 import subprocess
+import time
 import urllib.parse
 from datetime import datetime, timezone
+from pathlib import Path
 
 from . import config, identities
 from .log import get_logger
@@ -339,10 +343,49 @@ def check_fts() -> dict:
             "status": st}
 
 
+def _graph_token_dir() -> Path:
+    """config.graph_dir()'s path WITHOUT its mkdir side effect — doctor
+    checks stat, they never create (same purity rule as check_fts)."""
+    raw = os.environ.get("EMAIL_MCP_GRAPH_DIR", "").strip()
+    return Path(raw).expanduser() if raw else Path.home() / ".email-mcp" / "graph"
+
+
+def _graph_token_report(name: str, path: Path) -> dict:
+    """One identity's token cache: exists, refreshable shape, age."""
+    fix = f"python -m email_mcp.graph --login {name}"
+    try:
+        cache = json.loads(path.read_bytes())
+    except FileNotFoundError:
+        return {"ok": False, "detail": f"no token cache at {path} — never "
+                                       "logged in (schedules silently fall "
+                                       "back to launchd)", "fix": fix}
+    except (ValueError, OSError) as e:
+        return {"ok": False,
+                "detail": f"unreadable token cache {path}: {e}", "fix": fix}
+    if not cache.get("refresh_token"):
+        return {"ok": False,
+                "detail": f"token cache {path} has no refresh_token — "
+                          "silent refresh is impossible", "fix": fix}
+    out: dict = {"ok": True, "detail": "token cache present, refreshable"}
+    try:
+        obtained = float(cache.get("obtained_at") or path.stat().st_mtime)
+        age_days = max(0.0, (time.time() - obtained) / 86400)
+        out["age_days"] = round(age_days, 1)
+        out["detail"] += f" (obtained {age_days:.1f}d ago)"
+        # Entra refresh tokens die after ~90 idle days; flag well before.
+        if age_days > 60:
+            out["detail"] += " — aging; re-login before it expires"
+            out["fix"] = fix
+    except (TypeError, ValueError, OSError):
+        pass
+    return out
+
+
 def check_graph() -> dict:
-    """SOFT hook on the Graph executor. Substance (token age, draft
-    reachability) lands with the executor itself (S7); identities without
-    an `executor` attribute are plain launchd and report nothing."""
+    """Graph executor readiness: for every identity with executor="graph",
+    the token cache must exist and hold a refresh token, or reconcile and
+    schedule-time deferral cannot work — red with the --login fix. Still
+    soft (green, one line) when no identity opts in."""
     try:
         idents, _ = identities.load()
     except SendError:
@@ -354,9 +397,21 @@ def check_graph() -> dict:
     )
     if not graph_idents:
         return {"ok": True, "detail": "no identities use the graph executor"}
-    return {"ok": True,
-            "detail": f"graph executor on: {', '.join(graph_idents)} "
-                      "(token diagnostics land with the graph executor)"}
+    d = _graph_token_dir()
+    report = {name: _graph_token_report(name, d / f"{name}.token.json")
+              for name in graph_idents}
+    bad = sorted(n for n, r in report.items() if not r["ok"])
+    healthy = len(report) - len(bad)
+    out: dict = {
+        "ok": not bad,
+        "detail": f"{healthy}/{len(report)} graph identity(ies) ready: "
+                  f"{', '.join(graph_idents)}",
+        "identities": report,
+    }
+    if bad:
+        out["fix"] = "; ".join(report[n]["fix"] for n in bad
+                               if report[n].get("fix"))
+    return out
 
 
 # ---------------------------------------------------------------------- #

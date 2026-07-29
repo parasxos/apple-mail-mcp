@@ -265,6 +265,67 @@ def test_manifest_carries_identity_and_old_manifests_still_load():
     assert loaded is not None and loaded.identity == "default"
 
 
+def test_pre_v08_manifest_without_executor_dispatches_as_launchd(delivered):
+    """F11: pre-v0.8 manifests carry neither `executor` nor
+    `graph_draft_id` — they must load with launchd defaults and dispatch
+    through the local path unchanged."""
+    entry = sender.schedule_email(
+        to="paris.moschovakos@cern.ch", subject="s", body="b",
+        send_at=_future(-1),
+    )
+    from email_mcp import config
+    manifest = config.spool_dir() / "pending" / f"{entry.id}.json"
+    data = json.loads(manifest.read_text())
+    del data["executor"]
+    del data["graph_draft_id"]
+    manifest.write_text(json.dumps(data))
+
+    loaded = spool.load("pending", entry.id)
+    assert loaded.executor == "launchd" and loaded.graph_draft_id is None
+    assert dispatcher.run_once()["results"][entry.id] == "sent"
+    assert len(delivered) == 1
+
+
+def test_launchd_identity_round_trip_never_touches_graph(
+    delivered, monkeypatch,
+):
+    """F13 (CRITICAL): with an identity that never opted into the graph
+    executor, the full schedule → dispatch → list round-trip behaves
+    exactly as in v0.8.0 — same summary shape, same states, new manifest
+    fields present but defaulted — and the graph module is never even
+    imported, so its HTTP seam cannot possibly be called."""
+    import sys
+    monkeypatch.delitem(sys.modules, "email_mcp.graph", raising=False)
+
+    entry = sender.schedule_email(
+        to="paris.moschovakos@cern.ch", subject="s", body="b",
+        send_at=_future(-1),
+    )
+    assert entry.executor == "launchd" and entry.graph_draft_id is None
+    from email_mcp import config
+    manifest = json.loads(
+        (config.spool_dir() / "pending" / f"{entry.id}.json").read_text())
+    assert manifest["executor"] == "launchd"
+    assert manifest["graph_draft_id"] is None
+
+    summary = dispatcher.run_once()
+    assert set(summary) == {"checked_at", "due", "results"}   # v0.8.0 shape
+    assert summary["due"] == 1
+    assert summary["results"] == {entry.id: "sent"}
+    got = spool.load("sent", entry.id)
+    assert got.delivered_at and got.last_error is None
+    assert len(delivered) == 1
+
+    from email_mcp import server
+    res = server.tool_list_scheduled()
+    assert res["ok"] is True
+    assert res["sent"][-1]["executor"] == "launchd"           # defaulted field
+
+    # The whole round-trip ran without importing email_mcp.graph: the
+    # feature is inert — not merely unused — without opt-in.
+    assert "email_mcp.graph" not in sys.modules
+
+
 def test_fire_time_envelope_uses_frozen_from_not_current_env(monkeypatch):
     """The latent-bug fix: the envelope sender at fire time is the message's
     frozen From: header, not whatever mutable config resolves to by then."""

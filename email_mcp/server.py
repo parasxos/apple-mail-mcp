@@ -507,6 +507,55 @@ def tool_cancel_scheduled(id: str) -> dict:
         return {"ok": False,
                 "error": f"cannot cancel {id}: status is {state!r} "
                          "(only pending messages can be cancelled)"}
+
+    if entry.executor == "graph":
+        # Exchange holds an armed deferred draft — revoke it FIRST; the
+        # local manifest only moves to cancelled/ once Exchange's claim is
+        # confirmed gone. On any ambiguity the entry stays pending.
+        from . import graph, identities
+
+        try:
+            ident = identities.get(entry.identity)
+        except SendError as e:
+            return {"ok": False, "error": f"cannot cancel {id}: {e}"}
+        try:
+            draft_id = entry.graph_draft_id
+            if draft_id is None:
+                # Crash-window entry: the draft (if any) is unrecorded —
+                # the frozen Message-ID is the recovery key.
+                draft_id = graph.find_draft_by_message_id(
+                    ident, entry.message_id)
+            outcome = (graph.delete_draft(ident, draft_id)
+                       if draft_id else "gone")
+        except SendError as e:
+            return {"ok": False,
+                    "error": f"cannot cancel {id}: Exchange still holds the "
+                             f"deferred draft and the revoke failed ({e}). "
+                             "Retry, or discard the draft in Outlook/OWA "
+                             "yourself, then cancel again."}
+        if outcome == "gone":
+            # F10 race: the draft vanished on its own — did Exchange
+            # already send it? Only Sent Items can say.
+            try:
+                sent = graph.sent_by_message_id(ident, entry.message_id)
+            except SendError as e:
+                return {"ok": False,
+                        "error": f"cannot cancel {id}: the deferred draft is "
+                                 f"gone but Sent Items could not be checked "
+                                 f"({e}) — outcome ambiguous, retry."}
+            if sent:
+                entry.delivered_at = spool.iso(spool.utcnow())
+                entry.next_attempt_at = None
+                entry.last_error = None
+                spool.move(id, "pending", "sent", entry)
+                return {"ok": False, "id": id, "status": "sent",
+                        "error": f"cannot cancel {id}: Exchange already sent "
+                                 "it (found in Sent Items) — the entry has "
+                                 "been moved to sent/."}
+            # Confirmed absent from Drafts AND Sent Items: nothing is
+            # armed (someone may have discarded it in OWA) — proceed as
+            # revoked and cancel the local entry below.
+
     if not spool.claim(id, "pending", "cancelled"):
         return {"ok": False,
                 "error": f"cannot cancel {id}: a dispatcher just claimed it"}
@@ -638,7 +687,13 @@ def _build_mcp_server():
         """List scheduled emails by state: pending (waiting), sending
         (mid-flight), sent (delivered, with delivered_at), failed (gave up
         after retries, with last_error), cancelled. Omit `state` for all.
-        This is the equivalent of Mail.app's "Send Later" mailbox."""
+        This is the equivalent of Mail.app's "Send Later" mailbox.
+
+        Each entry carries `executor`: "launchd" means the local dispatcher
+        delivers it (Mac must be awake at/after send_at); "graph" means
+        Exchange holds an armed deferred draft (`graph_draft_id`) and sends
+        it server-side even with the Mac off — such entries stay pending
+        until a dispatcher pass confirms the outcome."""
         return tool_list_scheduled(state=state, limit=limit)
 
     @mcp.tool()
@@ -760,6 +815,12 @@ def _build_mcp_server():
             wake (same semantics as Mail.app's Send Later). Manage with
             list_scheduled / cancel_scheduled.
 
+            Identities with `executor = "graph"` additionally hand the frozen
+            message to Exchange as a deferred-send draft, so it transmits at
+            send_at even with the Mac off; if Graph refuses, the entry falls
+            back silently to the local launchd path. The returned entry's
+            `executor` field says which path holds it.
+
             `from_identity` selects the sending identity from
             ~/.email-mcp/identities.toml (omit for the default). Each identity
             carries its own From: address, transport (ssh_sendmail / smtp /
@@ -788,7 +849,13 @@ def _build_mcp_server():
         def cancel_scheduled(id: str) -> dict:
             """Cancel a pending scheduled email by id (from schedule_email /
             list_scheduled). Only pending messages can be cancelled — anything
-            already sending/sent is past the point of no return."""
+            already sending/sent is past the point of no return.
+
+            For executor="graph" entries the Exchange deferred draft is
+            revoked first; if the revoke fails the entry stays pending and
+            the error says how to discard the draft in Outlook/OWA. If
+            Exchange already sent it, the result is {ok: false} saying so and
+            the entry moves to sent/."""
             return tool_cancel_scheduled(id=id)
 
         @mcp.tool()

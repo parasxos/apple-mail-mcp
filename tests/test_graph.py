@@ -1,7 +1,10 @@
 """Graph executor tests — token cache hygiene (F14), device login,
 create_deferred_draft (payloads, ordering, no-orphan cleanup), throttle
 policy (F7), draft_status's four verdicts with Sent-Items disambiguation
-(F9), message-id lookups, and delete semantics (F4 precursor).
+(F9), message-id lookups, delete semantics (F4 precursor), and the W2
+integration surface: schedule-time two-phase manifest write + fallback
+(F5/F8), the dispatcher's graph reconcile (F1-F4, F6, F9, F12),
+cancel_scheduled's revoke-first branch (F10), and the doctor graph check.
 
 Every HTTP interaction goes through a monkeypatched `graph._http` — the
 module's single wire seam. No test touches urllib; nothing leaves the
@@ -11,13 +14,14 @@ from __future__ import annotations
 
 import base64
 import json
+import os
 import stat
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 import pytest
 
-from email_mcp import config, graph
+from email_mcp import config, dispatcher, graph, sender, server, spool
 from email_mcp.graph import GraphError
 from email_mcp.identities import Identity
 from email_mcp.transports import SendError
@@ -25,10 +29,13 @@ from email_mcp.transports import SendError
 
 @pytest.fixture(autouse=True)
 def _graph_env(monkeypatch, tmp_path):
-    """Token caches in tmp, identities pointed at a nonexistent file, and
-    no env-synthesized identity — nothing outside tmp_path is touched."""
-    monkeypatch.delenv("EMAIL_MCP_FROM_ADDR", raising=False)
+    """Token caches + spool in tmp, identities pointed at a nonexistent
+    file, and no env leakage — nothing outside tmp_path is touched."""
+    for k in list(os.environ):
+        if k.startswith("EMAIL_MCP_"):
+            monkeypatch.delenv(k, raising=False)
     monkeypatch.setenv("EMAIL_MCP_GRAPH_DIR", str(tmp_path / "graph"))
+    monkeypatch.setenv("EMAIL_MCP_SPOOL_DIR", str(tmp_path / "spool"))
     monkeypatch.setenv(
         "EMAIL_MCP_IDENTITIES", str(tmp_path / "no-identities.toml")
     )
@@ -575,3 +582,554 @@ def test_cli_status_without_cache_exits_one(monkeypatch, tmp_path, capsys):
     assert rc == 1
     info = json.loads(capsys.readouterr().out)
     assert info["has_refresh_token"] is False
+
+
+# ===================================================================== #
+# W2 integration: schedule fork, dispatcher reconcile, cancel, doctor    #
+# ===================================================================== #
+
+
+def _future(minutes: float) -> str:
+    return (datetime.now(timezone.utc) + timedelta(minutes=minutes)).isoformat()
+
+
+def _spool_entry(minutes_past_grace: float = 5.0, draft_id: str | None = "D1",
+                 identity: str = "cern",
+                 message_id: str = "<m1@example.org>") -> spool.Entry:
+    """Fabricate a pending graph-executor entry whose send_at is
+    `minutes_past_grace` minutes beyond the reconcile grace window
+    (negative = still inside Exchange's window)."""
+    now = spool.utcnow()
+    entry = spool.Entry(
+        id=spool.new_id(now),
+        send_at=spool.iso(now - timedelta(
+            minutes=dispatcher.GRAPH_GRACE_MINUTES + minutes_past_grace)),
+        created_at=spool.iso(now - timedelta(hours=1)),
+        to=["someone@example.org"], cc=[], bcc=[],
+        subject="deferred", attachments=[],
+        message_id=message_id,
+        identity=identity,
+        executor="graph",
+        graph_draft_id=draft_id,
+    )
+    spool.save(RAW, entry)
+    return entry
+
+
+@pytest.fixture
+def local_delivery(monkeypatch):
+    """Mock the local transport seams; record frozen bytes handed to it.
+    Any append here from a graph test is a double-send alarm."""
+    delivered: list[bytes] = []
+    monkeypatch.setattr(sender, "_socket_alive", lambda: True)
+    monkeypatch.setattr(sender, "_deliver_bytes", delivered.append)
+    monkeypatch.setattr(dispatcher, "_notify", lambda *a, **k: None)
+    return delivered
+
+
+# --------------------------------------------------------------------- #
+# schedule-time fork: two-phase manifest write + silent fallback         #
+# --------------------------------------------------------------------- #
+
+
+def test_schedule_graph_two_phase_manifest_write(monkeypatch, tmp_path):
+    """Amendment A: manifest hits pending/ (executor=graph, no draft id)
+    BEFORE the first byte goes to Graph; the id lands via update after."""
+    _write_graph_toml(tmp_path, monkeypatch)
+    _seed_token()
+    inner = FakeHttp((201, {"id": "D1"}), (200, {}), (202, {}))
+    manifests_during_create: list[dict] = []
+
+    def spy(method, url, ident, body=None, headers=None):
+        if not inner.calls:  # first wire call = the MIME draft create
+            manifests_during_create.extend(
+                json.loads(p.read_text())
+                for p in (config.spool_dir() / "pending").glob("*.json"))
+        return inner(method, url, ident, body=body, headers=headers)
+
+    monkeypatch.setattr(graph, "_http", spy)
+    entry = sender.schedule_email(
+        to="someone@example.org", subject="s", body="b",
+        send_at=_future(30), from_identity="cern",
+    )
+    assert manifests_during_create, "Graph was called before the manifest hit disk"
+    assert manifests_during_create[0]["executor"] == "graph"
+    assert manifests_during_create[0]["graph_draft_id"] is None
+    assert manifests_during_create[0]["message_id"] == entry.message_id
+
+    assert entry.executor == "graph" and entry.graph_draft_id == "D1"
+    stored = spool.load("pending", entry.id)
+    assert stored.executor == "graph" and stored.graph_draft_id == "D1"
+    raw = spool.read_eml("pending", entry.id)
+    assert entry.message_id.encode() in raw       # frozen recovery key
+    assert inner.calls[0][2] == base64.b64encode(raw)  # Exchange got the SAME bytes
+
+
+def test_schedule_graph_error_falls_back_to_launchd(monkeypatch, tmp_path):
+    """F5/F8: token refusal or 5xx at schedule time → entry flips to the
+    launchd executor, frozen .eml intact, no exception to the caller."""
+    _write_graph_toml(tmp_path, monkeypatch)
+    _seed_token()
+    _fake(monkeypatch, (503, {"error": {
+        "code": "ErrorServerBusy", "message": "try later"}}))
+    entry = sender.schedule_email(
+        to="someone@example.org", subject="s", body="b",
+        send_at=_future(30), from_identity="cern",
+    )
+    assert entry.executor == "launchd" and entry.graph_draft_id is None
+    stored = spool.load("pending", entry.id)
+    assert stored.executor == "launchd"
+    assert spool.read_eml("pending", entry.id)  # frozen .eml in EVERY path
+
+
+def test_schedule_graph_token_missing_falls_back_without_http(
+    monkeypatch, tmp_path,
+):
+    """F5: no token cache → GraphError before any wire call → launchd."""
+    _write_graph_toml(tmp_path, monkeypatch)
+    fake = _fake(monkeypatch)  # any HTTP call would blow up
+    entry = sender.schedule_email(
+        to="someone@example.org", subject="s", body="b",
+        send_at=_future(30), from_identity="cern",
+    )
+    assert entry.executor == "launchd"
+    assert fake.calls == []
+
+
+# --------------------------------------------------------------------- #
+# dispatcher reconcile: crash-window recovery (F1/F2)                    #
+# --------------------------------------------------------------------- #
+
+
+def test_reconcile_f1_no_draft_anywhere_flips_to_launchd_then_delivers(
+    monkeypatch, tmp_path, local_delivery,
+):
+    """F1: crash between manifest-save and draft-create. Drafts AND Sent
+    Items confirmed empty → flip to launchd; the SAME frozen .eml goes out
+    locally on the NEXT pass — exactly once."""
+    _write_graph_toml(tmp_path, monkeypatch)
+    _seed_token()
+    entry = _spool_entry(draft_id=None)
+    fake = _fake(
+        monkeypatch,
+        (200, {"value": []}),   # drafts: confirmed absent
+        (200, {"value": []}),   # sentitems: confirmed absent
+    )
+    summary = dispatcher.run_once()
+    assert "launchd" in summary["results"][entry.id] or \
+           "local" in summary["results"][entry.id]
+    assert "/me/mailFolders/drafts/" in fake.urls[0]
+    assert "/me/mailFolders/sentitems/" in fake.urls[1]
+    got = spool.load("pending", entry.id)
+    assert got.executor == "launchd" and got.graph_draft_id is None
+    assert local_delivery == []          # flip pass delivers NOTHING
+
+    summary2 = dispatcher.run_once()     # next pass: local path takes over
+    assert summary2["results"][entry.id] == "sent"
+    assert local_delivery == [RAW]       # the same frozen bytes, once
+
+
+def test_reconcile_f1_no_draft_but_sent_items_hit_moves_to_sent(
+    monkeypatch, tmp_path, local_delivery,
+):
+    """F1 disambiguation: the draft is gone from Drafts because Exchange
+    already transmitted it — never deliver locally on top."""
+    _write_graph_toml(tmp_path, monkeypatch)
+    _seed_token()
+    entry = _spool_entry(draft_id=None)
+    _fake(monkeypatch, (200, {"value": []}), (200, {"value": [{"id": "S1"}]}))
+    summary = dispatcher.run_once()
+    assert "Exchange" in summary["results"][entry.id]
+    got = spool.load("sent", entry.id)
+    assert got is not None and got.delivered_at and got.last_error is None
+    assert local_delivery == []
+
+
+def test_reconcile_f2_adopts_orphan_draft_by_message_id(
+    monkeypatch, tmp_path, local_delivery,
+):
+    """F2: crash after draft-create, before manifest-update. The Drafts
+    lookup by the frozen Message-ID adopts the orphan — Exchange keeps the
+    job; nothing is armed twice, nothing delivers locally."""
+    _write_graph_toml(tmp_path, monkeypatch)
+    _seed_token()
+    entry = _spool_entry(draft_id=None)
+    fake = _fake(monkeypatch, (200, {"value": [{"id": "D9"}]}))
+    summary = dispatcher.run_once()
+    assert "adopted" in summary["results"][entry.id]
+    got = spool.load("pending", entry.id)
+    assert got.executor == "graph" and got.graph_draft_id == "D9"
+    assert len(fake.calls) == 1
+    assert local_delivery == []
+
+
+def test_reconcile_f1_lookup_failure_leaves_entry_untouched(
+    monkeypatch, tmp_path, local_delivery,
+):
+    """Recovery lookups failing must NOT read as absence: entry stays on
+    graph with last_error, retried next pass."""
+    _write_graph_toml(tmp_path, monkeypatch)
+    _seed_token()
+    entry = _spool_entry(draft_id=None)
+    _fake(monkeypatch, (403, {"error": {
+        "code": "ErrorAccessDenied", "message": "no"}}))
+    dispatcher.run_once()
+    got = spool.load("pending", entry.id)
+    assert got.executor == "graph" and got.graph_draft_id is None
+    assert got.last_error and "drafts lookup" in got.last_error
+    assert local_delivery == []
+
+
+# --------------------------------------------------------------------- #
+# dispatcher reconcile: held / sent / cancelled / ambiguity (F3/F4/F9)   #
+# --------------------------------------------------------------------- #
+
+
+def test_reconcile_pre_grace_makes_no_http_calls(monkeypatch, tmp_path):
+    """Inside send_at + grace the entry is Exchange's business — the
+    reconcile pass asks nothing and touches nothing."""
+    _write_graph_toml(tmp_path, monkeypatch)
+    _seed_token()
+    entry = _spool_entry(minutes_past_grace=-5)  # still in Exchange's window
+    fake = _fake(monkeypatch)
+    summary = dispatcher.run_once()
+    assert fake.calls == []
+    assert entry.id not in summary["results"]
+    assert spool.load("pending", entry.id).executor == "graph"
+
+
+def test_reconcile_f3_held_past_grace_deletes_draft_before_flipping(
+    monkeypatch, tmp_path, local_delivery,
+):
+    """F3: Exchange is late and still holds the draft → DELETE first; only
+    the CONFIRMED delete flips the entry to launchd (delivery next pass)."""
+    _write_graph_toml(tmp_path, monkeypatch)
+    _seed_token()
+    entry = _spool_entry()
+    fake = _fake(
+        monkeypatch,
+        (200, {"id": "D1", "isDraft": True}),  # status probe: held
+        (204, {}),                             # DELETE: confirmed
+    )
+    summary = dispatcher.run_once()
+    assert fake.calls[1][0] == "DELETE"
+    assert fake.calls[1][1] == f"{graph.GRAPH}/me/messages/D1"
+    assert "revoked" in summary["results"][entry.id]
+    got = spool.load("pending", entry.id)
+    assert got.executor == "launchd" and got.graph_draft_id is None
+    assert got.next_attempt_at is not None
+    assert local_delivery == []              # never in the same pass
+
+    assert dispatcher.run_once()["results"][entry.id] == "sent"
+    assert local_delivery == [RAW]
+
+
+def test_reconcile_f3_delete_gone_redisambiguates_to_sent(
+    monkeypatch, tmp_path, local_delivery,
+):
+    """F3 race: DELETE returns 404 — Exchange won. The re-run status
+    disambiguation finds the Sent Items hit; NO local delivery."""
+    _write_graph_toml(tmp_path, monkeypatch)
+    _seed_token()
+    entry = _spool_entry()
+    _fake(
+        monkeypatch,
+        (200, {"id": "D1", "isDraft": True}),  # held
+        (404, {}),                             # DELETE → gone
+        (404, {}),                             # re-probe: vanished
+        (200, {"value": [{"id": "S1"}]}),      # Sent Items: Exchange sent it
+    )
+    summary = dispatcher.run_once()
+    assert "Exchange" in summary["results"][entry.id]
+    got = spool.load("sent", entry.id)
+    assert got is not None and got.delivered_at
+    assert local_delivery == []
+
+
+def test_reconcile_f3_delete_gone_ambiguous_never_delivers_locally(
+    monkeypatch, tmp_path, local_delivery,
+):
+    """F3 critical fence: draft gone + Sent Items unreachable = ambiguity.
+    The entry stays on graph, is NEVER flipped, NEVER delivered locally."""
+    _write_graph_toml(tmp_path, monkeypatch)
+    _seed_token()
+    entry = _spool_entry()
+    _fake(
+        monkeypatch,
+        (200, {"id": "D1", "isDraft": True}),  # held
+        (404, {}),                             # DELETE → gone
+        (404, {}),                             # re-probe: vanished
+        (503, {"error": {"code": "ErrorServerBusy", "message": "later"}}),
+    )
+    dispatcher.run_once()
+    got = spool.load("pending", entry.id)
+    assert got is not None and got.executor == "graph"
+    assert got.graph_draft_id == "D1"
+    assert local_delivery == []
+
+
+def test_reconcile_f4_delete_network_error_leaves_entry_on_graph(
+    monkeypatch, tmp_path, local_delivery,
+):
+    """F4: revoke times out → no confirmed delete → the entry keeps its
+    executor and draft id, gains last_error, and is retried next pass."""
+    _write_graph_toml(tmp_path, monkeypatch)
+    _seed_token()
+    entry = _spool_entry()
+    _fake(
+        monkeypatch,
+        (200, {"id": "D1", "isDraft": True}),
+        GraphError("[cern/graph] network error reaching graph.microsoft.com"),
+    )
+    summary = dispatcher.run_once()
+    assert "retrying" in summary["results"][entry.id]
+    got = spool.load("pending", entry.id)
+    assert got.executor == "graph" and got.graph_draft_id == "D1"
+    assert "network error" in got.last_error
+    assert local_delivery == []
+
+
+def test_reconcile_f6_token_refresh_failure_records_fix_and_leaves_entry(
+    monkeypatch, tmp_path, local_delivery,
+):
+    """F6: refresh refused at reconcile time → entry untouched on graph,
+    last_error carries the AADSTS reason AND the --login fix."""
+    _write_graph_toml(tmp_path, monkeypatch)
+    _seed_token(expires_in=-10)  # force the refresh path
+    entry = _spool_entry()
+    _fake(monkeypatch, (400, {
+        "error": "invalid_grant",
+        "error_description": "AADSTS700082: refresh token expired",
+    }))
+    dispatcher.run_once()
+    got = spool.load("pending", entry.id)
+    assert got.executor == "graph" and got.graph_draft_id == "D1"
+    assert "AADSTS700082" in got.last_error
+    assert "--login cern" in got.last_error
+    assert local_delivery == []
+
+
+def test_reconcile_f9_sent_moves_to_sent_with_delivered_at(
+    monkeypatch, tmp_path, local_delivery,
+):
+    """F9 reconcile-level: vanished draft + Sent Items hit = delivered by
+    Exchange → sent/, delivered_at set, last_error cleared."""
+    _write_graph_toml(tmp_path, monkeypatch)
+    _seed_token()
+    entry = _spool_entry()
+    _fake(monkeypatch, (404, {}), (200, {"value": [{"id": "S1"}]}))
+    summary = dispatcher.run_once()
+    assert summary["results"][entry.id] == "sent (delivered by Exchange)"
+    got = spool.load("sent", entry.id)
+    assert got.delivered_at and got.last_error is None
+    assert got.status == "sent"
+    assert local_delivery == []
+
+
+def test_reconcile_f9_cancelled_externally_names_owa(
+    monkeypatch, tmp_path, local_delivery,
+):
+    """F9: vanished draft + CONFIRMED Sent Items miss = someone discarded
+    it (e.g. OWA) → cancelled/, note naming Outlook/OWA, no local send."""
+    _write_graph_toml(tmp_path, monkeypatch)
+    _seed_token()
+    entry = _spool_entry()
+    _fake(monkeypatch, (404, {}), (200, {"value": []}))
+    summary = dispatcher.run_once()
+    assert "OWA" in summary["results"][entry.id]
+    got = spool.load("cancelled", entry.id)
+    assert got is not None and "OWA" in got.last_error
+    assert local_delivery == []
+
+
+def test_reconcile_f9_unknown_leaves_entry_and_never_guesses(
+    monkeypatch, tmp_path, local_delivery,
+):
+    """F9 critical fence at reconcile level: ambiguity (Sent Items lookup
+    failing) leaves the entry pending on graph — guessing 'sent' would
+    drop mail, guessing 'cancelled' would double-send."""
+    _write_graph_toml(tmp_path, monkeypatch)
+    _seed_token()
+    entry = _spool_entry()
+    _fake(monkeypatch, (404, {}), (503, {"error": {
+        "code": "ErrorServerBusy", "message": "later"}}))
+    dispatcher.run_once()
+    got = spool.load("pending", entry.id)
+    assert got is not None and got.executor == "graph"
+    assert local_delivery == []
+
+
+# --------------------------------------------------------------------- #
+# dispatcher reconcile: identity drift (F12)                             #
+# --------------------------------------------------------------------- #
+
+
+def test_reconcile_f12_unknown_identity_retries_and_pass_continues(
+    monkeypatch, tmp_path, local_delivery,
+):
+    """F12: identity removed from the TOML between schedule and fire —
+    that entry fails-with-backoff naming the identity; the OTHER graph
+    entry in the same pass still reconciles normally."""
+    _write_graph_toml(tmp_path, monkeypatch)
+    _seed_token()
+    ghost = _spool_entry(identity="ghost", draft_id="DG",
+                         message_id="<ghost@example.org>")
+    fine = _spool_entry(draft_id="D2", message_id="<m2@example.org>")
+    _fake(monkeypatch, (404, {}), (200, {"value": [{"id": "S1"}]}))
+    summary = dispatcher.run_once()
+
+    assert summary["results"][ghost.id].startswith("retry")
+    got = spool.load("pending", ghost.id)
+    assert got.attempts == 1 and got.executor == "graph"
+    assert "ghost" in got.last_error          # error names the identity
+    assert got.next_attempt_at is not None
+
+    assert "Exchange" in summary["results"][fine.id]  # pass continued
+    assert spool.load("sent", fine.id) is not None
+    assert local_delivery == []
+
+    # backoff respected: an immediate second pass makes no HTTP call and
+    # leaves the ghost entry alone (its script is already exhausted).
+    assert dispatcher.run_once()["results"] == {}
+
+
+# --------------------------------------------------------------------- #
+# cancel_scheduled: revoke-first + the F10 race                          #
+# --------------------------------------------------------------------- #
+
+
+def test_cancel_graph_revokes_draft_then_cancels(monkeypatch, tmp_path):
+    _write_graph_toml(tmp_path, monkeypatch)
+    _seed_token()
+    entry = _spool_entry(minutes_past_grace=-70)  # send_at ~1h ahead
+    fake = _fake(monkeypatch, (204, {}))
+    res = server.tool_cancel_scheduled(entry.id)
+    assert res["ok"] is True and res["status"] == "cancelled"
+    assert fake.calls[0][0] == "DELETE"
+    assert spool.load("cancelled", entry.id) is not None
+    assert spool.load("pending", entry.id) is None
+
+
+def test_cancel_graph_revoke_failure_keeps_entry_pending_names_owa(
+    monkeypatch, tmp_path,
+):
+    _write_graph_toml(tmp_path, monkeypatch)
+    _seed_token()
+    entry = _spool_entry(minutes_past_grace=-70)
+    _fake(monkeypatch, (503, {"error": {
+        "code": "ErrorServerBusy", "message": "later"}}))
+    res = server.tool_cancel_scheduled(entry.id)
+    assert res["ok"] is False
+    assert "OWA" in res["error"]              # remediation names OWA
+    got = spool.load("pending", entry.id)     # entry stays pending on graph
+    assert got is not None and got.executor == "graph"
+
+
+def test_cancel_graph_f10_race_already_sent_moves_to_sent(
+    monkeypatch, tmp_path,
+):
+    """F10: DELETE finds the draft gone and Sent Items has it — Exchange
+    won the race. {ok:false} names the outcome; the entry lands in sent/."""
+    _write_graph_toml(tmp_path, monkeypatch)
+    _seed_token()
+    entry = _spool_entry(minutes_past_grace=-70)
+    _fake(monkeypatch, (404, {}), (200, {"value": [{"id": "S1"}]}))
+    res = server.tool_cancel_scheduled(entry.id)
+    assert res["ok"] is False
+    assert "already sent" in res["error"]
+    got = spool.load("sent", entry.id)
+    assert got is not None and got.delivered_at
+    assert spool.load("pending", entry.id) is None
+
+
+def test_cancel_graph_f10_gone_but_not_sent_treated_as_revoked(
+    monkeypatch, tmp_path,
+):
+    """F10: draft gone AND Sent Items confirmed empty — nothing is armed;
+    the cancel proceeds as a normal revoke."""
+    _write_graph_toml(tmp_path, monkeypatch)
+    _seed_token()
+    entry = _spool_entry(minutes_past_grace=-70)
+    _fake(monkeypatch, (404, {}), (200, {"value": []}))
+    res = server.tool_cancel_scheduled(entry.id)
+    assert res["ok"] is True and res["status"] == "cancelled"
+    assert spool.load("cancelled", entry.id) is not None
+
+
+def test_cancel_graph_f10_sent_lookup_failure_is_ambiguous_no_action(
+    monkeypatch, tmp_path,
+):
+    """Draft gone but Sent Items unreachable → refuse to guess: the entry
+    stays pending and the error says to retry."""
+    _write_graph_toml(tmp_path, monkeypatch)
+    _seed_token()
+    entry = _spool_entry(minutes_past_grace=-70)
+    _fake(monkeypatch, (404, {}), (503, {"error": {
+        "code": "ErrorServerBusy", "message": "later"}}))
+    res = server.tool_cancel_scheduled(entry.id)
+    assert res["ok"] is False and "ambiguous" in res["error"]
+    assert spool.load("pending", entry.id) is not None
+
+
+def test_cancel_graph_unrecorded_draft_is_found_and_revoked(
+    monkeypatch, tmp_path,
+):
+    """Crash-window entry (graph_draft_id=None): cancel recovers the draft
+    by internetMessageId and revokes it before cancelling — otherwise the
+    orphan draft would still fire at send_at."""
+    _write_graph_toml(tmp_path, monkeypatch)
+    _seed_token()
+    entry = _spool_entry(minutes_past_grace=-70, draft_id=None)
+    fake = _fake(
+        monkeypatch,
+        (200, {"value": [{"id": "D9"}]}),  # drafts lookup by Message-ID
+        (204, {}),                         # DELETE the recovered draft
+    )
+    res = server.tool_cancel_scheduled(entry.id)
+    assert res["ok"] is True
+    assert fake.calls[1][0] == "DELETE"
+    assert "D9" in fake.calls[1][1]
+    assert spool.load("cancelled", entry.id) is not None
+
+
+# --------------------------------------------------------------------- #
+# doctor: graph check red with fix when a graph identity cannot fire     #
+# --------------------------------------------------------------------- #
+
+
+def test_doctor_graph_check_red_without_token_cache_names_login_fix(
+    monkeypatch, tmp_path,
+):
+    """F6 surface: a graph identity with no token cache is a red check
+    with the --login fix — and statting must not create the graph dir."""
+    from email_mcp import doctor
+
+    _write_graph_toml(tmp_path, monkeypatch)
+    check = doctor.check_graph()
+    assert check["ok"] is False
+    assert "python -m email_mcp.graph --login cern" in check["fix"]
+    assert check["identities"]["cern"]["ok"] is False
+    assert not (tmp_path / "graph").exists()  # stat, never create
+
+
+def test_doctor_graph_check_green_with_refreshable_cache(
+    monkeypatch, tmp_path,
+):
+    from email_mcp import doctor
+
+    _write_graph_toml(tmp_path, monkeypatch)
+    _seed_token()
+    check = doctor.check_graph()
+    assert check["ok"] is True
+    ident_report = check["identities"]["cern"]
+    assert ident_report["ok"] is True
+    assert "age_days" in ident_report
+
+
+def test_doctor_graph_check_soft_when_no_identity_opts_in(monkeypatch):
+    from email_mcp import doctor
+
+    monkeypatch.setenv("EMAIL_MCP_FROM_ADDR", "someone@example.org")
+    check = doctor.check_graph()
+    assert check["ok"] is True
+    assert "no identities use the graph executor" in check["detail"]

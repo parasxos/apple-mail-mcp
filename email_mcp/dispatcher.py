@@ -12,6 +12,10 @@ scheduling) → deliver the frozen bytes over the existing SSH path
 backoff (2/5/15/45/120 min), then park in failed/ with the error and a
 macOS notification.
 
+Entries whose manifest says executor="graph" belong to Exchange (deferred
+send armed at schedule time) and never enter the local claim/deliver path;
+each pass reconciles their outcome instead — see _reconcile_graph.
+
 CLI:
   python -m email_mcp.dispatcher              # one pass (what launchd runs)
   python -m email_mcp.dispatcher --status     # spool overview
@@ -29,6 +33,9 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from . import config, identities, sender, spool
+from .log import get_logger
+
+_log = get_logger()
 
 LAUNCHD_LABEL = "com.email-mcp.dispatcher"
 # Labels this agent shipped under before v0.8. install/uninstall boot these
@@ -63,17 +70,21 @@ def _notify(title: str, text: str) -> None:
         pass
 
 
-def _fail_or_retry(entry: spool.Entry, error: str, now: datetime) -> str:
+def _fail_or_retry(entry: spool.Entry, error: str, now: datetime,
+                   src: str = "sending") -> str:
+    """Consume an attempt: park in failed/ or back off in pending/.
+    `src` is where the entry currently lives — "sending" for claimed local
+    deliveries, "pending" for graph entries (which are never claimed)."""
     entry.attempts += 1
     entry.last_error = error
     if entry.attempts >= config.send_max_retries():
-        spool.move(entry.id, "sending", "failed", entry)
+        spool.move(entry.id, src, "failed", entry)
         _notify("email-mcp: send FAILED",
                 f"{entry.subject!r} to {', '.join(entry.to)} — {error[:120]}")
         return "failed"
     delay = BACKOFF_MINUTES[min(entry.attempts - 1, len(BACKOFF_MINUTES) - 1)]
     entry.next_attempt_at = spool.iso(now + timedelta(minutes=delay))
-    spool.move(entry.id, "sending", "pending", entry)
+    spool.move(entry.id, src, "pending", entry)
     return f"retry in {delay}m"
 
 
@@ -102,11 +113,177 @@ def _recover_stranded(now: datetime) -> list[str]:
     return recovered
 
 
+# Exchange owns a graph entry until send_at + this grace: normal deferred
+# transmission needs no help from us, so the reconcile pass only starts
+# asking questions once Exchange is convincingly late.
+GRAPH_GRACE_MINUTES = 10
+
+
+def _graph_mark_sent(entry: spool.Entry, now: datetime) -> str:
+    entry.delivered_at = spool.iso(now)
+    entry.next_attempt_at = None
+    entry.last_error = None
+    spool.move(entry.id, "pending", "sent", entry)
+    return "sent (delivered by Exchange)"
+
+
+def _graph_leave(entry: spool.Entry, error: str, note: str) -> str:
+    """F4/F6: no evidence either way — the entry stays on graph, untouched
+    except for last_error, and the next pass retries."""
+    entry.last_error = error
+    spool.update("pending", entry)
+    return note
+
+
+def _graph_apply_status(entry: spool.Entry, status: str, now: datetime) -> str:
+    """Fold a draft_status verdict into the spool. NEVER local-delivers:
+    'sent' and 'cancelled_externally' are terminal moves, anything
+    ambiguous leaves the entry for the next pass (F3/F9)."""
+    if status == "sent":
+        return _graph_mark_sent(entry, now)
+    if status == "cancelled_externally":
+        entry.next_attempt_at = None
+        entry.last_error = (
+            "deferred draft was discarded outside the spool (e.g. in "
+            "Outlook/OWA Drafts) — not sent, not sendable locally")
+        spool.move(entry.id, "pending", "cancelled", entry)
+        return "cancelled externally (draft discarded in Outlook/OWA)"
+    # 'held' (shouldn't recur here) / 'unknown': leave + retry next pass.
+    return f"graph: status {status} — left for next pass"
+
+
+def _reconcile_graph(now: datetime) -> dict[str, str]:
+    """One reconcile pass over pending graph-executor entries.
+
+    Exchange is the executor of record for these — they NEVER enter the
+    local claim/deliver path. Past send_at + GRAPH_GRACE_MINUTES we ask
+    what happened: confirmed sent → sent/, confirmed external cancel →
+    cancelled/, draft still held → revoke it (delete FIRST) and only on a
+    CONFIRMED delete flip to launchd for local delivery next pass. Every
+    ambiguous answer leaves the entry on graph for the next pass — the
+    double-send fence is "never deliver locally while Exchange may still
+    hold (or have sent) the message"."""
+    entries = [e for e in spool.entries("pending") if e.executor == "graph"]
+    if not entries:
+        return {}
+    from . import graph  # lazy: spools without graph entries never import it
+
+    results: dict[str, str] = {}
+    grace = timedelta(minutes=GRAPH_GRACE_MINUTES)
+    for entry in entries:
+        try:
+            send_at = datetime.fromisoformat(entry.send_at)
+        except ValueError:
+            send_at = now  # malformed stamp: reconcile now rather than never
+        if now < send_at + grace:
+            continue  # Exchange's window — nothing to reconcile yet
+        if (entry.next_attempt_at
+                and datetime.fromisoformat(entry.next_attempt_at) > now):
+            continue  # backing off after _fail_or_retry (e.g. F12)
+
+        try:
+            ident = identities.get(entry.identity)
+        except identities.IdentityError as e:
+            # F12: identity removed/renamed since scheduling — retry with
+            # backoff (time to fix the file); the pass continues.
+            results[entry.id] = _fail_or_retry(entry, str(e), now,
+                                               src="pending")
+            continue
+
+        if not entry.graph_draft_id:
+            # Crash window recovery (F1/F2): the manifest was written but
+            # no draft id recorded. The frozen Message-ID is the key.
+            try:
+                draft_id = graph.find_draft_by_message_id(
+                    ident, entry.message_id)
+            except graph.GraphError as e:
+                results[entry.id] = _graph_leave(
+                    entry, str(e), "graph: drafts lookup failed — retrying")
+                continue
+            if draft_id is not None:
+                # F2: the draft exists — adopt it; Exchange keeps the job.
+                entry.graph_draft_id = draft_id
+                entry.last_error = None
+                spool.update("pending", entry)
+                _log.info("graph: adopted orphan draft %s for %s",
+                          draft_id, entry.id)
+                results[entry.id] = "graph: adopted existing draft"
+                continue
+            try:
+                sent = graph.sent_by_message_id(ident, entry.message_id)
+            except graph.GraphError as e:
+                results[entry.id] = _graph_leave(
+                    entry, str(e), "graph: sent-items lookup failed — retrying")
+                continue
+            if sent:
+                results[entry.id] = _graph_mark_sent(entry, now)
+                continue
+            # F1: no draft was ever armed — the local spool takes over.
+            entry.executor = "launchd"
+            entry.next_attempt_at = spool.iso(now)
+            entry.last_error = None
+            spool.update("pending", entry)
+            _log.warning("graph: no draft found for %s — flipped to "
+                         "launchd for local delivery", entry.id)
+            results[entry.id] = "graph: no draft found — local delivery next pass"
+            continue
+
+        try:
+            status = graph.draft_status(
+                ident, entry.graph_draft_id, entry.message_id)
+        except graph.GraphError as e:
+            results[entry.id] = _graph_leave(
+                entry, str(e), "graph: unreachable — retrying next pass")
+            continue
+
+        if status != "held":
+            results[entry.id] = _graph_apply_status(entry, status, now)
+            continue
+
+        # Held past grace (F3): Exchange is late. Revoke the draft FIRST;
+        # only a CONFIRMED delete releases the message to local delivery.
+        try:
+            outcome = graph.delete_draft(ident, entry.graph_draft_id)
+        except graph.GraphError as e:
+            # F4: delete failed/timed out — entry stays on graph, untouched.
+            results[entry.id] = _graph_leave(
+                entry, str(e), "graph: draft revoke failed — retrying")
+            continue
+        if outcome == "deleted":
+            entry.executor = "launchd"
+            entry.graph_draft_id = None
+            entry.next_attempt_at = spool.iso(now)
+            entry.last_error = None
+            spool.update("pending", entry)
+            _log.warning("graph: revoked late draft for %s — flipped to "
+                         "launchd for local delivery", entry.id)
+            results[entry.id] = ("graph: draft revoked — local delivery "
+                                 "next pass")
+        else:
+            # 'gone': Exchange may have won the race between our status
+            # probe and the delete — re-disambiguate, never guess (F3).
+            try:
+                status = graph.draft_status(
+                    ident, entry.graph_draft_id, entry.message_id)
+            except graph.GraphError as e:
+                results[entry.id] = _graph_leave(
+                    entry, str(e),
+                    "graph: draft gone, outcome ambiguous — retrying")
+                continue
+            results[entry.id] = _graph_apply_status(entry, status, now)
+    return results
+
+
 def run_once(now: datetime | None = None) -> dict:
     now = now or spool.utcnow()
     _recover_stranded(now)
-    due = [e for e in spool.entries("pending") if _due(e, now)]
-    results: dict[str, str] = {}
+    # Partition: graph-executor entries NEVER enter the local claim/deliver
+    # path — Exchange holds the armed draft. The due snapshot is taken
+    # BEFORE reconciling, so an entry flipped back to launchd delivers on
+    # the NEXT pass, after the flip is durably on disk.
+    due = [e for e in spool.entries("pending")
+           if e.executor != "graph" and _due(e, now)]
+    results: dict[str, str] = _reconcile_graph(now)
     if not due:
         return {"checked_at": spool.iso(now), "due": 0, "results": results}
 
@@ -264,7 +441,8 @@ def status() -> dict:
         "pending": [
             {"id": e.id, "send_at": e.send_at, "to": e.to,
              "subject": e.subject, "attempts": e.attempts,
-             "next_attempt_at": e.next_attempt_at, "last_error": e.last_error}
+             "next_attempt_at": e.next_attempt_at, "last_error": e.last_error,
+             "executor": e.executor}
             for e in spool.entries("pending")
         ],
     }
@@ -287,8 +465,9 @@ def main() -> int:
         print(uninstall_launchd())
         return 0
     summary = run_once()
-    # Quiet when idle: only log passes that actually did something.
-    if summary["due"]:
+    # Quiet when idle: only log passes that actually did something
+    # (local deliveries due, or graph reconcile activity in results).
+    if summary["due"] or summary["results"]:
         json.dump(summary, sys.stdout)
         sys.stdout.write("\n")
     return 0

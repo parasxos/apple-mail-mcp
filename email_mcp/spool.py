@@ -44,6 +44,11 @@ class Entry:
     last_error: str | None = None
     delivered_at: str | None = None
     identity: str = "default"    # sending identity; pre-0.7.0 manifests omit it
+    # Which executor fires this entry: "launchd" (the local spool path) or
+    # "graph" (Exchange-side deferred send). Pre-v0.8 manifests omit both
+    # fields — the defaults keep them on the local path unchanged.
+    executor: str = "launchd"
+    graph_draft_id: str | None = None  # Exchange draft id once armed
 
 
 def utcnow() -> datetime:
