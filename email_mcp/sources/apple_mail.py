@@ -22,7 +22,16 @@ import urllib.parse
 from datetime import datetime, timezone
 from pathlib import Path
 
-from ..config import attach_dir, mail_dir, max_body_bytes
+from ..config import (
+    attach_dir,
+    fts_enabled,
+    fts_inline_batch,
+    fts_inline_budget,
+    fts_max_hits,
+    mail_dir,
+    max_body_bytes,
+)
+from ..log import get_logger
 from .apple_mail_paths import (
     account_label,
     build_emlx_path,
@@ -110,6 +119,8 @@ class AppleMailSource:
             )
         self._conn = _connect_readonly(index)
         self._columns = self._probe_columns()
+        self._fts_index = None  # lazy — see _fts()
+        self._last_fts: dict | None = None  # stash from the latest search()
 
     # ------------------------------------------------------------------ #
     # schema probing                                                     #
@@ -145,6 +156,75 @@ class AppleMailSource:
 
     def _have(self, table: str, column: str) -> bool:
         return column in self._columns.get(table, set())
+
+    # ------------------------------------------------------------------ #
+    # FTS body index hook (read-only consumer of email_mcp.fts)          #
+    # ------------------------------------------------------------------ #
+
+    def _fts(self):
+        """The body index, when usable: enabled AND already built.
+
+        Lazy + cached. NEVER creates the db or its directory — building is
+        the CLI's job (python -m email_mcp.fts --build); a machine that
+        never built the index must keep a zero-trace read path. While the
+        index is absent the check re-runs per call (cheap: env + stat), so
+        a build made mid-session is picked up without a restart.
+        """
+        if self._fts_index is not None:
+            return self._fts_index
+        if not fts_enabled():
+            return None
+        from .. import fts as fts_mod  # lazy — mirrors fts's own pattern
+
+        if not fts_mod.db_path().exists():
+            return None
+        self._fts_index = fts_mod.FtsIndex(mail_base=self._mail_dir)
+        return self._fts_index
+
+    def fts_status(self) -> dict | None:
+        """Index-health stash from the most recent search() (None before
+        any). The server layer folds this into the search_emails envelope
+        via getattr — sources without an index simply lack the attribute."""
+        return self._last_fts
+
+    def _fts_report(self, idx, rowids: list[int], capped: bool) -> dict:
+        """The {state, indexed, missing, backlog, hits, hits_capped,
+        remedy?} dict stashed per search. `rowids` rides along under its
+        own key for the server's body_match check — never in the envelope."""
+        out: dict = {
+            "state": "disabled",
+            "indexed": 0,
+            "missing": 0,
+            "backlog": 0,
+            "hits": len(rowids),
+            "hits_capped": capped,
+            "rowids": rowids,
+        }
+        if idx is None:
+            if fts_enabled():
+                out["state"] = "absent"
+                out["remedy"] = "python -m email_mcp.fts --build"
+            return out
+        st = idx.status()
+        out["state"] = st["state"]
+        if st["state"] == "error":
+            out["error"] = st.get("error")
+            return out
+        out["indexed"] = st["docs"]["indexed"]
+        out["missing"] = st["docs"]["missing"]
+        out["backlog"] = self._fts_backlog(st["last_rowid"])
+        if out["backlog"] > 0:
+            out["remedy"] = "python -m email_mcp.fts --sync"
+        return out
+
+    def _fts_backlog(self, hwm: int) -> int:
+        """Envelope rows the crawler has not scanned yet (ROWID > hwm)."""
+        deleted = "AND deleted = 0" if self._have("messages", "deleted") else ""
+        row = self._conn.execute(
+            f"SELECT COUNT(*) AS c FROM messages WHERE ROWID > ? {deleted}",
+            (hwm,),
+        ).fetchone()
+        return int(row["c"]) if row else 0
 
     # ------------------------------------------------------------------ #
     # unified-inbox helpers                                              #
@@ -304,15 +384,36 @@ class AppleMailSource:
         where: list[str] = ["m.deleted = 0"] if self._have("messages", "deleted") else []
         params: list[object] = []
 
+        # FTS body hits fold into the query OR-group below. The inline
+        # incremental pass is bounded (batch/budget) and best-effort — any
+        # failure is logged and search proceeds on the index as-is.
+        fts_rowids: list[int] = []
+        fts_capped = False
+        idx = self._fts()
+        if q.query and idx is not None:
+            try:
+                idx.incremental(max_docs=fts_inline_batch(),
+                                budget=fts_inline_budget())
+            except Exception as e:
+                get_logger().warning("fts: inline incremental failed: %s", e)
+            cap = fts_max_hits()
+            fts_rowids = idx.rowids_matching(q.query, cap)
+            fts_capped = len(fts_rowids) >= cap
+        self._last_fts = self._fts_report(idx, fts_rowids, fts_capped)
+
         if q.query:
             term = _like_escape(q.query)
-            where.append(
+            clause = (
                 "(s.subject LIKE ? ESCAPE '\\' "
                 "OR a.address LIKE ? ESCAPE '\\' "
                 "OR a.comment LIKE ? ESCAPE '\\' "
-                "OR EXISTS(SELECT 1 FROM summaries su WHERE su.ROWID = m.summary AND su.summary LIKE ? ESCAPE '\\'))"
+                "OR EXISTS(SELECT 1 FROM summaries su WHERE su.ROWID = m.summary AND su.summary LIKE ? ESCAPE '\\')"
             )
             params.extend([f"%{term}%"] * 4)
+            if fts_rowids:
+                clause += f" OR m.ROWID IN ({','.join('?' * len(fts_rowids))})"
+                params.extend(fts_rowids)
+            where.append(clause + ")")
 
         if q.from_addr:
             where.append("(a.address LIKE ? ESCAPE '\\' OR a.comment LIKE ? ESCAPE '\\')")

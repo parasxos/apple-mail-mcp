@@ -80,7 +80,7 @@ def tool_search_emails(
     unread_only: bool = False,
     limit: int = 50,
     offset: int = 0,
-) -> list[dict]:
+) -> dict:
     q = SearchQuery(
         query=query,
         from_addr=from_addr,
@@ -94,11 +94,83 @@ def tool_search_emails(
         limit=limit,
         offset=offset,
     )
-    return [_to_jsonable(r) for r in _source().search(q)]
+    src = _source()
+    results = [_to_jsonable(r) for r in src.search(q)]
+
+    # Index health rides along with every search (honest degradation) —
+    # sources without a body index simply lack the fts_status attribute.
+    fts = dict(getattr(src, "fts_status", lambda: None)() or {
+        "state": "unavailable", "hits": 0, "hits_capped": False,
+    })
+    hit_ids = {str(r) for r in fts.pop("rowids", [])}
+
+    # body_match: the hit came in via the body index and the query is not
+    # visible in what the caller already sees (subject/from/snippet).
+    ql = query.lower()
+    for r in results:
+        visible = bool(ql) and (
+            ql in r["subject"].lower()
+            or ql in r["from_addr"].lower()
+            or ql in r["snippet"].lower()
+        )
+        r["body_match"] = r["id"] in hit_ids and not visible
+
+    return {"ok": True, "fts": fts, "results": results}
 
 
-def tool_get_email(id: str) -> dict:
-    return _to_jsonable(_source().get(id))
+# Payload views for get_email / get_emails_batch, smallest first.
+_VIEWS = ("minimal", "metadata", "full")
+_BATCH_MAX_IDS = 50
+
+
+def _shape_email(msg: Any, view: str) -> dict:
+    """Size a full Email to the requested view.
+
+    full     — the complete shape (ref, headers, bodies, attachments, flags)
+    metadata — everything except the bodies
+    minimal  — id/subject/from/date skeleton (triage_plan's message shape)
+    """
+    full = _to_jsonable(msg)
+    if view == "full":
+        return full
+    if view == "metadata":
+        return {k: v for k, v in full.items()
+                if k not in ("body_text", "body_html")}
+    ref = full["ref"]
+    return {
+        "id": ref["id"], "subject": ref["subject"],
+        "from_addr": ref["from_addr"], "date": ref["date"],
+        "mailbox": ref["mailbox"], "unread": ref["unread"],
+    }
+
+
+def _bad_view(view: str) -> dict:
+    return {"ok": False,
+            "error": f"unknown view {view!r} (want one of {_VIEWS})"}
+
+
+def tool_get_email(id: str, view: str = "full") -> dict:
+    if view not in _VIEWS:
+        return _bad_view(view)
+    return _shape_email(_source().get(id), view)
+
+
+def tool_get_emails_batch(ids: list[str], view: str = "full") -> dict:
+    if view not in _VIEWS:
+        return _bad_view(view)
+    if len(ids) > _BATCH_MAX_IDS:
+        return {"ok": False,
+                "error": f"{len(ids)} ids exceeds the batch cap of "
+                         f"{_BATCH_MAX_IDS} — split the request"}
+    src = _source()
+    emails: list[dict] = []
+    errors: list[dict] = []
+    for id in ids:
+        try:
+            emails.append(_shape_email(src.get(str(id)), view))
+        except (ValueError, LookupError) as e:
+            errors.append({"id": str(id), "error": str(e)})
+    return {"ok": True, "view": view, "emails": emails, "errors": errors}
 
 
 def tool_get_thread(thread_id: str) -> list[dict]:
@@ -412,7 +484,7 @@ def tool_cancel_scheduled(id: str) -> dict:
 
 
 def _build_mcp_server():  # pragma: no cover — exercised by integration only
-    """Build the FastMCP Server with all sixteen tools registered."""
+    """Build the FastMCP Server with all seventeen tools registered."""
     from mcp.server.fastmcp import FastMCP  # type: ignore
 
     mcp = FastMCP("apple-mail")
@@ -430,9 +502,18 @@ def _build_mcp_server():  # pragma: no cover — exercised by integration only
         unread_only: bool = False,
         limit: int = 50,
         offset: int = 0,
-    ) -> list[dict]:
-        """Search emails. `query` matches subject, sender name/address, and the
-        stored snippet. All other filters are AND-combined. Returns up to 200."""
+    ) -> dict:
+        """Search emails. `query` matches subject, sender name/address, the
+        stored snippet, AND full message bodies (local FTS index). All other
+        filters are AND-combined.
+
+        Returns {ok, fts, results}. `fts` reports body-index health —
+        state (ready/absent/disabled), indexed/missing/backlog counts, hits
+        folded into this search, hits_capped, and a `remedy` command when
+        the index is absent or behind. `state: "absent"` means bodies were
+        NOT searched (subject/sender/snippet only) until the index is
+        built. Each result carries `body_match`: true when it matched only
+        in the body (the query is not visible in subject/from/snippet)."""
         return tool_search_emails(
             query=query, from_addr=from_addr, to_addr=to_addr,
             mailbox=mailbox, account=account, before=before, after=after,
@@ -441,10 +522,23 @@ def _build_mcp_server():  # pragma: no cover — exercised by integration only
         )
 
     @mcp.tool()
-    def get_email(id: str) -> dict:
-        """Get full headers, body (text + HTML), and attachment list for one
-        message by its envelope id."""
-        return tool_get_email(id)
+    def get_email(id: str, view: str = "full") -> dict:
+        """Get one message by its envelope id. `view` sizes the payload to
+        the question: "full" (headers + text/HTML bodies + attachment list —
+        the default), "metadata" (everything except the bodies), "minimal"
+        (id/subject/from/date/mailbox/unread skeleton). Bodies are always
+        read live from the mail store, never from the search index."""
+        return tool_get_email(id, view=view)
+
+    @mcp.tool()
+    def get_emails_batch(ids: list[str], view: str = "full") -> dict:
+        """Fetch up to 50 messages in one call — the token-efficient bulk
+        read. `ids` are envelope ids from search/list/thread; `view` works
+        as in get_email. Returns {ok, view, emails, errors}: per-id
+        failures (bad or vanished ids) land in `errors` as data and never
+        fail the batch. More than 50 ids is rejected outright ({ok: false})
+        — split the request."""
+        return tool_get_emails_batch(ids, view=view)
 
     @mcp.tool()
     def get_thread(thread_id: str) -> list[dict]:

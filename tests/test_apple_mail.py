@@ -135,6 +135,63 @@ def test_schema_probe_records_columns(mail_fixture):
     assert "deleted" in src._columns["messages"]
 
 
+# ---------------------------------------------------------------------- #
+# v0.8: FTS body hits folded into search()                                #
+# ---------------------------------------------------------------------- #
+
+
+def test_search_finds_body_only_term_after_build(mail_fixture):
+    from email_mcp.fts import FtsIndex
+
+    src = AppleMailSource(mail_base=mail_fixture)
+    # "retracted" lives only in message 100's BODY — never in subject,
+    # sender, or snippet — so the LIKE path alone cannot find it.
+    assert src.search(SearchQuery(query="retracted")) == []
+    assert src.fts_status()["state"] == "absent"
+
+    FtsIndex(mail_base=mail_fixture).build()
+    hits = src.search(SearchQuery(query="retracted"))
+    assert [r.id for r in hits] == ["100"]
+    st = src.fts_status()
+    assert st["state"] == "ready"
+    assert st["hits"] == 1
+    assert st["hits_capped"] is False
+    assert st["backlog"] == 0
+
+
+def test_search_multiword_body_query_has_and_semantics(mail_fixture):
+    from email_mcp.fts import FtsIndex
+
+    FtsIndex(mail_base=mail_fixture).build()
+    src = AppleMailSource(mail_base=mail_fixture)
+    # Both tokens in message 101's body ("See attached production figures.")
+    hits = src.search(SearchQuery(query="See attached"))
+    assert [r.id for r in hits] == ["101"]
+    # Tokens split across DIFFERENT bodies (101 has "attached", 100 has
+    # "retracted") must not match — AND-of-terms, not OR.
+    assert src.search(SearchQuery(query="attached retracted")) == []
+
+
+def test_absent_index_degrades_to_like_and_creates_nothing(
+        mail_fixture, monkeypatch, tmp_path):
+    from email_mcp import server
+
+    target = tmp_path / "fts-never-created"
+    monkeypatch.setenv("EMAIL_MCP_FTS_DIR", str(target))
+    monkeypatch.setattr(server, "_SOURCE", AppleMailSource(mail_base=mail_fixture))
+
+    out = server.tool_search_emails(query="I2C")
+    assert out["ok"] is True
+    assert out["fts"]["state"] == "absent"
+    assert out["fts"]["remedy"] == "python -m email_mcp.fts --build"
+    assert out["fts"]["hits"] == 0
+    # LIKE path still answers…
+    assert [r["id"] for r in out["results"]] == ["100"]
+    assert out["results"][0]["body_match"] is False
+    # …and the read path left zero traces on disk.
+    assert not target.exists()
+
+
 def test_immutable_open_works_with_concurrent_writer(tmp_path):
     """`?mode=ro&immutable=1` must let us read even if another connection holds
     a write lock on the same DB file — that's the live Mail.app scenario."""
