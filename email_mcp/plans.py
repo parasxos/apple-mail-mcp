@@ -25,7 +25,8 @@ STATUSES = ("draft", "applied", "failed", "expired")
 
 @dataclass
 class PlanAction:
-    action: str                      # move_to|mark_read|mark_unread|flag|unflag|delete
+    action: str                      # move_to|mark_read|mark_unread|flag|unflag
+                                     # (delete: staged only via triage_plan_delete)
     mailbox: str | None = None       # move_to only — decoded slash-joined path
     color: int | None = None         # flag only — 0..6
 

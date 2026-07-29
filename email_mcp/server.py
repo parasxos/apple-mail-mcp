@@ -20,7 +20,8 @@ from typing import Any
 from .config import source_name
 from .sender import SendError, reply_email, schedule_email, send_email
 from .triage import (
-    TriageError, apply_plan, build_plan, create_mailbox, delete_mailbox,
+    TriageError, apply_plan, build_delete_plan, build_plan, create_mailbox,
+    delete_mailbox,
 )
 from .sources import get_source
 from .sources.base import EmailSource, SearchQuery
@@ -394,6 +395,24 @@ def _triage_err(e: TriageError) -> dict:
     return {"ok": False, "code": e.code, "error": str(e)}
 
 
+def _plan_payload(plan) -> dict:
+    """The staged-plan response shape shared by triage_plan and
+    triage_plan_delete."""
+    return {
+        "ok": True,
+        "plan_id": plan.id,
+        "count": len(plan.messages),
+        "expires_at": plan.expires_at,
+        "summary": plan.summary,
+        "actions": [_to_jsonable(a) for a in plan.actions],
+        "messages": [
+            {"id": str(m.rowid), "subject": m.subject, "from_addr": m.from_addr,
+             "date": m.date, "mailbox": m.mailbox, "unread": m.unread}
+            for m in plan.messages
+        ],
+    }
+
+
 def tool_triage_plan(
     query: str = "",
     from_addr: str | None = None,
@@ -422,19 +441,37 @@ def tool_triage_plan(
         plan = build_plan(_source(), q, actions)
     except TriageError as e:
         return _triage_err(e)
-    return {
-        "ok": True,
-        "plan_id": plan.id,
-        "count": len(plan.messages),
-        "expires_at": plan.expires_at,
-        "summary": plan.summary,
-        "actions": [_to_jsonable(a) for a in plan.actions],
-        "messages": [
-            {"id": str(m.rowid), "subject": m.subject, "from_addr": m.from_addr,
-             "date": m.date, "mailbox": m.mailbox, "unread": m.unread}
-            for m in plan.messages
-        ],
-    }
+    return _plan_payload(plan)
+
+
+def tool_triage_plan_delete(
+    query: str = "",
+    from_addr: str | None = None,
+    to_addr: str | None = None,
+    mailbox: str | None = None,
+    account: str | None = None,
+    before: str | None = None,
+    after: str | None = None,
+    has_attachment: bool | None = None,
+    unread_only: bool = False,
+    limit: int = 0,
+) -> dict:
+    from .triage import delete_max
+
+    cap = delete_max()
+    q = SearchQuery(
+        query=query, from_addr=from_addr, to_addr=to_addr,
+        mailbox=mailbox, account=account,
+        before=_parse_dt(before), after=_parse_dt(after),
+        has_attachment=has_attachment, unread_only=unread_only,
+        limit=limit if 0 < limit <= cap else cap + 1,  # +1 exposes over-cap
+        offset=0,  # plans must be stable selections — no paging
+    )
+    try:
+        plan = build_delete_plan(_source(), q)
+    except TriageError as e:
+        return _triage_err(e)
+    return _plan_payload(plan)
 
 
 def tool_triage_apply(plan_id: str) -> dict:
@@ -753,11 +790,11 @@ def _build_mcp_server():  # pragma: no cover — exercised by integration only
         message, e.g. [{"action": "mark_read"}, {"action": "move_to",
         "mailbox": "Archive/JIRA"}]. Vocabulary: move_to (same-account,
         target must exist — see mailbox_create), mark_read, mark_unread,
-        flag (color 0-6), unflag, delete. `delete` uses Mail.app's own
-        delete verb → the account's Trash; nothing is erased permanently.
-        There is no `archive` action — use move_to with your archive
-        mailbox. Returns {ok, plan_id, count, expires_at, summary,
-        messages} or {ok: false, code, error}.
+        flag (color 0-6), unflag. There is deliberately NO `delete` here —
+        deletion has its own tool, triage_plan_delete. There is no
+        `archive` action — use move_to with your archive mailbox. Returns
+        {ok, plan_id, count, expires_at, summary, messages} or
+        {ok: false, code, error}.
         """
         return tool_triage_plan(
             query=query, from_addr=from_addr, to_addr=to_addr,
@@ -767,10 +804,45 @@ def _build_mcp_server():  # pragma: no cover — exercised by integration only
         )
 
     @mcp.tool()
+    def triage_plan_delete(
+        query: str = "",
+        from_addr: str | None = None,
+        to_addr: str | None = None,
+        mailbox: str | None = None,
+        account: str | None = None,
+        before: str | None = None,
+        after: str | None = None,
+        has_attachment: bool | None = None,
+        unread_only: bool = False,
+        limit: int = 0,
+    ) -> dict:
+        """Stage DELETION of the selected messages — the destructive verb's
+        own door (triage_plan refuses `delete`). SELECT with the same
+        filters as search_emails; NOTHING is deleted by this call — review
+        the returned plan (count, summary, messages) with the user, then
+        execute it via triage_apply, exactly like any other plan.
+
+        Deletion uses Mail.app's own delete verb → messages go to their
+        account's Trash mailbox; nothing is erased permanently. The
+        selection must live in ONE account (cross-account selections are
+        rejected — add the account= filter) and caps at 50 messages
+        (EMAIL_MCP_TRIAGE_DELETE_MAX), tighter than triage_plan's cap.
+        Returns {ok, plan_id, count, expires_at, summary, messages} or
+        {ok: false, code, error}.
+        """
+        return tool_triage_plan_delete(
+            query=query, from_addr=from_addr, to_addr=to_addr,
+            mailbox=mailbox, account=account, before=before, after=after,
+            has_attachment=has_attachment, unread_only=unread_only,
+            limit=limit,
+        )
+
+    @mcp.tool()
     def triage_apply(plan_id: str) -> dict:
-        """Execute a plan staged by triage_plan: one batched AppleScript
-        against Mail.app (messages addressed by database id — fast at any
-        mailbox size), then verification against Mail's own store.
+        """Execute a plan staged by triage_plan / triage_plan_delete: one
+        batched AppleScript against Mail.app (messages addressed by
+        database id — fast at any mailbox size), then verification against
+        Mail's own store.
 
         Large plans take a while (~0.2 s/message + overhead; a 200-message
         plan can run minutes) — do not re-invoke mid-flight; a second call

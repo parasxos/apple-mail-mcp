@@ -52,6 +52,63 @@ class SendResult:
 # address handling                                                      #
 # --------------------------------------------------------------------- #
 
+# Header-injection fence: CR/LF/NUL anywhere in a header-bound value lets a
+# caller smuggle extra headers (Bcc:, a second From:) into the wire format.
+# Provenance rule: REFUSE what the model supplies (compose-time check below);
+# SANITIZE what the store supplies (reply subjects are space-joined instead).
+_CTL_RE = re.compile(r"[\r\n\x00]")
+
+
+def _reject_header_injection(fields: dict[str, object]) -> None:
+    """Refuse control characters in model-supplied header values."""
+    for name, value in fields.items():
+        items = value if isinstance(value, list) else [value]
+        for item in items:
+            if item and _CTL_RE.search(str(item)):
+                raise SendError(
+                    f"header_injection: control character (CR/LF/NUL) in "
+                    f"`{name}`: {str(item)!r} — headers are single-line; "
+                    "put extra recipients in to/cc/bcc, extra text in body."
+                )
+
+
+def _validate_bare_addresses(field: str, addrs: list[str]) -> None:
+    """Each split entry must contain a plausible bare address: exactly one
+    @ with non-empty sides and no whitespace/control characters."""
+    for entry in addrs:
+        bare = parseaddr(entry)[1].strip()
+        local, sep, domain = bare.partition("@")
+        if (not sep or not local or not domain or "@" in domain
+                or any(c.isspace() or ord(c) < 0x20 for c in bare)):
+            raise SendError(
+                f"invalid_recipient: {entry!r} in `{field}` is not a usable "
+                "address (want user@domain, optionally as 'Name <user@domain>')."
+            )
+
+
+def _recipient_lists(
+    to: str | list[str] | None,
+    cc: str | list[str] | None,
+    bcc: str | list[str] | None,
+) -> tuple[list[str], list[str], list[str]]:
+    """to/cc/bcc → clean lists. Raw CR/LF/NUL is rejected BEFORE _split
+    (getaddresses would degrade an injected line into extra recipients),
+    then every split entry gets the bare-address sanity check."""
+    out: list[list[str]] = []
+    for name, raw in (("to", to), ("cc", cc), ("bcc", bcc)):
+        items = [] if not raw else ([raw] if isinstance(raw, str) else list(raw))
+        for item in items:
+            if _CTL_RE.search(str(item)):
+                raise SendError(
+                    f"invalid_recipient: control character (CR/LF/NUL) in "
+                    f"`{name}`: {str(item)!r} — addresses are single-line, "
+                    "comma-separated."
+                )
+        split = _split(raw)
+        _validate_bare_addresses(name, split)
+        out.append(split)
+    return out[0], out[1], out[2]
+
 
 def _split(addrs: str | list[str] | None) -> list[str]:
     """Normalise a recipient field (str with commas, or list) to a clean list
@@ -202,6 +259,9 @@ def _quote_html(original_html: str, original_text: str, attribution: str) -> str
     if original_html.strip():
         m = _HTML_INNER_RE.match(original_html)
         inner = m.group(1) if m else original_html
+        # Read-side fence: quoted history must not carry live script/style
+        # from a hostile original into the outgoing message.
+        inner = _TAG_BLOCK_RE.sub("", inner)
     else:
         inner = _html_paras(original_text)
     return (
@@ -242,20 +302,36 @@ def compose(
     """
     ident = identity if identity is not None else identities.get(None)
     from_addr = ident.from_addr
+    _reject_header_injection({
+        "subject": subject,
+        "in_reply_to": in_reply_to,
+        "references": references,
+        "to": to,
+        "cc": cc or [],
+        "bcc": bcc or [],
+        "from_addr": from_addr,
+        "from_name": ident.from_name,
+    })
     msg = EmailMessage()
-    msg["From"] = formataddr((ident.from_name, from_addr))
-    msg["To"] = ", ".join(to)
-    if cc:
-        msg["Cc"] = ", ".join(cc)
-    if bcc:
-        msg["Bcc"] = ", ".join(bcc)
-    msg["Subject"] = subject
-    domain = from_addr.rsplit("@", 1)[-1] if "@" in from_addr else "localhost"
-    msg["Message-ID"] = make_msgid(domain=domain)
-    if in_reply_to:
-        msg["In-Reply-To"] = in_reply_to
-        refs = (references + " " + in_reply_to).strip()
-        msg["References"] = refs
+    try:
+        # Belt to the fence above: the stdlib refuses some malformed header
+        # values with a bare ValueError — surface those as caller-fixable
+        # SendErrors instead of a traceback on the MCP wire.
+        msg["From"] = formataddr((ident.from_name, from_addr))
+        msg["To"] = ", ".join(to)
+        if cc:
+            msg["Cc"] = ", ".join(cc)
+        if bcc:
+            msg["Bcc"] = ", ".join(bcc)
+        msg["Subject"] = subject
+        domain = from_addr.rsplit("@", 1)[-1] if "@" in from_addr else "localhost"
+        msg["Message-ID"] = make_msgid(domain=domain)
+        if in_reply_to:
+            msg["In-Reply-To"] = in_reply_to
+            refs = (references + " " + in_reply_to).strip()
+            msg["References"] = refs
+    except ValueError as e:
+        raise SendError(f"invalid header content: {e}") from e
     msg.set_content(f"{body}\n\n{quote_text}\n" if quote_text else body)
     msg.add_alternative(_html_body(body, quote_html), subtype="html")
     for data, maintype, subtype, filename in attachments or []:
@@ -425,7 +501,7 @@ def send_email(
     from_identity: str | None = None,
 ) -> SendResult:
     ident = identities.get(from_identity)
-    to_l, cc_l, bcc_l = _split(to), _split(cc), _split(bcc)
+    to_l, cc_l, bcc_l = _recipient_lists(to, cc, bcc)
     if not to_l:
         raise SendError("`to` is required (no valid recipient address).")
     if not subject:
@@ -513,7 +589,7 @@ def schedule_email(
             "Use send_email for immediate delivery."
         )
 
-    to_l, cc_l, bcc_l = _split(to), _split(cc), _split(bcc)
+    to_l, cc_l, bcc_l = _recipient_lists(to, cc, bcc)
     if not to_l:
         raise SendError("`to` is required (no valid recipient address).")
     if not subject:
@@ -574,7 +650,9 @@ def reply_email(
     headers = original.headers
     orig_msgid = headers.get("Message-ID") or headers.get("Message-Id") or ""
     orig_refs = headers.get("References", "")
-    orig_subject = original.ref.subject or headers.get("Subject", "")
+    # Store-supplied value: sanitize, don't refuse (provenance rule) — a
+    # hostile subject in the mailbox must not make the message unanswerable.
+    orig_subject = _CTL_RE.sub(" ", original.ref.subject or headers.get("Subject", ""))
     subject = orig_subject if orig_subject.lower().startswith("re:") else f"Re: {orig_subject}"
 
     reply_to = headers.get("Reply-To") or original.ref.from_addr

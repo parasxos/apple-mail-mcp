@@ -125,7 +125,7 @@ def test_plan_validates_actions(src):
         ([{"action": "move_to"}], "invalid_action"),
         ([{"action": "mark_read"}, {"action": "mark_unread"}], "conflicting_actions"),
         ([{"action": "delete"}, {"action": "move_to", "mailbox": "X"}],
-         "conflicting_actions"),
+         "destructive_action"),  # delete segregated: refused before conflicts
         (None, "invalid_action"),
     ]
     for actions, code in cases:
@@ -136,6 +136,20 @@ def test_plan_validates_actions(src):
     parsed = triage._parse_actions(
         [{"action": "move_to", "mailbox": "X"}, {"action": "mark_read"}])
     assert [a.action for a in parsed] == ["mark_read", "move_to"]
+    # The move_to+delete conflict still holds where delete IS allowed.
+    with pytest.raises(triage.TriageError) as ei:
+        triage._parse_actions(
+            [{"action": "delete"}, {"action": "move_to", "mailbox": "X"}],
+            allowed=triage.ACTIONS | triage.DESTRUCTIVE)
+    assert ei.value.code == "conflicting_actions"
+
+
+def test_delete_via_triage_plan_points_at_its_own_tool(src):
+    with pytest.raises(triage.TriageError) as ei:
+        _plan(src, [{"action": "delete"}], unread_only=True)
+    assert ei.value.code == "destructive_action"
+    assert "triage_plan_delete" in str(ei.value)
+    assert list(config.plans_dir().glob("*.json")) == []  # nothing staged
 
 
 def test_plan_rejects_unknown_mailbox_and_cross_account(src):
@@ -240,8 +254,10 @@ def test_move_to_unsynced_mailbox_falls_back_to_mail_probe(src, db, fake_osa):
     assert res["verified"] == 1 and res["pending"] == []
 
 
-def test_apply_delete_verifies_via_deleted_flag(src, db, fake_osa):
-    plan = _plan(src, [{"action": "delete"}], unread_only=True)
+def test_apply_delete_plan_verifies_via_deleted_flag(src, db, fake_osa):
+    """build_delete_plan's output applies through the UNCHANGED apply_plan."""
+    plan = triage.build_delete_plan(src, SearchQuery(unread_only=True))
+    assert [a.action for a in plan.actions] == ["delete"]
 
     def batch(script):
         db.execute("UPDATE messages SET deleted=1 WHERE ROWID=100")
@@ -250,8 +266,27 @@ def test_apply_delete_verifies_via_deleted_flag(src, db, fake_osa):
     fake_osa.batch = batch
 
     res = triage.apply_plan(src, plan.id)
-    assert res["verified"] == 1
+    assert res["status"] == "applied" and res["verified"] == 1
+    assert "delete msgRef" in fake_osa.batch_scripts[0]
     assert src.search(SearchQuery(unread_only=True)) == []  # gone from search
+
+
+def test_delete_plan_cross_account_rejected(src):
+    with pytest.raises(triage.TriageError) as ei:  # all 4 msgs span 2 accounts
+        triage.build_delete_plan(src, SearchQuery(limit=10))
+    assert ei.value.code == "cross_account"
+    assert "account=" in str(ei.value)
+    assert list(config.plans_dir().glob("*.json")) == []  # nothing staged
+
+
+def test_delete_plan_cap_names_its_env_knob(src, monkeypatch):
+    monkeypatch.setenv("EMAIL_MCP_TRIAGE_DELETE_MAX", "2")
+    with pytest.raises(triage.TriageError) as ei:
+        triage.build_delete_plan(  # LOCAL account holds 3 messages
+            src, SearchQuery(account=LOCAL_ACCT, limit=10))
+    assert ei.value.code == "selection_too_large"
+    assert "EMAIL_MCP_TRIAGE_DELETE_MAX" in str(ei.value)
+    assert list(config.plans_dir().glob("*.json")) == []  # nothing staged
 
 
 def test_apply_partial_failure_reported(src, db, fake_osa):

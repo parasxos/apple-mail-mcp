@@ -12,6 +12,7 @@ Mail.app itself, which owns server sync (EWS/IMAP alike).
 """
 from __future__ import annotations
 
+import os
 import subprocess
 import time
 from datetime import datetime, timedelta
@@ -24,7 +25,11 @@ from .sources.base import SearchQuery
 _log = get_logger()
 
 RELOCATING = {"move_to", "delete"}
-ACTIONS = {"move_to", "mark_read", "mark_unread", "flag", "unflag", "delete"}
+# The destructive verb is segregated: `delete` is NOT in the shared actions
+# vocabulary — it enters only through build_delete_plan (triage_plan_delete),
+# so a fumbled parameter on triage_plan can never reach the Trash.
+ACTIONS = {"move_to", "mark_read", "mark_unread", "flag", "unflag"}
+DESTRUCTIVE = {"delete"}
 
 
 class TriageError(Exception):
@@ -40,7 +45,8 @@ class TriageError(Exception):
 # --------------------------------------------------------------------- #
 
 
-def _parse_actions(raw: list[dict] | None) -> list[PlanAction]:
+def _parse_actions(raw: list[dict] | None,
+                   allowed: set[str] = ACTIONS) -> list[PlanAction]:
     if not raw:
         raise TriageError("invalid_action", "`actions` is required (non-empty list).")
     parsed: list[PlanAction] = []
@@ -48,10 +54,15 @@ def _parse_actions(raw: list[dict] | None) -> list[PlanAction]:
         if not isinstance(item, dict) or "action" not in item:
             raise TriageError("invalid_action", f"malformed action entry: {item!r}")
         verb = str(item["action"])
-        if verb not in ACTIONS:
+        if verb not in allowed:
+            if verb in DESTRUCTIVE:
+                raise TriageError(
+                    "destructive_action",
+                    "delete has its own tool — use triage_plan_delete.",
+                )
             raise TriageError(
                 "invalid_action",
-                f"unknown action {verb!r} (want one of {sorted(ACTIONS)})",
+                f"unknown action {verb!r} (want one of {sorted(allowed)})",
             )
         mailbox = item.get("mailbox")
         color = item.get("color")
@@ -100,9 +111,10 @@ def _scheme(url: str) -> str:
     return url.split("://", 1)[0] if "://" in url else ""
 
 
-def build_plan(source, q: SearchQuery, actions: list[dict] | None) -> Plan:
+def build_plan(source, q: SearchQuery, actions: list[dict] | None,
+               allowed: set[str] = ACTIONS) -> Plan:
     plans.gc()
-    parsed = _parse_actions(actions)
+    parsed = _parse_actions(actions, allowed=allowed)
 
     snap_fn = getattr(source, "triage_snapshot", None)
     resolve_fn = getattr(source, "resolve_mailbox", None)
@@ -202,6 +214,46 @@ def build_plan(source, q: SearchQuery, actions: list[dict] | None) -> Plan:
     plans.save(plan)
     _log.info("triage plan %s: %s", plan.id, plan.summary)
     return plan
+
+
+def delete_max() -> int:
+    """Cap for delete plans (tighter than triage_max_messages — the verb is
+    destructive). TODO(S4): config.py grows triage_delete_max(); the getattr
+    below picks it up the moment it lands, and this helper can then shrink
+    to a plain delegate."""
+    getter = getattr(config, "triage_delete_max", None)
+    if getter is not None:
+        return int(getter())
+    return int(os.environ.get("EMAIL_MCP_TRIAGE_DELETE_MAX", "50"))
+
+
+def build_delete_plan(source, q: SearchQuery) -> Plan:
+    """Stage deletion — the destructive verb's own door (triage_plan_delete).
+
+    Two guards run before the ordinary planning path: the selection must
+    live in ONE account (symmetric with move_to's guard) and must fit the
+    tighter delete cap. The result is a normal frozen Plan carrying the one
+    `delete` action — it expires, is reviewed and applies through the
+    unchanged apply_plan exactly like any other plan."""
+    refs = source.search(q)
+    accounts = {r.account for r in refs}
+    if len(accounts) > 1:
+        raise TriageError(
+            "cross_account",
+            f"selection spans {len(accounts)} accounts "
+            f"({', '.join(sorted(accounts))}); delete needs one — "
+            "add the account= filter to pick which.",
+        )
+    cap = delete_max()
+    if len(refs) > cap:
+        raise TriageError(
+            "selection_too_large",
+            f"query matched more than {cap} messages (the delete cap) — "
+            "narrow the query, or raise EMAIL_MCP_TRIAGE_DELETE_MAX if the "
+            "deletion is genuinely intended.",
+        )
+    return build_plan(source, q, [{"action": "delete"}],
+                      allowed=ACTIONS | DESTRUCTIVE)
 
 
 # --------------------------------------------------------------------- #
