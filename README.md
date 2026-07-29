@@ -3,7 +3,7 @@
 **Your Apple Mail, fully agent-operable.**
 An MCP server that gives Claude direct access to Mail.app on your Mac — read at SQL speed, send Outlook-safe mail as any of your identities, schedule delivery, and triage whole mailboxes — without ever letting AppleScript near a message body.
 
-![version](https://img.shields.io/badge/version-v0.8.0-blue)
+![version](https://img.shields.io/badge/version-v0.9.0-blue)
 ![tools](https://img.shields.io/badge/MCP%20tools-19-brightgreen)
 ![tests](https://img.shields.io/badge/tests-172%20passing-success)
 ![platform](https://img.shields.io/badge/platform-macOS%20%2B%20Mail.app-orange)
@@ -91,7 +91,7 @@ op        = "op://Personal/gmail app password/password"   # 1Password ref
 # keychain = "email-mcp-gmail"                            # …or macOS Keychain
 ```
 
-Pick per send with `from_identity`; omit for the default. Each identity carries its own allowlist, Bcc-to-self, and Message-ID domain. No file? Set the minimal env trio — `EMAIL_MCP_FROM_ADDR`, `EMAIL_MCP_SEND_HOST`, `EMAIL_MCP_SEND_USER` — and a single ssh-lane identity is synthesized from the environment. Reading needs no sending configuration at all. Diagnose everything (permissions, identities, every transport lane) with `python -m email_mcp.server --doctor`.
+Pick per send with `from_identity`; omit for the default. Each identity carries its own allowlist, Bcc-to-self, and Message-ID domain. Exchange identities can add `executor = "graph"`: scheduled mail is handed to Exchange as a deferred draft (`PidTagDeferredSendTime`) and **sends with the lid closed** — calibrated live: delivered at the deferred time to the second while the Mac slept (`docs/graph-calibration-2026-07-29.md`). The launchd spool remains the executor for everything else and the fallback when Graph declines. No file? Set the minimal env trio — `EMAIL_MCP_FROM_ADDR`, `EMAIL_MCP_SEND_HOST`, `EMAIL_MCP_SEND_USER` — and a single ssh-lane identity is synthesized from the environment. Reading needs no sending configuration at all. Diagnose everything (permissions, identities, every transport lane) with `python -m email_mcp.server --doctor`.
 
 ## Use cases
 
