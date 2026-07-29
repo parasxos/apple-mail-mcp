@@ -1133,3 +1133,267 @@ def test_doctor_graph_check_soft_when_no_identity_opts_in(monkeypatch):
     check = doctor.check_graph()
     assert check["ok"] is True
     assert "no identities use the graph executor" in check["detail"]
+
+
+# --------------------------------------------------------------------- #
+# red-team additions: escaping, corruption, ambiguity, races, secrets    #
+# --------------------------------------------------------------------- #
+
+
+def test_find_by_message_id_escapes_single_quotes(monkeypatch):
+    """internetMessageId is the ONLY adoption key, and it must survive an
+    apostrophe (legal in Message-IDs) without breaking the OData $filter —
+    a mangled filter could match a WRONG draft or error out."""
+    from urllib.parse import parse_qs, urlsplit
+
+    _seed_token()
+    fake = _fake(monkeypatch, (200, {"value": []}))
+    assert graph.find_draft_by_message_id(
+        _ident(), "<o'brien@example.org>"
+    ) is None
+    q = parse_qs(urlsplit(fake.calls[0][1]).query)
+    assert q["$filter"] == ["internetMessageId eq '<o''brien@example.org>'"]
+    assert q["$select"] == ["id"]
+
+
+def test_token_cache_truncated_json_is_clear_error_not_traceback(
+    monkeypatch,
+):
+    """A corrupted (truncated) token cache must surface as ONE GraphError
+    naming the --login remedy — never a raw ValueError, never a wire call."""
+    path = _seed_token()
+    path.write_text('{"access_token": "acc-tok')  # truncated write
+    fake = _fake(monkeypatch)
+    with pytest.raises(GraphError) as ei:
+        graph._token(_ident())
+    assert "--login cern" in str(ei.value)
+    assert fake.calls == []
+
+
+def test_schedule_graph_dir_unwritable_falls_back_to_launchd(
+    monkeypatch, tmp_path,
+):
+    """config.graph_dir() raising OSError (unwritable disk/permissions) at
+    schedule time must behave like any GraphError: silent launchd
+    fallback, frozen .eml intact — not a traceback through the tool."""
+    _write_graph_toml(tmp_path, monkeypatch)
+
+    def boom():
+        raise PermissionError("read-only file system")
+
+    monkeypatch.setattr(config, "graph_dir", boom)
+    fake = _fake(monkeypatch)
+    entry = sender.schedule_email(
+        to="someone@example.org", subject="s", body="b",
+        send_at=_future(30), from_identity="cern",
+    )
+    assert entry.executor == "launchd" and entry.graph_draft_id is None
+    assert fake.calls == []
+    assert spool.read_eml("pending", entry.id)
+
+
+def test_create_send_wire_death_delete_gone_treated_as_armed(monkeypatch):
+    """Double-send fence at CREATE time: the wire dies during /send and
+    the cleanup DELETE finds the draft GONE — the /send almost certainly
+    won. Falling back to launchd would transmit twice, so the draft id is
+    returned and the entry stays on graph for reconcile to confirm."""
+    _seed_token()
+    fake = _fake(
+        monkeypatch,
+        (201, {"id": "D1"}),
+        (200, {}),
+        graph.GraphTransportError("[cern/graph] network error mid-/send"),
+        (404, {}),  # cleanup DELETE: draft already left Drafts
+    )
+    assert graph.create_deferred_draft(_ident(), RAW, WHEN) == "D1"
+    assert fake.calls[-1][0] == "DELETE"
+
+
+def test_create_send_wire_death_delete_confirmed_falls_back(monkeypatch):
+    """Same wire death, but the cleanup DELETE returns 204: the draft is
+    CONFIRMED revoked, Exchange cannot send it — the safe launchd
+    fallback (GraphError) is correct here."""
+    _seed_token()
+    _fake(
+        monkeypatch,
+        (201, {"id": "D1"}),
+        (200, {}),
+        graph.GraphTransportError("[cern/graph] network error mid-/send"),
+        (204, {}),
+    )
+    with pytest.raises(GraphError):
+        graph.create_deferred_draft(_ident(), RAW, WHEN)
+
+
+def test_create_send_wire_death_unconfirmed_cleanup_stays_armed(
+    monkeypatch,
+):
+    """Wire death on /send AND on the cleanup DELETE: nothing is
+    confirmed, an armed draft may exist — must NOT signal fallback."""
+    _seed_token()
+    _fake(
+        monkeypatch,
+        (201, {"id": "D1"}),
+        (200, {}),
+        graph.GraphTransportError("[cern/graph] network error mid-/send"),
+        graph.GraphTransportError("[cern/graph] network error on DELETE"),
+    )
+    assert graph.create_deferred_draft(_ident(), RAW, WHEN) == "D1"
+
+
+def test_schedule_send_ambiguity_keeps_graph_and_never_double_sends(
+    monkeypatch, tmp_path, local_delivery,
+):
+    """End-to-end H4: ambiguous /send at schedule time keeps the entry on
+    the graph executor with the draft id recorded — the local dispatcher
+    never picks it up, so no double-send is possible."""
+    _write_graph_toml(tmp_path, monkeypatch)
+    _seed_token()
+    _fake(
+        monkeypatch,
+        (201, {"id": "D1"}),
+        (200, {}),
+        graph.GraphTransportError("[cern/graph] network error mid-/send"),
+        (404, {}),
+    )
+    entry = sender.schedule_email(
+        to="someone@example.org", subject="s", body="b",
+        send_at=_future(30), from_identity="cern",
+    )
+    assert entry.executor == "graph" and entry.graph_draft_id == "D1"
+    stored = spool.load("pending", entry.id)
+    assert stored.executor == "graph" and stored.graph_draft_id == "D1"
+    dispatcher.run_once()  # pre-grace: no HTTP, no local pickup
+    assert local_delivery == []
+
+
+def test_reconcile_malformed_send_at_reconciles_now_not_never(
+    monkeypatch, tmp_path, local_delivery,
+):
+    """A graph entry whose send_at stamp is corrupted must be reconciled
+    NOW (the code's own promise) — not skipped forever, which would let
+    a sent/held outcome go unrecorded for eternity."""
+    _write_graph_toml(tmp_path, monkeypatch)
+    _seed_token()
+    entry = _spool_entry()
+    got = spool.load("pending", entry.id)
+    got.send_at = "not-a-timestamp"
+    spool.update("pending", got)
+    fake = _fake(monkeypatch, (404, {}), (200, {"value": [{"id": "S1"}]}))
+    summary = dispatcher.run_once()
+    assert len(fake.calls) == 2  # it DID reconcile
+    assert "Exchange" in summary["results"][entry.id]
+    assert spool.load("sent", entry.id) is not None
+    assert local_delivery == []
+
+
+def test_reconcile_malformed_backoff_stamp_does_not_kill_the_pass(
+    monkeypatch, tmp_path, local_delivery,
+):
+    """A corrupt next_attempt_at must read as 'no backoff', never raise
+    out of run_once (which would halt ALL scheduled mail)."""
+    _write_graph_toml(tmp_path, monkeypatch)
+    _seed_token()
+    entry = _spool_entry()
+    got = spool.load("pending", entry.id)
+    got.next_attempt_at = "garbage"
+    spool.update("pending", got)
+    _fake(monkeypatch, (404, {}), (200, {"value": [{"id": "S1"}]}))
+    summary = dispatcher.run_once()  # must not raise
+    assert "Exchange" in summary["results"][entry.id]
+    assert spool.load("sent", entry.id) is not None
+    assert local_delivery == []
+
+
+def test_reconcile_concurrent_flip_not_clobbered_by_terminal_move(
+    monkeypatch, tmp_path, local_delivery,
+):
+    """Race fence: while OUR pass has its status probe in flight, ANOTHER
+    pass revokes the draft and flips the entry to launchd. Our stale
+    'cancelled_externally' verdict must NOT move the flipped entry to
+    cancelled/ — that would silently drop the mail."""
+    _write_graph_toml(tmp_path, monkeypatch)
+    _seed_token()
+    entry = _spool_entry()
+    inner = FakeHttp((404, {}), (200, {"value": []}))
+
+    def racing(method, url, ident, body=None, headers=None):
+        if not inner.calls:  # first wire call: the other pass wins the flip
+            other = spool.load("pending", entry.id)
+            other.executor = "launchd"
+            other.graph_draft_id = None
+            other.next_attempt_at = spool.iso(spool.utcnow())
+            spool.update("pending", other)
+        return inner(method, url, ident, body=body, headers=headers)
+
+    monkeypatch.setattr(graph, "_http", racing)
+    summary = dispatcher.run_once()
+    assert summary["results"][entry.id] == dispatcher._SUPERSEDED
+    got = spool.load("pending", entry.id)
+    assert got is not None and got.executor == "launchd"  # flip preserved
+    assert spool.load("cancelled", entry.id) is None
+    assert local_delivery == []
+
+
+def test_reconcile_concurrent_adopt_not_clobbered_by_stale_leave(
+    monkeypatch, tmp_path, local_delivery,
+):
+    """Race fence for _graph_leave: our drafts lookup fails, but another
+    pass adopted the orphan draft mid-flight. Writing our stale entry
+    (graph_draft_id=None) back would erase the adoption."""
+    _write_graph_toml(tmp_path, monkeypatch)
+    _seed_token()
+    entry = _spool_entry(draft_id=None)
+
+    calls = []
+
+    def racing(method, url, ident, body=None, headers=None):
+        calls.append(url)
+        other = spool.load("pending", entry.id)
+        other.graph_draft_id = "D9"  # the other pass adopts
+        spool.update("pending", other)
+        raise GraphError("[cern/graph] network error")
+
+    monkeypatch.setattr(graph, "_http", racing)
+    summary = dispatcher.run_once()
+    assert summary["results"][entry.id] == dispatcher._SUPERSEDED
+    got = spool.load("pending", entry.id)
+    assert got.graph_draft_id == "D9"  # adoption preserved
+    assert local_delivery == []
+
+
+def test_no_token_material_ever_logged(monkeypatch, tmp_path):
+    """No access token, refresh token, or Authorization value may ever
+    reach the log — the rotating file outlives the tokens' secrecy."""
+    import logging
+
+    records: list[str] = []
+
+    class Grab(logging.Handler):
+        def emit(self, record):
+            records.append(record.getMessage())
+
+    logger = logging.getLogger("email_mcp")
+    handler = Grab()
+    logger.addHandler(handler)
+    try:
+        _write_graph_toml(tmp_path, monkeypatch)
+        _seed_token(access="SEKRIT-ACCESS-1", refresh="SEKRIT-REFRESH-1",
+                    expires_in=-10)  # force the refresh path
+        entry = _spool_entry()
+        _fake(
+            monkeypatch,
+            (200, {"access_token": "SEKRIT-ACCESS-2",
+                   "refresh_token": "SEKRIT-REFRESH-2",
+                   "expires_in": 3599}),
+            (404, {}),
+            (200, {"value": [{"id": "S1"}]}),
+        )
+        summary = dispatcher.run_once()
+        assert "Exchange" in summary["results"][entry.id]  # full path ran
+    finally:
+        logger.removeHandler(handler)
+    blob = "\n".join(records)
+    for secret in ("SEKRIT-ACCESS-1", "SEKRIT-ACCESS-2",
+                   "SEKRIT-REFRESH-1", "SEKRIT-REFRESH-2", "Bearer "):
+        assert secret not in blob, f"log leaked {secret!r}"

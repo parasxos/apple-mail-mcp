@@ -50,10 +50,27 @@ BACKOFF_MINUTES = (2, 5, 15, 45, 120)
 # --------------------------------------------------------------------- #
 
 
+def _parse_iso(stamp: str | None) -> datetime | None:
+    """Defensive manifest-timestamp parse: None on anything malformed
+    (hand-edited or corrupted manifests must never kill a whole pass),
+    naive stamps read as UTC so comparisons never TypeError."""
+    if not stamp:
+        return None
+    try:
+        dt = datetime.fromisoformat(stamp)
+    except (TypeError, ValueError):
+        return None
+    return dt if dt.tzinfo is not None else dt.replace(tzinfo=timezone.utc)
+
+
 def _due(entry: spool.Entry, now: datetime) -> bool:
-    if datetime.fromisoformat(entry.send_at) > now:
+    send_at = _parse_iso(entry.send_at)
+    if send_at is not None and send_at > now:
         return False
-    if entry.next_attempt_at and datetime.fromisoformat(entry.next_attempt_at) > now:
+    # A malformed send_at reads as due: deliver late rather than never
+    # (the stamp was valid when we wrote it; only hand edits break it).
+    nxt = _parse_iso(entry.next_attempt_at)
+    if nxt is not None and nxt > now:
         return False
     return True
 
@@ -98,8 +115,10 @@ def _recover_stranded(now: datetime) -> list[str]:
     also throttles a crash-looping message toward failed/)."""
     recovered = []
     for e in spool.entries("sending"):
-        ref = e.next_attempt_at or e.send_at
-        age_min = (now - datetime.fromisoformat(ref)).total_seconds() / 60
+        ref = _parse_iso(e.next_attempt_at) or _parse_iso(e.send_at)
+        # An unparseable reference stamp reads as infinitely stale —
+        # recover it rather than strand it (or crash the pass).
+        age_min = (now - ref).total_seconds() / 60 if ref else float("inf")
         if age_min < STALE_SENDING_MINUTES:
             continue
         e.attempts += 1
@@ -119,7 +138,30 @@ def _recover_stranded(now: datetime) -> list[str]:
 GRAPH_GRACE_MINUTES = 10
 
 
+_SUPERSEDED = "graph: entry changed under us — skipped (another pass won)"
+
+
+def _graph_current(entry: spool.Entry) -> bool:
+    """Freshness fence for reconcile writes. Graph entries are never
+    claim()-renamed, so two overlapping dispatcher passes (or a concurrent
+    cancel) can race on the same entry while OUR HTTP round-trips are in
+    flight — and a stale terminal move or manifest rewrite would clobber
+    the winner's flip (silently dropping mail). Re-read the manifest and
+    write only if it is still the same graph-executor entry we loaded.
+    This narrows the race from the seconds-long HTTP window to the
+    microseconds between check and write — negligible under launchd's
+    60 s cadence."""
+    try:
+        cur = spool.load("pending", entry.id)
+    except Exception:
+        return False  # unreadable manifest: never write over it blind
+    return (cur is not None and cur.executor == "graph"
+            and cur.graph_draft_id == entry.graph_draft_id)
+
+
 def _graph_mark_sent(entry: spool.Entry, now: datetime) -> str:
+    if not _graph_current(entry):
+        return _SUPERSEDED
     entry.delivered_at = spool.iso(now)
     entry.next_attempt_at = None
     entry.last_error = None
@@ -130,6 +172,8 @@ def _graph_mark_sent(entry: spool.Entry, now: datetime) -> str:
 def _graph_leave(entry: spool.Entry, error: str, note: str) -> str:
     """F4/F6: no evidence either way — the entry stays on graph, untouched
     except for last_error, and the next pass retries."""
+    if not _graph_current(entry):
+        return _SUPERSEDED  # never resurrect a stale executor/draft id
     entry.last_error = error
     spool.update("pending", entry)
     return note
@@ -142,6 +186,8 @@ def _graph_apply_status(entry: spool.Entry, status: str, now: datetime) -> str:
     if status == "sent":
         return _graph_mark_sent(entry, now)
     if status == "cancelled_externally":
+        if not _graph_current(entry):
+            return _SUPERSEDED
         entry.next_attempt_at = None
         entry.last_error = (
             "deferred draft was discarded outside the spool (e.g. in "
@@ -171,14 +217,13 @@ def _reconcile_graph(now: datetime) -> dict[str, str]:
     results: dict[str, str] = {}
     grace = timedelta(minutes=GRAPH_GRACE_MINUTES)
     for entry in entries:
-        try:
-            send_at = datetime.fromisoformat(entry.send_at)
-        except ValueError:
-            send_at = now  # malformed stamp: reconcile now rather than never
+        send_at = _parse_iso(entry.send_at)
+        if send_at is None:
+            send_at = now - grace  # malformed stamp: reconcile NOW, not never
         if now < send_at + grace:
             continue  # Exchange's window — nothing to reconcile yet
-        if (entry.next_attempt_at
-                and datetime.fromisoformat(entry.next_attempt_at) > now):
+        nxt = _parse_iso(entry.next_attempt_at)
+        if nxt is not None and nxt > now:
             continue  # backing off after _fail_or_retry (e.g. F12)
 
         try:
@@ -202,6 +247,9 @@ def _reconcile_graph(now: datetime) -> dict[str, str]:
                 continue
             if draft_id is not None:
                 # F2: the draft exists — adopt it; Exchange keeps the job.
+                if not _graph_current(entry):
+                    results[entry.id] = _SUPERSEDED
+                    continue
                 entry.graph_draft_id = draft_id
                 entry.last_error = None
                 spool.update("pending", entry)
@@ -219,6 +267,9 @@ def _reconcile_graph(now: datetime) -> dict[str, str]:
                 results[entry.id] = _graph_mark_sent(entry, now)
                 continue
             # F1: no draft was ever armed — the local spool takes over.
+            if not _graph_current(entry):
+                results[entry.id] = _SUPERSEDED
+                continue
             entry.executor = "launchd"
             entry.next_attempt_at = spool.iso(now)
             entry.last_error = None
@@ -250,6 +301,13 @@ def _reconcile_graph(now: datetime) -> dict[str, str]:
                 entry, str(e), "graph: draft revoke failed — retrying")
             continue
         if outcome == "deleted":
+            # The draft is CONFIRMED revoked — Exchange can no longer send
+            # it, so flipping is safe even if the manifest changed under
+            # us; the freshness fence only guards against overwriting a
+            # concurrent terminal move / cancel.
+            if not _graph_current(entry):
+                results[entry.id] = _SUPERSEDED
+                continue
             entry.executor = "launchd"
             entry.graph_draft_id = None
             entry.next_attempt_at = spool.iso(now)

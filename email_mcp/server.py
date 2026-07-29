@@ -544,10 +544,19 @@ def tool_cancel_scheduled(id: str) -> dict:
                                  f"gone but Sent Items could not be checked "
                                  f"({e}) — outcome ambiguous, retry."}
             if sent:
+                # Atomic ownership hand-off (same rename fence as the
+                # cancel below) — a concurrently reconciling dispatcher
+                # must not race this terminal move.
+                if not spool.claim(id, "pending", "sent"):
+                    return {"ok": False,
+                            "error": f"cannot cancel {id}: a dispatcher "
+                                     "just moved it — re-check "
+                                     "list_scheduled"}
                 entry.delivered_at = spool.iso(spool.utcnow())
                 entry.next_attempt_at = None
                 entry.last_error = None
-                spool.move(id, "pending", "sent", entry)
+                entry.status = "sent"
+                spool.update("sent", entry)
                 return {"ok": False, "id": id, "status": "sent",
                         "error": f"cannot cancel {id}: Exchange already sent "
                                  "it (found in Sent Items) — the entry has "

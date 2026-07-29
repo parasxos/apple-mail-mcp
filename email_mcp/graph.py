@@ -69,6 +69,14 @@ class GraphError(SendError):
     """
 
 
+class GraphTransportError(GraphError):
+    """The wire itself failed (DNS, refused, timeout, reset) — the request
+    MAY have been processed server-side before the connection died.
+    Distinguished from clean HTTP refusals so `create_deferred_draft` can
+    treat an ambiguous /send as possibly-armed instead of falling back to
+    launchd into a double-send."""
+
+
 def _name(ident) -> str:
     return getattr(ident, "name", str(ident))
 
@@ -104,7 +112,7 @@ def _http(method: str, url: str, ident, body: bytes | None = None,
         return e.code, data
     except OSError as e:  # URLError, socket.timeout, connection reset …
         reason = getattr(e, "reason", e)
-        raise GraphError(
+        raise GraphTransportError(
             f"[{_name(ident)}/graph] network error reaching "
             f"{urllib.parse.urlsplit(url).netloc}: {reason}"
         ) from e
@@ -200,7 +208,17 @@ def _graph_reason(body: dict) -> str:
 
 
 def _token_path(ident) -> Path:
-    return config.graph_dir() / f"{_name(ident)}.token.json"
+    try:
+        d = config.graph_dir()
+    except OSError as e:
+        # An unwritable/uncreatable state dir must surface as a GraphError:
+        # schedule-time callers then fall back to launchd instead of
+        # leaking a raw OSError traceback through the tool.
+        raise GraphError(
+            f"[{_name(ident)}/graph] cannot create/open the graph state "
+            f"dir: {e}"
+        ) from e
+    return d / f"{_name(ident)}.token.json"
 
 
 def _write_cache(path: Path, data: dict) -> None:
@@ -390,6 +408,7 @@ def create_deferred_draft(ident, raw: bytes, when: datetime) -> str:
             f"(HTTP {status}): {_graph_reason(draft)}"
         )
     draft_id = str(draft["id"])
+    send_ambiguous = False
     try:
         status, body = _graph(
             "PATCH", f"/me/messages/{draft_id}", ident,
@@ -401,17 +420,26 @@ def create_deferred_draft(ident, raw: bytes, when: datetime) -> str:
                 f"[{_name(ident)}/graph] deferred-send property rejected "
                 f"(HTTP {status}): {_graph_reason(body)}"
             )
-        status, body = _graph(
-            "POST", f"/me/messages/{draft_id}/send", ident
-        )
+        try:
+            status, body = _graph(
+                "POST", f"/me/messages/{draft_id}/send", ident
+            )
+        except GraphTransportError:
+            # The wire died mid-/send: Exchange MAY have accepted it and
+            # armed the draft — this is the one step where "failed" can
+            # still mean "sent".
+            send_ambiguous = True
+            raise
         if status != 202:
             raise GraphError(
                 f"[{_name(ident)}/graph] deferred /send rejected "
                 f"(HTTP {status}): {_graph_reason(body)}"
             )
     except Exception:
+        cleanup_status: int | None = None
         try:
             st, _b = _graph("DELETE", f"/me/messages/{draft_id}", ident)
+            cleanup_status = st
             if st not in (204, 404):
                 _log.warning(
                     "graph: cleanup DELETE of draft %s got HTTP %s [%s]",
@@ -420,6 +448,22 @@ def create_deferred_draft(ident, raw: bytes, when: datetime) -> str:
         except Exception as cleanup:  # best-effort only; original error wins
             _log.warning("graph: cleanup DELETE of draft %s failed: %s [%s]",
                          draft_id, cleanup, _name(ident))
+        if send_ambiguous and cleanup_status != 204:
+            # Double-send fence: /send's outcome is unknown AND the revoke
+            # is unconfirmed. A cleanup 404 means the draft already left
+            # Drafts — almost certainly because /send won; any other
+            # unconfirmed outcome may still leave an armed draft behind.
+            # Falling back to launchd here could transmit the message
+            # twice, so the entry STAYS on graph: return the draft id and
+            # let the reconcile pass disambiguate via draft_status /
+            # Sent Items at send_at + grace.
+            _log.warning(
+                "graph: /send outcome for draft %s is ambiguous (cleanup "
+                "DELETE -> %s) — treating as armed; the reconcile pass "
+                "will disambiguate [%s]",
+                draft_id, cleanup_status, _name(ident),
+            )
+            return draft_id
         raise
     return draft_id
 

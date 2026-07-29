@@ -376,3 +376,27 @@ def test_dispatcher_ensures_transport_once_per_identity(monkeypatch, delivered):
     assert set(summary["results"].values()) == {"sent"}
     assert len(delivered) == 2
     assert len(checks) == 1  # memoised: one preflight for both messages
+
+
+def test_corrupt_manifest_stamp_never_kills_the_whole_pass(delivered):
+    """One hand-corrupted send_at must not raise out of run_once and halt
+    ALL scheduled mail (including graph reconciliation). Malformed stamps
+    read as due — deliver late rather than never."""
+    bad = sender.schedule_email(
+        to="paris.moschovakos@cern.ch", subject="bad", body="b",
+        send_at=_future(60),
+    )
+    good = sender.schedule_email(
+        to="paris.moschovakos@cern.ch", subject="good", body="b",
+        send_at=_future(-1),
+    )
+    from email_mcp import config
+    manifest = config.spool_dir() / "pending" / f"{bad.id}.json"
+    data = json.loads(manifest.read_text())
+    data["send_at"] = "banana"
+    manifest.write_text(json.dumps(data))
+
+    summary = dispatcher.run_once()  # must not raise
+    assert summary["results"][good.id] == "sent"
+    assert summary["results"][bad.id] == "sent"  # late beats never
+    assert len(delivered) == 2
