@@ -1003,7 +1003,7 @@ def main() -> int:
     parser.add_argument("--subject", default="email-mcp send self-test")
     parser.add_argument(
         "--body",
-        default="This is a send_email self-test.\n\nSecond paragraph.\n\nParis",
+        default="This is a send_email self-test.\n\nSecond paragraph.",
     )
     parser.add_argument(
         "--attach",

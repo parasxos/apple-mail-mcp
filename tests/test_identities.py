@@ -35,6 +35,18 @@ def _write_toml(tmp_path, monkeypatch, text: str):
 # --------------------------------------------------------------------- #
 
 
+def test_absent_file_without_from_addr_names_the_remedy():
+    """The v0.8 guard: neither an identities file nor EMAIL_MCP_FROM_ADDR
+    (defaults are empty post-flip) → ONE clear IdentityError with the
+    remedy, instead of a cascade of empty-From failures downstream."""
+    with pytest.raises(IdentityError) as ei:
+        identities.load()
+    s = str(ei.value)
+    assert "no sending identity configured" in s
+    assert "identities.toml" in s
+    assert "EMAIL_MCP_FROM_ADDR" in s
+
+
 def test_absent_file_synthesizes_default_mirroring_env(monkeypatch):
     monkeypatch.setenv("EMAIL_MCP_FROM_ADDR", "someone@example.org")
     monkeypatch.setenv("EMAIL_MCP_FROM_NAME", "Someone Else")

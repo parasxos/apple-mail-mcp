@@ -30,7 +30,11 @@ from pathlib import Path
 
 from . import config, identities, sender, spool
 
-LAUNCHD_LABEL = "com.paris.email-mcp-dispatcher"
+LAUNCHD_LABEL = "com.email-mcp.dispatcher"
+# Labels this agent shipped under before v0.8. install/uninstall boot these
+# out and remove their plists — migrate, never strand a second dispatcher
+# ticking over the same spool.
+LEGACY_LABELS = ("com.paris.email-mcp-dispatcher",)
 BACKOFF_MINUTES = (2, 5, 15, 45, 120)
 
 
@@ -207,7 +211,25 @@ def _plist_content() -> str:
 """
 
 
+def _remove_legacy_plists() -> list[str]:
+    """Boot out and delete every LEGACY_LABELS agent. Returns the labels
+    actually found (loaded or on disk); best-effort, never raises."""
+    uid = os.getuid()
+    removed: list[str] = []
+    for label in LEGACY_LABELS:
+        plist = _plist_path().parent / f"{label}.plist"
+        # Service-target form works whether or not the plist still exists.
+        proc = subprocess.run(["launchctl", "bootout", f"gui/{uid}/{label}"],
+                              capture_output=True)
+        found = proc.returncode == 0 or plist.exists()
+        plist.unlink(missing_ok=True)
+        if found:
+            removed.append(label)
+    return removed
+
+
 def install_launchd() -> str:
+    migrated = _remove_legacy_plists()
     plist = _plist_path()
     plist.parent.mkdir(parents=True, exist_ok=True)
     plist.write_text(_plist_content())
@@ -218,16 +240,19 @@ def install_launchd() -> str:
                           capture_output=True, text=True)
     if proc.returncode != 0:
         return f"bootstrap failed: {proc.stderr.strip()}"
-    return f"installed {LAUNCHD_LABEL} (every 60s), log: {_log_path()}"
+    note = f" (migrated legacy: {', '.join(migrated)})" if migrated else ""
+    return f"installed {LAUNCHD_LABEL} (every 60s){note}, log: {_log_path()}"
 
 
 def uninstall_launchd() -> str:
+    removed_legacy = _remove_legacy_plists()
     plist = _plist_path()
     subprocess.run(["launchctl", "bootout", f"gui/{os.getuid()}", str(plist)],
                    capture_output=True)
     if plist.exists():
         plist.unlink()
-    return f"removed {LAUNCHD_LABEL}"
+    note = f" (+ legacy: {', '.join(removed_legacy)})" if removed_legacy else ""
+    return f"removed {LAUNCHD_LABEL}{note}"
 
 
 def status() -> dict:

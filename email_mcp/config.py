@@ -65,30 +65,31 @@ def attach_dir() -> Path:
 
 
 # ---------------------------------------------------------------------- #
-# Sending (send_email / reply_email). All optional; Paris-flavoured       #
-# defaults, every value overridable via env.                             #
+# Sending (send_email / reply_email). All optional; defaults are empty — #
+# real values live in ~/.email-mcp/identities.toml or the env vars here. #
 #                                                                        #
 # Rationale: macOS Mail.app's scripted-compose path wraps the body in a  #
 # collapsed blockquote (renders empty in Outlook), so we do NOT send     #
-# through Mail.app. Messages are composed here and delivered over an     #
-# existing SSH session to a CERN host.                                   #
+# through Mail.app. Messages are composed here and delivered over the    #
+# sending identity's transport (ssh_sendmail / smtp / pipe).             #
 # ---------------------------------------------------------------------- #
 
 
 def send_from_addr() -> str:
-    """The From: address for outgoing mail."""
-    return os.environ.get(
-        "EMAIL_MCP_FROM_ADDR", "paris.moschovakos@cern.ch"
-    ).strip()
+    """The From: address for outgoing mail. Empty (default) → no identity
+    can be synthesized from the environment: sending needs either
+    ~/.email-mcp/identities.toml or EMAIL_MCP_FROM_ADDR. Reads are
+    unaffected — they need no sending configuration at all."""
+    return os.environ.get("EMAIL_MCP_FROM_ADDR", "").strip()
 
 
 def send_from_name() -> str:
-    return os.environ.get("EMAIL_MCP_FROM_NAME", "Paris Moschovakos").strip()
+    return os.environ.get("EMAIL_MCP_FROM_NAME", "").strip()
 
 
 def send_allow_all() -> bool:
     """When false (default), recipients are restricted to the allowlist —
-    the trial-safety guard so a mistake can only reach Paris himself.
+    the trial-safety guard so a mistake can only reach your own address.
 
     Flip EMAIL_MCP_SEND_ALLOW_ALL=1 to send to anyone.
     """
@@ -117,16 +118,16 @@ def send_bcc_self() -> bool:
 
 
 def send_host() -> str:
-    return os.environ.get("EMAIL_MCP_SEND_HOST", "lxplus.cern.ch").strip()
+    return os.environ.get("EMAIL_MCP_SEND_HOST", "").strip()
 
 
 def send_user() -> str:
-    return os.environ.get("EMAIL_MCP_SEND_USER", "pmoschov").strip()
+    return os.environ.get("EMAIL_MCP_SEND_USER", "").strip()
 
 
 def send_ssh_socket() -> Path:
     raw = os.environ.get(
-        "EMAIL_MCP_SSH_SOCKET", "~/.ssh/sock-lxplus-mail"
+        "EMAIL_MCP_SSH_SOCKET", "~/.ssh/email-mcp-sock"
     ).strip()
     return Path(raw).expanduser()
 
@@ -288,16 +289,12 @@ def log_level() -> str:
 def send_bootstrap_cmd() -> str:
     """Shell command that (re)establishes the ControlMaster socket headlessly.
 
-    Empty (default) → resolve the bundled tools/lxplus_mail_master.sh relative
-    to the installed package. The script sources ~/.secrets/cern_secrets.sh
-    for CERN_PASSWORD and generates a TOTP, so it needs no interactive input.
+    Empty (default) → no bootstrap: a cold socket is reported as a clear
+    transport error instead of being repaired. Point EMAIL_MCP_SSH_BOOTSTRAP
+    (or an identity's `bootstrap` param) at your own script — the repo's
+    tools/lxplus_mail_master.sh is a documented example.
     """
-    raw = os.environ.get("EMAIL_MCP_SSH_BOOTSTRAP", "").strip()
-    if raw:
-        return raw
-    # repo layout: email_mcp/config.py → ../tools/lxplus_mail_master.sh
-    script = Path(__file__).resolve().parent.parent / "tools" / "lxplus_mail_master.sh"
-    return str(script)
+    return os.environ.get("EMAIL_MCP_SSH_BOOTSTRAP", "").strip()
 
 
 def identities_file() -> Path:

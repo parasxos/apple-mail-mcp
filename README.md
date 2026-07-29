@@ -86,7 +86,7 @@ op        = "op://Personal/gmail app password/password"   # 1Password ref
 # keychain = "email-mcp-gmail"                            # …or macOS Keychain
 ```
 
-Pick per send with `from_identity`; omit for the default. Each identity carries its own allowlist, Bcc-to-self, and Message-ID domain. No file? A single identity is synthesized from env vars — zero-config keeps working. Diagnose every lane with `python -m email_mcp.server --transport-check`.
+Pick per send with `from_identity`; omit for the default. Each identity carries its own allowlist, Bcc-to-self, and Message-ID domain. No file? Set the minimal env trio — `EMAIL_MCP_FROM_ADDR`, `EMAIL_MCP_SEND_HOST`, `EMAIL_MCP_SEND_USER` — and a single ssh-lane identity is synthesized from the environment. Reading needs no sending configuration at all. Diagnose everything (permissions, identities, every transport lane) with `python -m email_mcp.server --doctor`.
 
 ## Use cases
 

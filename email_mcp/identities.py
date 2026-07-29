@@ -6,7 +6,8 @@ parameters. Everything an identity implies follows from it — From: header,
 Message-ID domain, Bcc-to-self target, per-identity allowlist, driver.
 
 Absent file → a single identity named "default" synthesized from the env
-getters in `config.py`, so today's env-only setup keeps working unchanged.
+getters in `config.py` (requires EMAIL_MCP_FROM_ADDR), so an env-only
+setup keeps working without a file.
 """
 from __future__ import annotations
 
@@ -50,11 +51,20 @@ class Identity:
 
 
 def _synthesized() -> Identity:
-    """No identities file → mirror today's env-driven config exactly, so
-    the env-only path (and Paris's current setup) lives on unchanged."""
+    """No identities file → mirror the env-driven config exactly, so an
+    env-only setup works with zero files. With neither a file nor
+    EMAIL_MCP_FROM_ADDR there is no sending identity at all — fail here
+    with the remedy instead of cascading empty-From errors downstream."""
+    from_addr = config.send_from_addr()
+    if not from_addr:
+        raise IdentityError(
+            "no sending identity configured — create "
+            "~/.email-mcp/identities.toml (see docs/reference.md, "
+            "'Identities & transports') or set EMAIL_MCP_FROM_ADDR."
+        )
     return Identity(
         name="default",
-        from_addr=config.send_from_addr(),
+        from_addr=from_addr,
         from_name=config.send_from_name(),
         driver="ssh_sendmail",
         params={
