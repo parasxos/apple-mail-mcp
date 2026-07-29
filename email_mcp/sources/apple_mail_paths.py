@@ -86,12 +86,14 @@ def emlx_relpath_for_rowid(rowid: int) -> Path:
     return Path(*parts) / "Messages" / f"{rowid}.emlx"
 
 
-def build_emlx_path(
-    mail_dir: Path,
-    mailbox_url: str,
-    rowid: int,
-) -> Path:
-    """Full path on disk for an .emlx given the Mail base dir + url + rowid."""
+def mailbox_data_dir(mail_dir: Path, mailbox_url: str) -> Path:
+    """The <inner_uuid>/Data directory holding a mailbox's message shards.
+
+    Raises ValueError for a path-less url and FileNotFoundError when the
+    mailbox has no local store — same failure modes build_emlx_path always
+    had. Split out so bulk consumers (the FTS indexer) can resolve it once
+    per mailbox url instead of once per message.
+    """
     _, account_uuid, segments = parse_mailbox_url(mailbox_url)
     if not segments:
         raise ValueError(f"mailbox url has no path: {mailbox_url!r}")
@@ -99,7 +101,32 @@ def build_emlx_path(
     for seg in segments:
         mailbox_dir = mailbox_dir / f"{seg}.mbox"
     inner = _find_inner_uuid_dir(mailbox_dir)
-    return inner / "Data" / emlx_relpath_for_rowid(rowid)
+    return inner / "Data"
+
+
+def find_emlx_path(data_dir: Path, rowid: int) -> Path | None:
+    """Existing on-disk message file for a ROWID under a mailbox Data dir.
+
+    Tries `<rowid>.emlx` first, then `<rowid>.partial.emlx` (Mail.app writes
+    the latter while an IMAP fetch is incomplete — text parts are already
+    present, so it is worth reading). Returns None when neither exists.
+    """
+    p = data_dir / emlx_relpath_for_rowid(rowid)
+    if p.exists():
+        return p
+    partial = p.with_name(f"{rowid}.partial.emlx")
+    if partial.exists():
+        return partial
+    return None
+
+
+def build_emlx_path(
+    mail_dir: Path,
+    mailbox_url: str,
+    rowid: int,
+) -> Path:
+    """Full path on disk for an .emlx given the Mail base dir + url + rowid."""
+    return mailbox_data_dir(mail_dir, mailbox_url) / emlx_relpath_for_rowid(rowid)
 
 
 def account_label(mailbox_url: str) -> str:

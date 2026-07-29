@@ -252,3 +252,12 @@ def mail_fixture(tmp_path: Path) -> Path:
     _build_envelope_index(mail_dir / "MailData" / "Envelope Index")
     _build_emlx_tree(mail_dir)
     return mail_dir
+
+
+@pytest.fixture(autouse=True)
+def fts_dir_guard(tmp_path_factory, monkeypatch) -> Path:
+    """Point the FTS index at a per-test tmp dir for EVERY test — nothing in
+    the suite may ever touch (or create) ~/.email-mcp/fts."""
+    d = tmp_path_factory.mktemp("fts-index")
+    monkeypatch.setenv("EMAIL_MCP_FTS_DIR", str(d))
+    return d

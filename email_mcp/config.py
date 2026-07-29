@@ -185,6 +185,61 @@ def triage_verify_interval() -> float:
     return float(os.environ.get("EMAIL_MCP_TRIAGE_VERIFY_INTERVAL", "2.0"))
 
 
+# ---------------------------------------------------------------------- #
+# FTS body index (email_mcp.fts)                                          #
+# ---------------------------------------------------------------------- #
+
+
+def fts_dir(create: bool = True) -> Path:
+    """Root of the local FTS5 body index. Created 0700 like plans_dir —
+    the index stores extracted message bodies.
+
+    Default ~/.email-mcp/fts, override with EMAIL_MCP_FTS_DIR. Pass
+    create=False to resolve the path without touching the filesystem —
+    read paths (search, --status) must never create the index directory.
+    """
+    raw = os.environ.get("EMAIL_MCP_FTS_DIR", "").strip()
+    d = Path(raw).expanduser() if raw else Path.home() / ".email-mcp" / "fts"
+    if create:
+        d.mkdir(parents=True, exist_ok=True)
+        d.parent.chmod(0o700)
+        d.chmod(0o700)
+    return d
+
+
+def fts_enabled() -> bool:
+    """Master switch for FTS body hits in search. On by default; flip
+    EMAIL_MCP_FTS_ENABLED=0 to fall back to snippet-only search."""
+    return os.environ.get("EMAIL_MCP_FTS_ENABLED", "1").strip() in {
+        "1", "true", "True", "yes",
+    }
+
+
+def fts_max_hits() -> int:
+    """Cap on FTS rowid hits folded into one search (newest kept)."""
+    return int(os.environ.get("EMAIL_MCP_FTS_MAX_HITS", "2000"))
+
+
+def fts_inline_batch() -> int:
+    """Max documents the inline (search-time) incremental pass indexes."""
+    return int(os.environ.get("EMAIL_MCP_FTS_INLINE_BATCH", "500"))
+
+
+def fts_inline_budget() -> float:
+    """Wall-clock budget in seconds for the inline incremental pass."""
+    return float(os.environ.get("EMAIL_MCP_FTS_INLINE_BUDGET", "2.0"))
+
+
+def fts_doc_cap_bytes() -> int:
+    """Per-document cap on extracted body text handed to the index."""
+    return int(os.environ.get("EMAIL_MCP_FTS_DOC_CAP", "524288"))
+
+
+def fts_reconcile_days() -> int:
+    """How often --sync folds in a full rowid-set reconciliation."""
+    return int(os.environ.get("EMAIL_MCP_FTS_RECONCILE_DAYS", "7"))
+
+
 def send_max_attach_mb() -> float:
     """Total attachment budget per message, in MB (pre-base64 file bytes).
 
