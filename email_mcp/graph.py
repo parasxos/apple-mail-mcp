@@ -36,6 +36,7 @@ import sys
 import time
 import urllib.error
 import urllib.parse
+import ssl
 import urllib.request
 from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
@@ -86,6 +87,25 @@ def _name(ident) -> str:
 # --------------------------------------------------------------------- #
 
 
+def _ssl_context():
+    """TLS context that works everywhere the venv runs (launchd included):
+    python.org framework builds ship without a root-CA bundle wired, so
+    prefer certifi's when importable; fall back to system defaults."""
+    global _SSL_CTX
+    if _SSL_CTX is None:
+        cafile = None
+        try:
+            import certifi
+            cafile = certifi.where()
+        except ImportError:
+            pass
+        _SSL_CTX = ssl.create_default_context(cafile=cafile)
+    return _SSL_CTX
+
+
+_SSL_CTX = None
+
+
 def _http(method: str, url: str, ident, body: bytes | None = None,
           headers: dict | None = None) -> tuple[int, dict]:
     """THE single HTTP seam — every request in this module lands here, and
@@ -101,7 +121,8 @@ def _http(method: str, url: str, ident, body: bytes | None = None,
     for k, v in (headers or {}).items():
         req.add_header(k, v)
     try:
-        with urllib.request.urlopen(req, timeout=_TIMEOUT) as resp:
+        with urllib.request.urlopen(req, timeout=_TIMEOUT,
+                                    context=_ssl_context()) as resp:
             return resp.status, _parse(resp.read())
     except urllib.error.HTTPError as e:
         data = _parse(e.read())

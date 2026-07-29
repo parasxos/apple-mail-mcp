@@ -1397,3 +1397,17 @@ def test_no_token_material_ever_logged(monkeypatch, tmp_path):
     for secret in ("SEKRIT-ACCESS-1", "SEKRIT-ACCESS-2",
                    "SEKRIT-REFRESH-1", "SEKRIT-REFRESH-2", "Bearer "):
         assert secret not in blob, f"log leaked {secret!r}"
+
+
+def test_ssl_context_prefers_certifi_and_caches(monkeypatch):
+    """The venv's framework Python has no root-CA bundle; graph must wire
+    certifi when available (launchd-safe TLS) and build the context once."""
+    from email_mcp import graph as g
+    monkeypatch.setattr(g, "_SSL_CTX", None)
+    ctx1 = g._ssl_context()
+    ctx2 = g._ssl_context()
+    assert ctx1 is ctx2  # cached
+    import certifi, ssl as _ssl
+    assert isinstance(ctx1, _ssl.SSLContext)
+    # certifi present in this venv -> the context must have CA certs loaded
+    assert ctx1.cert_store_stats()["x509_ca"] > 0
