@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "email-mcp"
-version = "0.7.1"
+version = "0.8.0"
 description = "Local MCP server exposing Apple Mail read access + guarded sending for Claude Code."
 requires-python = ">=3.10"
 dependencies = [

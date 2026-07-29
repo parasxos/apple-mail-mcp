@@ -3,9 +3,9 @@
 **Your Apple Mail, fully agent-operable.**
 An MCP server that gives Claude direct access to Mail.app on your Mac — read at SQL speed, send Outlook-safe mail as any of your identities, schedule delivery, and triage whole mailboxes — without ever letting AppleScript near a message body.
 
-![version](https://img.shields.io/badge/version-v0.7.1-blue)
-![tools](https://img.shields.io/badge/MCP%20tools-16-brightgreen)
-![tests](https://img.shields.io/badge/tests-123%20passing-success)
+![version](https://img.shields.io/badge/version-v0.8.0-blue)
+![tools](https://img.shields.io/badge/MCP%20tools-19-brightgreen)
+![tests](https://img.shields.io/badge/tests-172%20passing-success)
 ![platform](https://img.shields.io/badge/platform-macOS%20%2B%20Mail.app-orange)
 
 ## Quick Start
@@ -56,15 +56,20 @@ triage_apply(plan_id)
 
 The plan freezes the exact selection; apply runs ONE batched AppleScript addressing each message by its Envelope Index ROWID (Mail's object id *is* the ROWID — the keyed-lookup trick nobody else uses); verification re-reads the index until the mutations are confirmed. `delete` means Mail's own Trash — nothing is ever erased.
 
-## MCP tools (16)
+## MCP tools (19)
 
 | Group | Tools |
 |---|---|
-| **Read** (7) | `search_emails` · `get_email` · `get_thread` · `list_mailboxes` · `list_recent` · `get_attachment` · `refresh_mail` |
+| **Read** (8) | `search_emails` (full-body FTS) · `get_email` (view levels) · `get_emails_batch` · `get_thread` · `list_mailboxes` · `list_recent` · `get_attachment` · `refresh_mail` |
 | **Send** (5) | `send_email` · `reply_email` (threaded, quoted) · `schedule_email` · `list_scheduled` · `cancel_scheduled` |
-| **Triage** (4) | `triage_plan` · `triage_apply` · `mailbox_create` · `mailbox_delete` |
+| **Triage** (5) | `triage_plan` · `triage_plan_delete` (segregated, capped) · `triage_apply` · `mailbox_create` · `mailbox_delete` |
+| **Meta** (1) | `doctor` — FDA/Automation/Accessibility/identities/transports/dispatcher/spool/FTS diagnostics with fix-it strings |
 
-Attachments both ways, size-budgeted. Reply threading via real `In-Reply-To`/`References`. Scheduling survives sleep — a message due while the lid was closed goes out on the first dispatcher tick after wake.
+Attachments both ways, size-budgeted. Reply threading via real `In-Reply-To`/`References`. Scheduling survives sleep — a message due while the lid was closed goes out on the first dispatcher tick after wake. `EMAIL_MCP_READ_ONLY=1` registers only the 10 tools that can move no mail and leave no durable trace.
+
+### Search means the whole mailbox
+
+Since v0.8 a local FTS5 sidecar (`~/.email-mcp/fts/`, derived state, rebuildable) indexes every locally-stored message body — Mail's own index only snippets ~36% of messages. Measured on a 305k-message store: **build 10m45s, 880 MB, ~190k bodies indexed**; searches stay in the same latency class (~0.4 s) and now surface body-only matches (flagged `body_match`) that snippet search structurally misses — one test query went from 0 hits to 20. New mail is absorbed by an inline incremental pass at search time (verified: one search catches a just-arrived message); `python -m email_mcp.fts --build` once, `--sync` for weekly hygiene.
 
 ## Identities
 
@@ -106,10 +111,12 @@ Every claim above with a number was measured on a live 305k-message store; the f
 
 ## Status
 
-**v0.7.1** — 16 tools, 123 tests passing, live-calibrated end-to-end (send, schedule+launchd, triage, both transport lanes). The tool surface and the seam contracts (`sender._deliver_bytes`, `MailTransport`, `EmailSource`) are stable for the `0.7.x` line. Personal project, built for one Mac — the read layer and triage port anywhere Mail.app runs; the ssh lane is CERN-shaped by design.
+**v0.8.0** — 19 tools, 172 tests passing, live-calibrated end-to-end (full-body search on a 305k store, send, schedule+launchd, triage, both transport lanes, doctor). v0.8 removed the fine print: search covers bodies, destructive verbs have their own doors (`triage_plan_delete`, `EMAIL_MCP_READ_ONLY`), header injection is refused at compose, and the config defaults are person-clean — identities live in `~/.email-mcp/identities.toml`. The tool surface and the seam contracts (`sender._deliver_bytes`, `MailTransport`, `EmailSource`) are stable for the `0.8.x` line. Personal project, built for one Mac — the read layer and triage port anywhere Mail.app runs.
 
 ## See also
 
 - [`docs/reference.md`](docs/reference.md) — full operational reference: every env var, safety guards, SSH bootstrap, spool internals
 - [`docs/triage-design.md`](docs/triage-design.md) — the selection × disposition design + measured numbers
 - [`docs/transport-design.md`](docs/transport-design.md) — the Identity × Driver design + the 2029 rationale
+- [`docs/v0.8-concept.md`](docs/v0.8-concept.md) — "removing the asterisks": the v0.8 design narrative
+- [`docs/landscape-2026-07.md`](docs/landscape-2026-07.md) — 40-server ecosystem survey
