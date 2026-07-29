@@ -5,6 +5,7 @@ launches per the README's ``~/.claude.json`` snippet.
 
 Add ``--selftest`` to do a non-MCP smoke check that prints mailbox + latest
 subject counts. Useful for verifying Full-Disk-Access on a new machine.
+``--doctor`` runs the full environment diagnosis (email_mcp.doctor).
 """
 from __future__ import annotations
 
@@ -515,16 +516,27 @@ def tool_cancel_scheduled(id: str) -> dict:
             "subject": entry.subject, "was_due": entry.send_at}
 
 
+def tool_doctor() -> dict:
+    from . import doctor
+
+    return doctor.run()
+
+
 # ---------------------------------------------------------------------- #
 # MCP wiring                                                             #
 # ---------------------------------------------------------------------- #
 
 
-def _build_mcp_server():  # pragma: no cover — exercised by integration only
-    """Build the FastMCP Server with all seventeen tools registered."""
+def _build_mcp_server():
+    """Build the FastMCP Server: nineteen tools, or exactly the ten
+    read-side tools when EMAIL_MCP_READ_ONLY=1 — the mutating nine are
+    lexically gated below, so in a read-only session they never exist."""
     from mcp.server.fastmcp import FastMCP  # type: ignore
 
+    from .config import read_only
+
     mcp = FastMCP("apple-mail")
+    ro = read_only()
 
     @mcp.tool()
     def search_emails(
@@ -622,132 +634,6 @@ def _build_mcp_server():  # pragma: no cover — exercised by integration only
         )
 
     @mcp.tool()
-    def send_email(
-        to: str,
-        subject: str,
-        body: str,
-        cc: str | None = None,
-        bcc: str | None = None,
-        attachments: list[str] | None = None,
-        from_identity: str | None = None,
-    ) -> dict:
-        """Send an email. Composition and delivery are handled internally —
-        never send mail any other way (Mail.app's scripted compose corrupts
-        the body into a collapsed quote).
-
-        `to`/`cc`/`bcc` are comma-separated address strings ("Name <a@b>" or
-        "a@b"). `body` is plain text; blank lines become paragraphs. Replies
-        should use `reply_email` instead so threading headers are set.
-
-        `attachments` is a list of local file paths (each entry ONE path —
-        never comma-joined). Files are attached with guessed MIME types;
-        directories are refused (zip first). Total size is capped (default
-        20 MB, EMAIL_MCP_MAX_ATTACH_MB) — over-budget returns {ok: false,
-        error} before anything is sent.
-
-        `from_identity` selects the sending identity from
-        ~/.email-mcp/identities.toml (omit for the default). Each identity
-        carries its own From: address, transport (ssh_sendmail / smtp /
-        pipe) and allowlist, so which lane the mail leaves on follows from
-        the name alone.
-
-        Safety: while the allowlist guard is active (default), recipients are
-        restricted to the sending identity's own address — a returned
-        {ok: false, error} naming a blocked address means the guard fired,
-        not a delivery failure. A Bcc-to-self is added automatically for a
-        Sent record. Returns {ok, message_id, to, cc, bcc, subject,
-        attachments} on success.
-        """
-        return tool_send_email(
-            to=to, subject=subject, body=body, cc=cc, bcc=bcc,
-            attachments=attachments, from_identity=from_identity,
-        )
-
-    @mcp.tool()
-    def reply_email(
-        id: str,
-        body: str,
-        reply_all: bool = False,
-        cc: str | None = None,
-        bcc: str | None = None,
-        include_history: bool = True,
-        attachments: list[str] | None = None,
-        from_identity: str | None = None,
-    ) -> dict:
-        """Reply to message `id` (an envelope id from search/get), threading
-        correctly via In-Reply-To / References and an "Re:" subject.
-
-        The original message is quoted below `body` (attribution line +
-        `>`-prefixed plain text / HTML blockquote), like a normal client's
-        Reply; set include_history=False for a bare reply.
-
-        Defaults to replying to the original sender only; set reply_all=True
-        to also Cc the original To+Cc (minus your own address). `attachments`
-        works exactly as in send_email (list of local file paths, size-capped).
-        Same delivery and allowlist safety as send_email. Returns the same
-        shape.
-
-        `from_identity` selects the sending identity from
-        ~/.email-mcp/identities.toml (omit for the default). Each identity
-        carries its own From: address, transport (ssh_sendmail / smtp /
-        pipe) and allowlist — the reply goes out as that identity.
-        """
-        return tool_reply_email(
-            id=id, body=body, reply_all=reply_all, cc=cc, bcc=bcc,
-            include_history=include_history, attachments=attachments,
-            from_identity=from_identity,
-        )
-
-    @mcp.tool()
-    def schedule_email(
-        to: str,
-        subject: str,
-        body: str,
-        send_at: str,
-        cc: str | None = None,
-        bcc: str | None = None,
-        attachments: list[str] | None = None,
-        from_identity: str | None = None,
-    ) -> dict:
-        """Schedule an email for later delivery (the MCP's "Send Later").
-
-        `send_at` is ISO-8601; a naive timestamp ("2026-07-29T09:00") means
-        LOCAL time, an explicit offset is respected. Everything else works
-        exactly like send_email (addresses, body, attachments, allowlist,
-        auto Bcc-to-self).
-
-        The message is composed and FROZEN now — attachments are embedded at
-        schedule time, so later edits to the source files change nothing. A
-        launchd agent checks every 60s and delivers when due; if the Mac is
-        asleep at send_at, the message goes out on the first check after
-        wake (same semantics as Mail.app's Send Later). Manage with
-        list_scheduled / cancel_scheduled.
-
-        `from_identity` selects the sending identity from
-        ~/.email-mcp/identities.toml (omit for the default). Each identity
-        carries its own From: address, transport (ssh_sendmail / smtp /
-        pipe) and allowlist; the manifest records the identity so the
-        dispatcher delivers on that identity's transport at fire time.
-
-        Returns {ok, id, send_at (UTC), message_id, ...}. If the result
-        warns the dispatcher is not installed, run:
-        python -m email_mcp.dispatcher --install-launchd
-        """
-        res = tool_schedule_email(
-            to=to, subject=subject, body=body, send_at=send_at,
-            cc=cc, bcc=bcc, attachments=attachments,
-            from_identity=from_identity,
-        )
-        if res.get("ok"):
-            from .dispatcher import _plist_path
-            if not _plist_path().exists():
-                res["warning"] = (
-                    "dispatcher launchd agent NOT installed — nothing will "
-                    "send. Run: python -m email_mcp.dispatcher --install-launchd"
-                )
-        return res
-
-    @mcp.tool()
     def list_scheduled(state: str | None = None, limit: int = 50) -> dict:
         """List scheduled emails by state: pending (waiting), sending
         (mid-flight), sent (delivered, with delivered_at), failed (gave up
@@ -756,130 +642,273 @@ def _build_mcp_server():  # pragma: no cover — exercised by integration only
         return tool_list_scheduled(state=state, limit=limit)
 
     @mcp.tool()
-    def cancel_scheduled(id: str) -> dict:
-        """Cancel a pending scheduled email by id (from schedule_email /
-        list_scheduled). Only pending messages can be cancelled — anything
-        already sending/sent is past the point of no return."""
-        return tool_cancel_scheduled(id=id)
+    def doctor() -> dict:
+        """Diagnose this MCP's environment in one pass: mail-store
+        readability (Full Disk Access), Mail.app Automation permission,
+        Accessibility (only needed for mailbox_delete's UI fallback), the
+        identities file, every transport's health (never bootstraps), the
+        scheduled-send dispatcher, spool/plan hygiene, and the FTS body
+        index. Returns {ok, read_only, checks} where each check is
+        {ok, detail} plus a concrete `fix` (a command or a Settings pane)
+        when something is off. Read-only and side-effect free — call it
+        first when any other tool misbehaves."""
+        return tool_doctor()
 
-    @mcp.tool()
-    def triage_plan(
-        query: str = "",
-        from_addr: str | None = None,
-        to_addr: str | None = None,
-        mailbox: str | None = None,
-        account: str | None = None,
-        before: str | None = None,
-        after: str | None = None,
-        has_attachment: bool | None = None,
-        unread_only: bool = False,
-        limit: int = 0,
-        actions: list[dict] | None = None,
-    ) -> dict:
-        """Stage a mailbox-management operation: SELECT messages with the
-        same filters as search_emails, and freeze them + `actions` into a
-        reviewable plan. NOTHING is modified — mutation happens only when
-        triage_apply is called with the returned plan_id.
+    if not ro:
+        # Mutating tools — everything below can move mail or leave a
+        # durable trace; under EMAIL_MCP_READ_ONLY=1 none of it registers.
 
-        The two-call plan/apply split is BY DESIGN: show the returned plan
-        (count, summary, messages) to the user before applying. Plans
-        expire after 10 minutes and cap at 200 messages (larger selections
-        are rejected, never truncated — narrow the query).
+        @mcp.tool()
+        def send_email(
+            to: str,
+            subject: str,
+            body: str,
+            cc: str | None = None,
+            bcc: str | None = None,
+            attachments: list[str] | None = None,
+            from_identity: str | None = None,
+        ) -> dict:
+            """Send an email. Composition and delivery are handled internally —
+            never send mail any other way (Mail.app's scripted compose corrupts
+            the body into a collapsed quote).
 
-        `actions` is a list of dispositions applied to every selected
-        message, e.g. [{"action": "mark_read"}, {"action": "move_to",
-        "mailbox": "Archive/JIRA"}]. Vocabulary: move_to (same-account,
-        target must exist — see mailbox_create), mark_read, mark_unread,
-        flag (color 0-6), unflag. There is deliberately NO `delete` here —
-        deletion has its own tool, triage_plan_delete. There is no
-        `archive` action — use move_to with your archive mailbox. Returns
-        {ok, plan_id, count, expires_at, summary, messages} or
-        {ok: false, code, error}.
-        """
-        return tool_triage_plan(
-            query=query, from_addr=from_addr, to_addr=to_addr,
-            mailbox=mailbox, account=account, before=before, after=after,
-            has_attachment=has_attachment, unread_only=unread_only,
-            limit=limit, actions=actions,
-        )
+            `to`/`cc`/`bcc` are comma-separated address strings ("Name <a@b>" or
+            "a@b"). `body` is plain text; blank lines become paragraphs. Replies
+            should use `reply_email` instead so threading headers are set.
 
-    @mcp.tool()
-    def triage_plan_delete(
-        query: str = "",
-        from_addr: str | None = None,
-        to_addr: str | None = None,
-        mailbox: str | None = None,
-        account: str | None = None,
-        before: str | None = None,
-        after: str | None = None,
-        has_attachment: bool | None = None,
-        unread_only: bool = False,
-        limit: int = 0,
-    ) -> dict:
-        """Stage DELETION of the selected messages — the destructive verb's
-        own door (triage_plan refuses `delete`). SELECT with the same
-        filters as search_emails; NOTHING is deleted by this call — review
-        the returned plan (count, summary, messages) with the user, then
-        execute it via triage_apply, exactly like any other plan.
+            `attachments` is a list of local file paths (each entry ONE path —
+            never comma-joined). Files are attached with guessed MIME types;
+            directories are refused (zip first). Total size is capped (default
+            20 MB, EMAIL_MCP_MAX_ATTACH_MB) — over-budget returns {ok: false,
+            error} before anything is sent.
 
-        Deletion uses Mail.app's own delete verb → messages go to their
-        account's Trash mailbox; nothing is erased permanently. The
-        selection must live in ONE account (cross-account selections are
-        rejected — add the account= filter) and caps at 50 messages
-        (EMAIL_MCP_TRIAGE_DELETE_MAX), tighter than triage_plan's cap.
-        Returns {ok, plan_id, count, expires_at, summary, messages} or
-        {ok: false, code, error}.
-        """
-        return tool_triage_plan_delete(
-            query=query, from_addr=from_addr, to_addr=to_addr,
-            mailbox=mailbox, account=account, before=before, after=after,
-            has_attachment=has_attachment, unread_only=unread_only,
-            limit=limit,
-        )
+            `from_identity` selects the sending identity from
+            ~/.email-mcp/identities.toml (omit for the default). Each identity
+            carries its own From: address, transport (ssh_sendmail / smtp /
+            pipe) and allowlist, so which lane the mail leaves on follows from
+            the name alone.
 
-    @mcp.tool()
-    def triage_apply(plan_id: str) -> dict:
-        """Execute a plan staged by triage_plan / triage_plan_delete: one
-        batched AppleScript against Mail.app (messages addressed by
-        database id — fast at any mailbox size), then verification against
-        Mail's own store.
+            Safety: while the allowlist guard is active (default), recipients are
+            restricted to the sending identity's own address — a returned
+            {ok: false, error} naming a blocked address means the guard fired,
+            not a delivery failure. A Bcc-to-self is added automatically for a
+            Sent record. Returns {ok, message_id, to, cc, bcc, subject,
+            attachments} on success.
+            """
+            return tool_send_email(
+                to=to, subject=subject, body=body, cc=cc, bcc=bcc,
+                attachments=attachments, from_identity=from_identity,
+            )
 
-        Large plans take a while (~0.2 s/message + overhead; a 200-message
-        plan can run minutes) — do not re-invoke mid-flight; a second call
-        safely returns plan_claimed. Requires Mail.app Automation
-        permission (same as refresh_mail). Returns {ok, status, planned,
-        acted, verified, failures[], pending[]} — per-message failures are
-        data, not errors; `pending` means Mail's local store hasn't
-        confirmed within the poll window yet, not that the action failed.
-        """
-        return tool_triage_apply(plan_id=plan_id)
+        @mcp.tool()
+        def reply_email(
+            id: str,
+            body: str,
+            reply_all: bool = False,
+            cc: str | None = None,
+            bcc: str | None = None,
+            include_history: bool = True,
+            attachments: list[str] | None = None,
+            from_identity: str | None = None,
+        ) -> dict:
+            """Reply to message `id` (an envelope id from search/get), threading
+            correctly via In-Reply-To / References and an "Re:" subject.
 
-    @mcp.tool()
-    def mailbox_create(account: str, path: str) -> dict:
-        """Create a mailbox/folder in an account (account = the UUID shown
-        in search results; path may nest with slashes, e.g. "Archive/JIRA").
-        Idempotent: returns existed=true without touching Mail if it is
-        already there. index_verified=false with applescript="OK" means
-        Mail created it but the local index hasn't caught up yet.
+            The original message is quoted below `body` (attribution line +
+            `>`-prefixed plain text / HTML blockquote), like a normal client's
+            Reply; set include_history=False for a bare reply.
 
-        ⚠ Exchange (EWS) accounts: AppleScript-created folders may not
-        persist server-side — the result carries a warning and moves into
-        such a folder can be silently reverted by the server. For Exchange,
-        create folders in Mail.app/OWA and triage into them once they
-        appear; mailbox_create is reliable for local (On My Mac) and
-        plain-IMAP accounts."""
-        return tool_mailbox_create(account=account, path=path)
+            Defaults to replying to the original sender only; set reply_all=True
+            to also Cc the original To+Cc (minus your own address). `attachments`
+            works exactly as in send_email (list of local file paths, size-capped).
+            Same delivery and allowlist safety as send_email. Returns the same
+            shape.
 
-    @mcp.tool()
-    def mailbox_delete(account: str, path: str) -> dict:
-        """Delete an EMPTY mailbox (non-empty ones are refused — triage the
-        messages out first). Idempotent: already-absent returns ok with
-        existed=false. The outcome is decided by a live existence re-probe,
-        not by AppleScript's reply — Mail's delete verb often reports a
-        false error (-10000) on success. deleted=false with ok=false means
-        the mailbox genuinely survived (typical for phantom Exchange
-        folders — remove those in Mail.app/OWA)."""
-        return tool_mailbox_delete(account=account, path=path)
+            `from_identity` selects the sending identity from
+            ~/.email-mcp/identities.toml (omit for the default). Each identity
+            carries its own From: address, transport (ssh_sendmail / smtp /
+            pipe) and allowlist — the reply goes out as that identity.
+            """
+            return tool_reply_email(
+                id=id, body=body, reply_all=reply_all, cc=cc, bcc=bcc,
+                include_history=include_history, attachments=attachments,
+                from_identity=from_identity,
+            )
+
+        @mcp.tool()
+        def schedule_email(
+            to: str,
+            subject: str,
+            body: str,
+            send_at: str,
+            cc: str | None = None,
+            bcc: str | None = None,
+            attachments: list[str] | None = None,
+            from_identity: str | None = None,
+        ) -> dict:
+            """Schedule an email for later delivery (the MCP's "Send Later").
+
+            `send_at` is ISO-8601; a naive timestamp ("2026-07-29T09:00") means
+            LOCAL time, an explicit offset is respected. Everything else works
+            exactly like send_email (addresses, body, attachments, allowlist,
+            auto Bcc-to-self).
+
+            The message is composed and FROZEN now — attachments are embedded at
+            schedule time, so later edits to the source files change nothing. A
+            launchd agent checks every 60s and delivers when due; if the Mac is
+            asleep at send_at, the message goes out on the first check after
+            wake (same semantics as Mail.app's Send Later). Manage with
+            list_scheduled / cancel_scheduled.
+
+            `from_identity` selects the sending identity from
+            ~/.email-mcp/identities.toml (omit for the default). Each identity
+            carries its own From: address, transport (ssh_sendmail / smtp /
+            pipe) and allowlist; the manifest records the identity so the
+            dispatcher delivers on that identity's transport at fire time.
+
+            Returns {ok, id, send_at (UTC), message_id, ...}. If the result
+            warns the dispatcher is not installed, run:
+            python -m email_mcp.dispatcher --install-launchd
+            """
+            res = tool_schedule_email(
+                to=to, subject=subject, body=body, send_at=send_at,
+                cc=cc, bcc=bcc, attachments=attachments,
+                from_identity=from_identity,
+            )
+            if res.get("ok"):
+                from .dispatcher import _plist_path
+                if not _plist_path().exists():
+                    res["warning"] = (
+                        "dispatcher launchd agent NOT installed — nothing will "
+                        "send. Run: python -m email_mcp.dispatcher --install-launchd"
+                    )
+            return res
+
+        @mcp.tool()
+        def cancel_scheduled(id: str) -> dict:
+            """Cancel a pending scheduled email by id (from schedule_email /
+            list_scheduled). Only pending messages can be cancelled — anything
+            already sending/sent is past the point of no return."""
+            return tool_cancel_scheduled(id=id)
+
+        @mcp.tool()
+        def triage_plan(
+            query: str = "",
+            from_addr: str | None = None,
+            to_addr: str | None = None,
+            mailbox: str | None = None,
+            account: str | None = None,
+            before: str | None = None,
+            after: str | None = None,
+            has_attachment: bool | None = None,
+            unread_only: bool = False,
+            limit: int = 0,
+            actions: list[dict] | None = None,
+        ) -> dict:
+            """Stage a mailbox-management operation: SELECT messages with the
+            same filters as search_emails, and freeze them + `actions` into a
+            reviewable plan. NOTHING is modified — mutation happens only when
+            triage_apply is called with the returned plan_id.
+
+            The two-call plan/apply split is BY DESIGN: show the returned plan
+            (count, summary, messages) to the user before applying. Plans
+            expire after 10 minutes and cap at 200 messages (larger selections
+            are rejected, never truncated — narrow the query).
+
+            `actions` is a list of dispositions applied to every selected
+            message, e.g. [{"action": "mark_read"}, {"action": "move_to",
+            "mailbox": "Archive/JIRA"}]. Vocabulary: move_to (same-account,
+            target must exist — see mailbox_create), mark_read, mark_unread,
+            flag (color 0-6), unflag. There is deliberately NO `delete` here —
+            deletion has its own tool, triage_plan_delete. There is no
+            `archive` action — use move_to with your archive mailbox. Returns
+            {ok, plan_id, count, expires_at, summary, messages} or
+            {ok: false, code, error}.
+            """
+            return tool_triage_plan(
+                query=query, from_addr=from_addr, to_addr=to_addr,
+                mailbox=mailbox, account=account, before=before, after=after,
+                has_attachment=has_attachment, unread_only=unread_only,
+                limit=limit, actions=actions,
+            )
+
+        @mcp.tool()
+        def triage_plan_delete(
+            query: str = "",
+            from_addr: str | None = None,
+            to_addr: str | None = None,
+            mailbox: str | None = None,
+            account: str | None = None,
+            before: str | None = None,
+            after: str | None = None,
+            has_attachment: bool | None = None,
+            unread_only: bool = False,
+            limit: int = 0,
+        ) -> dict:
+            """Stage DELETION of the selected messages — the destructive verb's
+            own door (triage_plan refuses `delete`). SELECT with the same
+            filters as search_emails; NOTHING is deleted by this call — review
+            the returned plan (count, summary, messages) with the user, then
+            execute it via triage_apply, exactly like any other plan.
+
+            Deletion uses Mail.app's own delete verb → messages go to their
+            account's Trash mailbox; nothing is erased permanently. The
+            selection must live in ONE account (cross-account selections are
+            rejected — add the account= filter) and caps at 50 messages
+            (EMAIL_MCP_TRIAGE_DELETE_MAX), tighter than triage_plan's cap.
+            Returns {ok, plan_id, count, expires_at, summary, messages} or
+            {ok: false, code, error}.
+            """
+            return tool_triage_plan_delete(
+                query=query, from_addr=from_addr, to_addr=to_addr,
+                mailbox=mailbox, account=account, before=before, after=after,
+                has_attachment=has_attachment, unread_only=unread_only,
+                limit=limit,
+            )
+
+        @mcp.tool()
+        def triage_apply(plan_id: str) -> dict:
+            """Execute a plan staged by triage_plan / triage_plan_delete: one
+            batched AppleScript against Mail.app (messages addressed by
+            database id — fast at any mailbox size), then verification against
+            Mail's own store.
+
+            Large plans take a while (~0.2 s/message + overhead; a 200-message
+            plan can run minutes) — do not re-invoke mid-flight; a second call
+            safely returns plan_claimed. Requires Mail.app Automation
+            permission (same as refresh_mail). Returns {ok, status, planned,
+            acted, verified, failures[], pending[]} — per-message failures are
+            data, not errors; `pending` means Mail's local store hasn't
+            confirmed within the poll window yet, not that the action failed.
+            """
+            return tool_triage_apply(plan_id=plan_id)
+
+        @mcp.tool()
+        def mailbox_create(account: str, path: str) -> dict:
+            """Create a mailbox/folder in an account (account = the UUID shown
+            in search results; path may nest with slashes, e.g. "Archive/JIRA").
+            Idempotent: returns existed=true without touching Mail if it is
+            already there. index_verified=false with applescript="OK" means
+            Mail created it but the local index hasn't caught up yet.
+
+            ⚠ Exchange (EWS) accounts: AppleScript-created folders may not
+            persist server-side — the result carries a warning and moves into
+            such a folder can be silently reverted by the server. For Exchange,
+            create folders in Mail.app/OWA and triage into them once they
+            appear; mailbox_create is reliable for local (On My Mac) and
+            plain-IMAP accounts."""
+            return tool_mailbox_create(account=account, path=path)
+
+        @mcp.tool()
+        def mailbox_delete(account: str, path: str) -> dict:
+            """Delete an EMPTY mailbox (non-empty ones are refused — triage the
+            messages out first). Idempotent: already-absent returns ok with
+            existed=false. The outcome is decided by a live existence re-probe,
+            not by AppleScript's reply — Mail's delete verb often reports a
+            false error (-10000) on success. deleted=false with ok=false means
+            the mailbox genuinely survived (typical for phantom Exchange
+            folders — remove those in Mail.app/OWA)."""
+            return tool_mailbox_delete(account=account, path=path)
 
     return mcp
 
@@ -925,38 +954,26 @@ def _send_test(
 
 
 def _transport_check() -> int:
-    """Healthcheck every configured identity's transport and print one JSON
-    report: {default, identities: {name: {...healthcheck, from_addr}}}.
-
-    One broken identity must not hide the others — each is checked
-    independently and failures become {ok: false, error} entries. Exit 0
-    only when every identity checks out; ok:false is a state (e.g. a cold
-    SSH socket), not necessarily a bug.
+    """DEPRECATED alias for --doctor: prints only the doctor's transports
+    check (the old per-identity healthcheck loop, which moved to
+    email_mcp.doctor.check_transports). Exit 0 only when every identity
+    checks out; ok:false is a state (e.g. a cold SSH socket), not
+    necessarily a bug.
     """
-    from . import identities
-    from .transports import get_transport
+    from . import doctor
 
-    try:
-        idents, default = identities.load()
-    except SendError as e:
-        json.dump({"ok": False, "error": str(e)}, sys.stdout, indent=2)
-        sys.stdout.write("\n")
-        return 1
+    check = doctor.check_transports()
+    json.dump(check, sys.stdout, indent=2, default=str)
+    sys.stdout.write("\n")
+    return 0 if check.get("ok") else 1
 
-    report: dict = {"default": default, "identities": {}}
-    all_ok = True
-    for name in sorted(idents):
-        ident = idents[name]
-        try:
-            result = get_transport(ident).healthcheck()
-        except SendError as e:
-            result = {"ok": False, "error": str(e)}
-        result["from_addr"] = ident.from_addr
-        all_ok = all_ok and bool(result.get("ok"))
-        report["identities"][name] = result
+
+def _doctor() -> int:
+    """Run every doctor check and print the full JSON report."""
+    report = tool_doctor()
     json.dump(report, sys.stdout, indent=2, default=str)
     sys.stdout.write("\n")
-    return 0 if all_ok else 1
+    return 0 if report["ok"] else 1
 
 
 def main() -> int:
@@ -1003,16 +1020,25 @@ def main() -> int:
              "identities.toml; default: the file's default identity).",
     )
     parser.add_argument(
+        "--doctor",
+        action="store_true",
+        help="Run every diagnostic check (permissions, identities, "
+             "transports, dispatcher, spool, body index), print one JSON "
+             "report, and exit 0 only when all checks are ok.",
+    )
+    parser.add_argument(
         "--transport-check",
         action="store_true",
-        help="Healthcheck every identity's transport, print one JSON report, "
-             "and exit 0 only if all are ok.",
+        help="DEPRECATED — alias for the doctor's transports check; prints "
+             "only that section. Prefer --doctor for the full picture.",
     )
     args = parser.parse_args()
     if args.selftest:
         return _selftest()
     if args.refresh_test:
         return _refresh_test(wait_seconds=args.refresh_wait)
+    if args.doctor:
+        return _doctor()
     if args.transport_check:
         return _transport_check()
     if args.send_test:

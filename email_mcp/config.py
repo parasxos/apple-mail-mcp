@@ -38,6 +38,17 @@ def source_name() -> str:
     return os.environ.get("EMAIL_MCP_SOURCE", "apple").strip() or "apple"
 
 
+def read_only() -> bool:
+    """When true, only the read-side tools register with the MCP server —
+    the widest trust envelope for demos, reviews and new users. Staged
+    mutation (triage_plan / triage_plan_delete) counts as mutating: intent
+    plus a durable plan file. Flip with EMAIL_MCP_READ_ONLY=1.
+    """
+    return os.environ.get("EMAIL_MCP_READ_ONLY", "0").strip() in {
+        "1", "true", "True", "yes",
+    }
+
+
 def max_body_bytes() -> int:
     return int(os.environ.get("EMAIL_MCP_MAX_BODY_BYTES", "2000000"))
 
@@ -165,6 +176,12 @@ def triage_max_messages() -> int:
     """Hard cap on messages per plan; bigger selections are rejected,
     never silently truncated."""
     return int(os.environ.get("EMAIL_MCP_TRIAGE_MAX", "200"))
+
+
+def triage_delete_max() -> int:
+    """Tighter cap for delete plans (triage_plan_delete) — the destructive
+    verb gets its own, smaller ceiling than triage_max_messages."""
+    return int(os.environ.get("EMAIL_MCP_TRIAGE_DELETE_MAX", "50"))
 
 
 def triage_ttl_seconds() -> int:

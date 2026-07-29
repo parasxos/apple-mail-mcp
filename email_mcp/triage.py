@@ -12,7 +12,6 @@ Mail.app itself, which owns server sync (EWS/IMAP alike).
 """
 from __future__ import annotations
 
-import os
 import subprocess
 import time
 from datetime import datetime, timedelta
@@ -218,13 +217,8 @@ def build_plan(source, q: SearchQuery, actions: list[dict] | None,
 
 def delete_max() -> int:
     """Cap for delete plans (tighter than triage_max_messages — the verb is
-    destructive). TODO(S4): config.py grows triage_delete_max(); the getattr
-    below picks it up the moment it lands, and this helper can then shrink
-    to a plain delegate."""
-    getter = getattr(config, "triage_delete_max", None)
-    if getter is not None:
-        return int(getter())
-    return int(os.environ.get("EMAIL_MCP_TRIAGE_DELETE_MAX", "50"))
+    destructive)."""
+    return config.triage_delete_max()
 
 
 def build_delete_plan(source, q: SearchQuery) -> Plan:
