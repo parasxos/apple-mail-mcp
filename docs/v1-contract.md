@@ -326,6 +326,13 @@ at the point it becomes durable):
 | `plan_finish` | library (`plans.finish` — the one seam covering apply success, all failure sites, expiry AND gc's stale-claim finalisation) | applied / failed / expired; carries `Plan.summary` + compact per-message outcomes (`{id, code}` + pending ids) — this **outlives plan GC** |
 | `mailbox_create` | server tool layer | emitted only when actually created (idempotent no-op emits nothing) |
 | `mailbox_delete` | server tool layer | emitted only when a deletion was actually issued |
+| `doctor_fix` | cli (`doctor --fix`) | *added v0.11* — one event per applied/failed repair, outcome `fixed` / `failed`, detail `{repair, finding, action}`; every event of one `--fix` run shares one freshly-minted `op` |
+| `lifecycle` | cli | *added v0.11* — one event per lifecycle run, outcome `setup` / `update` / `uninstall`; detail carries names and counts only (identity *names*, agents, migrations, purge plan) — never addresses or secrets. The `uninstall` event is emitted BEFORE removal; with `--purge` it is destroyed with the ledger moments later (the documented deal — the receipts hint prints first) |
+
+The two `cli`-sourced rows are v0.11 additions under §8's allowance for new
+audit event types (additive — no `v` bump); with them the lifecycle CLI
+becomes a third writer process beside server and dispatcher, using the same
+single-`os.write` O_APPEND emit.
 
 Not ledger-worthy by design: FTS activity (derived state, rebuildable) and
 `_graph_leave` no-evidence passes (would spam one event per tick while
