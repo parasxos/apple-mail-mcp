@@ -358,6 +358,16 @@ def check_audit() -> dict:
     from . import audit, ids
 
     root = config.audit_dir(create=False)  # purity: never create here
+    if root.exists() and not root.is_dir():
+        # Pathological: a regular file where the ledger dir belongs. emit()
+        # would silently drop every event (mkdir over a file raises) — the
+        # one state the fresh-install branch must not mistake for healthy.
+        return {
+            "ok": False,
+            "detail": f"{root} exists but is not a directory — every audit "
+                      "event is being dropped.",
+            "fix": f"move it aside: mv {root} {root}.bak && re-run doctor",
+        }
     if not root.is_dir():
         probe = root.parent
         while not probe.exists():

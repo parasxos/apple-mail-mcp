@@ -241,3 +241,16 @@ def test_crashed_check_becomes_red_entry_not_exception(monkeypatch):
     report = doctor.run()
     assert report["ok"] is False
     assert "crashed" in report["checks"]["mail_store"]["detail"]
+
+
+def test_check_audit_flags_file_where_dir_belongs(monkeypatch, tmp_path):
+    """Red-team S3 finding (left for ownership reasons): a regular FILE at
+    the audit path must read as a fault, not a fresh install."""
+    bogus = tmp_path / "audit"
+    bogus.write_text("not a directory")
+    monkeypatch.setenv("EMAIL_MCP_AUDIT_DIR", str(bogus))
+    from email_mcp import doctor
+    res = doctor.check_audit()
+    assert res["ok"] is False
+    assert "not a directory" in res["detail"]
+    assert "mv " in res["fix"]
