@@ -1,6 +1,7 @@
-"""Lifecycle commands: ``email-mcp setup`` — the guided install (v0.11 L3).
+"""Lifecycle commands: ``email-mcp setup`` / ``update`` / ``uninstall``
+(v0.11 L3+L4).
 
-Eight steps, run in order, each reported as a :class:`StepResult`:
+Setup — eight steps, run in order, each reported as a :class:`StepResult`:
 
 1. **preflight** — macOS only; detect Mail.app, the macOS version and
    ``~/Library/Mail``; an existing ``meta.json`` flips the run into
@@ -37,6 +38,26 @@ emitted per run that touched state:
 ``detail = {mode, identities: [names], agents, fts_choice}`` — identity
 NAMES only, never addresses, never secrets.
 
+``email-mcp update`` (L4) is post-upgrade housekeeping: run the pending
+:data:`MIGRATIONS` in ascending target order (each printed + logged),
+re-render + re-bootstrap every INSTALLED launchd agent whose plist
+differs from a fresh render (a moved venv bakes a dead ``sys.executable``
+into ProgramArguments), stamp ``meta.json`` (state_version,
+package_version, updated_at), run the doctor and point at the releases
+page. Idempotent: a second run is a no-op report. One ``lifecycle`` event
+(outcome ``update``) per run.
+
+``email-mcp uninstall`` (L4) removes the launchd agents (both labels plus
+the legacy ones) and the Graph token caches; state stays unless
+``--purge``, which additionally removes the HARDCODED ``~/.email-mcp``
+through the :func:`purge_state` fences (design D7: never an
+env-overridden path, never a symlink, never outside ``$HOME``) plus
+``~/Library/Logs/email-mcp*.log``. A typed confirmation guards the run
+(``--yes`` skips); the ``lifecycle`` event (outcome ``uninstall``) is
+emitted BEFORE removal; ``~/Library/Mail`` is never touched; Keychain and
+1Password secrets are never deleted — the exact
+``security delete-generic-password`` commands are printed for the user.
+
 Printing here is by design: this module is a CLI entry point, not library
 code (contract §7 lists the print-by-design entry points; the MCP serve
 path never routes through here).
@@ -50,6 +71,7 @@ import os
 import platform
 import re
 import shutil
+import stat
 import sys
 import tomllib
 from dataclasses import dataclass, field
@@ -63,10 +85,14 @@ from .transports import DRIVERS, SendError
 _log = get_logger()
 
 # The on-disk state schema version written to meta.json. `email-mcp
-# update` (L4) walks MIGRATIONS from the recorded version up to here;
-# the hook is empty until a migration exists.
+# update` walks MIGRATIONS from the recorded version up to here: each
+# entry is (target_state_version, fn) where fn(meta) -> meta performs
+# the on-disk work for that step and returns the updated meta dict.
+# Empty at v0.11 BY DESIGN — the hook exists (and is exercised by tests
+# with fake migrations) so the first real migration is a one-entry
+# addition next to a STATE_VERSION bump.
 STATE_VERSION = 1
-MIGRATIONS: dict[int, Callable[[dict], dict]] = {}
+MIGRATIONS: tuple[tuple[int, Callable[[dict], dict]], ...] = ()
 
 # Identity names become graph/<name>.token.json — this regex is a path
 # traversal fence, not cosmetics. Table/param keys get the same charset.
@@ -1013,3 +1039,486 @@ def run_setup_cli(argv: list[str] | None = None) -> int:
 
     results = run_setup(answers, interactive=interactive)
     return 1 if any(r.status == "blocked" for r in results) else 0
+
+
+# --------------------------------------------------------------------- #
+# update (L4): migrations → plist drift → meta stamp → doctor            #
+# --------------------------------------------------------------------- #
+
+_RELEASES_URL = "https://github.com/parasxos/email-mcp/releases"
+
+
+def _stdin_is_tty() -> bool:
+    try:
+        return sys.stdin is not None and sys.stdin.isatty()
+    except (AttributeError, ValueError):
+        return False
+
+
+def meta_state_version(meta: dict) -> int:
+    """The recorded state schema version; 0 when absent or corrupt (the
+    cli._state_version tolerance)."""
+    value = meta.get("state_version", 0)
+    return value if isinstance(value, int) else 0
+
+
+def pending_migrations(
+    from_version: int,
+) -> tuple[tuple[int, Callable[[dict], dict]], ...]:
+    """The (target, fn) steps update must run, ascending target order:
+    everything past the recorded version, up to and including
+    STATE_VERSION (a target beyond it belongs to a newer package)."""
+    return tuple(sorted(
+        ((t, fn) for t, fn in MIGRATIONS
+         if from_version < t <= STATE_VERSION),
+        key=lambda pair: pair[0]))
+
+
+def plist_current(render: str, path: Path) -> bool:
+    """True when the installed plist at ``path`` matches the fresh
+    ``render``; False on any read trouble — an unreadable plist needs
+    the re-render just as much as a stale one."""
+    try:
+        return path.read_text() == render
+    except OSError:
+        return False
+
+
+def _refresh_agents() -> tuple[list[str], list[str], list[str]]:
+    """Re-render + re-bootstrap every INSTALLED agent whose plist differs
+    from a fresh render — a moved venv bakes a dead ``sys.executable``
+    into ProgramArguments and only a re-render heals it. Returns
+    ``(refreshed, current, failed)`` label lists. An absent plist means
+    the agent was never installed: update installs NOTHING (that is
+    setup's decision — the repairs registry's rule). render() is only
+    called past the exists() check, so an uninstalled FTS agent never
+    costs the fts dir its never-created-here guarantee."""
+    from . import dispatcher, fts
+
+    refreshed: list[str] = []
+    current: list[str] = []
+    failed: list[str] = []
+    agents = (
+        (dispatcher.LAUNCHD_LABEL, dispatcher._plist_path,
+         dispatcher._plist_content, dispatcher.install_launchd),
+        (fts.LAUNCHD_LABEL, fts._plist_path,
+         fts._plist_content, fts.install_launchd),
+    )
+    for label, plist_path, render, install in agents:
+        path = plist_path()
+        if not path.exists():
+            print(f"  agent {label}: not installed — left that way")
+            continue
+        if plist_current(render(), path):
+            print(f"  agent {label}: plist current")
+            current.append(label)
+            continue
+        message = install()  # the module's own re-render+bootout+bootstrap
+        print(f"  agent {label}: stale plist — {message}")
+        _log.info("update: %s stale plist — %s", label, message)
+        if "bootstrap failed" in message:
+            failed.append(label)
+        else:
+            refreshed.append(label)
+    return refreshed, current, failed
+
+
+def _stamp_meta(meta: dict) -> dict:
+    """The update stamp: created_at kept (or adopted), updated_at now,
+    env overrides recorded, package_version refreshed."""
+    now = ids.iso(ids.utcnow())
+    meta.setdefault("created_at", now)
+    meta["updated_at"] = now
+    meta["env_overrides"] = sorted(StatePaths.resolve().env_overrides)
+    try:
+        from .cli import _package_version
+        meta["package_version"] = _package_version()
+    except Exception:  # never let version metadata block the write
+        pass
+    return meta
+
+
+def run_update() -> int:
+    """Run pending migrations in order, heal plist drift on installed
+    agents, stamp meta.json, run the doctor, point at the releases page.
+    Idempotent — a second run reports nothing pending and changes only
+    ``updated_at``. ONE ``lifecycle`` audit event (outcome ``update``)
+    per run; exit 1 when a migration or an agent re-bootstrap failed."""
+    audit.set_process("cli")
+    print("email-mcp update")
+    meta = read_meta()
+    before = meta_state_version(meta)
+    ran: list[str] = []
+    failed_migration: dict | None = None
+    for target, fn in pending_migrations(before):
+        name = getattr(fn, "__name__", repr(fn))
+        print(f"  migration -> state_version {target}: {name}")
+        _log.info("update: migration -> state_version %d (%s)",
+                  target, name)
+        try:
+            migrated = fn(meta)
+            if not isinstance(migrated, dict):
+                raise TypeError(
+                    f"migration returned {type(migrated).__name__}, "
+                    "not the meta dict")
+        except Exception as e:  # noqa: BLE001 — a broken migration must
+            # report and stop cleanly, never dump a traceback as UX
+            _log.exception("update: migration -> %d failed", target)
+            print(f"  migration -> state_version {target} FAILED: {e!r} "
+                  "(details in the log) — stopping here; state_version "
+                  f"stays {meta_state_version(meta)}")
+            failed_migration = {"target": target, "migration": name}
+            break
+        meta = migrated
+        meta["state_version"] = target
+        ran.append(name)
+
+    if failed_migration is not None:
+        # Progress up to the failure is durable: the completed steps'
+        # work is on disk and their state_version is recorded, so the
+        # re-run resumes at the failed step, never repeats one.
+        write_meta(_stamp_meta(meta))
+        audit.emit("lifecycle", outcome="update", detail={
+            "from_state_version": before,
+            "state_version": meta_state_version(meta),
+            "migrations": ran,
+            "failed_migration": failed_migration,
+        })
+        return 1
+
+    if not ran:
+        if before == STATE_VERSION:
+            print(f"  state_version {before}: current — no migrations "
+                  "pending")
+        elif before < STATE_VERSION:
+            # The v0.9/v0.10 adoption path: real state, no meta.json yet.
+            print(f"  state_version {before} -> {STATE_VERSION} (no "
+                  "migration steps registered for this range)")
+    if before > STATE_VERSION:
+        print(f"  state_version {before} is newer than this package's "
+              f"{STATE_VERSION} — left untouched; upgrade the package")
+    else:
+        meta["state_version"] = STATE_VERSION
+
+    refreshed, current, failed_agents = _refresh_agents()
+
+    write_meta(_stamp_meta(meta))
+    print(f"  meta.json: state_version {meta['state_version']}, "
+          f"package_version {meta.get('package_version', 'unknown')}")
+
+    from .cli import _render_doctor
+    report = doctor.run()
+    _render_doctor(report)
+    print(f"release notes: {_RELEASES_URL}")
+
+    audit.emit("lifecycle", outcome="update", detail={
+        "from_state_version": before,
+        "state_version": meta_state_version(meta),
+        "migrations": ran,
+        "agents_refreshed": refreshed,
+        "agents_current": current,
+        "agents_failed": failed_agents,
+        "package_version": meta.get("package_version"),
+    })
+    return 1 if failed_agents else 0
+
+
+def run_update_cli(argv: list[str] | None = None) -> int:
+    """``email-mcp update [--yes]`` → exit 0 on a clean run, 1 when a
+    migration or agent re-bootstrap failed, 2 on usage errors (including
+    a non-terminal invocation without --yes)."""
+    parser = argparse.ArgumentParser(
+        prog="email-mcp update",
+        description="Post-upgrade housekeeping: run pending state "
+                    "migrations, re-render stale launchd plists, stamp "
+                    "meta.json, run the doctor.",
+    )
+    parser.add_argument("--yes", action="store_true",
+                        help="run without a terminal (update rewrites "
+                             "meta.json and re-bootstraps launchd "
+                             "agents, so scripts must opt in)")
+    args = parser.parse_args(argv)
+    if not args.yes and not _stdin_is_tty():
+        # This refusal keeps the stub's frozen contract
+        # (tests/test_cli.py::test_lifecycle_stubs_exit_2_with_pointer):
+        # exit 2, silent stdout, "update" + the "L4" stage pointer on
+        # stderr — update mutates launchd + meta, so a non-terminal run
+        # must opt in explicitly.
+        print("email-mcp update: refusing to run outside a terminal "
+              "without --yes (L4 of the v0.11 lifecycle work) — rerun "
+              "in one, or pass --yes.", file=sys.stderr)
+        return 2
+    return run_update()
+
+
+# --------------------------------------------------------------------- #
+# uninstall (L4): agents + token caches out; state only with --purge     #
+# --------------------------------------------------------------------- #
+
+
+class PurgeRefused(Exception):
+    """A purge fence tripped — NOTHING was removed. The fences are
+    deliberate paranoia (design D7): purge only ever removes the
+    HARDCODED ``~/.email-mcp`` and refuses anything that smells like a
+    redirection (symlinked root, degenerate ``$HOME``, a squatting
+    file)."""
+
+
+def purge_state() -> Path | None:
+    """Remove the state tree — the HARDCODED ``Path.home()/.email-mcp``
+    and nothing else, ever (design D7). Env-overridden dirs are NEVER
+    removed here; callers print them instead.
+
+    Fences, each raising :class:`PurgeRefused` with nothing removed:
+    ``Path.home()`` must be an absolute path other than ``/`` and the
+    root's direct parent; the root must not be a symlink (``os.lstat``
+    — the link is never followed) and must be a real directory. Removal
+    is ``shutil.rmtree``, whose macOS implementation is fd-based and
+    does not follow directory symlinks inside the tree. Returns the
+    removed root, or None when it was already absent (idempotent)."""
+    home = Path.home()
+    root = home / ".email-mcp"  # HARDCODED: env overrides never move this
+    if not home.is_absolute() or home == Path("/"):
+        raise PurgeRefused(
+            f"$HOME resolves to {str(home)!r} — refusing to purge")
+    if root.parent != home:  # unreachable by construction; belt anyway
+        raise PurgeRefused(
+            f"{root} is not directly under {home} — refusing to purge")
+    try:
+        st = os.lstat(root)
+    except FileNotFoundError:
+        return None  # already gone — purge is idempotent
+    if stat.S_ISLNK(st.st_mode):
+        raise PurgeRefused(
+            f"{root} is a symlink (os.lstat) — refusing to follow it; "
+            "remove the link and its target yourself if that is intended")
+    if not stat.S_ISDIR(st.st_mode):
+        raise PurgeRefused(
+            f"{root} is not a directory — refusing; move the file aside "
+            "yourself")
+    shutil.rmtree(root)
+    _log.info("uninstall: purged %s", root)
+    return root
+
+
+def _purge_logs() -> list[Path]:
+    """Unlink ``~/Library/Logs/email-mcp*.log`` (config.log_file's
+    default home). unlink never recurses, so a symlinked log costs only
+    the link itself."""
+    removed: list[Path] = []
+    logs = Path.home() / "Library" / "Logs"
+    for path in sorted(logs.glob("email-mcp*.log")):
+        try:
+            path.unlink()
+        except OSError:
+            continue
+        removed.append(path)
+    return removed
+
+
+def uninstall_plan(purge: bool) -> dict:
+    """Side-effect-free preview of ``email-mcp uninstall``:
+    ``{remove, keep, print_only, env_overrides}`` — remove/keep/
+    print_only are one-line strings, env_overrides the live EMAIL_MCP_*
+    path map. Everything slated for removal lives under the HARDCODED
+    home paths; anything env-overridden lands in print_only — uninstall
+    reports it and leaves it alone (design D7)."""
+    from . import dispatcher, fts
+
+    home = Path.home()
+    root = home / ".email-mcp"
+    agents_dir = home / "Library" / "LaunchAgents"
+    paths = StatePaths.resolve()
+    remove: list[str] = []
+    keep: list[str] = []
+    print_only: list[str] = []
+
+    for label in (dispatcher.LAUNCHD_LABEL, fts.LAUNCHD_LABEL,
+                  *dispatcher.LEGACY_LABELS):
+        plist = agents_dir / f"{label}.plist"
+        if plist.exists():
+            remove.append(f"launchd agent {label} ({plist})")
+    graph_default = root / "graph"
+    if graph_default.is_dir():
+        for token in sorted(graph_default.glob("*.token.json")):
+            remove.append(str(token))
+    if paths.graph != graph_default and paths.graph.is_dir():
+        for token in sorted(paths.graph.glob("*.token.json")):
+            print_only.append(
+                f"{token} (EMAIL_MCP_GRAPH_DIR override — never removed; "
+                "delete it yourself)")
+
+    if purge:
+        remove.append(f"{root} (state tree: spool, plans, audit ledger, "
+                      "identities.toml, meta.json)")
+        for log in sorted((home / "Library" / "Logs")
+                          .glob("email-mcp*.log")):
+            remove.append(str(log))
+        for var, raw in sorted(paths.env_overrides.items()):
+            print_only.append(
+                f"{var}={raw} (env-overridden path — never removed; "
+                "delete it yourself)")
+        keep.append(f"{home / 'Library' / 'Mail'} — never touched")
+        keep.append("macOS Keychain items — never touched (delete "
+                    "commands are printed at removal time)")
+        keep.append("1Password entries — never touched")
+    else:
+        keep.append(f"{root} (spool, plans, audit ledger, "
+                    "identities.toml, meta.json — remove with "
+                    "`email-mcp uninstall --purge`)")
+        keep.append(f"{home / 'Library' / 'Logs'}/email-mcp*.log "
+                    "(--purge removes them)")
+        keep.append(f"{home / 'Library' / 'Mail'} — never touched")
+    return {"remove": remove, "keep": keep, "print_only": print_only,
+            "env_overrides": dict(paths.env_overrides)}
+
+
+def keychain_instructions(identities_doc: dict) -> list[str]:
+    """Print (and return) the exact ``security delete-generic-password``
+    commands for every Keychain item the identities document references
+    — run by the USER; uninstall itself never touches the Keychain, and
+    1Password entries are never touched either. The caller parses
+    identities.toml BEFORE any deletion — with --purge the file is gone
+    moments later."""
+    commands: list[str] = []
+    has_op = False
+    for name in sorted(identities_doc):
+        table = identities_doc[name]
+        if not isinstance(table, dict):
+            continue
+        if str(table.get("op", "")).strip():
+            has_op = True
+        item = str(table.get("keychain", "")).strip()
+        if not item:
+            continue
+        account = (str(table.get("username", "")).strip()
+                   or str(table.get("from_addr", "")).strip())
+        cmd = f"security delete-generic-password -s {item}"
+        if account:
+            cmd += f" -a {account}"
+        commands.append(cmd)
+    lines: list[str] = []
+    if commands:
+        lines.append("  Keychain items referenced by identities.toml are "
+                     "never deleted by uninstall — remove each yourself "
+                     "if wanted:")
+        lines += [f"    {c}" for c in commands]
+    if has_op:
+        lines.append("  1Password entries (op:// references) are never "
+                     "touched — nothing to clean up there.")
+    for line in lines:
+        print(line)
+    return lines
+
+
+def run_uninstall(purge: bool, assume_yes: bool) -> int:
+    """Plan → typed confirmation → keychain instructions (identities
+    parsed FIRST) → ONE ``lifecycle`` audit event, emitted BEFORE any
+    removal (with --purge those are the ledger's last words — hence the
+    receipts-export hint in the plan) → both agents out (legacy labels
+    included) → token caches deleted → with --purge the fenced
+    :func:`purge_state` plus the log files."""
+    audit.set_process("cli")
+    from . import dispatcher, fts
+
+    plan = uninstall_plan(purge)
+    print("email-mcp uninstall" + (" --purge" if purge else ""))
+    for line in plan["remove"]:
+        print(f"  remove: {line}")
+    if not plan["remove"]:
+        print("  remove: nothing found (no agents, no token caches"
+              + (", no state tree" if purge else "") + ")")
+    for line in plan["print_only"]:
+        print(f"  left alone: {line}")
+    for line in plan["keep"]:
+        print(f"  kept: {line}")
+    if purge:
+        print("  NOTE: --purge deletes the audit ledger with the rest "
+              "of the state tree. Export your receipts first if you "
+              "want them:")
+        print("    email-mcp audit --since 1970-01-01 > receipts.jsonl")
+
+    if not assume_yes:
+        word = "purge" if purge else "uninstall"
+        typed = _input(f'  type "{word}" to confirm: ').strip()
+        if typed != word:
+            print("aborted — nothing removed.")
+            return 1
+
+    # Parse identities BEFORE anything is deleted: the delete commands
+    # are derived from a file --purge is about to remove.
+    identities_doc: dict = {}
+    try:
+        with config.identities_file().open("rb") as f:
+            identities_doc = tomllib.load(f)
+    except (OSError, tomllib.TOMLDecodeError):
+        identities_doc = {}
+    keychain_instructions(identities_doc)
+
+    # The ledger's record of this run, BEFORE removal — with --purge the
+    # event itself is destroyed moments later; that is the documented
+    # deal, and why the receipts hint above prints first.
+    audit.emit("lifecycle", outcome="uninstall", detail={
+        "purge": purge,
+        "remove": plan["remove"],
+        "print_only": plan["print_only"],
+    })
+
+    print(f"  {dispatcher.uninstall_launchd()}")
+    print(f"  {fts.uninstall_launchd()}")
+
+    graph_default = Path.home() / ".email-mcp" / "graph"
+    if graph_default.is_dir():
+        for token in sorted(graph_default.glob("*.token.json")):
+            try:
+                token.unlink()
+            except OSError as e:
+                print(f"  could not remove {token}: {e}", file=sys.stderr)
+                continue
+            print(f"  removed {token}")
+
+    if purge:
+        try:
+            root = purge_state()
+        except PurgeRefused as e:
+            print(f"email-mcp uninstall: purge refused: {e}",
+                  file=sys.stderr)
+            return 1
+        if root is None:
+            print(f"  {Path.home() / '.email-mcp'} already absent")
+        else:
+            print(f"  removed {root}")
+        for log_path in _purge_logs():
+            print(f"  removed {log_path}")
+    print("uninstall complete." + ("" if purge else
+          " State kept — `email-mcp uninstall --purge` removes it."))
+    return 0
+
+
+def run_uninstall_cli(argv: list[str] | None = None) -> int:
+    """``email-mcp uninstall [--purge] [--yes]`` → exit 0 on completion,
+    1 when aborted or refused, 2 on usage errors (including no terminal
+    for the typed confirmation without --yes)."""
+    parser = argparse.ArgumentParser(
+        prog="email-mcp uninstall",
+        description="Remove the launchd agents and Graph token caches; "
+                    "state stays unless --purge. ~/Library/Mail is "
+                    "never touched.",
+    )
+    parser.add_argument("--purge", action="store_true",
+                        help="also remove ~/.email-mcp (spool, plans, "
+                             "audit ledger, identities.toml, meta.json) "
+                             "and ~/Library/Logs/email-mcp*.log")
+    parser.add_argument("--yes", action="store_true",
+                        help="skip the typed confirmation")
+    args = parser.parse_args(argv)
+    if not args.yes and not _stdin_is_tty():
+        # This refusal keeps the stub's frozen contract
+        # (tests/test_cli.py::test_lifecycle_stubs_exit_2_with_pointer):
+        # exit 2, silent stdout, "uninstall" + the "L4" stage pointer on
+        # stderr.
+        print("email-mcp uninstall: the typed confirmation (L4 of the "
+              "v0.11 lifecycle work) needs a terminal — rerun in one, "
+              "or pass --yes.", file=sys.stderr)
+        return 2
+    return run_uninstall(purge=args.purge, assume_yes=args.yes)

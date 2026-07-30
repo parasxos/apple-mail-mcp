@@ -20,9 +20,8 @@ design:
 ``audit``/``fts``/``graph`` delegate to their module ``main(argv)`` with
 the remaining argv verbatim; ``dispatcher`` and ``serve`` go through a
 ``sys.argv`` shim because their targets parse ``sys.argv`` themselves.
-``setup`` delegates to the lifecycle module (L3); ``update``/
-``uninstall`` land there with L4 and until then exit 2 with a pointer.
-Printing here is by design
+``setup``/``update``/``uninstall`` delegate to the lifecycle module
+(L3/L4). Printing here is by design
 — this module is a CLI entry point, not library code; contract §7 lists
 the print-by-design entry points and the serve path stays silent.
 """
@@ -183,7 +182,7 @@ def cmd_version(rest: list[str]) -> int:
 
 
 # --------------------------------------------------------------------- #
-# delegates + lifecycle stubs                                            #
+# delegates + lifecycle commands                                         #
 # --------------------------------------------------------------------- #
 
 
@@ -211,12 +210,6 @@ def cmd_dispatcher(rest: list[str]) -> int:
     return _shim_argv(rest, dispatcher.main)
 
 
-def _stub(name: str, stage: str) -> int:
-    print(f"email-mcp {name}: not available yet — landing in {stage} of "
-          "the v0.11 lifecycle work.", file=sys.stderr)
-    return 2
-
-
 def cmd_setup(rest: list[str]) -> int:
     from . import lifecycle
 
@@ -224,11 +217,15 @@ def cmd_setup(rest: list[str]) -> int:
 
 
 def cmd_update(rest: list[str]) -> int:
-    return _stub("update", "L4")
+    from . import lifecycle
+
+    return lifecycle.run_update_cli(rest)
 
 
 def cmd_uninstall(rest: list[str]) -> int:
-    return _stub("uninstall", "L4")
+    from . import lifecycle
+
+    return lifecycle.run_uninstall_cli(rest)
 
 
 # --------------------------------------------------------------------- #
