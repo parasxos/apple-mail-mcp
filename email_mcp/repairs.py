@@ -77,23 +77,37 @@ def _graph_root() -> Path:
     return _env_dir("EMAIL_MCP_GRAPH_DIR", _state_root() / "graph")
 
 
+def _degenerate(path: Path) -> bool:
+    """True when a resolved state path IS the home directory or an
+    ancestor of it (an EMAIL_MCP_*_DIR pointed at ``$HOME`` or ``/``).
+    Repairs never manage such a path: mkdir would scatter spool
+    subdirectories through the home directory and chmod 0700 would
+    retighten the home directory itself — neither is this fixer's to do.
+    """
+    home = Path.home()
+    return path == home or path in home.parents
+
+
 def _state_dirs() -> list[Path]:
     """Every directory the state tree owns, root first (creation order).
 
     The FTS dir is DERIVED state: it is listed only when an index file
     already exists (i.e. the dir is live) — repairs never create it, and
     ``python -m email_mcp.fts --build`` remains the only builder.
+    Degenerate env overrides (``$HOME`` and above) are dropped: see
+    :func:`_degenerate`.
     """
     spool_root = _spool_root()
-    dirs = [
-        _state_root(), spool_root,
-        *(spool_root / s for s in spool.STATES),
-        _plans_root(), config.audit_dir(create=False), _graph_root(),
-    ]
+    dirs = [_state_root(), spool_root]
+    if not _degenerate(spool_root):
+        # A spool override at $HOME must not drag its five state
+        # subdirectories into the home directory either.
+        dirs += [spool_root / s for s in spool.STATES]
+    dirs += [_plans_root(), config.audit_dir(create=False), _graph_root()]
     from . import fts  # lazy, like doctor's checks
     if fts.db_path().exists():
         dirs.append(config.fts_dir(create=False))
-    return list(dict.fromkeys(dirs))
+    return [d for d in dict.fromkeys(dirs) if not _degenerate(d)]
 
 
 # --------------------------------------------------------------------- #
@@ -101,11 +115,32 @@ def _state_dirs() -> list[Path]:
 # --------------------------------------------------------------------- #
 
 
+def _tree_links() -> set[Path]:
+    """Symlinks squatting on managed state-dir paths. The path AT a link
+    and every path BEHIND one is off-limits to every repair: mkdir and
+    chmod both resolve through the redirection and would act on whatever
+    the link points at (an arbitrary victim directory)."""
+    return {d for d in _state_dirs() if d.is_symlink()}
+
+
+def _off_limits(path: Path, links: set[Path]) -> bool:
+    return any(link in path.parents for link in links)
+
+
+def _missing_state_dirs() -> list[Path]:
+    links = _tree_links()
+    return [d for d in _state_dirs()
+            if not d.exists() and not d.is_symlink()
+            and not _off_limits(d, links)]
+
+
 def _detect_state_dir_missing() -> str | None:
     # exists() (not is_dir): a file squatting on a dir path is NOT
     # "missing" — that is audit_path_is_file's fault to heal, and mkdir
-    # over it could only fail.
-    missing = [d for d in _state_dirs() if not d.exists()]
+    # over it could only fail. A dangling symlink is not "missing"
+    # either: mkdir there would fail, and healing it means following a
+    # redirection.
+    missing = _missing_state_dirs()
     if not missing:
         return None
     return "missing state dir(s): " + ", ".join(str(d) for d in missing)
@@ -113,7 +148,7 @@ def _detect_state_dir_missing() -> str | None:
 
 def _apply_state_dir_missing() -> str:
     created: list[str] = []
-    for d in _state_dirs():
+    for d in _missing_state_dirs():
         if d.exists():
             continue
         d.mkdir(parents=True, exist_ok=True)
@@ -129,15 +164,38 @@ def _mode(p: Path) -> int:
 
 
 def _dirs_not_0700() -> list[Path]:
-    return [d for d in _state_dirs() if d.is_dir() and _mode(d) != 0o700]
+    """Real state dirs (not symlinks, not behind one) with a wrong mode
+    — the only ones a chmod may touch. chmod FOLLOWS symlinks, so a link
+    squatting on a state-dir path (or on a parent) would redirect the
+    fix onto an arbitrary victim directory; leaf symlinks are flagged
+    (below), never chmodded through."""
+    links = _tree_links()
+    return [d for d in _state_dirs()
+            if d.is_dir() and not d.is_symlink()
+            and not _off_limits(d, links) and _mode(d) != 0o700]
+
+
+def _symlinked_bad_dirs() -> list[Path]:
+    """Symlinks squatting on state-dir paths whose TARGET mode is wrong —
+    exactly what the pre-fence code would have chmodded through."""
+    return [d for d in _state_dirs()
+            if d.is_symlink() and d.is_dir() and _mode(d) != 0o700]
 
 
 def _detect_state_dir_perms() -> str | None:
     bad = _dirs_not_0700()
-    if not bad:
+    links = _symlinked_bad_dirs()
+    if not bad and not links:
         return None
-    return "state dir(s) not 0700: " + ", ".join(
-        f"{d} ({_mode(d):o})" for d in bad)
+    parts = []
+    if bad:
+        parts.append("state dir(s) not 0700: " + ", ".join(
+            f"{d} ({_mode(d):o})" for d in bad))
+    if links:
+        parts.append(
+            "symlinked state dir(s) with target not 0700 (never chmod "
+            "through a link): " + ", ".join(str(d) for d in links))
+    return "; ".join(parts)
 
 
 def _apply_state_dir_perms() -> str:
@@ -145,35 +203,62 @@ def _apply_state_dir_perms() -> str:
     for d in _dirs_not_0700():
         d.chmod(0o700)
         fixed.append(str(d))
+    links = _symlinked_bad_dirs()
+    if links:
+        done = f" (did chmod 0700: {', '.join(fixed)})" if fixed else ""
+        raise RuntimeError(  # caught by run_fixes → failed[], flagged
+            "refusing to chmod through symlinked state dir(s): "
+            + ", ".join(str(d) for d in links)
+            + " — remove the link or fix the target yourself" + done)
     return "chmod 0700: " + ", ".join(fixed)
 
 
 def _state_files() -> list[Path]:
     """The secret-adjacent files the tree owns: the identities TOML,
-    ledger months, Graph token caches. All must be 0600."""
+    ledger months, Graph token caches. All must be 0600. A symlinked
+    ROOT is never descended into — the files behind it belong to
+    whatever the link points at, and chmodding them would reach through
+    the redirection (the symlinked-dir repair flags the root itself)."""
+    links = _tree_links()
     files: list[Path] = []
     ident = config.identities_file()
-    if ident.is_file():
+    if ident.is_file() and not _off_limits(ident, links):
         files.append(ident)
-    audit_root = config.audit_dir(create=False)
-    if audit_root.is_dir():
-        files += sorted(audit_root.glob("*.jsonl"))
-    graph_root = _graph_root()
-    if graph_root.is_dir():
-        files += sorted(graph_root.glob("*.token.json"))
+    for root, pattern in ((config.audit_dir(create=False), "*.jsonl"),
+                          (_graph_root(), "*.token.json")):
+        if (root.is_dir() and not root.is_symlink()
+                and not _off_limits(root, links)):
+            files += sorted(root.glob(pattern))
     return files
 
 
 def _files_not_0600() -> list[Path]:
-    return [f for f in _state_files() if _mode(f) != 0o600]
+    """Real (non-symlink) files only — chmod follows symlinks, and a
+    link squatting on identities.toml (or planted in the ledger) must
+    never redirect the fix onto a victim file."""
+    return [f for f in _state_files()
+            if not f.is_symlink() and _mode(f) != 0o600]
+
+
+def _symlinked_bad_files() -> list[Path]:
+    return [f for f in _state_files()
+            if f.is_symlink() and _mode(f) != 0o600]
 
 
 def _detect_state_file_perms() -> str | None:
     bad = _files_not_0600()
-    if not bad:
+    links = _symlinked_bad_files()
+    if not bad and not links:
         return None
-    return "state file(s) not 0600: " + ", ".join(
-        f"{f} ({_mode(f):o})" for f in bad)
+    parts = []
+    if bad:
+        parts.append("state file(s) not 0600: " + ", ".join(
+            f"{f} ({_mode(f):o})" for f in bad))
+    if links:
+        parts.append(
+            "symlinked state file(s) with target not 0600 (never chmod "
+            "through a link): " + ", ".join(str(f) for f in links))
+    return "; ".join(parts)
 
 
 def _apply_state_file_perms() -> str:
@@ -181,6 +266,13 @@ def _apply_state_file_perms() -> str:
     for f in _files_not_0600():
         f.chmod(0o600)
         fixed.append(str(f))
+    links = _symlinked_bad_files()
+    if links:
+        done = f" (did chmod 0600: {', '.join(fixed)})" if fixed else ""
+        raise RuntimeError(  # caught by run_fixes → failed[], flagged
+            "refusing to chmod through symlinked state file(s): "
+            + ", ".join(str(f) for f in links)
+            + " — remove the link or fix the target yourself" + done)
     return "chmod 0600: " + ", ".join(fixed)
 
 

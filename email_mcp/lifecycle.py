@@ -98,6 +98,11 @@ MIGRATIONS: tuple[tuple[int, Callable[[dict], dict]], ...] = ()
 # traversal fence, not cosmetics. Table/param keys get the same charset.
 _NAME_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
 _KEY_RE = re.compile(r"^[A-Za-z0-9_-]+$")
+# The compose-time header-injection fence (sender._CTL_RE): CR/LF/NUL in
+# a header-bound value smuggles extra headers. The wizard refuses them at
+# write time so identities.toml can never hold a From: compose will
+# reject anyway.
+_CTL_RE = re.compile(r"[\r\n\x00]")
 
 # Keys whose VALUE would be a secret. identities.toml stores references
 # (a Keychain item name, an op:// path), never the secrets themselves —
@@ -327,6 +332,14 @@ def _validate_tables(tables: dict[str, dict], default: str) -> None:
         _fence_secret_keys(name, table)
         if not str(table.get("from_addr", "")).strip():
             raise SetupError(f"identity [{name}] needs `from_addr`.")
+        for header_key in ("from_addr", "from_name"):
+            value = str(table.get(header_key, ""))
+            if _CTL_RE.search(value):
+                raise SetupError(
+                    f"identity [{name}]: control character (CR/LF/NUL) in "
+                    f"`{header_key}` {value!r} — header values are "
+                    "single-line (the compose fence would refuse every "
+                    "send from this identity).")
         driver = str(table.get("driver", "")).strip()
         if driver not in DRIVERS:
             raise SetupError(
@@ -529,10 +542,39 @@ def _step_permissions(answers: Answers, interactive: bool) -> StepResult:
                       "mail_store, automation, accessibility all green")
 
 
+def _degenerate_overrides(paths: "StatePaths") -> list[str]:
+    """EMAIL_MCP_* path overrides pointing at ``$HOME`` itself or any of
+    its ancestors. config.spool_dir()/plans_dir()/graph_dir() mkdir the
+    target AND ``chmod 0700`` its PARENT, so an override at ``$HOME``
+    means chmodding ``/Users`` (and growing five spool subdirs in the
+    home directory). Setup refuses instead — no state path may manage a
+    directory that contains the user's home."""
+    home = Path.home()
+    ancestors = {home, *home.parents}
+    bad: list[str] = []
+    for var, resolved in (("EMAIL_MCP_SPOOL_DIR", paths.spool),
+                          ("EMAIL_MCP_PLANS_DIR", paths.plans),
+                          ("EMAIL_MCP_GRAPH_DIR", paths.graph),
+                          ("EMAIL_MCP_AUDIT_DIR", paths.audit),
+                          ("EMAIL_MCP_FTS_DIR", paths.fts)):
+        if var in paths.env_overrides and resolved in ancestors:
+            bad.append(f"{var}={paths.env_overrides[var]} -> {resolved}")
+    return bad
+
+
 def _step_state_dirs(facts: dict) -> StepResult:
     from . import spool
 
     paths = StatePaths.resolve()
+    degenerate = _degenerate_overrides(paths)
+    if degenerate:
+        return StepResult(
+            "state_dirs", "blocked",
+            "refusing to build state under your home directory (or above "
+            "it): " + "; ".join(degenerate) + " — creating the tree there "
+            "would chmod 0700 that directory's PARENT and scatter spool "
+            "subdirectories in it. Unset the variable or point it at a "
+            "dedicated directory.")
     # The config getters mkdir + chmod 0700 (and spool creates its five
     # state subdirs — with umask modes, so they are tightened here to the
     # 0700 the repairs registry considers healthy). The FTS dir is
@@ -789,7 +831,15 @@ def _step_launchd(
         if not wanted:
             notes.append(f"{label} not installed")
             continue
-        message = install()
+        try:
+            message = install()
+        except OSError as e:
+            # launchctl (or the plist dir) unavailable: a degraded step,
+            # never a crashed wizard — the run continues past launchd.
+            _log.warning("setup: %s install failed: %s", label, e)
+            failures.append(f"{label}: install failed: {e}")
+            print(f"  {label}: install failed: {e}")
+            continue
         print(f"  {message}")
         if "bootstrap failed" in message:
             failures.append(f"{label}: {message}")
@@ -1113,7 +1163,15 @@ def _refresh_agents() -> tuple[list[str], list[str], list[str]]:
             print(f"  agent {label}: plist current")
             current.append(label)
             continue
-        message = install()  # the module's own re-render+bootout+bootstrap
+        try:
+            message = install()  # the module's own re-render+bootout+bootstrap
+        except OSError as e:
+            # launchctl unavailable: report the agent as failed, never
+            # dump a traceback out of `email-mcp update`.
+            _log.warning("update: %s re-install failed: %s", label, e)
+            print(f"  agent {label}: stale plist — re-install failed: {e}")
+            failed.append(label)
+            continue
         print(f"  agent {label}: stale plist — {message}")
         _log.info("update: %s stale plist — %s", label, message)
         if "bootstrap failed" in message:
@@ -1339,7 +1397,11 @@ def uninstall_plan(purge: bool) -> dict:
         if plist.exists():
             remove.append(f"launchd agent {label} ({plist})")
     graph_default = root / "graph"
-    if graph_default.is_dir():
+    if graph_default.is_symlink():
+        print_only.append(
+            f"{graph_default} (symlink — token caches behind it are "
+            "never followed; delete them yourself)")
+    elif graph_default.is_dir():
         for token in sorted(graph_default.glob("*.token.json")):
             remove.append(str(token))
     if paths.graph != graph_default and paths.graph.is_dir():
@@ -1464,11 +1526,26 @@ def run_uninstall(purge: bool, assume_yes: bool) -> int:
         "print_only": plan["print_only"],
     })
 
-    print(f"  {dispatcher.uninstall_launchd()}")
-    print(f"  {fts.uninstall_launchd()}")
+    for agent_uninstall in (dispatcher.uninstall_launchd,
+                            fts.uninstall_launchd):
+        try:
+            print(f"  {agent_uninstall()}")
+        except OSError as e:
+            # launchctl unavailable must not abort the rest of the
+            # uninstall (tokens, purge) with a traceback.
+            _log.warning("uninstall: launchd removal failed: %s", e)
+            print(f"  launchd agent removal failed ({e}) — remove the "
+                  "plists under ~/Library/LaunchAgents yourself",
+                  file=sys.stderr)
 
     graph_default = Path.home() / ".email-mcp" / "graph"
-    if graph_default.is_dir():
+    if graph_default.is_symlink():
+        # Deleting *.token.json THROUGH a link would reach whatever
+        # directory the link points at — the D7 rule (never follow a
+        # redirection) applies to the token sweep too.
+        print(f"  left alone: {graph_default} is a symlink — token "
+              "caches behind it are never followed; delete them yourself")
+    elif graph_default.is_dir():
         for token in sorted(graph_default.glob("*.token.json")):
             try:
                 token.unlink()
