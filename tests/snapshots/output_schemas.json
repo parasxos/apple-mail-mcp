@@ -21,7 +21,7 @@
     "triage_plan": null,
     "triage_plan_delete": null
   },
-  "read_success_shapes": {
+  "success_shapes": {
     "audit": {
       "events": [
         {
@@ -39,6 +39,23 @@
       "ok": "bool",
       "skipped_lines": "int"
     },
+    "cancel_scheduled": {
+      "id": "str",
+      "ok": "bool",
+      "status": "str",
+      "subject": "str",
+      "was_due": "str"
+    },
+    "doctor": {
+      "audit": {
+        "detail": "str",
+        "last_event": "null",
+        "ok": "bool"
+      },
+      "checks": {},
+      "ok": "bool",
+      "read_only": "bool"
+    },
     "get_attachment": {
       "attachment": {
         "mime": "str",
@@ -50,7 +67,14 @@
     },
     "get_email": {
       "email": {
-        "attachments": [],
+        "attachments": [
+          {
+            "attachment_id": "str",
+            "mime": "str",
+            "name": "str",
+            "size": "int"
+          }
+        ],
         "body_html": "str",
         "body_text": "str",
         "flags": {
@@ -58,16 +82,20 @@
           "read": "bool"
         },
         "headers": {
+          "Cc": "str",
           "Content-Type": "str",
           "Date": "str",
           "From": "str",
+          "MIME-Version": "str",
           "Message-ID": "str",
           "Subject": "str",
           "To": "str"
         },
         "ref": {
           "account": "str",
-          "cc": [],
+          "cc": [
+            "str"
+          ],
           "date": "str",
           "from_addr": "str",
           "has_attachment": "bool",
@@ -87,7 +115,14 @@
     "get_emails_batch": {
       "emails": [
         {
-          "attachments": [],
+          "attachments": [
+            {
+              "attachment_id": "str",
+              "mime": "str",
+              "name": "str",
+              "size": "int"
+            }
+          ],
           "body_html": "str",
           "body_text": "str",
           "flags": {
@@ -95,16 +130,20 @@
             "read": "bool"
           },
           "headers": {
+            "Cc": "str",
             "Content-Type": "str",
             "Date": "str",
             "From": "str",
+            "MIME-Version": "str",
             "Message-ID": "str",
             "Subject": "str",
             "To": "str"
           },
           "ref": {
             "account": "str",
-            "cc": [],
+            "cc": [
+              "str"
+            ],
             "date": "str",
             "from_addr": "str",
             "has_attachment": "bool",
@@ -114,13 +153,19 @@
             "subject": "str",
             "thread_id": "str",
             "to": [
-              "..."
+              "str"
             ],
             "unread": "bool"
           }
         }
       ],
-      "errors": [],
+      "errors": [
+        {
+          "code": "str",
+          "error": "str",
+          "id": "str"
+        }
+      ],
       "ok": "bool",
       "view": "str"
     },
@@ -138,7 +183,9 @@
           "snippet": "str",
           "subject": "str",
           "thread_id": "str",
-          "to": [],
+          "to": [
+            "str"
+          ],
           "unread": "bool"
         }
       ]
@@ -179,14 +226,145 @@
       "ok": "bool"
     },
     "list_scheduled": {
-      "cancelled": [],
+      "cancelled": [
+        {
+          "attachments": [],
+          "attempts": "int",
+          "bcc": [
+            "str"
+          ],
+          "cc": [],
+          "created_at": "str",
+          "delivered_at": "null",
+          "executor": "str",
+          "graph_draft_id": "null",
+          "id": "str",
+          "identity": "str",
+          "last_error": "null",
+          "message_id": "str",
+          "next_attempt_at": "null",
+          "send_at": "str",
+          "status": "str",
+          "subject": "str",
+          "to": [
+            "str"
+          ]
+        }
+      ],
       "dispatcher_installed": "bool",
       "dispatcher_label": "str",
       "failed": [],
       "ok": "bool",
-      "pending": [],
+      "pending": [
+        {
+          "attachments": [],
+          "attempts": "int",
+          "bcc": [
+            "str"
+          ],
+          "cc": [],
+          "created_at": "str",
+          "delivered_at": "null",
+          "executor": "str",
+          "graph_draft_id": "null",
+          "id": "str",
+          "identity": "str",
+          "last_error": "null",
+          "message_id": "str",
+          "next_attempt_at": "null",
+          "send_at": "str",
+          "status": "str",
+          "subject": "str",
+          "to": [
+            "str"
+          ]
+        }
+      ],
       "sending": [],
       "sent": []
+    },
+    "mailbox_create": {
+      "account": "str",
+      "applescript": "null",
+      "existed": "bool",
+      "index_verified": "bool",
+      "mail_verified": "bool",
+      "ok": "bool",
+      "path": "str",
+      "warning": "null"
+    },
+    "mailbox_delete": {
+      "account": "str",
+      "deleted": "bool",
+      "existed": "bool",
+      "mail_verified": "bool",
+      "method": "str",
+      "ok": "bool",
+      "path": "str",
+      "warning": "null"
+    },
+    "refresh_mail": {
+      "after": {
+        "newest_date": "str",
+        "newest_from": "str",
+        "newest_subject": "str",
+        "total": "int"
+      },
+      "applescript_duration_ms": "int",
+      "before": {
+        "newest_date": "str",
+        "newest_from": "str",
+        "newest_subject": "str",
+        "total": "int"
+      },
+      "code": "null",
+      "error": "null",
+      "error_code": "null",
+      "new_messages": "int",
+      "ok": "bool",
+      "waited_seconds": "float"
+    },
+    "reply_email": {
+      "attachments": [],
+      "bcc": [
+        "str"
+      ],
+      "bootstrapped": "bool",
+      "cc": [
+        "str"
+      ],
+      "error": "null",
+      "message_id": "str",
+      "ok": "bool",
+      "subject": "str",
+      "to": [
+        "str"
+      ]
+    },
+    "schedule_email": {
+      "attachments": [],
+      "attempts": "int",
+      "bcc": [
+        "str"
+      ],
+      "cc": [],
+      "created_at": "str",
+      "delivered_at": "null",
+      "executor": "str",
+      "graph_draft_id": "null",
+      "id": "str",
+      "identity": "str",
+      "last_error": "null",
+      "message_id": "str",
+      "next_attempt_at": "null",
+      "ok": "bool",
+      "send_at": "str",
+      "status": "str",
+      "subject": "str",
+      "to": [
+        "str"
+      ],
+      "warning": "str"
     },
     "search_emails": {
       "fts": {
@@ -218,6 +396,97 @@
           "unread": "bool"
         }
       ]
+    },
+    "send_email": {
+      "attachments": [],
+      "bcc": [
+        "str"
+      ],
+      "bootstrapped": "bool",
+      "cc": [],
+      "error": "null",
+      "message_id": "str",
+      "ok": "bool",
+      "subject": "str",
+      "to": [
+        "str"
+      ]
+    },
+    "triage_apply": {
+      "acted": "int",
+      "duration_ms": "int",
+      "failures": [],
+      "note": "null",
+      "ok": "bool",
+      "osascript_ms": "int",
+      "pending": [
+        {
+          "expected": {
+            "read": "int"
+          },
+          "id": "str",
+          "observed": {
+            "deleted": "int",
+            "flag_color": "int",
+            "flagged": "int",
+            "mailbox_rowid": "int",
+            "read": "int"
+          }
+        }
+      ],
+      "plan_id": "str",
+      "planned": "int",
+      "status": "str",
+      "verified": "int",
+      "verify_polls": "int"
+    },
+    "triage_plan": {
+      "actions": [
+        {
+          "action": "str",
+          "color": "null",
+          "mailbox": "null"
+        }
+      ],
+      "count": "int",
+      "expires_at": "str",
+      "messages": [
+        {
+          "date": "str",
+          "from_addr": "str",
+          "id": "str",
+          "mailbox": "str",
+          "subject": "str",
+          "unread": "bool"
+        }
+      ],
+      "ok": "bool",
+      "plan_id": "str",
+      "summary": "str"
+    },
+    "triage_plan_delete": {
+      "actions": [
+        {
+          "action": "str",
+          "color": "null",
+          "mailbox": "null"
+        }
+      ],
+      "count": "int",
+      "expires_at": "str",
+      "messages": [
+        {
+          "date": "str",
+          "from_addr": "str",
+          "id": "str",
+          "mailbox": "str",
+          "subject": "str",
+          "unread": "bool"
+        }
+      ],
+      "ok": "bool",
+      "plan_id": "str",
+      "summary": "str"
     }
   }
 }

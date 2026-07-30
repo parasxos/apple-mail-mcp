@@ -33,34 +33,37 @@ Conformance is staged deliberately:
   assignments of §3.4, made on paper here, get wired), and outputSchema is
   frozen by snapshot. inputSchema is already frozen at v0.10 (§8).
 
-| # | Tool | Side | Success shape today | Failure shape today | v0.10 change | Fully conformant at |
+| # | Tool | Side | Success shape (v0.11) | Failure shape (v0.11) | v0.10 change | Fully conformant at |
 |---|------|------|--------------------|--------------------|--------------|---------------------|
 | 1 | `search_emails` | R | `{ok: true, fts, results}` | crashed on bad `before`/`after` (ValueError leak) | belt: coded failures (`invalid_input`, `mail_unavailable`, `internal_error`) | **v0.10** |
-| 2 | `get_email` | R | **bare** shaped dict (v0.7-compat choice) | crashed on unknown id / unreadable store; `{ok: false, error}` (no code) on bad view | belt: coded failures on the crash paths (`not_found`, `mail_unavailable`, …) | v0.11 (success envelope + coded bad-view) |
-| 3 | `get_emails_batch` | R | `{ok: true, view, emails, errors}` — per-id failures are data in `errors[]` | `{ok: false, error}` (no code) on bad view / >50 ids | belt on crash paths | v0.11 (codes on the two rejects; `errors[].code`) |
-| 4 | `get_thread` | R | **bare array** of refs | crashes leak | none — **deferred**: its declared outputSchema is an array, so a coded dict cannot be returned without breaking the declared schema | v0.11 (gains envelope) |
-| 5 | `list_mailboxes` | R | **bare array** | crashes leak | none — **deferred** (same reason as get_thread) | v0.11 |
-| 6 | `list_recent` | R | **bare array** | crashes leak | none — **deferred** (same reason as get_thread) | v0.11 |
-| 7 | `get_attachment` | R | **bare** dict (path, meta) | crashed on unknown id / vanished file | belt: coded failures | v0.11 (success envelope) |
-| 8 | `refresh_mail` | R | `{ok, before, after, new_messages, …}` (hardened since v0.4) | `{ok: false, error, error_code?}` — numeric osascript code, no string code | none needed (already total) | v0.11 (string `code` via §3.3 map) |
-| 9 | `list_scheduled` | R | `{ok: true, dispatcher_installed, …states}` | `{ok: false, error}` (no code) on unknown state | belt on crash paths | v0.11 (code on the reject) |
+| 2 | `get_email` | R | `{ok: true, email}` — envelope since v0.11 (was bare dict) | `{ok: false, code, error}` — `not_found`, `mail_unavailable`, `invalid_input` (bad view), … | belt: coded failures on the crash paths (`not_found`, `mail_unavailable`, …) | **v0.11** — shipped |
+| 3 | `get_emails_batch` | R | `{ok: true, view, emails, errors}` — per-id failures are data in `errors[]`, each `{id, code, error}` | `{ok: false, code, error}` on bad view / >50 ids | belt on crash paths | **v0.11** — shipped |
+| 4 | `get_thread` | R | `{ok: true, thread: [...]}` — envelope since v0.11 (was bare array) | belted: `{ok: false, code, error}` | none — deferred: the declared array outputSchema blocked a coded dict | **v0.11** — shipped |
+| 5 | `list_mailboxes` | R | `{ok: true, mailboxes: [...]}` — envelope since v0.11 | belted: `{ok: false, code, error}` | none — deferred (same reason as get_thread) | **v0.11** — shipped |
+| 6 | `list_recent` | R | `{ok: true, messages: [...]}` — envelope since v0.11 | belted: `{ok: false, code, error}` | none — deferred (same reason as get_thread) | **v0.11** — shipped |
+| 7 | `get_attachment` | R | `{ok: true, attachment}` — envelope since v0.11 (was bare dict) | `{ok: false, code, error}` | belt: coded failures | **v0.11** — shipped |
+| 8 | `refresh_mail` | R | `{ok, before, after, new_messages, …}` (hardened since v0.4) | `{ok: false, error, error_code?, code?}` — the raw osascript number now carries its mapped string `code` (§3.3) | none needed (already total) | **v0.11** — shipped |
+| 9 | `list_scheduled` | R | `{ok: true, dispatcher_installed, …states}` | `{ok: false, code: invalid_input, error}` on unknown state | belt on crash paths | **v0.11** — shipped |
 | 10 | `doctor` | R | `{ok, read_only, checks}` — **`ok` reports environment health**, not tool failure (documented exception to §2) | already total | gains the `audit` check | **v0.10** |
 | 11 | `audit` | R | `{ok: true, events, files_scanned, skipped_lines}` | `{ok: false, code, error, fix?}` | **new tool** — born conformant | **v0.10** |
-| 12 | `send_email` | W | `{ok: true, message_id, to, cc, bcc, subject, attachments, bootstrapped}` | `{ok: false, error}` — SendError prose, no code | audit `send` event on every terminal outcome | v0.11 (codes per §3.4) |
-| 13 | `reply_email` | W | same as send_email | same | audit `reply` event | v0.11 (codes per §3.4) |
-| 14 | `schedule_email` | W | `{ok: true, id, send_at, message_id, executor, …, warning?}` | `{ok: false, error}` — prose | audit `schedule` event | v0.11 (codes per §3.4) |
-| 15 | `cancel_scheduled` | W | `{ok: true, id, status, subject, was_due}` | `{ok: false, error}` — **7 prose-only failure sites**, no codes | audit `cancel` event | v0.11 (sites gain codes from §3; unknown id → `not_found`, the rest pinned in the v0.11 plan) |
+| 12 | `send_email` | W | `{ok: true, message_id, to, cc, bcc, subject, attachments, bootstrapped}` | `{ok: false, code, error}` — every SendError site coded per §3.4 | audit `send` event on every terminal outcome | **v0.11** — shipped |
+| 13 | `reply_email` | W | same as send_email | same | audit `reply` event | **v0.11** — shipped |
+| 14 | `schedule_email` | W | `{ok: true, id, send_at, message_id, executor, …, warning?}` | `{ok: false, code, error}` — §3.4 codes | audit `schedule` event | **v0.11** — shipped |
+| 15 | `cancel_scheduled` | W | `{ok: true, id, status, subject, was_due}` | `{ok: false, code, error, operation_id?}` — all 7 sites coded: unknown id → `not_found`, state conflicts → `invalid_input`, identity/Exchange trouble via §3.4 | audit `cancel` event | **v0.11** — shipped |
 | 16 | `triage_plan` | W | `{ok: true, plan_id, count, expires_at, summary, actions, messages}` | `{ok: false, code, error}` — TriageError codes | belt closes the `before`/`after` ValueError leak | **v0.10** |
 | 17 | `triage_plan_delete` | W | same as triage_plan | same | same belt | **v0.10** |
 | 18 | `triage_apply` | W | `{ok: true, status, planned, acted, failures[], verified, pending[], …}` — per-message failures are data | `{ok: false, code, error}` | belt (carries `operation_id: plan_id`); audit `plan_finish` via plans.finish | **v0.10** |
 | 19 | `mailbox_create` | W | `{ok: true, existed, applescript, index_verified, mail_verified, warning}` | `{ok: false, code, error}` | audit `mailbox_create` event (created only) | **v0.10** |
 | 20 | `mailbox_delete` | W | `{ok: true, existed, deleted, mail_verified, method?, warning}` | `{ok: false, code, error}` (incl. the literal-only codes, §3.1) | audit `mailbox_delete` event (issued only) | **v0.10** |
 
-The three bare-**list** tools (4–6) are the only ones whose v0.10 status is
-"conformance deferred, stated here": their registered outputSchema declares
-an array, so even a failure envelope would violate the schema the client
-already holds. They gain envelopes exactly once, at v0.11, together with the
-outputSchema snapshot freeze.
+Shipped status (2026-07-30, branch v0.11): every "v0.11 — shipped" row
+above is live. The three bare-**list** tools (4–6) — whose v0.10 deferral
+existed because their registered outputSchema declared an array, so even a
+failure envelope would have violated the schema the client already held —
+and the two bare-dict tools (2, 7) took their one allowed break into
+envelopes; batch `errors[]` entries carry `code`; every send/cancel failure
+site carries its §3 code. The output surface is frozen by snapshot from
+this point (§8).
 
 ## 2. Envelope semantics
 
@@ -401,8 +404,22 @@ gains an `audit` check (dir exists, perms, writability).
   v0.11). Tool *descriptions* are excluded from the freeze — docstrings may
   evolve.
 - **outputSchema: frozen at v0.11**, after the bare shapes (§1, tools
-  2, 4–7) take their one allowed break into envelopes. That break is the
-  known normalization debt named in the roadmap and happens exactly once.
+  2, 4–7) took their one allowed break into envelopes. That break was the
+  known normalization debt named in the roadmap and happened exactly once.
+  *Mechanism note (v0.11):* FastMCP (1.27) declares no outputSchema for
+  `-> dict` tools, so the freeze is structural —
+  `tests/snapshots/output_schemas.json` pins (a) the declared-schema map
+  (all `null` today; a future typed return trips it deliberately) and
+  (b) the success-envelope shape of ALL 20 tools, mutating tools
+  included, probed against the mail fixture with only the
+  transport/osascript/launchd boundaries faked. List shapes are
+  element-unions: a key or type change in any element breaks the
+  snapshot. `doctor` is pinned at envelope level only
+  (ok/read_only/checks + the ledger check) — its per-check diagnostics
+  vary with machine state by design (§2's documented exception). A
+  missing snapshot file fails the suite loudly (never a silent
+  re-freeze); regeneration is a deliberate act, stated explicitly in the
+  change that carries it.
 - **Audit schema**: `v` is bumped only for breaking changes to the event
   envelope; adding optional fields does not bump it. Readers must ignore
   unknown fields and tolerate mixed `v` within one file month.
