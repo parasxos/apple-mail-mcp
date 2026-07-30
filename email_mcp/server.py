@@ -14,6 +14,7 @@ import functools
 import inspect
 import json
 import re
+import sqlite3
 import subprocess
 import sys
 import time
@@ -109,11 +110,29 @@ def _belt(op_from: str | None = None):
         def wrapper(*args, **kwargs):
             try:
                 return fn(*args, **kwargs)
+            except UnicodeDecodeError as e:
+                # ValueError subclass, but NOT the caller's fault: MCP
+                # arguments arrive as valid str — undecodable bytes come
+                # from the store or a bug (audit finding F6).
+                return _fail(codes.INTERNAL_ERROR,
+                             f"{type(e).__name__}: {e}", args, kwargs)
             except ValueError as e:
                 return _fail(codes.INVALID_INPUT, str(e), args, kwargs)
+            except (KeyError, IndexError) as e:
+                # LookupError subclasses, but sources signal unknown ids
+                # with bare LookupError/ValueError (apple_mail.get /
+                # .attachment) — a KeyError/IndexError reaching the belt
+                # is an internal container miss, not a caller reference
+                # that wasn't found (audit finding F6).
+                return _fail(codes.INTERNAL_ERROR,
+                             f"{type(e).__name__}: {e}", args, kwargs)
             except LookupError as e:
                 return _fail(codes.NOT_FOUND, str(e), args, kwargs)
-            except FileNotFoundError as e:
+            except (FileNotFoundError, PermissionError,
+                    sqlite3.OperationalError) as e:
+                # The store (or its SQLite index) is not readable —
+                # missing Mail setup, missing Full Disk Access, locked or
+                # corrupt index (contract §3.5, audit finding F6).
                 return _fail(codes.MAIL_UNAVAILABLE, str(e), args, kwargs)
             except Exception as e:
                 return _fail(codes.INTERNAL_ERROR,
@@ -205,7 +224,7 @@ def _shape_email(msg: Any, view: str) -> dict:
 
 
 def _bad_view(view: str) -> dict:
-    return {"ok": False,
+    return {"ok": False, "code": codes.INVALID_INPUT,
             "error": f"unknown view {view!r} (want one of {_VIEWS})"}
 
 
@@ -213,7 +232,7 @@ def _bad_view(view: str) -> dict:
 def tool_get_email(id: str, view: str = "full") -> dict:
     if view not in _VIEWS:
         return _bad_view(view)
-    return _shape_email(_source().get(id), view)
+    return {"ok": True, "email": _shape_email(_source().get(id), view)}
 
 
 @_belt()
@@ -221,39 +240,53 @@ def tool_get_emails_batch(ids: list[str], view: str = "full") -> dict:
     if view not in _VIEWS:
         return _bad_view(view)
     if len(ids) > _BATCH_MAX_IDS:
-        return {"ok": False,
+        return {"ok": False, "code": codes.INVALID_INPUT,
                 "error": f"{len(ids)} ids exceeds the batch cap of "
                          f"{_BATCH_MAX_IDS} — split the request"}
     src = _source()
     emails: list[dict] = []
     errors: list[dict] = []
     for id in ids:
+        # Per-id failures are data inside the ok envelope (§2); each entry
+        # carries the same code the single-read belt would have used.
         try:
             emails.append(_shape_email(src.get(str(id)), view))
-        except (ValueError, LookupError) as e:
-            errors.append({"id": str(id), "error": str(e)})
+        except ValueError as e:
+            errors.append({"id": str(id), "code": codes.INVALID_INPUT,
+                           "error": str(e)})
+        except LookupError as e:
+            errors.append({"id": str(id), "code": codes.NOT_FOUND,
+                           "error": str(e)})
     return {"ok": True, "view": view, "emails": emails, "errors": errors}
 
 
-def tool_get_thread(thread_id: str) -> list[dict]:
-    return [_to_jsonable(r) for r in _source().thread(thread_id)]
+@_belt()
+def tool_get_thread(thread_id: str) -> dict:
+    return {"ok": True,
+            "thread": [_to_jsonable(r) for r in _source().thread(thread_id)]}
 
 
-def tool_list_mailboxes() -> list[dict]:
-    return [_to_jsonable(m) for m in _source().mailboxes()]
+@_belt()
+def tool_list_mailboxes() -> dict:
+    return {"ok": True,
+            "mailboxes": [_to_jsonable(m) for m in _source().mailboxes()]}
 
 
+@_belt()
 def tool_list_recent(
     mailbox: str | None = None,
     account: str | None = None,
     limit: int = 50,
-) -> list[dict]:
-    return [_to_jsonable(r) for r in _source().recent(mailbox, account, limit)]
+) -> dict:
+    return {"ok": True,
+            "messages": [_to_jsonable(r)
+                         for r in _source().recent(mailbox, account, limit)]}
 
 
 @_belt()
 def tool_get_attachment(id: str, attachment_id: str) -> dict:
-    return _to_jsonable(_source().attachment(id, attachment_id))
+    return {"ok": True,
+            "attachment": _to_jsonable(_source().attachment(id, attachment_id))}
 
 
 # ---------------------------------------------------------------------- #
@@ -291,12 +324,14 @@ def _run_mail_check_for_new(timeout_seconds: float) -> dict:
             "ok": False,
             "duration_ms": int((time.monotonic() - started) * 1000),
             "error": "osascript not found — this tool only works on macOS.",
+            "code": codes.OSASCRIPT_UNAVAILABLE,
         }
     except subprocess.TimeoutExpired:
         return {
             "ok": False,
             "duration_ms": int((time.monotonic() - started) * 1000),
             "error": f"osascript timed out after {timeout_seconds:g}s.",
+            "code": codes.MAIL_UNRESPONSIVE,
         }
 
     duration_ms = int((time.monotonic() - started) * 1000)
@@ -325,6 +360,11 @@ def _run_mail_check_for_new(timeout_seconds: float) -> dict:
     out: dict = {"ok": False, "duration_ms": duration_ms, "error": msg}
     if code is not None:
         out["error_code"] = code
+        # Contract §3.3: the raw osascript number additionally carries its
+        # mapped namespace string (v0.11); unmapped numbers carry none.
+        mapped = codes.OSA_CODE_MAP.get(code)
+        if mapped:
+            out["code"] = mapped
     return out
 
 
@@ -366,12 +406,90 @@ def tool_refresh_mail(wait_seconds: float = 5.0, timeout_seconds: float = 30.0) 
         "new_messages": new_messages,
         "error": result.get("error"),
         "error_code": result.get("error_code"),
+        "code": result.get("code"),
     }
 
 
 # ---------------------------------------------------------------------- #
 # send_email / reply_email — the only write path                        #
 # ---------------------------------------------------------------------- #
+
+
+# Contract §3.4 (SEND_CODES_V011): the frozen prose → code table, wired.
+# The raise sites' prose IS the table's left column verbatim, so matching
+# is exact, not fuzzy. Two tiers because transports prefix their messages
+# with the lane ("[<identity>/<driver>] …"): compose/validation prose is
+# matched at the START of the message, transport prose anywhere after the
+# lane prefix. Order matters within the second tier — the "transport
+# unavailable:" preflight wrapper must win over the secret-source prose it
+# may embed (a failed preflight is transport_unavailable per §3.4 even
+# when the underlying reason is an unreadable credential).
+_SEND_PREFIX_CODES: tuple[tuple[str, str], ...] = (
+    ("header_injection:", codes.HEADER_INJECTION),
+    ("invalid_recipient:", codes.INVALID_RECIPIENT),
+    ("Refusing to send as identity", codes.RECIPIENT_NOT_ALLOWED),
+    ("attachment not found:", codes.ATTACHMENT_NOT_FOUND),
+    ("attachment is a directory:", codes.ATTACHMENT_UNREADABLE),
+    ("cannot read attachment", codes.ATTACHMENT_UNREADABLE),
+    ("attachments total", codes.ATTACHMENTS_TOO_LARGE),
+    ("invalid header content:", codes.INVALID_HEADER),
+    ("`to` is required", codes.INVALID_INPUT),
+    ("`subject` is required", codes.INVALID_INPUT),
+    ("`body` is empty", codes.INVALID_INPUT),
+    ("invalid send_at", codes.INVALID_SEND_AT),
+    ("send_at is in the past", codes.SEND_AT_IN_PAST),
+    # smtp's (still) unprefixed secret-source errors — the §3.4 known gap.
+    ("`security` CLI not found", codes.CREDENTIALS_UNAVAILABLE),
+    ("Keychain read for", codes.CREDENTIALS_UNAVAILABLE),
+    ("Keychain item", codes.CREDENTIALS_UNAVAILABLE),
+    ("`op` CLI not found", codes.CREDENTIALS_UNAVAILABLE),
+    ("1Password read for", codes.CREDENTIALS_UNAVAILABLE),
+)
+_SEND_LANE_CODES: tuple[tuple[str, str], ...] = (
+    ("transport unavailable:", codes.TRANSPORT_UNAVAILABLE),
+    ("ssh not found on PATH", codes.TRANSPORT_UNAVAILABLE),
+    ("command not found:", codes.TRANSPORT_UNAVAILABLE),
+    ("delivery pipe timed out", codes.DELIVERY_FAILED),
+    ("delivery failed (exit", codes.DELIVERY_FAILED),
+    ("hung for 60s", codes.DELIVERY_FAILED),
+    ("SMTP delivery via", codes.DELIVERY_FAILED),
+    ("SMTP auth failed", codes.AUTH_FAILED),
+    ("unknown transport driver", codes.IDENTITY_MISCONFIGURED),
+    ("bad transport params", codes.IDENTITY_MISCONFIGURED),
+    ("needs a secret source", codes.IDENTITY_MISCONFIGURED),
+    ("`command` is empty.", codes.IDENTITY_MISCONFIGURED),
+)
+
+
+def _send_code(e: SendError) -> str:
+    """Map a SendError to its §3.4 code. Exception TYPE decides first
+    (IdentityError / GraphError are classes), then the frozen prose table.
+    An unmatched message (future prose drift) degrades to the closest
+    honest bucket: a lane-prefixed error came from a transport mid-flight
+    (delivery_failed); anything else is caller-fixable by construction
+    (§7) and reads as invalid_input."""
+    from .identities import IdentityError
+
+    if isinstance(e, IdentityError):
+        return (codes.UNKNOWN_IDENTITY
+                if str(e).startswith("unknown identity")
+                else codes.IDENTITY_MISCONFIGURED)
+    # GraphError subclasses SendError but lives in a lazily-imported
+    # module (launchd-only setups never load it) — if one was raised, the
+    # module is in sys.modules by definition. The Exchange lane could not
+    # complete the call: retry later, same remedy as a failed preflight.
+    graph_mod = sys.modules.get("email_mcp.graph")
+    if graph_mod is not None and isinstance(e, graph_mod.GraphError):
+        return codes.TRANSPORT_UNAVAILABLE
+    msg = str(e)
+    for prefix, code in _SEND_PREFIX_CODES:
+        if msg.startswith(prefix):
+            return code
+    for needle, code in _SEND_LANE_CODES:
+        if needle in msg:
+            return code
+    return (codes.DELIVERY_FAILED if msg.startswith("[")
+            else codes.INVALID_INPUT)
 
 
 @_belt()
@@ -385,18 +503,21 @@ def tool_send_email(
     from_identity: str | None = None,
 ) -> dict:
     """Compose + send. Returns {ok, message_id, to, cc, bcc, ...} or a
-    structured {ok: false, error} for caller-fixable failures. Every
-    terminal outcome records ONE `send` ledger event (transmission
-    family: failures are ledger-worthy too — an attempt to transmit)."""
+    structured {ok: false, code, error} for caller-fixable failures (the
+    code per contract §3.4). Every terminal outcome records ONE `send`
+    ledger event (transmission family: failures are ledger-worthy too —
+    an attempt to transmit)."""
     try:
         res = send_email(
             to=to, subject=subject, body=body, cc=cc, bcc=bcc,
             attachments=attachments, from_identity=from_identity,
         )
     except SendError as e:
+        code = _send_code(e)
         audit.emit("send", outcome="failed", tool="send_email",
-                   subject=subject, detail={"error": str(e)[:300]})
-        return {"ok": False, "error": str(e)}
+                   subject=subject,
+                   detail={"error": str(e)[:300], "code": code})
+        return {"ok": False, "code": code, "error": str(e)}
     audit.emit("send", outcome="sent", tool="send_email",
                message_id=res.message_id, identity=from_identity,
                to=res.to, cc=res.cc or None, bcc=res.bcc or None,
@@ -426,10 +547,11 @@ def tool_reply_email(
     except SendError as e:
         # The reply context (which message, whether reply-all) is lost
         # below the sender return — record it here, at the tool layer.
+        code = _send_code(e)
         audit.emit("reply", outcome="failed", tool="reply_email",
                    detail={"orig_id": id, "reply_all": reply_all,
-                           "error": str(e)[:300]})
-        return {"ok": False, "error": str(e)}
+                           "error": str(e)[:300], "code": code})
+        return {"ok": False, "code": code, "error": str(e)}
     audit.emit("reply", outcome="sent", tool="reply_email",
                message_id=res.message_id, identity=from_identity,
                to=res.to, cc=res.cc or None, bcc=res.bcc or None,
@@ -456,9 +578,11 @@ def tool_schedule_email(
             from_identity=from_identity,
         )
     except SendError as e:
+        code = _send_code(e)
         audit.emit("schedule", outcome="failed", tool="schedule_email",
-                   subject=subject, detail={"error": str(e)[:300]})
-        return {"ok": False, "error": str(e)}
+                   subject=subject,
+                   detail={"error": str(e)[:300], "code": code})
+        return {"ok": False, "code": code, "error": str(e)}
     # graph_fallback: the identity asked for Exchange-side deferred send
     # but the entry landed on launchd — the silent-fallback decision is
     # only recoverable here, at the tool layer.
@@ -479,7 +603,16 @@ def tool_schedule_email(
                 "draft_id": entry.graph_draft_id,
                 "graph_fallback": graph_fallback},
     )
-    return {"ok": True, **_to_jsonable(entry)}
+    out = {"ok": True, **_to_jsonable(entry)}
+    # Inside the belt (leak closure): the plist probe must not be the one
+    # unbelted line on the schedule path.
+    from .dispatcher import _plist_path
+    if not _plist_path().exists():
+        out["warning"] = (
+            "dispatcher launchd agent NOT installed — nothing will "
+            "send. Run: python -m email_mcp.dispatcher --install-launchd"
+        )
+    return out
 
 
 @_belt()
@@ -489,7 +622,7 @@ def tool_list_scheduled(state: str | None = None, limit: int = 50) -> dict:
 
     states = [state] if state else list(spool.STATES)
     if state and state not in spool.STATES:
-        return {"ok": False,
+        return {"ok": False, "code": codes.INVALID_INPUT,
                 "error": f"unknown state {state!r} (want one of {spool.STATES})"}
     out = {s: [_to_jsonable(e) for e in spool.entries(s)][-limit:] for s in states}
     return {
@@ -627,6 +760,12 @@ def tool_mailbox_delete(account: str, path: str) -> dict:
 
 @_belt()
 def tool_cancel_scheduled(id: str) -> dict:
+    """Failure envelopes carry a §3 code (v0.11): unknown id → not_found;
+    state conflicts (not pending / claimed mid-call / already sent) →
+    invalid_input with the state in the prose; identity and Exchange
+    problems map through _send_code. Every failure after the entry was
+    found also carries operation_id = the spool id (§2: the durable
+    artifact already existed), threading it to the ledger's `op`."""
     from . import spool
 
     def _done(out: dict, outcome: str, *, reason: str | None = None,
@@ -643,12 +782,13 @@ def tool_cancel_scheduled(id: str) -> dict:
     found = spool.find(id)
     if found is None:
         return _done(
-            {"ok": False, "error": f"no scheduled message with id {id!r}"},
+            {"ok": False, "code": codes.NOT_FOUND,
+             "error": f"no scheduled message with id {id!r}"},
             "failed", reason="not_found")
     state, entry = found
     if state != "pending":
         return _done(
-            {"ok": False,
+            {"ok": False, "code": codes.INVALID_INPUT, "operation_id": id,
              "error": f"cannot cancel {id}: status is {state!r} "
                       "(only pending messages can be cancelled)"},
             "failed", reason="not_pending", subject=entry.subject,
@@ -664,7 +804,8 @@ def tool_cancel_scheduled(id: str) -> dict:
             ident = identities.get(entry.identity)
         except SendError as e:
             return _done(
-                {"ok": False, "error": f"cannot cancel {id}: {e}"},
+                {"ok": False, "code": _send_code(e), "operation_id": id,
+                 "error": f"cannot cancel {id}: {e}"},
                 "failed", reason="identity_unavailable",
                 subject=entry.subject)
         try:
@@ -678,7 +819,7 @@ def tool_cancel_scheduled(id: str) -> dict:
                        if draft_id else "gone")
         except SendError as e:
             return _done(
-                {"ok": False,
+                {"ok": False, "code": _send_code(e), "operation_id": id,
                  "error": f"cannot cancel {id}: Exchange still holds the "
                           f"deferred draft and the revoke failed ({e}). "
                           "Retry, or discard the draft in Outlook/OWA "
@@ -691,7 +832,8 @@ def tool_cancel_scheduled(id: str) -> dict:
                 sent = graph.sent_by_message_id(ident, entry.message_id)
             except SendError as e:
                 return _done(
-                    {"ok": False,
+                    {"ok": False, "code": _send_code(e),
+                     "operation_id": id,
                      "error": f"cannot cancel {id}: the deferred draft is "
                               f"gone but Sent Items could not be checked "
                               f"({e}) — outcome ambiguous, retry."},
@@ -703,7 +845,8 @@ def tool_cancel_scheduled(id: str) -> dict:
                 # must not race this terminal move.
                 if not spool.claim(id, "pending", "sent"):
                     return _done(
-                        {"ok": False,
+                        {"ok": False, "code": codes.INVALID_INPUT,
+                         "operation_id": id,
                          "error": f"cannot cancel {id}: a dispatcher "
                                   "just moved it — re-check "
                                   "list_scheduled"},
@@ -717,7 +860,8 @@ def tool_cancel_scheduled(id: str) -> dict:
                 # Terminal state change, ok:false on the wire — still a
                 # ledger-worthy outcome of its own.
                 return _done(
-                    {"ok": False, "id": id, "status": "sent",
+                    {"ok": False, "code": codes.INVALID_INPUT,
+                     "operation_id": id, "id": id, "status": "sent",
                      "error": f"cannot cancel {id}: Exchange already sent "
                               "it (found in Sent Items) — the entry has "
                               "been moved to sent/."},
@@ -728,7 +872,7 @@ def tool_cancel_scheduled(id: str) -> dict:
 
     if not spool.claim(id, "pending", "cancelled"):
         return _done(
-            {"ok": False,
+            {"ok": False, "code": codes.INVALID_INPUT, "operation_id": id,
              "error": f"cannot cancel {id}: a dispatcher just claimed it"},
             "failed", reason="claim_lost", subject=entry.subject)
     entry.status = "cancelled"
@@ -837,7 +981,8 @@ def _build_mcp_server():
         the question: "full" (headers + text/HTML bodies + attachment list —
         the default), "metadata" (everything except the bodies), "minimal"
         (id/subject/from/date/mailbox/unread skeleton). Bodies are always
-        read live from the mail store, never from the search index."""
+        read live from the mail store, never from the search index.
+        Returns {ok, email} — the shaped message rides under `email`."""
         return tool_get_email(id, view=view)
 
     @mcp.tool()
@@ -851,13 +996,15 @@ def _build_mcp_server():
         return tool_get_emails_batch(ids, view=view)
 
     @mcp.tool()
-    def get_thread(thread_id: str) -> list[dict]:
-        """Get every message in a conversation, oldest first."""
+    def get_thread(thread_id: str) -> dict:
+        """Get every message in a conversation, oldest first.
+        Returns {ok, thread} — the refs ride under `thread`."""
         return tool_get_thread(thread_id)
 
     @mcp.tool()
-    def list_mailboxes() -> list[dict]:
-        """List all known mailboxes across all accounts, with message counts."""
+    def list_mailboxes() -> dict:
+        """List all known mailboxes across all accounts, with message counts.
+        Returns {ok, mailboxes}."""
         return tool_list_mailboxes()
 
     @mcp.tool()
@@ -865,14 +1012,16 @@ def _build_mcp_server():
         mailbox: str | None = None,
         account: str | None = None,
         limit: int = 50,
-    ) -> list[dict]:
-        """List the newest messages, optionally scoped to a mailbox/account."""
+    ) -> dict:
+        """List the newest messages, optionally scoped to a mailbox/account.
+        Returns {ok, messages}."""
         return tool_list_recent(mailbox=mailbox, account=account, limit=limit)
 
     @mcp.tool()
     def get_attachment(id: str, attachment_id: str) -> dict:
         """Materialise an attachment to a tmp file and return its path. The
-        caller (Claude) can then `Read` the file. Bytes are never inlined."""
+        caller (Claude) can then `Read` the file. Bytes are never inlined.
+        Returns {ok, attachment} — path and metadata under `attachment`."""
         return tool_get_attachment(id, attachment_id)
 
     @mcp.tool()
@@ -915,11 +1064,12 @@ def _build_mcp_server():
         Accessibility (only needed for mailbox_delete's UI fallback), the
         identities file, every transport's health (never bootstraps), the
         scheduled-send dispatcher, spool/plan hygiene, the FTS body index,
-        and the audit ledger (reported as the top-level `audit` section).
-        Returns {ok, read_only, checks, audit} where each check is
-        {ok, detail} plus a concrete `fix` (a command or a Settings pane)
-        when something is off. Read-only and side-effect free — call it
-        first when any other tool misbehaves."""
+        and the audit ledger (the `audit` member of `checks` since v0.11;
+        a deprecated top-level `audit` mirror remains for v0.10 readers).
+        Returns {ok, read_only, checks} where each check is {ok, detail}
+        plus a concrete `fix` (a command or a Settings pane) when
+        something is off. Read-only and side-effect free — call it first
+        when any other tool misbehaves."""
         return tool_doctor()
 
     @mcp.tool()
@@ -985,7 +1135,7 @@ def _build_mcp_server():
             never comma-joined). Files are attached with guessed MIME types;
             directories are refused (zip first). Total size is capped (default
             20 MB, EMAIL_MCP_MAX_ATTACH_MB) — over-budget returns {ok: false,
-            error} before anything is sent.
+            code: "attachments_too_large", error} before anything is sent.
 
             `from_identity` selects the sending identity from
             ~/.email-mcp/identities.toml (omit for the default). Each identity
@@ -995,10 +1145,11 @@ def _build_mcp_server():
 
             Safety: while the allowlist guard is active (default), recipients are
             restricted to the sending identity's own address — a returned
-            {ok: false, error} naming a blocked address means the guard fired,
-            not a delivery failure. A Bcc-to-self is added automatically for a
-            Sent record. Returns {ok, message_id, to, cc, bcc, subject,
-            attachments} on success.
+            {ok: false, code: "recipient_not_allowed", error} means the guard
+            fired, not a delivery failure. A Bcc-to-self is added automatically
+            for a Sent record. Returns {ok, message_id, to, cc, bcc, subject,
+            attachments} on success; failures carry a stable `code` (contract
+            §3.4) beside the prose.
             """
             return tool_send_email(
                 to=to, subject=subject, body=body, cc=cc, bcc=bcc,
@@ -1081,19 +1232,11 @@ def _build_mcp_server():
             warns the dispatcher is not installed, run:
             python -m email_mcp.dispatcher --install-launchd
             """
-            res = tool_schedule_email(
+            return tool_schedule_email(
                 to=to, subject=subject, body=body, send_at=send_at,
                 cc=cc, bcc=bcc, attachments=attachments,
                 from_identity=from_identity,
             )
-            if res.get("ok"):
-                from .dispatcher import _plist_path
-                if not _plist_path().exists():
-                    res["warning"] = (
-                        "dispatcher launchd agent NOT installed — nothing will "
-                        "send. Run: python -m email_mcp.dispatcher --install-launchd"
-                    )
-            return res
 
         @mcp.tool()
         def cancel_scheduled(id: str) -> dict:

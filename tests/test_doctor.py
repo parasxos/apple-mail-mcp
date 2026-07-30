@@ -17,6 +17,7 @@ from email_mcp.transports import SendError
 CHECK_NAMES = {
     "mail_store", "automation", "accessibility", "identities",
     "transports", "dispatcher", "spool_plans", "fts", "graph",
+    "audit",  # folded into checks at v0.11 (contract §1 row 10)
 }
 
 
@@ -96,6 +97,27 @@ def test_run_shape_and_all_green(tmp_path):
 def test_read_only_flag_is_reflected(monkeypatch):
     monkeypatch.setenv("EMAIL_MCP_READ_ONLY", "1")
     assert doctor.run()["read_only"] is True
+
+
+def test_audit_check_folded_into_checks_with_deprecated_mirror():
+    """v0.11: the ledger check is the tenth member of `checks`; the
+    top-level `audit` key stays as a deprecated mirror of the same dict
+    (v0.10 readers keep working, §8 additive-only)."""
+    report = doctor.run()
+    assert "audit" in report["checks"]
+    assert report["audit"] is report["checks"]["audit"]
+    assert report["checks"]["audit"]["ok"] is True
+
+
+def test_red_audit_check_reddens_the_doctor(monkeypatch):
+    monkeypatch.setattr(
+        doctor, "_CHECKS",
+        tuple((n, (lambda: {"ok": False, "detail": "ledger broken"})
+               if n == "audit" else f) for n, f in doctor._CHECKS),
+    )
+    report = doctor.run()
+    assert report["ok"] is False
+    assert report["checks"]["audit"]["ok"] is False
 
 
 # --------------------------------------------------------------------- #

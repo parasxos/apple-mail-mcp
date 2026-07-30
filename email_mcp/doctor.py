@@ -1,14 +1,14 @@
 """Environment diagnostics: every permission, path and transport the MCP
 needs, checked in one pass with remediation hints.
 
-`run()` returns {ok, read_only, checks: {name: {ok, detail, fix?, ...}},
-audit} — `ok` is the AND of every check (the audit ledger check included);
-`fix` appears only when there is a concrete next step (a Settings pane or
-a command). The v0.10 ledger check reports as the top-level `audit`
-section, NOT a tenth member of `checks`: that mapping's membership is the
-v0.9 doctor surface, pinned by its shape tests, and v0.10 does not touch
-existing success shapes (docs/v1-contract.md §8) — folding it into
-`checks` is v0.11's move, with the outputSchema freeze.
+`run()` returns {ok, read_only, checks: {name: {ok, detail, fix?, ...}}} —
+`ok` is the AND of every check; `fix` appears only when there is a
+concrete next step (a Settings pane or a command). Since v0.11 the audit
+ledger check is the tenth member of `checks` (the fold this module's
+v0.10 docstring scheduled for the outputSchema freeze; contract §1 row 10
+declares `{ok, read_only, checks}`); the top-level `audit` key remains as
+a deprecated mirror of checks["audit"] so v0.10 readers keep working —
+kept additively (§8), to be dropped no earlier than v2.
 Checks never mutate anything:
 transports are healthchecked but never bootstrapped, the FTS index is
 statted but never created, and the osascript probes are benign reads.
@@ -504,6 +504,7 @@ _CHECKS = (
     ("spool_plans", check_spool_plans),
     ("fts", check_fts),
     ("graph", check_graph),
+    ("audit", check_audit),  # folded into checks at v0.11 (as scheduled)
 )
 
 
@@ -518,12 +519,15 @@ def _guarded(name: str, fn) -> dict:
 
 
 def run() -> dict:
-    """Run every check. Returns {ok, read_only, checks, audit} — the
-    ledger check rides beside `checks` (see the module docstring for why
-    its membership stays at the v0.9 nine) but still gates `ok`: a ledger
-    that silently drops events is a red doctor."""
+    """Run every check. Returns {ok, read_only, checks} — the ledger
+    check is a member of `checks` since v0.11 and gates `ok` like any
+    other: a ledger that silently drops events is a red doctor. The
+    top-level `audit` key mirrors checks["audit"] for v0.10 readers
+    (deprecated; see the module docstring)."""
     checks = {name: _guarded(name, fn) for name, fn in _CHECKS}
-    audit_check = _guarded("audit", check_audit)
+    # The mirror falls back to its own run when `checks` was narrowed
+    # (tests monkeypatch _CHECKS) — the ledger check must always report.
+    audit_check = checks.get("audit") or _guarded("audit", check_audit)
     return {
         "ok": all(c["ok"] for c in checks.values()) and audit_check["ok"],
         "read_only": config.read_only(),
