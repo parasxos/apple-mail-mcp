@@ -10,7 +10,10 @@ subject counts. Useful for verifying Full-Disk-Access on a new machine.
 from __future__ import annotations
 
 import argparse
+import functools
+import inspect
 import json
+import re
 import subprocess
 import sys
 import time
@@ -18,7 +21,9 @@ from dataclasses import asdict, is_dataclass
 from datetime import datetime, timezone
 from typing import Any
 
+from . import audit, codes
 from .config import source_name
+from .log import get_logger
 from .sender import SendError, reply_email, schedule_email, send_email
 from .triage import (
     TriageError, apply_plan, build_delete_plan, build_plan, create_mailbox,
@@ -26,6 +31,8 @@ from .triage import (
 )
 from .sources import get_source
 from .sources.base import EmailSource, SearchQuery
+
+_log = get_logger()
 
 
 # Lazy singleton — avoid touching ~/Library/Mail until a tool is actually called.
@@ -66,10 +73,61 @@ def _to_jsonable(obj: Any) -> Any:
 
 
 # ---------------------------------------------------------------------- #
+# Wire-safety belt (docs/v1-contract.md §3.5 / §7)                        #
+# ---------------------------------------------------------------------- #
+
+
+def _belt(op_from: str | None = None):
+    """No exception escapes a dict-returning tool to the MCP wire: known
+    caller-fixable classes map to coded envelopes, anything else is the
+    belt of last resort, `internal_error`. Every catch logs the FULL
+    traceback to the file log (never the wire) and the envelope carries
+    fix: "run doctor". Success shapes pass through byte-untouched — the
+    belt only exists where the tool used to crash.
+
+    `op_from` names the parameter whose value is the operation's durable
+    artifact id (triage_apply's plan_id), threaded into the failure
+    envelope as operation_id per contract §2."""
+    def deco(fn):
+        sig = inspect.signature(fn)
+
+        def _fail(code: str, error: str, args: tuple, kwargs: dict) -> dict:
+            _log.exception("belt[%s]: %s", fn.__name__, code)
+            out: dict = {"ok": False, "code": code, "error": error,
+                         "fix": "run doctor"}
+            if op_from is not None:
+                try:
+                    value = sig.bind_partial(*args, **kwargs) \
+                               .arguments.get(op_from)
+                except TypeError:
+                    value = None
+                if value:
+                    out["operation_id"] = str(value)
+            return out
+
+        @functools.wraps(fn)
+        def wrapper(*args, **kwargs):
+            try:
+                return fn(*args, **kwargs)
+            except ValueError as e:
+                return _fail(codes.INVALID_INPUT, str(e), args, kwargs)
+            except LookupError as e:
+                return _fail(codes.NOT_FOUND, str(e), args, kwargs)
+            except FileNotFoundError as e:
+                return _fail(codes.MAIL_UNAVAILABLE, str(e), args, kwargs)
+            except Exception as e:
+                return _fail(codes.INTERNAL_ERROR,
+                             f"{type(e).__name__}: {e}", args, kwargs)
+        return wrapper
+    return deco
+
+
+# ---------------------------------------------------------------------- #
 # Tool implementations (pure functions; wired into MCP below)            #
 # ---------------------------------------------------------------------- #
 
 
+@_belt()
 def tool_search_emails(
     query: str = "",
     from_addr: str | None = None,
@@ -151,12 +209,14 @@ def _bad_view(view: str) -> dict:
             "error": f"unknown view {view!r} (want one of {_VIEWS})"}
 
 
+@_belt()
 def tool_get_email(id: str, view: str = "full") -> dict:
     if view not in _VIEWS:
         return _bad_view(view)
     return _shape_email(_source().get(id), view)
 
 
+@_belt()
 def tool_get_emails_batch(ids: list[str], view: str = "full") -> dict:
     if view not in _VIEWS:
         return _bad_view(view)
@@ -191,6 +251,7 @@ def tool_list_recent(
     return [_to_jsonable(r) for r in _source().recent(mailbox, account, limit)]
 
 
+@_belt()
 def tool_get_attachment(id: str, attachment_id: str) -> dict:
     return _to_jsonable(_source().attachment(id, attachment_id))
 
@@ -267,6 +328,7 @@ def _run_mail_check_for_new(timeout_seconds: float) -> dict:
     return out
 
 
+@_belt()
 def tool_refresh_mail(wait_seconds: float = 5.0, timeout_seconds: float = 30.0) -> dict:
     """Ask Mail.app to fetch new mail, then report what changed.
 
@@ -312,6 +374,7 @@ def tool_refresh_mail(wait_seconds: float = 5.0, timeout_seconds: float = 30.0) 
 # ---------------------------------------------------------------------- #
 
 
+@_belt()
 def tool_send_email(
     to: str,
     subject: str,
@@ -322,17 +385,28 @@ def tool_send_email(
     from_identity: str | None = None,
 ) -> dict:
     """Compose + send. Returns {ok, message_id, to, cc, bcc, ...} or a
-    structured {ok: false, error} for caller-fixable failures."""
+    structured {ok: false, error} for caller-fixable failures. Every
+    terminal outcome records ONE `send` ledger event (transmission
+    family: failures are ledger-worthy too — an attempt to transmit)."""
     try:
         res = send_email(
             to=to, subject=subject, body=body, cc=cc, bcc=bcc,
             attachments=attachments, from_identity=from_identity,
         )
-        return _to_jsonable(res)
     except SendError as e:
+        audit.emit("send", outcome="failed", tool="send_email",
+                   subject=subject, detail={"error": str(e)[:300]})
         return {"ok": False, "error": str(e)}
+    audit.emit("send", outcome="sent", tool="send_email",
+               message_id=res.message_id, identity=from_identity,
+               to=res.to, cc=res.cc or None, bcc=res.bcc or None,
+               subject=res.subject,
+               detail={"attachments": res.attachments}
+               if res.attachments else None)
+    return _to_jsonable(res)
 
 
+@_belt()
 def tool_reply_email(
     id: str,
     body: str,
@@ -349,11 +423,22 @@ def tool_reply_email(
             include_history=include_history, attachments=attachments,
             from_identity=from_identity,
         )
-        return _to_jsonable(res)
     except SendError as e:
+        # The reply context (which message, whether reply-all) is lost
+        # below the sender return — record it here, at the tool layer.
+        audit.emit("reply", outcome="failed", tool="reply_email",
+                   detail={"orig_id": id, "reply_all": reply_all,
+                           "error": str(e)[:300]})
         return {"ok": False, "error": str(e)}
+    audit.emit("reply", outcome="sent", tool="reply_email",
+               message_id=res.message_id, identity=from_identity,
+               to=res.to, cc=res.cc or None, bcc=res.bcc or None,
+               subject=res.subject,
+               detail={"orig_id": id, "reply_all": reply_all})
+    return _to_jsonable(res)
 
 
+@_belt()
 def tool_schedule_email(
     to: str,
     subject: str,
@@ -370,11 +455,34 @@ def tool_schedule_email(
             cc=cc, bcc=bcc, attachments=attachments,
             from_identity=from_identity,
         )
-        return {"ok": True, **_to_jsonable(entry)}
     except SendError as e:
+        audit.emit("schedule", outcome="failed", tool="schedule_email",
+                   subject=subject, detail={"error": str(e)[:300]})
         return {"ok": False, "error": str(e)}
+    # graph_fallback: the identity asked for Exchange-side deferred send
+    # but the entry landed on launchd — the silent-fallback decision is
+    # only recoverable here, at the tool layer.
+    graph_fallback = False
+    if entry.executor == "launchd":
+        from . import identities
+        try:
+            graph_fallback = identities.get(entry.identity).executor == "graph"
+        except SendError:
+            pass  # identities unreadable mid-call: not a fallback signal
+    audit.emit(
+        "schedule", outcome="scheduled", operation_id=entry.id,
+        tool="schedule_email", spool_id=entry.id,
+        message_id=entry.message_id, identity=entry.identity,
+        to=entry.to, cc=entry.cc or None, bcc=entry.bcc or None,
+        subject=entry.subject,
+        detail={"executor": entry.executor, "send_at": entry.send_at,
+                "draft_id": entry.graph_draft_id,
+                "graph_fallback": graph_fallback},
+    )
+    return {"ok": True, **_to_jsonable(entry)}
 
 
+@_belt()
 def tool_list_scheduled(state: str | None = None, limit: int = 50) -> dict:
     from . import spool
     from .dispatcher import LAUNCHD_LABEL, _plist_path
@@ -414,6 +522,7 @@ def _plan_payload(plan) -> dict:
     }
 
 
+@_belt()
 def tool_triage_plan(
     query: str = "",
     from_addr: str | None = None,
@@ -445,6 +554,7 @@ def tool_triage_plan(
     return _plan_payload(plan)
 
 
+@_belt()
 def tool_triage_plan_delete(
     query: str = "",
     from_addr: str | None = None,
@@ -475,6 +585,7 @@ def tool_triage_plan_delete(
     return _plan_payload(plan)
 
 
+@_belt(op_from="plan_id")
 def tool_triage_apply(plan_id: str) -> dict:
     try:
         return apply_plan(_source(), plan_id)
@@ -482,31 +593,66 @@ def tool_triage_apply(plan_id: str) -> dict:
         return _triage_err(e)
 
 
+@_belt()
 def tool_mailbox_create(account: str, path: str) -> dict:
     try:
-        return create_mailbox(_source(), account, path)
+        out = create_mailbox(_source(), account, path)
     except TriageError as e:
         return _triage_err(e)
+    # Store family: emit only on actual change — the idempotent
+    # already-there path (existed=true) leaves no ledger event.
+    if out.get("existed") is False:
+        audit.emit("mailbox_create", outcome="created",
+                   tool="mailbox_create", account=account, mailbox=path)
+    return out
 
 
+@_belt()
 def tool_mailbox_delete(account: str, path: str) -> dict:
     try:
-        return delete_mailbox(_source(), account, path)
+        out = delete_mailbox(_source(), account, path)
     except TriageError as e:
         return _triage_err(e)
+    # Emit only when a deletion was actually issued at Mail (existed) —
+    # the idempotent already-absent path leaves no ledger event.
+    if out.get("existed"):
+        outcome = "deleted" if out.get("deleted") \
+            else out.get("code", "delete_failed")
+        audit.emit("mailbox_delete", outcome=outcome, tool="mailbox_delete",
+                   account=account, mailbox=path,
+                   detail={"method": out["method"]}
+                   if out.get("method") else None)
+    return out
 
 
+@_belt()
 def tool_cancel_scheduled(id: str) -> dict:
     from . import spool
 
+    def _done(out: dict, outcome: str, *, reason: str | None = None,
+              subject: str | None = None, **extra) -> dict:
+        """The ONE cancel emit: every terminal exit records exactly one
+        `cancel` event; op = the spool id (the artifact-id rule threads
+        it to the entry's schedule/deliver events)."""
+        detail = {"reason": reason, **extra} if reason else None
+        audit.emit("cancel", outcome=outcome, operation_id=id,
+                   tool="cancel_scheduled", spool_id=id, subject=subject,
+                   detail=detail)
+        return out
+
     found = spool.find(id)
     if found is None:
-        return {"ok": False, "error": f"no scheduled message with id {id!r}"}
+        return _done(
+            {"ok": False, "error": f"no scheduled message with id {id!r}"},
+            "failed", reason="not_found")
     state, entry = found
     if state != "pending":
-        return {"ok": False,
-                "error": f"cannot cancel {id}: status is {state!r} "
-                         "(only pending messages can be cancelled)"}
+        return _done(
+            {"ok": False,
+             "error": f"cannot cancel {id}: status is {state!r} "
+                      "(only pending messages can be cancelled)"},
+            "failed", reason="not_pending", subject=entry.subject,
+            state=state)
 
     if entry.executor == "graph":
         # Exchange holds an armed deferred draft — revoke it FIRST; the
@@ -517,7 +663,10 @@ def tool_cancel_scheduled(id: str) -> dict:
         try:
             ident = identities.get(entry.identity)
         except SendError as e:
-            return {"ok": False, "error": f"cannot cancel {id}: {e}"}
+            return _done(
+                {"ok": False, "error": f"cannot cancel {id}: {e}"},
+                "failed", reason="identity_unavailable",
+                subject=entry.subject)
         try:
             draft_id = entry.graph_draft_id
             if draft_id is None:
@@ -528,56 +677,110 @@ def tool_cancel_scheduled(id: str) -> dict:
             outcome = (graph.delete_draft(ident, draft_id)
                        if draft_id else "gone")
         except SendError as e:
-            return {"ok": False,
-                    "error": f"cannot cancel {id}: Exchange still holds the "
-                             f"deferred draft and the revoke failed ({e}). "
-                             "Retry, or discard the draft in Outlook/OWA "
-                             "yourself, then cancel again."}
+            return _done(
+                {"ok": False,
+                 "error": f"cannot cancel {id}: Exchange still holds the "
+                          f"deferred draft and the revoke failed ({e}). "
+                          "Retry, or discard the draft in Outlook/OWA "
+                          "yourself, then cancel again."},
+                "failed", reason="revoke_failed", subject=entry.subject)
         if outcome == "gone":
             # F10 race: the draft vanished on its own — did Exchange
             # already send it? Only Sent Items can say.
             try:
                 sent = graph.sent_by_message_id(ident, entry.message_id)
             except SendError as e:
-                return {"ok": False,
-                        "error": f"cannot cancel {id}: the deferred draft is "
-                                 f"gone but Sent Items could not be checked "
-                                 f"({e}) — outcome ambiguous, retry."}
+                return _done(
+                    {"ok": False,
+                     "error": f"cannot cancel {id}: the deferred draft is "
+                              f"gone but Sent Items could not be checked "
+                              f"({e}) — outcome ambiguous, retry."},
+                    "failed", reason="sent_check_failed",
+                    subject=entry.subject)
             if sent:
                 # Atomic ownership hand-off (same rename fence as the
                 # cancel below) — a concurrently reconciling dispatcher
                 # must not race this terminal move.
                 if not spool.claim(id, "pending", "sent"):
-                    return {"ok": False,
-                            "error": f"cannot cancel {id}: a dispatcher "
-                                     "just moved it — re-check "
-                                     "list_scheduled"}
+                    return _done(
+                        {"ok": False,
+                         "error": f"cannot cancel {id}: a dispatcher "
+                                  "just moved it — re-check "
+                                  "list_scheduled"},
+                        "failed", reason="claim_lost",
+                        subject=entry.subject)
                 entry.delivered_at = spool.iso(spool.utcnow())
                 entry.next_attempt_at = None
                 entry.last_error = None
                 entry.status = "sent"
                 spool.update("sent", entry)
-                return {"ok": False, "id": id, "status": "sent",
-                        "error": f"cannot cancel {id}: Exchange already sent "
-                                 "it (found in Sent Items) — the entry has "
-                                 "been moved to sent/."}
+                # Terminal state change, ok:false on the wire — still a
+                # ledger-worthy outcome of its own.
+                return _done(
+                    {"ok": False, "id": id, "status": "sent",
+                     "error": f"cannot cancel {id}: Exchange already sent "
+                              "it (found in Sent Items) — the entry has "
+                              "been moved to sent/."},
+                    "too_late_sent", subject=entry.subject)
             # Confirmed absent from Drafts AND Sent Items: nothing is
             # armed (someone may have discarded it in OWA) — proceed as
             # revoked and cancel the local entry below.
 
     if not spool.claim(id, "pending", "cancelled"):
-        return {"ok": False,
-                "error": f"cannot cancel {id}: a dispatcher just claimed it"}
+        return _done(
+            {"ok": False,
+             "error": f"cannot cancel {id}: a dispatcher just claimed it"},
+            "failed", reason="claim_lost", subject=entry.subject)
     entry.status = "cancelled"
     spool.update("cancelled", entry)
-    return {"ok": True, "id": id, "status": "cancelled",
-            "subject": entry.subject, "was_due": entry.send_at}
+    return _done(
+        {"ok": True, "id": id, "status": "cancelled",
+         "subject": entry.subject, "was_due": entry.send_at},
+        "cancelled", subject=entry.subject)
 
 
+@_belt()
 def tool_doctor() -> dict:
     from . import doctor
 
     return doctor.run()
+
+
+_ISO_BOUND_RE = re.compile(r"\d{4}(-\d{2}(-\d{2})?)?")
+
+
+def _valid_iso_bound(value: str) -> bool:
+    """A ledger query bound is either a calendar prefix (2026, 2026-07,
+    2026-07-29) or a full ISO-8601 timestamp."""
+    if _ISO_BOUND_RE.fullmatch(value):
+        return True
+    try:
+        datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return False
+    return True
+
+
+@_belt()
+def tool_audit(
+    since: str | None = None,
+    until: str | None = None,
+    tool: str | None = None,
+    event: str | None = None,
+    plan_id: str | None = None,
+    operation_id: str | None = None,
+    limit: int = 50,
+) -> dict:
+    for name, value in (("since", since), ("until", until)):
+        if value is not None and not _valid_iso_bound(str(value)):
+            return {"ok": False, "code": codes.INVALID_INPUT,
+                    "error": f"invalid ISO datetime for `{name}`: {value!r} "
+                             "(want ISO-8601; prefixes allowed, e.g. "
+                             "2026-07 or 2026-07-29)"}
+    out = audit.query(since=since, until=until, tool=tool, event=event,
+                      plan_id=plan_id, operation_id=operation_id,
+                      limit=limit)
+    return {"ok": True, **out}
 
 
 # ---------------------------------------------------------------------- #
@@ -586,7 +789,7 @@ def tool_doctor() -> dict:
 
 
 def _build_mcp_server():
-    """Build the FastMCP Server: nineteen tools, or exactly the ten
+    """Build the FastMCP Server: twenty tools, or exactly the eleven
     read-side tools when EMAIL_MCP_READ_ONLY=1 — the mutating nine are
     lexically gated below, so in a read-only session they never exist."""
     from mcp.server.fastmcp import FastMCP  # type: ignore
@@ -711,12 +914,50 @@ def _build_mcp_server():
         readability (Full Disk Access), Mail.app Automation permission,
         Accessibility (only needed for mailbox_delete's UI fallback), the
         identities file, every transport's health (never bootstraps), the
-        scheduled-send dispatcher, spool/plan hygiene, and the FTS body
-        index. Returns {ok, read_only, checks} where each check is
+        scheduled-send dispatcher, spool/plan hygiene, the FTS body index,
+        and the audit ledger (reported as the top-level `audit` section).
+        Returns {ok, read_only, checks, audit} where each check is
         {ok, detail} plus a concrete `fix` (a command or a Settings pane)
         when something is off. Read-only and side-effect free — call it
         first when any other tool misbehaves."""
         return tool_doctor()
+
+    @mcp.tool()
+    def audit(
+        since: str | None = None,
+        until: str | None = None,
+        tool: str | None = None,
+        event: str | None = None,
+        plan_id: str | None = None,
+        operation_id: str | None = None,
+        limit: int = 50,
+    ) -> dict:
+        """Read the append-only audit ledger — the MCP's own receipts.
+        Every mutation records exactly one event (send, reply, schedule,
+        deliver, cancel, recover, plan_create, plan_finish,
+        mailbox_create, mailbox_delete, and the graph_* reconcile
+        outcomes), so "what did the tool change yesterday?" is one call:
+        audit(since=...). Events outlive the artifacts they index (plan
+        files are GC'd after 7 days; the ledger keeps their summary).
+
+        Filters AND-combine. `since`/`until` are ISO-8601 bounds —
+        prefixes are allowed and inclusive ("2026-07" means that whole
+        month). `tool` filters by the emitting tool name, `event` by
+        event name, `plan_id` by triage plan. `operation_id` threads one
+        operation across processes: a scheduled send's `schedule` and
+        `deliver` events share it (it is the spool id; for triage it is
+        the plan id).
+
+        Returns {ok, events, files_scanned, skipped_lines} with events
+        newest-first (`limit` clamped to 1..500, default 50).
+        `skipped_lines` counts torn or corrupt ledger lines that were
+        tolerated and skipped — non-zero flags ledger damage but never
+        fails the call. Events carry recipients and subjects, NEVER
+        message bodies."""
+        return tool_audit(
+            since=since, until=until, tool=tool, event=event,
+            plan_id=plan_id, operation_id=operation_id, limit=limit,
+        )
 
     if not ro:
         # Mutating tools — everything below can move mail or leave a

@@ -1,0 +1,869 @@
+{
+  "audit": {
+    "properties": {
+      "event": {
+        "anyOf": [
+          {
+            "type": "string"
+          },
+          {
+            "type": "null"
+          }
+        ],
+        "default": null,
+        "title": "Event"
+      },
+      "limit": {
+        "default": 50,
+        "title": "Limit",
+        "type": "integer"
+      },
+      "operation_id": {
+        "anyOf": [
+          {
+            "type": "string"
+          },
+          {
+            "type": "null"
+          }
+        ],
+        "default": null,
+        "title": "Operation Id"
+      },
+      "plan_id": {
+        "anyOf": [
+          {
+            "type": "string"
+          },
+          {
+            "type": "null"
+          }
+        ],
+        "default": null,
+        "title": "Plan Id"
+      },
+      "since": {
+        "anyOf": [
+          {
+            "type": "string"
+          },
+          {
+            "type": "null"
+          }
+        ],
+        "default": null,
+        "title": "Since"
+      },
+      "tool": {
+        "anyOf": [
+          {
+            "type": "string"
+          },
+          {
+            "type": "null"
+          }
+        ],
+        "default": null,
+        "title": "Tool"
+      },
+      "until": {
+        "anyOf": [
+          {
+            "type": "string"
+          },
+          {
+            "type": "null"
+          }
+        ],
+        "default": null,
+        "title": "Until"
+      }
+    },
+    "title": "auditArguments",
+    "type": "object"
+  },
+  "cancel_scheduled": {
+    "properties": {
+      "id": {
+        "title": "Id",
+        "type": "string"
+      }
+    },
+    "required": [
+      "id"
+    ],
+    "title": "cancel_scheduledArguments",
+    "type": "object"
+  },
+  "doctor": {
+    "properties": {},
+    "title": "doctorArguments",
+    "type": "object"
+  },
+  "get_attachment": {
+    "properties": {
+      "attachment_id": {
+        "title": "Attachment Id",
+        "type": "string"
+      },
+      "id": {
+        "title": "Id",
+        "type": "string"
+      }
+    },
+    "required": [
+      "id",
+      "attachment_id"
+    ],
+    "title": "get_attachmentArguments",
+    "type": "object"
+  },
+  "get_email": {
+    "properties": {
+      "id": {
+        "title": "Id",
+        "type": "string"
+      },
+      "view": {
+        "default": "full",
+        "title": "View",
+        "type": "string"
+      }
+    },
+    "required": [
+      "id"
+    ],
+    "title": "get_emailArguments",
+    "type": "object"
+  },
+  "get_emails_batch": {
+    "properties": {
+      "ids": {
+        "items": {
+          "type": "string"
+        },
+        "title": "Ids",
+        "type": "array"
+      },
+      "view": {
+        "default": "full",
+        "title": "View",
+        "type": "string"
+      }
+    },
+    "required": [
+      "ids"
+    ],
+    "title": "get_emails_batchArguments",
+    "type": "object"
+  },
+  "get_thread": {
+    "properties": {
+      "thread_id": {
+        "title": "Thread Id",
+        "type": "string"
+      }
+    },
+    "required": [
+      "thread_id"
+    ],
+    "title": "get_threadArguments",
+    "type": "object"
+  },
+  "list_mailboxes": {
+    "properties": {},
+    "title": "list_mailboxesArguments",
+    "type": "object"
+  },
+  "list_recent": {
+    "properties": {
+      "account": {
+        "anyOf": [
+          {
+            "type": "string"
+          },
+          {
+            "type": "null"
+          }
+        ],
+        "default": null,
+        "title": "Account"
+      },
+      "limit": {
+        "default": 50,
+        "title": "Limit",
+        "type": "integer"
+      },
+      "mailbox": {
+        "anyOf": [
+          {
+            "type": "string"
+          },
+          {
+            "type": "null"
+          }
+        ],
+        "default": null,
+        "title": "Mailbox"
+      }
+    },
+    "title": "list_recentArguments",
+    "type": "object"
+  },
+  "list_scheduled": {
+    "properties": {
+      "limit": {
+        "default": 50,
+        "title": "Limit",
+        "type": "integer"
+      },
+      "state": {
+        "anyOf": [
+          {
+            "type": "string"
+          },
+          {
+            "type": "null"
+          }
+        ],
+        "default": null,
+        "title": "State"
+      }
+    },
+    "title": "list_scheduledArguments",
+    "type": "object"
+  },
+  "mailbox_create": {
+    "properties": {
+      "account": {
+        "title": "Account",
+        "type": "string"
+      },
+      "path": {
+        "title": "Path",
+        "type": "string"
+      }
+    },
+    "required": [
+      "account",
+      "path"
+    ],
+    "title": "mailbox_createArguments",
+    "type": "object"
+  },
+  "mailbox_delete": {
+    "properties": {
+      "account": {
+        "title": "Account",
+        "type": "string"
+      },
+      "path": {
+        "title": "Path",
+        "type": "string"
+      }
+    },
+    "required": [
+      "account",
+      "path"
+    ],
+    "title": "mailbox_deleteArguments",
+    "type": "object"
+  },
+  "refresh_mail": {
+    "properties": {
+      "timeout_seconds": {
+        "default": 30.0,
+        "title": "Timeout Seconds",
+        "type": "number"
+      },
+      "wait_seconds": {
+        "default": 5.0,
+        "title": "Wait Seconds",
+        "type": "number"
+      }
+    },
+    "title": "refresh_mailArguments",
+    "type": "object"
+  },
+  "reply_email": {
+    "properties": {
+      "attachments": {
+        "anyOf": [
+          {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          {
+            "type": "null"
+          }
+        ],
+        "default": null,
+        "title": "Attachments"
+      },
+      "bcc": {
+        "anyOf": [
+          {
+            "type": "string"
+          },
+          {
+            "type": "null"
+          }
+        ],
+        "default": null,
+        "title": "Bcc"
+      },
+      "body": {
+        "title": "Body",
+        "type": "string"
+      },
+      "cc": {
+        "anyOf": [
+          {
+            "type": "string"
+          },
+          {
+            "type": "null"
+          }
+        ],
+        "default": null,
+        "title": "Cc"
+      },
+      "from_identity": {
+        "anyOf": [
+          {
+            "type": "string"
+          },
+          {
+            "type": "null"
+          }
+        ],
+        "default": null,
+        "title": "From Identity"
+      },
+      "id": {
+        "title": "Id",
+        "type": "string"
+      },
+      "include_history": {
+        "default": true,
+        "title": "Include History",
+        "type": "boolean"
+      },
+      "reply_all": {
+        "default": false,
+        "title": "Reply All",
+        "type": "boolean"
+      }
+    },
+    "required": [
+      "id",
+      "body"
+    ],
+    "title": "reply_emailArguments",
+    "type": "object"
+  },
+  "schedule_email": {
+    "properties": {
+      "attachments": {
+        "anyOf": [
+          {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          {
+            "type": "null"
+          }
+        ],
+        "default": null,
+        "title": "Attachments"
+      },
+      "bcc": {
+        "anyOf": [
+          {
+            "type": "string"
+          },
+          {
+            "type": "null"
+          }
+        ],
+        "default": null,
+        "title": "Bcc"
+      },
+      "body": {
+        "title": "Body",
+        "type": "string"
+      },
+      "cc": {
+        "anyOf": [
+          {
+            "type": "string"
+          },
+          {
+            "type": "null"
+          }
+        ],
+        "default": null,
+        "title": "Cc"
+      },
+      "from_identity": {
+        "anyOf": [
+          {
+            "type": "string"
+          },
+          {
+            "type": "null"
+          }
+        ],
+        "default": null,
+        "title": "From Identity"
+      },
+      "send_at": {
+        "title": "Send At",
+        "type": "string"
+      },
+      "subject": {
+        "title": "Subject",
+        "type": "string"
+      },
+      "to": {
+        "title": "To",
+        "type": "string"
+      }
+    },
+    "required": [
+      "to",
+      "subject",
+      "body",
+      "send_at"
+    ],
+    "title": "schedule_emailArguments",
+    "type": "object"
+  },
+  "search_emails": {
+    "properties": {
+      "account": {
+        "anyOf": [
+          {
+            "type": "string"
+          },
+          {
+            "type": "null"
+          }
+        ],
+        "default": null,
+        "title": "Account"
+      },
+      "after": {
+        "anyOf": [
+          {
+            "type": "string"
+          },
+          {
+            "type": "null"
+          }
+        ],
+        "default": null,
+        "title": "After"
+      },
+      "before": {
+        "anyOf": [
+          {
+            "type": "string"
+          },
+          {
+            "type": "null"
+          }
+        ],
+        "default": null,
+        "title": "Before"
+      },
+      "from_addr": {
+        "anyOf": [
+          {
+            "type": "string"
+          },
+          {
+            "type": "null"
+          }
+        ],
+        "default": null,
+        "title": "From Addr"
+      },
+      "has_attachment": {
+        "anyOf": [
+          {
+            "type": "boolean"
+          },
+          {
+            "type": "null"
+          }
+        ],
+        "default": null,
+        "title": "Has Attachment"
+      },
+      "limit": {
+        "default": 50,
+        "title": "Limit",
+        "type": "integer"
+      },
+      "mailbox": {
+        "anyOf": [
+          {
+            "type": "string"
+          },
+          {
+            "type": "null"
+          }
+        ],
+        "default": null,
+        "title": "Mailbox"
+      },
+      "offset": {
+        "default": 0,
+        "title": "Offset",
+        "type": "integer"
+      },
+      "query": {
+        "default": "",
+        "title": "Query",
+        "type": "string"
+      },
+      "to_addr": {
+        "anyOf": [
+          {
+            "type": "string"
+          },
+          {
+            "type": "null"
+          }
+        ],
+        "default": null,
+        "title": "To Addr"
+      },
+      "unread_only": {
+        "default": false,
+        "title": "Unread Only",
+        "type": "boolean"
+      }
+    },
+    "title": "search_emailsArguments",
+    "type": "object"
+  },
+  "send_email": {
+    "properties": {
+      "attachments": {
+        "anyOf": [
+          {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          {
+            "type": "null"
+          }
+        ],
+        "default": null,
+        "title": "Attachments"
+      },
+      "bcc": {
+        "anyOf": [
+          {
+            "type": "string"
+          },
+          {
+            "type": "null"
+          }
+        ],
+        "default": null,
+        "title": "Bcc"
+      },
+      "body": {
+        "title": "Body",
+        "type": "string"
+      },
+      "cc": {
+        "anyOf": [
+          {
+            "type": "string"
+          },
+          {
+            "type": "null"
+          }
+        ],
+        "default": null,
+        "title": "Cc"
+      },
+      "from_identity": {
+        "anyOf": [
+          {
+            "type": "string"
+          },
+          {
+            "type": "null"
+          }
+        ],
+        "default": null,
+        "title": "From Identity"
+      },
+      "subject": {
+        "title": "Subject",
+        "type": "string"
+      },
+      "to": {
+        "title": "To",
+        "type": "string"
+      }
+    },
+    "required": [
+      "to",
+      "subject",
+      "body"
+    ],
+    "title": "send_emailArguments",
+    "type": "object"
+  },
+  "triage_apply": {
+    "properties": {
+      "plan_id": {
+        "title": "Plan Id",
+        "type": "string"
+      }
+    },
+    "required": [
+      "plan_id"
+    ],
+    "title": "triage_applyArguments",
+    "type": "object"
+  },
+  "triage_plan": {
+    "properties": {
+      "account": {
+        "anyOf": [
+          {
+            "type": "string"
+          },
+          {
+            "type": "null"
+          }
+        ],
+        "default": null,
+        "title": "Account"
+      },
+      "actions": {
+        "anyOf": [
+          {
+            "items": {
+              "additionalProperties": true,
+              "type": "object"
+            },
+            "type": "array"
+          },
+          {
+            "type": "null"
+          }
+        ],
+        "default": null,
+        "title": "Actions"
+      },
+      "after": {
+        "anyOf": [
+          {
+            "type": "string"
+          },
+          {
+            "type": "null"
+          }
+        ],
+        "default": null,
+        "title": "After"
+      },
+      "before": {
+        "anyOf": [
+          {
+            "type": "string"
+          },
+          {
+            "type": "null"
+          }
+        ],
+        "default": null,
+        "title": "Before"
+      },
+      "from_addr": {
+        "anyOf": [
+          {
+            "type": "string"
+          },
+          {
+            "type": "null"
+          }
+        ],
+        "default": null,
+        "title": "From Addr"
+      },
+      "has_attachment": {
+        "anyOf": [
+          {
+            "type": "boolean"
+          },
+          {
+            "type": "null"
+          }
+        ],
+        "default": null,
+        "title": "Has Attachment"
+      },
+      "limit": {
+        "default": 0,
+        "title": "Limit",
+        "type": "integer"
+      },
+      "mailbox": {
+        "anyOf": [
+          {
+            "type": "string"
+          },
+          {
+            "type": "null"
+          }
+        ],
+        "default": null,
+        "title": "Mailbox"
+      },
+      "query": {
+        "default": "",
+        "title": "Query",
+        "type": "string"
+      },
+      "to_addr": {
+        "anyOf": [
+          {
+            "type": "string"
+          },
+          {
+            "type": "null"
+          }
+        ],
+        "default": null,
+        "title": "To Addr"
+      },
+      "unread_only": {
+        "default": false,
+        "title": "Unread Only",
+        "type": "boolean"
+      }
+    },
+    "title": "triage_planArguments",
+    "type": "object"
+  },
+  "triage_plan_delete": {
+    "properties": {
+      "account": {
+        "anyOf": [
+          {
+            "type": "string"
+          },
+          {
+            "type": "null"
+          }
+        ],
+        "default": null,
+        "title": "Account"
+      },
+      "after": {
+        "anyOf": [
+          {
+            "type": "string"
+          },
+          {
+            "type": "null"
+          }
+        ],
+        "default": null,
+        "title": "After"
+      },
+      "before": {
+        "anyOf": [
+          {
+            "type": "string"
+          },
+          {
+            "type": "null"
+          }
+        ],
+        "default": null,
+        "title": "Before"
+      },
+      "from_addr": {
+        "anyOf": [
+          {
+            "type": "string"
+          },
+          {
+            "type": "null"
+          }
+        ],
+        "default": null,
+        "title": "From Addr"
+      },
+      "has_attachment": {
+        "anyOf": [
+          {
+            "type": "boolean"
+          },
+          {
+            "type": "null"
+          }
+        ],
+        "default": null,
+        "title": "Has Attachment"
+      },
+      "limit": {
+        "default": 0,
+        "title": "Limit",
+        "type": "integer"
+      },
+      "mailbox": {
+        "anyOf": [
+          {
+            "type": "string"
+          },
+          {
+            "type": "null"
+          }
+        ],
+        "default": null,
+        "title": "Mailbox"
+      },
+      "query": {
+        "default": "",
+        "title": "Query",
+        "type": "string"
+      },
+      "to_addr": {
+        "anyOf": [
+          {
+            "type": "string"
+          },
+          {
+            "type": "null"
+          }
+        ],
+        "default": null,
+        "title": "To Addr"
+      },
+      "unread_only": {
+        "default": false,
+        "title": "Unread Only",
+        "type": "boolean"
+      }
+    },
+    "title": "triage_plan_deleteArguments",
+    "type": "object"
+  }
+}

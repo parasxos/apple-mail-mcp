@@ -1,9 +1,15 @@
 """Environment diagnostics: every permission, path and transport the MCP
 needs, checked in one pass with remediation hints.
 
-`run()` returns {ok, read_only, checks: {name: {ok, detail, fix?, ...}}} —
-`ok` is the AND of every check; `fix` appears only when there is a concrete
-next step (a Settings pane or a command). Checks never mutate anything:
+`run()` returns {ok, read_only, checks: {name: {ok, detail, fix?, ...}},
+audit} — `ok` is the AND of every check (the audit ledger check included);
+`fix` appears only when there is a concrete next step (a Settings pane or
+a command). The v0.10 ledger check reports as the top-level `audit`
+section, NOT a tenth member of `checks`: that mapping's membership is the
+v0.9 doctor surface, pinned by its shape tests, and v0.10 does not touch
+existing success shapes (docs/v1-contract.md §8) — folding it into
+`checks` is v0.11's move, with the outputSchema freeze.
+Checks never mutate anything:
 transports are healthchecked but never bootstrapped, the FTS index is
 statted but never created, and the osascript probes are benign reads.
 
@@ -343,6 +349,65 @@ def check_fts() -> dict:
             "status": st}
 
 
+def check_audit() -> dict:
+    """Audit ledger: directory exists with 0700 and the current month is
+    appendable — probed with os.access, NEVER by writing an event (doctor
+    is side-effect free; a probe event would be a lie in the ledger). An
+    absent directory is a fresh install, not a fault: emit() creates it
+    on the first mutation. Reports the last recorded event via tail(1)."""
+    from . import audit, ids
+
+    root = config.audit_dir(create=False)  # purity: never create here
+    if not root.is_dir():
+        probe = root.parent
+        while not probe.exists():
+            probe = probe.parent
+        creatable = os.access(probe, os.W_OK | os.X_OK)
+        out: dict = {
+            "ok": creatable,
+            "detail": (f"no ledger yet at {root} — created on the first "
+                       "mutation" if creatable else
+                       f"cannot create {root}: {probe} is not writable — "
+                       "events would be dropped"),
+            "last_event": None,
+        }
+        if not creatable:
+            out["fix"] = f"chmod u+wx {probe}"
+        return out
+
+    problems: list[str] = []
+    fixes: list[str] = []
+    mode = root.stat().st_mode & 0o777
+    if mode != 0o700:
+        problems.append(f"dir mode {mode:o} (want 700 — events carry "
+                        "recipients and subjects)")
+        fixes.append(f"chmod 700 {root}")
+    month = root / f"{ids.iso(ids.utcnow())[:7]}.jsonl"
+    target = month if month.exists() else root
+    writable = (os.access(month, os.W_OK) if month.exists()
+                else os.access(root, os.W_OK | os.X_OK))
+    if not writable:
+        problems.append(f"{target} not writable — events are being "
+                        "dropped (emit is log-and-continue)")
+        fixes.append(f"chmod u+w {target}")
+
+    last = audit.tail(1)
+    last_txt = (f"last event {last[0].get('ts')} {last[0].get('event')}/"
+                f"{last[0].get('outcome')}" if last else "no events yet")
+    months = sum(1 for p in root.glob("*.jsonl"))
+    detail = f"{months} monthly file(s); {last_txt}"
+    if problems:
+        detail += "; " + "; ".join(problems)
+    out = {
+        "ok": not problems,
+        "detail": detail,
+        "last_event": last[0].get("ts") if last else None,
+    }
+    if fixes:
+        out["fix"] = "; ".join(fixes)
+    return out
+
+
 def _graph_token_dir() -> Path:
     """config.graph_dir()'s path WITHOUT its mkdir side effect — doctor
     checks stat, they never create (same purity rule as check_fts)."""
@@ -443,10 +508,15 @@ def _guarded(name: str, fn) -> dict:
 
 
 def run() -> dict:
-    """Run every check. Returns {ok, read_only, checks}."""
+    """Run every check. Returns {ok, read_only, checks, audit} — the
+    ledger check rides beside `checks` (see the module docstring for why
+    its membership stays at the v0.9 nine) but still gates `ok`: a ledger
+    that silently drops events is a red doctor."""
     checks = {name: _guarded(name, fn) for name, fn in _CHECKS}
+    audit_check = _guarded("audit", check_audit)
     return {
-        "ok": all(c["ok"] for c in checks.values()),
+        "ok": all(c["ok"] for c in checks.values()) and audit_check["ok"],
         "read_only": config.read_only(),
         "checks": checks,
+        "audit": audit_check,
     }

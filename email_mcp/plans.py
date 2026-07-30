@@ -17,7 +17,7 @@ from dataclasses import asdict, dataclass, field
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-from . import config, ids
+from . import audit, config, ids
 
 STATUSES = ("draft", "applied", "failed", "expired")
 
@@ -118,12 +118,36 @@ def claim(plan_id: str) -> Plan | None:
     return plan
 
 
+def _finish_detail(result: dict | None) -> dict | None:
+    """Compact, GC-surviving extract of a finish result: counts, per-message
+    failure codes and pending ids — never the full dicts, never bodies."""
+    if not result:
+        return None
+    detail: dict = {k: result[k] for k in ("planned", "acted", "verified")
+                    if k in result}
+    if "failures" in result:
+        detail["failures"] = [{"id": f.get("id"), "code": f.get("code")}
+                              for f in result["failures"]]
+    if "pending" in result:
+        detail["pending"] = [p.get("id") for p in result["pending"]]
+    if "error" in result:
+        detail["error"] = result["error"]
+    return detail or None
+
+
 def finish(plan: Plan, status: str, result: dict | None) -> None:
-    """Write the final plan JSON and release the claim."""
+    """Write the final plan JSON, release the claim, and record the ONE
+    `plan_finish` ledger event — this seam covers apply success, every
+    apply failure site, expiry, and gc's stale-claim finalisation. The
+    event carries the plan summary and compact outcomes, so the story
+    outlives the plan file's 7-day GC."""
     plan.status = status
     plan.result = result
     save(plan)
     _claim_path(plan.id).unlink(missing_ok=True)
+    audit.emit("plan_finish", outcome=status, operation_id=plan.id,
+               plan_id=plan.id, summary=plan.summary,
+               detail=_finish_detail(result))
 
 
 def expire(plan: Plan) -> None:
@@ -159,10 +183,12 @@ def gc(now: datetime | None = None) -> int:
         elif path.name.endswith(".applying") and mtime < stale:
             try:
                 plan = _revive(json.loads(path.read_bytes()))
-                plan.result = {"error": "stale claim: apply crashed mid-flight"}
-                plan.status = "failed"
-                save(plan)
             except (json.JSONDecodeError, TypeError):
-                pass
-            path.unlink(missing_ok=True)
+                plan = None
+            if plan is not None:
+                # Through finish(): the stale claim gets the same terminal
+                # write + plan_finish event as every other ending.
+                finish(plan, "failed",
+                       {"error": "stale claim: apply crashed mid-flight"})
+            path.unlink(missing_ok=True)  # id/filename mismatch safety net
     return removed

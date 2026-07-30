@@ -16,7 +16,7 @@ import subprocess
 import time
 from datetime import datetime, timedelta
 
-from . import config, plans
+from . import audit, config, plans
 from .log import get_logger
 from .plans import Plan, PlanAction, PlanMessage
 from .sources.base import SearchQuery
@@ -211,6 +211,15 @@ def build_plan(source, q: SearchQuery, actions: list[dict] | None,
         summary=_summary(messages, parsed, target),
     )
     plans.save(plan)
+    detail: dict = {
+        "count": len(plan.messages),
+        "actions": [{k: v for k, v in vars(a).items() if v is not None}
+                    for a in plan.actions],
+    }
+    if plan.target is not None:
+        detail["target"] = plan.target
+    audit.emit("plan_create", outcome="created", operation_id=plan.id,
+               plan_id=plan.id, summary=plan.summary, detail=detail)
     _log.info("triage plan %s: %s", plan.id, plan.summary)
     return plan
 

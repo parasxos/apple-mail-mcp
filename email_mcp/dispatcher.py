@@ -32,7 +32,7 @@ import sys
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-from . import config, identities, sender, spool
+from . import audit, codes, config, identities, sender, spool
 from .log import get_logger
 
 _log = get_logger()
@@ -98,11 +98,19 @@ def _fail_or_retry(entry: spool.Entry, error: str, now: datetime,
         spool.move(entry.id, src, "failed", entry)
         _notify("email-mcp: send FAILED",
                 f"{entry.subject!r} to {', '.join(entry.to)} — {error[:120]}")
-        return "failed"
-    delay = BACKOFF_MINUTES[min(entry.attempts - 1, len(BACKOFF_MINUTES) - 1)]
-    entry.next_attempt_at = spool.iso(now + timedelta(minutes=delay))
-    spool.move(entry.id, src, "pending", entry)
-    return f"retry in {delay}m"
+        outcome, note = "failed", "failed"
+    else:
+        delay = BACKOFF_MINUTES[min(entry.attempts - 1,
+                                    len(BACKOFF_MINUTES) - 1)]
+        entry.next_attempt_at = spool.iso(now + timedelta(minutes=delay))
+        spool.move(entry.id, src, "pending", entry)
+        outcome, note = "retry", f"retry in {delay}m"
+    # ONE emit for the whole funnel: every consumed attempt is on record.
+    audit.emit("deliver", outcome=outcome, operation_id=entry.id,
+               spool_id=entry.id, identity=entry.identity,
+               subject=entry.subject,
+               detail={"attempts": entry.attempts, "error": error[:300]})
+    return note
 
 
 STALE_SENDING_MINUTES = 10
@@ -125,9 +133,15 @@ def _recover_stranded(now: datetime) -> list[str]:
         e.last_error = e.last_error or "dispatcher died mid-delivery (recovered from sending/)"
         if e.attempts >= config.send_max_retries():
             spool.move(e.id, "sending", "failed", e)
+            audit.emit("recover", outcome="failed", operation_id=e.id,
+                       spool_id=e.id, subject=e.subject,
+                       detail={"attempts": e.attempts})
         else:
             e.next_attempt_at = spool.iso(now)
             spool.move(e.id, "sending", "pending", e)
+            audit.emit("recover", outcome="requeued", operation_id=e.id,
+                       spool_id=e.id, subject=e.subject,
+                       detail={"attempts": e.attempts})
             recovered.append(e.id)
     return recovered
 
@@ -166,7 +180,46 @@ def _graph_mark_sent(entry: spool.Entry, now: datetime) -> str:
     entry.next_attempt_at = None
     entry.last_error = None
     spool.move(entry.id, "pending", "sent", entry)
+    audit.emit("graph_sent", outcome="sent", operation_id=entry.id,
+               spool_id=entry.id, identity=entry.identity,
+               message_id=entry.message_id, subject=entry.subject)
     return "sent (delivered by Exchange)"
+
+
+def _graph_adopt(entry: spool.Entry, draft_id: str) -> str:
+    """F2 crash-window recovery: the unrecorded draft exists — record its
+    id; Exchange keeps the job."""
+    if not _graph_current(entry):
+        return _SUPERSEDED
+    entry.graph_draft_id = draft_id
+    entry.last_error = None
+    spool.update("pending", entry)
+    _log.info("graph: adopted orphan draft %s for %s", draft_id, entry.id)
+    audit.emit("graph_adopt", outcome="adopted", operation_id=entry.id,
+               spool_id=entry.id, draft_id=draft_id,
+               message_id=entry.message_id)
+    return "graph: adopted existing draft"
+
+
+def _graph_flip_to_launchd(entry: spool.Entry, now: datetime, reason: str,
+                           clear_draft: bool) -> str:
+    """Release the entry to local delivery next pass: either no draft was
+    ever armed (F1) or the late draft is CONFIRMED revoked. `clear_draft`
+    drops the recorded draft id in the revoked case."""
+    if not _graph_current(entry):
+        return _SUPERSEDED
+    entry.executor = "launchd"  # the ONE flip site: _graph_flip_to_launchd
+    if clear_draft:
+        entry.graph_draft_id = None
+    entry.next_attempt_at = spool.iso(now)
+    entry.last_error = None
+    spool.update("pending", entry)
+    _log.warning("graph: %s for %s — flipped to launchd for local delivery",
+                 reason, entry.id)
+    audit.emit("graph_flip", outcome="flipped", operation_id=entry.id,
+               spool_id=entry.id, message_id=entry.message_id,
+               detail={"reason": reason})
+    return f"graph: {reason} — local delivery next pass"
 
 
 def _graph_leave(entry: spool.Entry, error: str, note: str) -> str:
@@ -193,6 +246,9 @@ def _graph_apply_status(entry: spool.Entry, status: str, now: datetime) -> str:
             "deferred draft was discarded outside the spool (e.g. in "
             "Outlook/OWA Drafts) — not sent, not sendable locally")
         spool.move(entry.id, "pending", "cancelled", entry)
+        audit.emit("graph_cancelled_external", outcome="cancelled",
+                   operation_id=entry.id, spool_id=entry.id,
+                   message_id=entry.message_id, subject=entry.subject)
         return "cancelled externally (draft discarded in Outlook/OWA)"
     # 'held' (shouldn't recur here) / 'unknown': leave + retry next pass.
     return f"graph: status {status} — left for next pass"
@@ -247,15 +303,7 @@ def _reconcile_graph(now: datetime) -> dict[str, str]:
                 continue
             if draft_id is not None:
                 # F2: the draft exists — adopt it; Exchange keeps the job.
-                if not _graph_current(entry):
-                    results[entry.id] = _SUPERSEDED
-                    continue
-                entry.graph_draft_id = draft_id
-                entry.last_error = None
-                spool.update("pending", entry)
-                _log.info("graph: adopted orphan draft %s for %s",
-                          draft_id, entry.id)
-                results[entry.id] = "graph: adopted existing draft"
+                results[entry.id] = _graph_adopt(entry, draft_id)
                 continue
             try:
                 sent = graph.sent_by_message_id(ident, entry.message_id)
@@ -267,16 +315,8 @@ def _reconcile_graph(now: datetime) -> dict[str, str]:
                 results[entry.id] = _graph_mark_sent(entry, now)
                 continue
             # F1: no draft was ever armed — the local spool takes over.
-            if not _graph_current(entry):
-                results[entry.id] = _SUPERSEDED
-                continue
-            entry.executor = "launchd"
-            entry.next_attempt_at = spool.iso(now)
-            entry.last_error = None
-            spool.update("pending", entry)
-            _log.warning("graph: no draft found for %s — flipped to "
-                         "launchd for local delivery", entry.id)
-            results[entry.id] = "graph: no draft found — local delivery next pass"
+            results[entry.id] = _graph_flip_to_launchd(
+                entry, now, "no draft found", clear_draft=False)
             continue
 
         try:
@@ -305,18 +345,8 @@ def _reconcile_graph(now: datetime) -> dict[str, str]:
             # it, so flipping is safe even if the manifest changed under
             # us; the freshness fence only guards against overwriting a
             # concurrent terminal move / cancel.
-            if not _graph_current(entry):
-                results[entry.id] = _SUPERSEDED
-                continue
-            entry.executor = "launchd"
-            entry.graph_draft_id = None
-            entry.next_attempt_at = spool.iso(now)
-            entry.last_error = None
-            spool.update("pending", entry)
-            _log.warning("graph: revoked late draft for %s — flipped to "
-                         "launchd for local delivery", entry.id)
-            results[entry.id] = ("graph: draft revoked — local delivery "
-                                 "next pass")
+            results[entry.id] = _graph_flip_to_launchd(
+                entry, now, "draft revoked", clear_draft=True)
         else:
             # 'gone': Exchange may have won the race between our status
             # probe and the delete — re-disambiguate, never guess (F3).
@@ -378,6 +408,12 @@ def run_once(now: datetime | None = None) -> dict:
         except FileNotFoundError:
             entry.last_error = "spool .eml missing"
             spool.move(entry.id, "sending", "failed", entry)
+            # Bypasses the _fail_or_retry funnel (no retry can help a
+            # vanished .eml) — so it records its own deliver event.
+            audit.emit("deliver", outcome="failed", operation_id=entry.id,
+                       spool_id=entry.id, identity=entry.identity,
+                       subject=entry.subject,
+                       detail={"code": codes.SPOOL_EML_MISSING})
             results[entry.id] = "failed"
             continue
         try:
@@ -396,6 +432,12 @@ def run_once(now: datetime | None = None) -> dict:
         entry.next_attempt_at = None
         entry.last_error = None  # succeeded — a stale error reads as failure
         spool.move(entry.id, "sending", "sent", entry)
+        # op = the spool id, so this deliver event threads with the
+        # server's schedule event for free (the artifact-id rule).
+        audit.emit("deliver", outcome="sent", operation_id=entry.id,
+                   spool_id=entry.id, identity=entry.identity,
+                   message_id=entry.message_id, to=entry.to,
+                   subject=entry.subject)
         results[entry.id] = "sent"
 
     return {"checked_at": spool.iso(now), "due": len(due), "results": results}
@@ -507,6 +549,7 @@ def status() -> dict:
 
 
 def main() -> int:
+    audit.set_process("dispatcher")  # tag this process's ledger events
     parser = argparse.ArgumentParser(prog="email_mcp.dispatcher")
     parser.add_argument("--status", action="store_true")
     parser.add_argument("--install-launchd", action="store_true")
