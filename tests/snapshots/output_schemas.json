@@ -1,0 +1,223 @@
+{
+  "declared": {
+    "audit": null,
+    "cancel_scheduled": null,
+    "doctor": null,
+    "get_attachment": null,
+    "get_email": null,
+    "get_emails_batch": null,
+    "get_thread": null,
+    "list_mailboxes": null,
+    "list_recent": null,
+    "list_scheduled": null,
+    "mailbox_create": null,
+    "mailbox_delete": null,
+    "refresh_mail": null,
+    "reply_email": null,
+    "schedule_email": null,
+    "search_emails": null,
+    "send_email": null,
+    "triage_apply": null,
+    "triage_plan": null,
+    "triage_plan_delete": null
+  },
+  "read_success_shapes": {
+    "audit": {
+      "events": [
+        {
+          "event": "str",
+          "op": "str",
+          "outcome": "str",
+          "spool_id": "str",
+          "src": "str",
+          "tool": "str",
+          "ts": "str",
+          "v": "int"
+        }
+      ],
+      "files_scanned": "int",
+      "ok": "bool",
+      "skipped_lines": "int"
+    },
+    "get_attachment": {
+      "attachment": {
+        "mime": "str",
+        "name": "str",
+        "path": "str",
+        "size": "int"
+      },
+      "ok": "bool"
+    },
+    "get_email": {
+      "email": {
+        "attachments": [],
+        "body_html": "str",
+        "body_text": "str",
+        "flags": {
+          "flagged": "bool",
+          "read": "bool"
+        },
+        "headers": {
+          "Content-Type": "str",
+          "Date": "str",
+          "From": "str",
+          "Message-ID": "str",
+          "Subject": "str",
+          "To": "str"
+        },
+        "ref": {
+          "account": "str",
+          "cc": [],
+          "date": "str",
+          "from_addr": "str",
+          "has_attachment": "bool",
+          "id": "str",
+          "mailbox": "str",
+          "snippet": "str",
+          "subject": "str",
+          "thread_id": "str",
+          "to": [
+            "str"
+          ],
+          "unread": "bool"
+        }
+      },
+      "ok": "bool"
+    },
+    "get_emails_batch": {
+      "emails": [
+        {
+          "attachments": [],
+          "body_html": "str",
+          "body_text": "str",
+          "flags": {
+            "flagged": "bool",
+            "read": "bool"
+          },
+          "headers": {
+            "Content-Type": "str",
+            "Date": "str",
+            "From": "str",
+            "Message-ID": "str",
+            "Subject": "str",
+            "To": "str"
+          },
+          "ref": {
+            "account": "str",
+            "cc": [],
+            "date": "str",
+            "from_addr": "str",
+            "has_attachment": "bool",
+            "id": "str",
+            "mailbox": "str",
+            "snippet": "str",
+            "subject": "str",
+            "thread_id": "str",
+            "to": [
+              "..."
+            ],
+            "unread": "bool"
+          }
+        }
+      ],
+      "errors": [],
+      "ok": "bool",
+      "view": "str"
+    },
+    "get_thread": {
+      "ok": "bool",
+      "thread": [
+        {
+          "account": "str",
+          "cc": [],
+          "date": "str",
+          "from_addr": "str",
+          "has_attachment": "bool",
+          "id": "str",
+          "mailbox": "str",
+          "snippet": "str",
+          "subject": "str",
+          "thread_id": "str",
+          "to": [],
+          "unread": "bool"
+        }
+      ]
+    },
+    "list_mailboxes": {
+      "mailboxes": [
+        {
+          "account": "str",
+          "name": "str",
+          "path": "str",
+          "total": "int",
+          "unread": "int"
+        }
+      ],
+      "ok": "bool"
+    },
+    "list_recent": {
+      "messages": [
+        {
+          "account": "str",
+          "cc": [
+            "str"
+          ],
+          "date": "str",
+          "from_addr": "str",
+          "has_attachment": "bool",
+          "id": "str",
+          "mailbox": "str",
+          "snippet": "str",
+          "subject": "str",
+          "thread_id": "str",
+          "to": [
+            "str"
+          ],
+          "unread": "bool"
+        }
+      ],
+      "ok": "bool"
+    },
+    "list_scheduled": {
+      "cancelled": [],
+      "dispatcher_installed": "bool",
+      "dispatcher_label": "str",
+      "failed": [],
+      "ok": "bool",
+      "pending": [],
+      "sending": [],
+      "sent": []
+    },
+    "search_emails": {
+      "fts": {
+        "backlog": "int",
+        "hits": "int",
+        "hits_capped": "bool",
+        "indexed": "int",
+        "missing": "int",
+        "remedy": "str",
+        "state": "str"
+      },
+      "ok": "bool",
+      "results": [
+        {
+          "account": "str",
+          "body_match": "bool",
+          "cc": [],
+          "date": "str",
+          "from_addr": "str",
+          "has_attachment": "bool",
+          "id": "str",
+          "mailbox": "str",
+          "snippet": "str",
+          "subject": "str",
+          "thread_id": "str",
+          "to": [
+            "str"
+          ],
+          "unread": "bool"
+        }
+      ]
+    }
+  }
+}
