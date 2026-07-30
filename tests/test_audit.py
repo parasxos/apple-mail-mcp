@@ -65,7 +65,7 @@ def test_emit_writes_single_parseable_envelope_line(audit_dir_guard):
     rec = json.loads(lines[0])
     assert rec["v"] == audit.SCHEMA_VERSION == 1
     assert rec["op"] == op
-    assert re.fullmatch(r"\d{8}T\d{6}Z-[0-9a-f]{6}", op)  # ids.new_id shape
+    assert re.fullmatch(r"\d{8}T\d{6}Z-[0-9a-f]{12}", op)  # ids.new_id shape
     assert rec["src"] == "server"
     assert rec["event"] == "send"
     assert rec["outcome"] == "sent"

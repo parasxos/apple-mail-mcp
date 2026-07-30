@@ -102,8 +102,19 @@ def emit(
         line = _fit(record)
         # Month resolved from this event's own ts: no rollover race.
         path = config.audit_dir() / f"{ts[:7]}.jsonl"
-        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+        # O_RDWR (not O_WRONLY) so the torn-tail probe below can pread.
+        fd = os.open(path, os.O_RDWR | os.O_CREAT | os.O_APPEND, 0o600)
         try:
+            # Torn-tail heal: a previous crash/short write can leave the
+            # file without a trailing newline; appending straight after it
+            # would weld THIS event onto the torn fragment and lose it too.
+            # A leading newline isolates the fragment on its own (skipped,
+            # counted) line. Still ONE os.write per event — lines from two
+            # processes can never interleave. If both writers heal the same
+            # torn tail, the extra blank line is skipped silently.
+            size = os.fstat(fd).st_size
+            if size and os.pread(fd, 1, size - 1) != b"\n":
+                line = b"\n" + line
             os.write(fd, line + b"\n")
         finally:
             os.close(fd)
@@ -116,8 +127,11 @@ def emit(
 
 
 def _dumps(record: dict) -> bytes:
+    # default=str: a hook passing a Path / datetime / bytes inside detail
+    # must cost a coerced value, never the whole event (emit would drop it
+    # wholesale on TypeError otherwise — a silently lost receipt).
     return json.dumps(
-        record, separators=(",", ":"), ensure_ascii=False
+        record, separators=(",", ":"), ensure_ascii=False, default=str
     ).encode("utf-8")
 
 
