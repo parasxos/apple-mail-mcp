@@ -40,11 +40,37 @@ SUBJECT_MAX_CHARS = 200
 
 _ENVELOPE = ("v", "ts", "op", "src", "event", "outcome")
 # Schema v1's closed optional-field vocabulary (contract §6); anything
-# else a hook wants to record belongs inside `detail`.
+# else a hook wants to record belongs inside `detail` — which is FENCED:
+# §6's no-bodies/no-secrets guarantee is enforced here, not left to
+# call-site discipline (audit finding F2). Keys on the denylist are
+# dropped recursively and their names recorded under `_fenced`.
 _OPTIONAL = (
     "identity", "account", "mailbox", "message_id", "spool_id", "plan_id",
     "draft_id", "to", "cc", "bcc", "subject", "summary", "detail",
 )
+
+_DETAIL_FENCE = frozenset({
+    "body", "body_text", "body_html", "content", "html", "raw",
+    "password", "secret", "token", "access_token", "refresh_token",
+    "authorization",
+})
+
+
+def _fence_detail(value, fenced: list):
+    """Recursively strip denylisted keys from a detail payload. The ledger
+    is a permanent record: message bodies and credential material must be
+    structurally unreachable, not merely avoided by callers."""
+    if isinstance(value, dict):
+        out = {}
+        for k, v in value.items():
+            if str(k).lower() in _DETAIL_FENCE:
+                fenced.append(str(k))
+                continue
+            out[k] = _fence_detail(v, fenced)
+        return out
+    if isinstance(value, (list, tuple)):
+        return [_fence_detail(v, fenced) for v in value]
+    return value
 _MONTH_FILE = re.compile(r"\d{4}-\d{2}\.jsonl")
 
 _PROCESS = "server"
@@ -91,6 +117,10 @@ def emit(
         if tool is not None:
             record["tool"] = tool
         if detail is not None:
+            fenced: list = []
+            detail = _fence_detail(detail, fenced)
+            if fenced and isinstance(detail, dict):
+                detail["_fenced"] = sorted(set(fenced))
             fields["detail"] = detail
         for key in _OPTIONAL:
             value = fields.get(key)

@@ -145,9 +145,15 @@ def finish(plan: Plan, status: str, result: dict | None) -> None:
     plan.result = result
     save(plan)
     _claim_path(plan.id).unlink(missing_ok=True)
+    try:
+        detail = _finish_detail(result)
+    except Exception:  # noqa: BLE001 — detail is best-effort; a shaped-data
+        # surprise must never turn a finished apply into an error or lose
+        # the plan_finish event (audit finding F5: this expression used to
+        # sit OUTSIDE emit()'s log-and-continue fence).
+        detail = {"detail_error": "unrenderable result"}
     audit.emit("plan_finish", outcome=status, operation_id=plan.id,
-               plan_id=plan.id, summary=plan.summary,
-               detail=_finish_detail(result))
+               plan_id=plan.id, summary=plan.summary, detail=detail)
 
 
 def expire(plan: Plan) -> None:

@@ -6,6 +6,8 @@ from __future__ import annotations
 
 import asyncio
 import json
+
+import pytest
 from pathlib import Path
 
 from email_mcp import server
@@ -48,9 +50,17 @@ def _render(schemas: dict) -> str:
 def test_input_schemas_match_snapshot(monkeypatch):
     current = _current_schemas(monkeypatch)
     assert len(current) == 20
-    if not SNAPSHOT.exists():  # first run only: freeze the surface
-        SNAPSHOT.parent.mkdir(parents=True, exist_ok=True)
-        SNAPSHOT.write_text(_render(current), encoding="utf-8")
+    if not SNAPSHOT.exists():
+        # The freeze must be self-defending: a deleted snapshot fails loudly
+        # instead of silently re-freezing whatever the code now emits
+        # (audit finding F7). Restore it from git, or regenerate DELIBERATELY:
+        #   python -c "from tests.test_schema_snapshot import *; \
+        #              SNAPSHOT.write_text(_render(_current_schemas(...)))"
+        pytest.fail(
+            "tests/snapshots/input_schemas.json is missing — the inputSchema "
+            "freeze (contract §8) cannot be verified. Restore it via "
+            "`git checkout tests/snapshots/` or regenerate deliberately."
+        )
     frozen = json.loads(SNAPSHOT.read_text(encoding="utf-8"))
     assert current == frozen, (
         "inputSchema drift against tests/snapshots/input_schemas.json — "

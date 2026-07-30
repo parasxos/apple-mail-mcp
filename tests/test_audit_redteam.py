@@ -638,14 +638,14 @@ def test_emit_coerces_nonserializable_detail(audit_dir_guard):
     op = audit.emit("deliver", outcome="sent", detail={
         "path": Path("/tmp/x.eml"),
         "when": datetime(2026, 7, 30, tzinfo=timezone.utc),
-        "raw": b"bytes",
-        "codes": {1, 2},
+        "blob": b"bytes",   # key renamed from "raw": that key is now FENCED
+        "codes": {1, 2},    # (F2 detail denylist) — coercion intent unchanged
     })
     assert op is not None
     rec, = _events(audit_dir_guard)
     assert rec["detail"]["path"] == "/tmp/x.eml"
     assert rec["detail"]["when"].startswith("2026-07-30")
-    assert isinstance(rec["detail"]["raw"], str)
+    assert isinstance(rec["detail"]["blob"], str)
     assert isinstance(rec["detail"]["codes"], str)
 
 

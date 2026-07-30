@@ -285,7 +285,7 @@ manifests, Message-IDs) — it does not create truth. Storage: append-only
 monthly JSONL, `~/.email-mcp/audit/YYYY-MM.jsonl`, dir 0700, files 0600.
 ONE event per mutation. Two writer processes exist (server + launchd
 dispatcher); each emit is a single `os.write` on an
-`O_WRONLY|O_CREAT|O_APPEND` fd resolved per event, so lines never interleave
+`O_RDWR|O_CREAT|O_APPEND` fd resolved per event (RDWR so the tail probe can `pread`; `O_APPEND` carries the atomicity), so lines never interleave
 and month rollover has no race.
 
 **Envelope (always present):**
@@ -301,7 +301,8 @@ and month rollover has no race.
 
 **Optional fields** (only non-null keys are serialized): `identity`,
 `account`, `mailbox`, `message_id`, `spool_id`, `plan_id`, `draft_id`,
-`to`, `cc`, `bcc`, `subject`, `summary`, `detail`.
+`to`, `cc`, `bcc`, `subject`, `summary`, `detail`, `tool` (the MCP tool
+name; present on every server-layer event — audit finding F9).
 
 **Events** (placement rule: emit in the process that decides the outcome,
 at the point it becomes durable):
@@ -372,6 +373,10 @@ gains an `audit` check (dir exists, perms, writability).
   could raise is either handled with a specific code or caught by a belt
   that logs the full traceback and returns
   `{ok: false, code: "internal_error", error, fix: "run doctor"}`.
+  *v0.10 carve-out (audit finding F1):* the three array-shaped tools
+  (`get_thread`, `list_mailboxes`, `list_recent`) are un-belted until their
+  v0.11 envelope migration — §1 rows 4-6 govern; this sentence becomes
+  absolute at v0.11.
 - Every tool return is JSON-serializable (dataclasses/datetimes converted
   at the boundary).
 - **Secrets never appear in envelopes, logs, or audit events.** Secret

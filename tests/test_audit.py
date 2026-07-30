@@ -293,3 +293,49 @@ def test_cli_tail_and_status(audit_dir_guard, capsys):
 
     assert audit.main([]) == 2  # bare invocation prints help
     assert "usage:" in capsys.readouterr().out
+
+
+def test_detail_fence_strips_bodies_and_secrets_recursively(tmp_path, monkeypatch):
+    """Audit finding F2: the no-bodies guarantee must be a structural fence,
+    not call-site discipline — denylisted keys never reach the ledger, at
+    any nesting depth, and the redaction itself is on record."""
+    monkeypatch.setenv("EMAIL_MCP_AUDIT_DIR", str(tmp_path))
+    from email_mcp import audit
+    audit.emit(
+        "send", outcome="sent", operation_id="op-fence-1",
+        detail={
+            "body": "SECRET BODY TEXT",
+            "nested": {"refresh_token": "tok-123", "keep": "yes"},
+            "items": [{"password": "hunter2", "id": "a"}],
+            "reason": "ok-to-keep",
+        },
+    )
+    line = next(tmp_path.glob("*.jsonl")).read_text()
+    assert "SECRET BODY TEXT" not in line
+    assert "tok-123" not in line and "hunter2" not in line
+    assert '"keep": "yes"' in line.replace("  ", " ") or '"keep":"yes"' in line
+    assert "ok-to-keep" in line
+    import json
+    event = json.loads(line)
+    assert sorted(event["detail"]["_fenced"]) == ["body", "password", "refresh_token"]
+
+
+def test_plan_finish_survives_malformed_result(tmp_path, monkeypatch):
+    """Audit finding F5: a shaped-data surprise in the finish result must
+    neither raise out of plans.finish nor lose the plan_finish event."""
+    monkeypatch.setenv("EMAIL_MCP_AUDIT_DIR", str(tmp_path / "audit"))
+    monkeypatch.setenv("EMAIL_MCP_PLANS_DIR", str(tmp_path / "plans"))
+    from email_mcp import audit, plans
+    plan = plans.Plan(
+        id=plans.new_id(), created_at=plans.iso(plans.utcnow()),
+        expires_at=plans.iso(plans.utcnow()), status="draft", query={},
+        actions=[], target=None, messages=[], summary="s",
+    )
+    plans.save(plan)
+    # failures contains a NON-DICT element — _finish_detail would AttributeError
+    plans.finish(plan, "applied", {"planned": 1, "failures": ["not-a-dict"]})
+    assert plans.load(plan.id).status == "applied"
+    events = audit.query(limit=10)["events"]
+    finish_events = [e for e in events if e["event"] == "plan_finish"]
+    assert len(finish_events) == 1
+    assert finish_events[0]["detail"] == {"detail_error": "unrenderable result"}
