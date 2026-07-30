@@ -22,7 +22,11 @@ classifiers = [
     "Topic :: Communications :: Email",
 ]
 dependencies = [
-    "mcp>=1.0",
+    # Upper bound is load-bearing: mcp 2.0 removed `mcp.server.fastmcp`,
+    # which server.py imports — an unbounded pin makes a fresh `pipx install`
+    # resolve 2.x and fail to serve at all (v0.11 audit finding F-NEW-1).
+    # Porting to the 2.x API is its own deliberate stage.
+    "mcp>=1.2,<2",
 ]
 
 [project.urls]
