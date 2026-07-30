@@ -13,12 +13,11 @@ process wins the rename owns the apply; the loser sees FileNotFoundError.
 from __future__ import annotations
 
 import json
-import secrets
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-from . import config
+from . import config, ids
 
 STATUSES = ("draft", "applied", "failed", "expired")
 
@@ -61,17 +60,11 @@ class Plan:
     result: dict | None = None       # filled by apply
 
 
-def utcnow() -> datetime:
-    return datetime.now(timezone.utc)
-
-
-def iso(dt: datetime) -> str:
-    return dt.astimezone(timezone.utc).isoformat(timespec="seconds")
-
-
-def new_id(now: datetime | None = None) -> str:
-    stamp = (now or utcnow()).strftime("%Y%m%dT%H%M%SZ")
-    return f"{stamp}-{secrets.token_hex(3)}"
+# Single source in ids.py (shared with spool.py and the audit ledger);
+# the names stay public here so call sites and monkeypatches don't churn.
+utcnow = ids.utcnow
+iso = ids.iso
+new_id = ids.new_id
 
 
 def _path(plan_id: str) -> Path:

@@ -15,12 +15,10 @@ moves on. That makes overlapping dispatcher runs double-send-safe.
 from __future__ import annotations
 
 import json
-import secrets
 from dataclasses import asdict, dataclass, field
-from datetime import datetime, timezone
 from pathlib import Path
 
-from . import config
+from . import config, ids
 
 STATES = ("pending", "sending", "sent", "failed", "cancelled")
 
@@ -51,17 +49,11 @@ class Entry:
     graph_draft_id: str | None = None  # Exchange draft id once armed
 
 
-def utcnow() -> datetime:
-    return datetime.now(timezone.utc)
-
-
-def iso(dt: datetime) -> str:
-    return dt.astimezone(timezone.utc).isoformat(timespec="seconds")
-
-
-def new_id(now: datetime | None = None) -> str:
-    stamp = (now or utcnow()).strftime("%Y%m%dT%H%M%SZ")
-    return f"{stamp}-{secrets.token_hex(3)}"
+# Single source in ids.py (shared with plans.py and the audit ledger);
+# the names stay public here so call sites and monkeypatches don't churn.
+utcnow = ids.utcnow
+iso = ids.iso
+new_id = ids.new_id
 
 
 def _paths(state: str, id: str) -> tuple[Path, Path]:

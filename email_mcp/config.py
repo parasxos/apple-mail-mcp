@@ -273,6 +273,32 @@ def fts_reconcile_days() -> int:
     return int(os.environ.get("EMAIL_MCP_FTS_RECONCILE_DAYS", "7"))
 
 
+# ---------------------------------------------------------------------- #
+# Audit ledger (email_mcp.audit)                                          #
+# ---------------------------------------------------------------------- #
+
+
+def audit_dir(create: bool = True) -> Path:
+    """Root of the append-only audit ledger (monthly JSONL event files).
+    Created 0700 like plans_dir — events carry recipients and subjects.
+
+    Default ~/.email-mcp/audit, override with EMAIL_MCP_AUDIT_DIR. Pass
+    create=False to resolve the path without touching the filesystem —
+    read paths (query, --status) must never create the ledger directory.
+    """
+    raw = os.environ.get("EMAIL_MCP_AUDIT_DIR", "").strip()
+    d = Path(raw).expanduser() if raw else Path.home() / ".email-mcp" / "audit"
+    if create:
+        d.mkdir(parents=True, exist_ok=True)
+        if not raw:
+            # Lock down ~/.email-mcp itself. An env-overridden dir's
+            # parent is not ours to chmod (and may refuse — e.g. a
+            # root-owned temp root), which must never cost an event.
+            d.parent.chmod(0o700)
+        d.chmod(0o700)
+    return d
+
+
 def send_max_attach_mb() -> float:
     """Total attachment budget per message, in MB (pre-base64 file bytes).
 
