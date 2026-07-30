@@ -146,6 +146,11 @@ def _recover_stranded(now: datetime) -> list[str]:
     return recovered
 
 
+# Public seam for doctor --fix (email_mcp.repairs): the same function
+# under a stable name — no behavior change.
+recover_stranded = _recover_stranded
+
+
 # Exchange owns a graph entry until send_at + this grace: normal deferred
 # transmission needs no help from us, so the reconcile pass only starts
 # asking questions once Exchange is convincingly late.
@@ -503,6 +508,11 @@ def _remove_legacy_plists() -> list[str]:
         if found:
             removed.append(label)
     return removed
+
+
+# Public seam for doctor --fix (email_mcp.repairs): the same function
+# under a stable name — no behavior change.
+remove_legacy_plists = _remove_legacy_plists
 
 
 def install_launchd() -> str:
