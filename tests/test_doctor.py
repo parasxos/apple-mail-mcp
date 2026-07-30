@@ -248,8 +248,10 @@ def test_check_audit_flags_file_where_dir_belongs(monkeypatch, tmp_path):
     the audit path must read as a fault, not a fresh install."""
     bogus = tmp_path / "audit"
     bogus.write_text("not a directory")
-    monkeypatch.setenv("EMAIL_MCP_AUDIT_DIR", str(bogus))
-    from email_mcp import doctor
+    # conftest's audit_dir_guard monkeypatches config.audit_dir itself
+    # (env alone is inert here) — override the getter, per its docstring.
+    from email_mcp import config, doctor
+    monkeypatch.setattr(config, "audit_dir", lambda create=True: bogus)
     res = doctor.check_audit()
     assert res["ok"] is False
     assert "not a directory" in res["detail"]
