@@ -1,0 +1,1015 @@
+"""Lifecycle commands: ``email-mcp setup`` — the guided install (v0.11 L3).
+
+Eight steps, run in order, each reported as a :class:`StepResult`:
+
+1. **preflight** — macOS only; detect Mail.app, the macOS version and
+   ``~/Library/Mail``; an existing ``meta.json`` flips the run into
+   review/repair mode (nothing is ever installed twice blindly).
+2. **permissions** — the doctor's own ``check_mail_store`` /
+   ``check_automation`` / ``check_accessibility`` probes, with the check's
+   own ``fix`` text on red and an Enter-to-retry / s-to-skip loop.
+   Full Disk Access honesty: FDA binds when a process STARTS, so a grant
+   made mid-wizard cannot help this process — the wizard says so and asks
+   for a terminal restart instead of retry-looping forever.
+3. **state_dirs** — the ``~/.email-mcp`` tree via the config getters
+   (which already mkdir + chmod 0700), then ``meta.json`` (0600,
+   tmp + rename). The FTS dir is DERIVED state and is never created here —
+   ``email-mcp fts --build`` remains the only builder.
+4. **identity** — the identities.toml question tree (per driver:
+   ssh_sendmail / smtp / pipe). Secret VALUES are never read and never
+   stored: for smtp the wizard prints the exact
+   ``security add-generic-password`` command for the user to run
+   themselves, or accepts an ``op://`` reference. Identity names must
+   match ``^[A-Za-z0-9_-]{1,64}$`` — the name becomes
+   ``graph/<name>.token.json``, so the regex is a path-traversal fence.
+   Skipped entirely under ``--read-only``.
+5. **launchd** — the dispatcher (scheduled send) and FTS (nightly sync)
+   agents, asked per agent, installed via the modules' own
+   ``install_launchd()``.
+6. **fts** — full build / quick start (``--limit``) / defer / skip, with
+   an honest time warning before a full first build.
+7. **client_config** — the ready-to-paste ``mcpServers`` JSON with the
+   ABSOLUTE entry-point path, plus the read-only env variant.
+8. **smoke** — ``doctor.run()`` rendered as a table; optional self-send.
+
+One ``lifecycle`` audit event (an additive event type, contract §8) is
+emitted per run that touched state:
+``detail = {mode, identities: [names], agents, fts_choice}`` — identity
+NAMES only, never addresses, never secrets.
+
+Printing here is by design: this module is a CLI entry point, not library
+code (contract §7 lists the print-by-design entry points; the MCP serve
+path never routes through here).
+"""
+from __future__ import annotations
+
+import argparse
+import dataclasses
+import json
+import os
+import platform
+import re
+import shutil
+import sys
+import tomllib
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Callable
+
+from . import audit, config, doctor, ids
+from .log import get_logger
+from .transports import DRIVERS, SendError
+
+_log = get_logger()
+
+# The on-disk state schema version written to meta.json. `email-mcp
+# update` (L4) walks MIGRATIONS from the recorded version up to here;
+# the hook is empty until a migration exists.
+STATE_VERSION = 1
+MIGRATIONS: dict[int, Callable[[dict], dict]] = {}
+
+# Identity names become graph/<name>.token.json — this regex is a path
+# traversal fence, not cosmetics. Table/param keys get the same charset.
+_NAME_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
+_KEY_RE = re.compile(r"^[A-Za-z0-9_-]+$")
+
+# Keys whose VALUE would be a secret. identities.toml stores references
+# (a Keychain item name, an op:// path), never the secrets themselves —
+# a block carrying one of these is refused outright.
+_SECRET_KEYS = frozenset({
+    "password", "passwd", "app_password", "secret", "token",
+    "access_token", "refresh_token", "api_key", "credential",
+    "credentials",
+})
+
+# EMAIL_MCP_* variables that redirect state paths; StatePaths.resolve()
+# records which of these are in effect.
+_PATH_ENV_VARS = (
+    "EMAIL_MCP_MAIL_DIR", "EMAIL_MCP_SPOOL_DIR", "EMAIL_MCP_PLANS_DIR",
+    "EMAIL_MCP_GRAPH_DIR", "EMAIL_MCP_AUDIT_DIR", "EMAIL_MCP_FTS_DIR",
+    "EMAIL_MCP_IDENTITIES",
+)
+
+_FDA_RESTART_NOTE = (
+    "Full Disk Access binds when a process starts: after granting it, "
+    "restart this terminal and re-run `email-mcp setup`."
+)
+
+# Module-level seam so tests can script the interactive prompts.
+_input = input
+
+
+class SetupError(Exception):
+    """A caller-fixable problem with the setup answers (bad identity
+    name, secret value where a reference belongs, unknown driver)."""
+
+
+# --------------------------------------------------------------------- #
+# meta.json + state paths                                                #
+# --------------------------------------------------------------------- #
+
+
+def meta_path() -> Path:
+    return Path.home() / ".email-mcp" / "meta.json"
+
+
+def read_meta() -> dict:
+    """Parse meta.json; {} when absent or unreadable (same tolerance as
+    cli._state_version — a corrupt meta must never crash the wizard)."""
+    try:
+        data = json.loads(meta_path().read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def write_meta(meta: dict) -> Path:
+    """Write meta.json atomically: tmp in the same directory, chmod 0600,
+    then rename over the target (the graph token-cache discipline)."""
+    path = meta_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.parent.chmod(0o700)
+    tmp = path.with_name(f"{path.name}.{os.getpid()}.tmp")
+    tmp.write_text(json.dumps(meta, indent=2, sort_keys=True) + "\n",
+                   encoding="utf-8")
+    tmp.chmod(0o600)
+    tmp.replace(path)
+    return path
+
+
+@dataclass(frozen=True)
+class StatePaths:
+    """Every path the state tree owns, resolved WITHOUT filesystem side
+    effects, plus the EMAIL_MCP_* overrides in effect."""
+
+    root: Path
+    spool: Path
+    plans: Path
+    graph: Path
+    audit: Path
+    fts: Path
+    identities: Path
+    meta: Path
+    env_overrides: dict[str, str]
+
+    @classmethod
+    def resolve(cls) -> "StatePaths":
+        """Resolve via the config getters where they are pure
+        (audit_dir/fts_dir take create=False; identities_file only
+        resolves) and via their documented env-or-default rule where they
+        are not (spool_dir/plans_dir/graph_dir mkdir + chmod on every
+        call — the purity mirror doctor._graph_token_dir and repairs
+        follow)."""
+        def env_dir(var: str, default: Path) -> Path:
+            raw = os.environ.get(var, "").strip()
+            return Path(raw).expanduser() if raw else default
+
+        root = Path.home() / ".email-mcp"
+        overrides = {
+            var: os.environ[var] for var in _PATH_ENV_VARS
+            if os.environ.get(var, "").strip()
+        }
+        return cls(
+            root=root,
+            spool=env_dir("EMAIL_MCP_SPOOL_DIR", root / "spool"),
+            plans=env_dir("EMAIL_MCP_PLANS_DIR", root / "plans"),
+            graph=env_dir("EMAIL_MCP_GRAPH_DIR", root / "graph"),
+            audit=config.audit_dir(create=False),
+            fts=config.fts_dir(create=False),
+            identities=config.identities_file(),
+            meta=root / "meta.json",
+            env_overrides=overrides,
+        )
+
+
+# --------------------------------------------------------------------- #
+# answers + results                                                      #
+# --------------------------------------------------------------------- #
+
+
+@dataclass
+class Answers:
+    """Scripted answers for a non-interactive run (``--yes`` uses the
+    defaults below; ``--answers FILE`` loads a JSON object of them)."""
+
+    read_only: bool = False
+    # Scripted "s" to every red permission check; without it a red check
+    # blocks a non-interactive run.
+    skip_permissions: bool = False
+    # With an existing identities.toml: keep it untouched or add/replace
+    # the blocks in `identities`. (Interactive mode also offers edit.)
+    identity_action: str = "keep"
+    identities: list[dict] = field(default_factory=list)
+    default_identity: str = ""
+    install_dispatcher: bool = False
+    install_fts_agent: bool = False
+    fts_choice: str = "defer"  # full | quick | defer | skip
+    fts_limit: int = 500
+    self_send: bool = False
+
+    @classmethod
+    def from_dict(cls, data: dict) -> "Answers":
+        known = {f.name for f in dataclasses.fields(cls)}
+        unknown = sorted(set(data) - known)
+        if unknown:
+            raise ValueError(
+                f"unknown answer key(s) {unknown}; valid: {sorted(known)}")
+        answers = cls(**data)
+        if answers.identity_action not in {"keep", "add"}:
+            raise ValueError(
+                f"identity_action must be 'keep' or 'add', "
+                f"not {answers.identity_action!r}")
+        if answers.fts_choice not in {"full", "quick", "defer", "skip"}:
+            raise ValueError(
+                "fts_choice must be one of full/quick/defer/skip, "
+                f"not {answers.fts_choice!r}")
+        if not isinstance(answers.identities, list) or not all(
+                isinstance(b, dict) for b in answers.identities):
+            raise ValueError("identities must be a list of objects")
+        return answers
+
+    @classmethod
+    def from_file(cls, path: str | Path) -> "Answers":
+        data = json.loads(Path(path).read_text(encoding="utf-8"))
+        if not isinstance(data, dict):
+            raise ValueError("answers file must hold one JSON object")
+        return cls.from_dict(data)
+
+
+@dataclass
+class StepResult:
+    """One setup step's outcome. ``blocked`` stops the run and makes the
+    CLI exit nonzero; ``failed`` is a non-fatal step failure (the run
+    continues — e.g. an FTS build that errored); ``skipped`` was a
+    deliberate choice."""
+
+    step: str
+    status: str  # "ok" | "skipped" | "failed" | "blocked"
+    detail: str = ""
+
+
+# --------------------------------------------------------------------- #
+# identities.toml writing (backup-first, tmp+rename, 0600)               #
+# --------------------------------------------------------------------- #
+
+
+def _toml_value(value) -> str:
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    if isinstance(value, (int, float)):
+        return str(value)
+    if isinstance(value, str):
+        # json string escaping is a valid TOML basic string.
+        return json.dumps(value)
+    if isinstance(value, (list, tuple)):
+        return "[" + ", ".join(_toml_value(v) for v in value) + "]"
+    raise SetupError(
+        f"cannot serialize a {type(value).__name__} into identities.toml")
+
+
+def _fence_secret_keys(name: str, table: dict) -> None:
+    for key, value in table.items():
+        if str(key).lower() in _SECRET_KEYS:
+            raise SetupError(
+                f"identity [{name}]: key {key!r} refused — identities.toml "
+                "never stores secret values. Put the app password in the "
+                "macOS Keychain (security add-generic-password -s <item> "
+                "-a <account> -w) or 1Password, and reference it with "
+                "`keychain` / `op`."
+            )
+        if not _KEY_RE.fullmatch(str(key)):
+            raise SetupError(
+                f"identity [{name}]: key {key!r} is not a bare TOML key "
+                "([A-Za-z0-9_-]+).")
+        if isinstance(value, dict):
+            _fence_secret_keys(f"{name}.{key}", value)
+
+
+def _validate_tables(tables: dict[str, dict], default: str) -> None:
+    if not tables:
+        raise SetupError("no identities to write.")
+    for name, table in tables.items():
+        if not _NAME_RE.fullmatch(str(name)):
+            raise SetupError(
+                f"invalid identity name {name!r} — must match "
+                "^[A-Za-z0-9_-]{1,64}$. The name becomes "
+                "graph/<name>.token.json, so this is a path fence, "
+                "not cosmetics."
+            )
+        if not isinstance(table, dict):
+            raise SetupError(f"identity [{name}] must be a table.")
+        _fence_secret_keys(name, table)
+        if not str(table.get("from_addr", "")).strip():
+            raise SetupError(f"identity [{name}] needs `from_addr`.")
+        driver = str(table.get("driver", "")).strip()
+        if driver not in DRIVERS:
+            raise SetupError(
+                f"identity [{name}] has missing or unknown driver "
+                f"{driver!r}. Available: {sorted(DRIVERS)}")
+        if driver == "smtp" and not (
+                str(table.get("keychain", "")).strip()
+                or str(table.get("op", "")).strip()):
+            raise SetupError(
+                f"identity [{name}]: the smtp driver needs a secret "
+                "REFERENCE — set `keychain` (a Keychain item name; store "
+                "the app password once with: security add-generic-password "
+                "-s <item> -a <username> -w) or `op` (a 1Password op:// "
+                "secret reference). The password itself is never stored "
+                "here."
+            )
+    if default not in tables:
+        raise SetupError(
+            f"default identity {default!r} has no table. "
+            f"Available: {sorted(tables)}")
+
+
+def _render_identities(tables: dict[str, dict], default: str) -> str:
+    lines = [f"default = {json.dumps(default)}", ""]
+    for name, table in tables.items():
+        lines.append(f"[{name}]")
+        subtables: dict[str, dict] = {}
+        for key, value in table.items():
+            if isinstance(value, dict):
+                subtables[key] = value
+                continue
+            lines.append(f"{key} = {_toml_value(value)}")
+        for key, sub in subtables.items():
+            lines.append("")
+            lines.append(f"[{name}.{key}]")
+            for k, v in sub.items():
+                lines.append(f"{k} = {_toml_value(v)}")
+        lines.append("")
+    return "\n".join(lines).rstrip("\n") + "\n"
+
+
+def write_identities(
+    tables: dict[str, dict],
+    default: str,
+    path: Path | None = None,
+) -> tuple[Path, Path | None]:
+    """Validate, serialize and atomically install identities.toml (0600).
+
+    An existing file is backed up FIRST to
+    ``identities.toml.bak-<UTCSTAMP>`` (mode preserved, collision-looped,
+    never overwritten) — only then is the new content written to a tmp
+    file, chmod 0600, and renamed over the target. Validation runs before
+    the backup, so a refused write touches nothing at all.
+
+    Returns ``(path, backup_path_or_None)``.
+    """
+    path = path or config.identities_file()
+    _validate_tables(tables, default)
+    text = _render_identities(tables, default)
+    # Belt: whatever we wrote must parse back — never install a file the
+    # loader would reject as malformed TOML.
+    tomllib.loads(text)
+
+    backup: Path | None = None
+    if path.exists():
+        stamp = ids.utcnow().strftime("%Y%m%dT%H%M%SZ")
+        backup = path.with_name(f"{path.name}.bak-{stamp}")
+        n = 1
+        while backup.exists():
+            backup = path.with_name(f"{path.name}.bak-{stamp}-{n}")
+            n += 1
+        shutil.copy2(path, backup)  # mode-preserved backup BEFORE clobber
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(f"{path.name}.{os.getpid()}.tmp")
+    tmp.write_text(text, encoding="utf-8")
+    tmp.chmod(0o600)
+    tmp.replace(path)
+    _log.info("lifecycle: wrote %s (%d identity(ies), default %r)%s",
+              path, len(tables), default,
+              f", backup {backup.name}" if backup else "")
+    return path, backup
+
+
+def _identity_names(path: Path) -> list[str]:
+    """Table names in an identities file; [] when absent/unparseable.
+    Names only — never addresses — these feed the lifecycle event."""
+    try:
+        with path.open("rb") as f:
+            data = tomllib.load(f)
+    except (OSError, tomllib.TOMLDecodeError):
+        return []
+    return sorted(k for k, v in data.items() if isinstance(v, dict))
+
+
+# --------------------------------------------------------------------- #
+# interactive helpers                                                    #
+# --------------------------------------------------------------------- #
+
+
+def _ask(prompt: str, default: str = "") -> str:
+    suffix = f" [{default}]" if default else ""
+    raw = _input(f"  {prompt}{suffix}: ").strip()
+    return raw or default
+
+
+def _ask_required(prompt: str) -> str:
+    while True:
+        value = _ask(prompt)
+        if value:
+            return value
+        print("  (required)")
+
+
+def _ask_yn(prompt: str, default: bool = False) -> bool:
+    raw = _input(f"  {prompt} [{'Y/n' if default else 'y/N'}]: ").strip()
+    if not raw:
+        return default
+    return raw.lower() in {"y", "yes"}
+
+
+def _ask_choice(prompt: str, choices: list[str], default: str) -> str:
+    while True:
+        value = _ask(f"{prompt} ({'/'.join(choices)})", default)
+        if value in choices:
+            return value
+        print(f"  (one of: {', '.join(choices)})")
+
+
+# --------------------------------------------------------------------- #
+# steps 1-3: preflight, permissions, state_dirs                          #
+# --------------------------------------------------------------------- #
+
+
+def _step_preflight(facts: dict) -> StepResult:
+    if sys.platform != "darwin":
+        return StepResult(
+            "preflight", "blocked",
+            f"email-mcp is macOS-only (sys.platform {sys.platform!r}) — "
+            "it reads the Apple Mail store and scripts Mail.app.")
+    mac_version = platform.mac_ver()[0] or "unknown"
+    mail_app = next(
+        (p for p in ("/System/Applications/Mail.app", "/Applications/Mail.app")
+         if Path(p).exists()), None)
+    mail_lib = Path.home() / "Library" / "Mail"
+    meta = read_meta()
+    if meta.get("state_version"):
+        facts["mode"] = "review"
+        print(f"  existing installation detected (state_version "
+              f"{meta['state_version']}) — reviewing/repairing, not "
+              "starting over.")
+    bits = [
+        f"macOS {mac_version}",
+        f"Mail.app {'found' if mail_app else 'NOT found'}",
+        f"~/Library/Mail {'present' if mail_lib.is_dir() else 'absent'}",
+        f"mode {facts['mode']}",
+    ]
+    return StepResult("preflight", "ok", "; ".join(bits))
+
+
+# (name, doctor check attr) — resolved via getattr at call time so tests
+# can monkeypatch the doctor module's checks.
+_PERMISSION_CHECKS = ("mail_store", "automation", "accessibility")
+
+
+def _step_permissions(answers: Answers, interactive: bool) -> StepResult:
+    skipped: list[str] = []
+    for name in _PERMISSION_CHECKS:
+        check_fn = getattr(doctor, f"check_{name}")
+        while True:
+            check = check_fn()
+            if check.get("ok"):
+                print(f"  ok   {name}: {check.get('detail', '')}")
+                break
+            print(f"  FAIL {name}: {check.get('detail', '')}")
+            if check.get("fix"):
+                print(f"       fix: {check['fix']}")
+            if name == "mail_store":
+                print(f"       note: {_FDA_RESTART_NOTE}")
+            if not interactive:
+                if answers.skip_permissions:
+                    skipped.append(name)
+                    break
+                return StepResult(
+                    "permissions", "blocked",
+                    f"{name} check is red and this run is non-interactive "
+                    "— grant the permission and re-run, or set "
+                    '"skip_permissions": true in the answers file to '
+                    "continue anyway.")
+            choice = _input(
+                "       Enter to retry, or s to skip this check: ").strip()
+            if choice.lower() == "s":
+                skipped.append(name)
+                break
+    if skipped:
+        return StepResult("permissions", "ok",
+                          "skipped red check(s): " + ", ".join(skipped)
+                          + " — `email-mcp doctor` will keep reporting them")
+    return StepResult("permissions", "ok",
+                      "mail_store, automation, accessibility all green")
+
+
+def _step_state_dirs(facts: dict) -> StepResult:
+    from . import spool
+
+    paths = StatePaths.resolve()
+    # The config getters mkdir + chmod 0700 (and spool creates its five
+    # state subdirs — with umask modes, so they are tightened here to the
+    # 0700 the repairs registry considers healthy). The FTS dir is
+    # deliberately NOT among them: derived state, --build only.
+    spool_root = config.spool_dir()
+    for sub in spool.STATES:
+        (spool_root / sub).chmod(0o700)
+    config.plans_dir()
+    config.graph_dir()
+    config.audit_dir()
+
+    meta = read_meta()
+    now = ids.iso(ids.utcnow())
+    meta.setdefault("created_at", now)
+    meta["state_version"] = STATE_VERSION
+    meta["updated_at"] = now
+    meta["env_overrides"] = sorted(paths.env_overrides)
+    try:
+        from .cli import _package_version
+        meta["package_version"] = _package_version()
+    except Exception:  # never let version metadata block the write
+        pass
+    write_meta(meta)
+    facts["state_ready"] = True
+
+    detail = (f"state tree ready under {paths.root}; meta.json "
+              f"state_version {STATE_VERSION}")
+    if paths.env_overrides:
+        detail += (" (env overrides in effect: "
+                   + ", ".join(sorted(paths.env_overrides)) + ")")
+    return StepResult("state_dirs", "ok", detail)
+
+
+# --------------------------------------------------------------------- #
+# step 4: identity                                                       #
+# --------------------------------------------------------------------- #
+
+
+def _security_hint(name: str, table: dict) -> None:
+    """The exact command that stores the smtp app password — run by the
+    USER, never by the wizard; the value never touches this process."""
+    if str(table.get("driver", "")) != "smtp":
+        return
+    item = str(table.get("keychain", "")).strip()
+    if not item:
+        return
+    account = str(table.get("username", "")).strip() or table.get("from_addr")
+    print(f"  store the {name!r} app password once (the wizard never reads "
+          "or stores it):")
+    print(f"    security add-generic-password -s {item} -a {account} -w")
+
+
+def _ask_identity_block(name: str = "") -> tuple[str, dict]:
+    """The interactive question tree for one identity."""
+    while True:
+        name = _ask("identity name (becomes graph/<name>.token.json)",
+                    name) or _ask_required(
+                        "identity name (becomes graph/<name>.token.json)")
+        if _NAME_RE.fullmatch(name):
+            break
+        print("  (must match ^[A-Za-z0-9_-]{1,64}$ — it is used as a "
+              "filename)")
+        name = ""
+    table: dict = {"from_addr": _ask_required("From: address")}
+    from_name = _ask("display name (optional)")
+    if from_name:
+        table["from_name"] = from_name
+    driver = _ask_choice("transport driver", sorted(DRIVERS), "ssh_sendmail")
+    table["driver"] = driver
+    if driver == "ssh_sendmail":
+        table["host"] = _ask_required("SSH host (e.g. lxplus.cern.ch)")
+        table["user"] = _ask_required("SSH user")
+        table["socket"] = _ask("ControlMaster socket path",
+                               "~/.ssh/email-mcp-sock")
+        bootstrap = _ask("bootstrap command (optional, re-opens the socket)")
+        if bootstrap:
+            table["bootstrap"] = bootstrap
+        table["delivery_cmd"] = _ask("remote delivery command",
+                                     "/usr/sbin/sendmail")
+    elif driver == "smtp":
+        table["host"] = _ask_required("SMTP host (e.g. smtp.gmail.com)")
+        table["port"] = int(_ask("SMTP port", "587"))
+        username = _ask("SMTP username", table["from_addr"])
+        if username != table["from_addr"]:
+            table["username"] = username
+        source = _ask_choice("secret source", ["keychain", "op"], "keychain")
+        if source == "keychain":
+            table["keychain"] = _ask("Keychain item name",
+                                     f"email-mcp-{name}")
+        else:
+            table["op"] = _ask_required(
+                "1Password secret reference (op://vault/item/field)")
+    else:  # pipe
+        table["command"] = _ask("delivery command",
+                                "/usr/sbin/sendmail -t -i")
+    return name, table
+
+
+def _load_existing_tables(path: Path) -> tuple[dict[str, dict], str]:
+    """Existing identities.toml → (tables, default). Malformed TOML is a
+    SetupError: setup refuses to clobber a file it cannot merge."""
+    if not path.is_file():
+        return {}, ""
+    try:
+        with path.open("rb") as f:
+            data = tomllib.load(f)
+    except (OSError, tomllib.TOMLDecodeError) as e:
+        raise SetupError(
+            f"cannot merge into {path}: {e} — fix or move the file aside, "
+            "then re-run setup.") from e
+    tables = {k: dict(v) for k, v in data.items() if isinstance(v, dict)}
+    default = data.get("default")
+    return tables, default if isinstance(default, str) else ""
+
+
+def _merge_answer_blocks(
+    path: Path, blocks: list[dict], default_answer: str,
+) -> tuple[dict[str, dict], str]:
+    tables, existing_default = _load_existing_tables(path)
+    first_new = ""
+    for block in blocks:
+        block = dict(block)
+        name = str(block.pop("name", "")).strip()
+        if not name:
+            raise SetupError("every identity block needs a `name`.")
+        first_new = first_new or name
+        tables[name] = block
+    default = default_answer or existing_default or first_new
+    return tables, default
+
+
+def _step_identity(
+    answers: Answers, interactive: bool, facts: dict,
+) -> StepResult:
+    if answers.read_only or config.read_only():
+        return StepResult(
+            "identity", "skipped",
+            "read-only mode — no sending identity needed (reads require "
+            "no configuration at all)")
+    path = config.identities_file()
+    exists = path.is_file()
+    facts["identities"] = _identity_names(path)
+
+    if interactive:
+        return _step_identity_interactive(path, exists, facts)
+
+    action = (answers.identity_action if exists
+              else ("add" if answers.identities else "keep"))
+    if action == "keep":
+        if exists:
+            return StepResult(
+                "identity", "ok",
+                f"kept existing {path} "
+                f"({', '.join(facts['identities']) or 'unparseable'})")
+        return StepResult(
+            "identity", "skipped",
+            "no identities.toml and no identity answers — sending stays "
+            "env-driven (EMAIL_MCP_FROM_ADDR) or disabled; reads work "
+            "regardless")
+    try:
+        tables, default = _merge_answer_blocks(
+            path, answers.identities, answers.default_identity)
+        written, backup = write_identities(tables, default, path)
+    except SetupError as e:
+        return StepResult("identity", "blocked", str(e))
+    for name in sorted(tables):
+        _security_hint(name, tables[name])
+    facts["identities"] = sorted(tables)
+    detail = (f"wrote {written} ({', '.join(sorted(tables))}; "
+              f"default {default!r})")
+    if backup:
+        detail += f"; previous file backed up to {backup.name}"
+    return StepResult("identity", "ok", detail)
+
+
+def _step_identity_interactive(
+    path: Path, exists: bool, facts: dict,
+) -> StepResult:
+    if exists:
+        names = facts["identities"]
+        print(f"  identities.toml exists with: "
+              f"{', '.join(names) or '(unparseable)'}")
+        action = _ask_choice("keep, add or edit", ["keep", "add", "edit"],
+                             "keep")
+        if action == "keep":
+            return StepResult("identity", "ok", f"kept existing {path}")
+    else:
+        if not _ask_yn("configure a sending identity now?", True):
+            return StepResult(
+                "identity", "skipped",
+                "no identity configured — sending disabled until "
+                "identities.toml exists (re-run setup any time)")
+        action = "add"
+
+    try:
+        tables, default = _load_existing_tables(path)
+        edit_name = ""
+        if action == "edit":
+            edit_name = _ask_choice(
+                "which identity", sorted(tables) or [""],
+                sorted(tables)[0] if tables else "")
+        while True:
+            name, table = _ask_identity_block(edit_name)
+            tables[name] = table
+            _security_hint(name, table)
+            edit_name = ""
+            if not _ask_yn("add another identity?", False):
+                break
+        if len(tables) > 1:
+            default = _ask_choice("default identity", sorted(tables),
+                                  default if default in tables
+                                  else sorted(tables)[0])
+        else:
+            default = next(iter(tables))
+        written, backup = write_identities(tables, default, path)
+    except SetupError as e:
+        return StepResult("identity", "blocked", str(e))
+    facts["identities"] = sorted(tables)
+    detail = (f"wrote {written} ({', '.join(sorted(tables))}; "
+              f"default {default!r})")
+    if backup:
+        detail += f"; previous file backed up to {backup.name}"
+    return StepResult("identity", "ok", detail)
+
+
+# --------------------------------------------------------------------- #
+# steps 5-6: launchd agents, fts index                                   #
+# --------------------------------------------------------------------- #
+
+
+def _step_launchd(
+    answers: Answers, interactive: bool, facts: dict,
+) -> StepResult:
+    from . import dispatcher, fts
+
+    agents = (
+        ("dispatcher", dispatcher.LAUNCHD_LABEL,
+         "scheduled-send dispatcher (runs every 60s)",
+         dispatcher.install_launchd, answers.install_dispatcher),
+        ("fts", fts.LAUNCHD_LABEL,
+         "nightly FTS body-index sync (03:30)",
+         fts.install_launchd, answers.install_fts_agent),
+    )
+    installed: list[str] = []
+    failures: list[str] = []
+    notes: list[str] = []
+    for name, label, blurb, install, wanted in agents:
+        if name == "dispatcher" and (answers.read_only or config.read_only()):
+            notes.append(f"{label} skipped (read-only mode never sends)")
+            continue
+        if interactive:
+            wanted = _ask_yn(f"install the {blurb} launchd agent?",
+                             default=False)
+        if not wanted:
+            notes.append(f"{label} not installed")
+            continue
+        message = install()
+        print(f"  {message}")
+        if "bootstrap failed" in message:
+            failures.append(f"{label}: {message}")
+        else:
+            installed.append(label)
+    facts["agents"] = installed
+    detail = "installed: " + (", ".join(installed) or "none")
+    if notes:
+        detail += "; " + "; ".join(notes)
+    if failures:
+        return StepResult("launchd", "failed",
+                          detail + "; " + "; ".join(failures))
+    return StepResult("launchd", "ok", detail)
+
+
+_FTS_WARNING = (
+    "a full first build reads every message body — on a large mailbox "
+    "this can run from many minutes to hours (resumable; Ctrl-C is safe)"
+)
+
+
+def _step_fts(answers: Answers, interactive: bool, facts: dict) -> StepResult:
+    from . import fts
+
+    if interactive:
+        print(f"  full-text body index — note: {_FTS_WARNING}")
+        print("    full:  build everything now")
+        print(f"    quick: index the newest {answers.fts_limit} now, "
+              "the rest later")
+        print("    defer: build later with `email-mcp fts --build`")
+        print("    skip:  no body index (EMAIL_MCP_FTS_ENABLED=0 to "
+              "silence search's fallback note)")
+        choice = _ask_choice("index choice",
+                             ["full", "quick", "defer", "skip"], "defer")
+    else:
+        choice = answers.fts_choice
+    facts["fts_choice"] = choice
+
+    if choice == "full":
+        print(f"  building ({_FTS_WARNING})…")
+        rc = fts.main(["--build"])
+        if rc != 0:
+            return StepResult(
+                "fts", "failed",
+                f"full build failed (exit {rc}) — run `email-mcp fts "
+                "--build` once the doctor is green")
+        return StepResult("fts", "ok", "full build completed")
+    if choice == "quick":
+        rc = fts.main(["--build", "--limit", str(answers.fts_limit)])
+        if rc != 0:
+            return StepResult(
+                "fts", "failed",
+                f"quick build failed (exit {rc}) — run `email-mcp fts "
+                "--build` once the doctor is green")
+        return StepResult(
+            "fts", "ok",
+            f"quick start: newest {answers.fts_limit} indexed; finish "
+            "later with `email-mcp fts --build` (or the nightly agent)")
+    if choice == "skip":
+        return StepResult(
+            "fts", "skipped",
+            "no body index — search falls back to subjects/snippets; "
+            "set EMAIL_MCP_FTS_ENABLED=0 to make that explicit")
+    return StepResult(
+        "fts", "skipped",
+        "deferred — build any time with `email-mcp fts --build` "
+        f"({_FTS_WARNING})")
+
+
+# --------------------------------------------------------------------- #
+# steps 7-8: client config, smoke                                        #
+# --------------------------------------------------------------------- #
+
+
+def _entry_point() -> tuple[str, list[str]]:
+    """The ABSOLUTE path MCP clients should launch. The console script
+    next to the running interpreter wins (the venv that owns this
+    install); PATH lookup is the fallback; `python -m email_mcp.cli`
+    covers a scriptless checkout."""
+    # NOT .resolve() first: sys.executable in a venv is a symlink to the
+    # base interpreter, and resolving would leave the venv's bin/ where
+    # the console script actually lives.
+    script = Path(sys.executable).parent / "email-mcp"
+    if script.is_file() and os.access(script, os.X_OK):
+        return str(script), []
+    found = shutil.which("email-mcp")
+    if found:
+        return str(Path(found).resolve()), []
+    return sys.executable, ["-m", "email_mcp.cli"]
+
+
+def _step_client_config() -> StepResult:
+    command, args = _entry_point()
+    spec: dict = {"command": command}
+    if args:
+        spec["args"] = args
+    block = {"mcpServers": {"apple-mail": dict(spec)}}
+    read_only = {"mcpServers": {"apple-mail": {
+        **spec, "env": {"EMAIL_MCP_READ_ONLY": "1"}}}}
+    print("  paste into your MCP client's config (e.g. ~/.claude.json):")
+    print(json.dumps(block, indent=2))
+    print("  read-only variant (only the 11 read-side tools register):")
+    print(json.dumps(read_only, indent=2))
+    return StepResult("client_config", "ok", f"entry point: {command}")
+
+
+def _step_smoke(answers: Answers, interactive: bool) -> StepResult:
+    from .cli import _render_doctor
+
+    report = doctor.run()
+    _render_doctor(report)
+    verdict = "doctor green" if report.get("ok") else (
+        "doctor RED — see the FAIL lines above; `email-mcp doctor --fix` "
+        "handles the safe ones")
+
+    if answers.read_only or config.read_only():
+        return StepResult("smoke", "ok", verdict + "; self-send n/a "
+                                                   "(read-only)")
+    want_send = (answers.self_send if not interactive
+                 else _ask_yn("send a self-test email to your own address?",
+                              False))
+    if not want_send:
+        return StepResult("smoke", "ok", verdict)
+    try:
+        from . import identities, sender
+        ident = identities.get(None)
+        result = sender.send_email(
+            to=ident.from_addr,
+            subject="email-mcp setup self-test",
+            body="This is the email-mcp setup smoke test. If you can read "
+                 "this in your inbox, sending works end to end.",
+        )
+        print(f"  self-send ok: message_id {result.message_id}")
+        return StepResult("smoke", "ok",
+                          verdict + f"; self-send ok ({result.message_id})")
+    except SendError as e:
+        print(f"  self-send failed: {e}")
+        return StepResult("smoke", "failed", verdict + f"; self-send "
+                                                       f"failed: {e}")
+
+
+# --------------------------------------------------------------------- #
+# the run                                                                #
+# --------------------------------------------------------------------- #
+
+_STATUS_TAGS = {"ok": "ok", "skipped": "skip", "failed": "FAIL",
+                "blocked": "BLOCKED"}
+
+
+def run_setup(answers: Answers, interactive: bool) -> list[StepResult]:
+    """Run the eight setup steps in order; stop at the first ``blocked``
+    result. Emits ONE ``lifecycle`` audit event when the run touched
+    state (identity NAMES, agent labels and the fts choice only — no
+    addresses, no secrets)."""
+    audit.set_process("cli")
+    facts: dict = {"mode": "setup", "identities": [], "agents": [],
+                   "fts_choice": None}
+    steps: tuple[tuple[str, Callable[[], StepResult]], ...] = (
+        ("preflight", lambda: _step_preflight(facts)),
+        ("permissions", lambda: _step_permissions(answers, interactive)),
+        ("state_dirs", lambda: _step_state_dirs(facts)),
+        ("identity", lambda: _step_identity(answers, interactive, facts)),
+        ("launchd", lambda: _step_launchd(answers, interactive, facts)),
+        ("fts", lambda: _step_fts(answers, interactive, facts)),
+        ("client_config", lambda: _step_client_config()),
+        ("smoke", lambda: _step_smoke(answers, interactive)),
+    )
+    results: list[StepResult] = []
+    for i, (name, fn) in enumerate(steps, 1):
+        print(f"[{i}/{len(steps)}] {name}")
+        try:
+            result = fn()
+        except Exception as e:  # noqa: BLE001 — the wizard must never
+            # dump a traceback as its UX; the log gets the full story
+            _log.exception("setup step %s crashed", name)
+            result = StepResult(name, "blocked",
+                                f"step crashed: {e!r} (details in the log)")
+        results.append(result)
+        print(f"  {_STATUS_TAGS[result.status]:7s} {result.detail}")
+        if result.status == "blocked":
+            break
+
+    blocked = results[-1].status == "blocked" if results else False
+    if facts.get("state_ready"):
+        detail = {"mode": facts["mode"], "identities": facts["identities"],
+                  "agents": facts["agents"],
+                  "fts_choice": facts["fts_choice"]}
+        if blocked:
+            detail["blocked"] = results[-1].step
+        audit.emit("lifecycle", outcome="setup", detail=detail)
+    print(f"setup {'blocked at ' + results[-1].step if blocked else 'complete'}"
+          f" — {sum(1 for r in results if r.status == 'ok')} ok, "
+          f"{sum(1 for r in results if r.status == 'skipped')} skipped, "
+          f"{sum(1 for r in results if r.status == 'failed')} failed"
+          + (", 1 blocked" if blocked else ""))
+    return results
+
+
+def run_setup_cli(argv: list[str] | None = None) -> int:
+    """``email-mcp setup [--yes] [--answers FILE] [--read-only]`` →
+    exit 0 on a completed run, 1 when a step blocked, 2 on usage errors
+    (including a non-interactive invocation without --yes/--answers)."""
+    parser = argparse.ArgumentParser(
+        prog="email-mcp setup",
+        description="Guided install: permissions, state tree, identities, "
+                    "launchd agents, FTS index, client config, smoke test.",
+    )
+    parser.add_argument("--yes", action="store_true",
+                        help="non-interactive; accept the safe defaults "
+                             "(keep identities, install nothing, defer FTS)")
+    parser.add_argument("--answers", metavar="FILE",
+                        help="non-interactive; scripted answers from a "
+                             "JSON file")
+    parser.add_argument("--read-only", action="store_true",
+                        help="set up the read-only surface — the identity "
+                             "step is skipped entirely")
+    args = parser.parse_args(argv)
+
+    if args.answers:
+        try:
+            answers = Answers.from_file(args.answers)
+        except (OSError, ValueError) as e:
+            print(f"email-mcp setup: cannot load answers file: {e}",
+                  file=sys.stderr)
+            return 2
+    else:
+        answers = Answers()
+    if args.read_only:
+        answers.read_only = True
+
+    interactive = not (args.yes or args.answers)
+    if interactive:
+        try:
+            has_tty = sys.stdin is not None and sys.stdin.isatty()
+        except (AttributeError, ValueError):
+            has_tty = False
+        if not has_tty:
+            # This refusal keeps the stub's frozen contract
+            # (tests/test_cli.py::test_lifecycle_stubs_exit_2_with_pointer):
+            # exit 2, silent stdout, "setup" + the "L3" stage pointer on
+            # stderr — the wizard landed in L3, the pointer stays honest.
+            print("email-mcp setup: the interactive wizard (L3 of the "
+                  "v0.11 lifecycle work) needs a terminal — rerun in "
+                  "one, or script it with --yes or --answers FILE.",
+                  file=sys.stderr)
+            return 2
+
+    results = run_setup(answers, interactive=interactive)
+    return 1 if any(r.status == "blocked" for r in results) else 0

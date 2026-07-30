@@ -20,8 +20,9 @@ design:
 ``audit``/``fts``/``graph`` delegate to their module ``main(argv)`` with
 the remaining argv verbatim; ``dispatcher`` and ``serve`` go through a
 ``sys.argv`` shim because their targets parse ``sys.argv`` themselves.
-``setup``/``update``/``uninstall`` land with the lifecycle module (L3
-and L4) and until then exit 2 with a pointer. Printing here is by design
+``setup`` delegates to the lifecycle module (L3); ``update``/
+``uninstall`` land there with L4 and until then exit 2 with a pointer.
+Printing here is by design
 — this module is a CLI entry point, not library code; contract §7 lists
 the print-by-design entry points and the serve path stays silent.
 """
@@ -217,7 +218,9 @@ def _stub(name: str, stage: str) -> int:
 
 
 def cmd_setup(rest: list[str]) -> int:
-    return _stub("setup", "L3")
+    from . import lifecycle
+
+    return lifecycle.run_setup_cli(rest)
 
 
 def cmd_update(rest: list[str]) -> int:
