@@ -10,7 +10,10 @@ def test_freshness_snapshot_reports_total_and_newest(mail_fixture):
     src = AppleMailSource(mail_base=mail_fixture)
     snap = src.freshness_snapshot()
 
-    assert snap["total"] == 4  # four rows in the fixture, none deleted
+    # Four rows in the fixture. That the deleted=0 filter is honored is a
+    # separate property the fixture cannot show (no row has deleted=1) —
+    # test_freshness_snapshot_excludes_deleted_messages covers it.
+    assert snap["total"] == 4
     # Newest by date_sent is ROWID 101 (1714700000): "EMCI production update"
     # from DCS Ops <ops-bot@cern.ch>.
     assert snap["newest_date"] is not None
@@ -56,6 +59,40 @@ def test_freshness_snapshot_handles_empty_db(tmp_path):
         "newest_subject": None,
         "newest_from": None,
     }
+
+
+def test_freshness_snapshot_excludes_deleted_messages(mail_fixture):
+    """`WHERE m.deleted = 0` is load-bearing and no fixture row exercises it.
+
+    The deleted row below carries the newest timestamp in the store, so a
+    dropped filter shows up twice: `total` goes to 5 and `newest_subject`
+    becomes the trashed message. refresh_mail's delta
+    (`max(0, after.total - before.total)`) is built on this total, so an
+    unfiltered count silently misreports every delta on a store with trash.
+    """
+    import sqlite3
+    src = AppleMailSource(mail_base=mail_fixture)
+
+    db = mail_fixture / "MailData" / "Envelope Index"
+    writer = sqlite3.connect(db)
+    writer.execute(
+        "INSERT INTO subjects(ROWID, subject) VALUES (?,?)",
+        (98, "trashed but newest"),
+    )
+    writer.execute(
+        "INSERT INTO messages(ROWID, subject, sender, summary, date_sent, "
+        "date_received, mailbox, read, flagged, deleted, conversation_id, "
+        "global_message_id) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+        (998, 98, 1, 1, 1900000000, 1900000100, 1, 0, 0, 1, 8002, 5556),
+    )
+    writer.commit()
+    writer.close()
+
+    snap = src.freshness_snapshot()
+    assert snap["total"] == 4, "deleted message was counted"
+    assert snap["newest_subject"] == "EMCI production update", (
+        "deleted message became the newest"
+    )
 
 
 def test_freshness_snapshot_reflects_writer_commits(mail_fixture):
