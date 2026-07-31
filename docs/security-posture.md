@@ -240,10 +240,18 @@ rather than fenced harder.
 #### 1.6.1 Created-only chmod
 
 **A directory this tool creates is 0700. A directory that already existed
-is never chmodded at all.** That is the whole rule, and it lives in one
-function (`config._make_ours`): `mkdir(exist_ok=False)` succeeds → we made
-it → `chmod 0700`; `FileExistsError` → it was already there → we touch
-nothing.
+is never chmodded on the configuration path.** That is the whole rule, and
+it lives in one function (`config._make_ours`): `mkdir(exist_ok=False)`
+succeeds → we made it → `chmod 0700`; `FileExistsError` → it was already
+there → we touch nothing.
+
+The scope qualifier is load-bearing, so it is stated rather than implied:
+`doctor --fix` *does* chmod a pre-existing directory — that is its job (§7
+below), it prints what it changed, and it only runs when asked. What it can
+reach is confined to `repairs._state_dirs()`: the managed root and its
+fixed leaves. Never a path named by `EMAIL_MCP_IDENTITIES` or
+`EMAIL_MCP_ATTACH_DIR`, never through a symlink, never under a root the
+resolver refuses.
 
 "email-mcp changed the mode of a directory I did not name" is therefore
 **unrepresentable**, not fenced. Nothing on the configuration path — not

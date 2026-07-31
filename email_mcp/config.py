@@ -248,9 +248,17 @@ def _make_ours(d: Path) -> bool:
 
     The whole permission story rests here: a directory this tool creates is
     ours to mode 0700, and a directory that already existed is never
-    chmodded at all. That makes "email-mcp changed the mode of a directory
-    I did not name" unrepresentable rather than fenced — three release
-    gates in a row found a new way past the fences.
+    chmodded *on the configuration path*. That makes "email-mcp changed the
+    mode of a directory I did not name" unrepresentable rather than fenced
+    — three release gates in a row found a new way past the fences.
+
+    Scoped precisely, because the absolute phrasing this once carried was
+    wider than the code: `doctor --fix` DOES chmod a pre-existing directory,
+    on explicit request, and says so. What it may reach is confined to
+    `repairs._state_dirs()` — the managed root and its fixed leaves, never a
+    path from EMAIL_MCP_IDENTITIES or EMAIL_MCP_ATTACH_DIR, never through a
+    symlink, and never under a root the resolver refuses. Configuration is
+    silent and never re-modes; the fixer is loud and may.
     """
     try:
         # parents=False deliberately. `parents=True` creates every missing
