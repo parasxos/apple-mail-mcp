@@ -73,6 +73,13 @@ def home(tmp_path, monkeypatch, mail_fixture):
     yield h
     audit.set_process("server")  # lifecycle tags "cli"; restore
 
+@pytest.fixture(autouse=True)
+def state_root_guard(home, monkeypatch):
+    """Shadow conftest's root guard by name: conftest PATCHES
+    config.state_root, which would override this module's fake HOME. These
+    tests need the real env-driven resolution inside that HOME."""
+    monkeypatch.delenv("EMAIL_MCP_STATE_DIR", raising=False)
+    return home / ".email-mcp"
 
 @pytest.fixture(autouse=True)
 def fts_dir_guard(home):
@@ -195,9 +202,7 @@ def _scan_tree_for(home: Path, needle: bytes) -> list[Path]:
 # --------------------------------------------------------------------- #
 
 
-@pytest.mark.parametrize("var", ["EMAIL_MCP_SPOOL_DIR",
-                                 "EMAIL_MCP_PLANS_DIR",
-                                 "EMAIL_MCP_AUDIT_DIR"])
+@pytest.mark.parametrize("var", ["EMAIL_MCP_STATE_DIR"])
 def test_purge_env_override_at_home_never_removes_home(
     home, monkeypatch, capsys, var,
 ):
@@ -219,9 +224,7 @@ def test_purge_env_override_at_home_never_removes_home(
     assert var in out and "never removed" in out
 
 
-@pytest.mark.parametrize("var", ["EMAIL_MCP_SPOOL_DIR",
-                                 "EMAIL_MCP_PLANS_DIR",
-                                 "EMAIL_MCP_GRAPH_DIR"])
+@pytest.mark.parametrize("var", ["EMAIL_MCP_STATE_DIR"])
 def test_setup_refuses_state_override_at_home(home, monkeypatch, capsys, var):
     """The write-side twin of the purge case. config.spool_dir() /
     plans_dir() / graph_dir() mkdir the target and ``chmod 0700`` its

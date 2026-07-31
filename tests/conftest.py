@@ -254,47 +254,41 @@ def mail_fixture(tmp_path: Path) -> Path:
     return mail_dir
 
 
-@pytest.fixture(autouse=True)
-def fts_dir_guard(tmp_path_factory, monkeypatch) -> Path:
-    """Point the FTS index at a per-test tmp dir for EVERY test — nothing in
-    the suite may ever touch (or create) ~/.email-mcp/fts."""
-    d = tmp_path_factory.mktemp("fts-index")
-    monkeypatch.setenv("EMAIL_MCP_FTS_DIR", str(d))
-    return d
+@pytest.fixture
+def audit_dir_guard(state_root_guard) -> Path:
+    """The ledger directory under the pinned root. Derived, not pinned
+    separately — one root is the whole point."""
+    return state_root_guard / "audit"
+
+
+@pytest.fixture
+def fts_dir_guard(state_root_guard) -> Path:
+    """The FTS index directory under the pinned root."""
+    return state_root_guard / "fts"
 
 
 @pytest.fixture(autouse=True)
-def log_file_guard(tmp_path_factory, monkeypatch) -> Path:
-    """Point the debug log at a per-test tmp file for EVERY test (mirrors the
-    fts/audit guards).
+def state_root_guard(tmp_path_factory, monkeypatch) -> Path:
+    """Point the ENTIRE state tree at a per-test tmp root for EVERY test.
 
-    Without this the suite appends to the developer's REAL
-    ~/Library/Logs/email-mcp.log, and any test running under a *relative*
-    $HOME resolves it relative to cwd — which is how a stray
-    `relhome/Library/Logs/email-mcp.log` appeared inside the repo and came
-    within one `git add -A` of being committed."""
-    d = tmp_path_factory.mktemp("logs")
-    monkeypatch.setenv("EMAIL_MCP_LOG_FILE", str(d / "email-mcp.log"))
-    return d / "email-mcp.log"
-
-
-@pytest.fixture(autouse=True)
-def audit_dir_guard(tmp_path_factory, monkeypatch) -> Path:
-    """Point the audit ledger at a per-test tmp dir for EVERY test — nothing
-    in the suite may ever touch (or create) ~/.email-mcp/audit (mirrors the
-    fts guard above).
+    One guard replaces the old per-directory fts/audit pins: since v0.11
+    every managed directory derives from a single root, so isolating the
+    root isolates the spool, plans, graph, index and ledger together, and
+    nothing in the suite can touch (or create) the developer's own
+    ~/.email-mcp.
 
     Belt on top of the env pin: several test modules wipe every EMAIL_MCP_*
     variable in their own autouse fixtures, which run AFTER this one — the
-    env pin alone would not survive them, and any mutation-path emit (the
-    v0.10 hooks fire in dispatcher/triage/server tests) would land in the
-    REAL ledger. So the resolver itself is pinned too. test_audit.py
-    shadows this fixture by name on purpose: its tests exercise the real
-    env-driven config.audit_dir (permissions, absent-dir, parent-chmod)."""
+    env pin alone would not survive them, and any mutation-path emit would
+    land in the REAL ledger. So the resolver is pinned too.
+    tests/test_config_state_dirs.py shadows this fixture by name on purpose:
+    its tests exercise the real env-driven resolution inside a fake HOME.
+    """
     from email_mcp import config
 
-    d = tmp_path_factory.mktemp("audit-ledger")
-    d.chmod(0o700)  # what config.audit_dir guarantees; doctor checks it
-    monkeypatch.setenv("EMAIL_MCP_AUDIT_DIR", str(d))
-    monkeypatch.setattr(config, "audit_dir", lambda create=True: d)
+    d = tmp_path_factory.mktemp("state-root")
+    monkeypatch.setenv("EMAIL_MCP_STATE_DIR", str(d))
+    monkeypatch.setattr(config, "state_root", lambda create=True: d)
     return d
+
+

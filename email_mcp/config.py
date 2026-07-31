@@ -53,29 +53,6 @@ def max_body_bytes() -> int:
     return int(os.environ.get("EMAIL_MCP_MAX_BODY_BYTES", "2000000"))
 
 
-def attach_dir() -> Path:
-    raw = os.environ.get("EMAIL_MCP_ATTACH_DIR", "").strip()
-    if raw:
-        d = Path(raw).expanduser()
-    else:
-        tmp = os.environ.get("TMPDIR", "/tmp")
-        d = Path(tmp) / "email-mcp"
-    _refuse_degenerate(d, bool(raw))
-    d.mkdir(parents=True, exist_ok=True)
-    return d
-
-
-# ---------------------------------------------------------------------- #
-# Sending (send_email / reply_email). All optional; defaults are empty — #
-# real values live in ~/.email-mcp/identities.toml or the env vars here. #
-#                                                                        #
-# Rationale: macOS Mail.app's scripted-compose path wraps the body in a  #
-# collapsed blockquote (renders empty in Outlook), so we do NOT send     #
-# through Mail.app. Messages are composed here and delivered over the    #
-# sending identity's transport (ssh_sendmail / smtp / pipe).             #
-# ---------------------------------------------------------------------- #
-
-
 def send_from_addr() -> str:
     """The From: address for outgoing mail. Empty (default) → no identity
     can be synthesized from the environment: sending needs either
@@ -138,20 +115,29 @@ def send_delivery_cmd() -> str:
 
 
 class StateDirRefused(OSError):
-    """An EMAIL_MCP_*_DIR resolves to $HOME or an ancestor of it.
+    """The chosen state root is not a directory this tool may manage.
 
-    The fence lives HERE, in the getter that performs the mkdir and chmod,
-    rather than only in `lifecycle._degenerate_overrides` / `repairs._degenerate`
-    — those cover `setup` and `doctor --fix`, but the MCP server, the launchd
-    dispatcher, the FTS agent and the Graph token cache all reach the getters
-    directly. Refusing loudly beats silently tightening a directory the user
-    did not name: `EMAIL_MCP_SPOOL_DIR=/Users` would otherwise `chmod 0700
-    /Users`, breaking every other account's traversal.
+    Raised BEFORE any filesystem effect. Two things make a root refusable:
+    it is $HOME or an ancestor of it, or an override names an existing
+    directory that already holds someone else's files and carries no
+    ownership marker.
     """
 
 
+STATE_MARKER = ".email-mcp-root"
+STATE_ROOT_VERSION = 1
+_LEAVES = ("spool", "plans", "graph", "fts", "audit")
+
+
 def _is_same_dir(a: Path, b: Path) -> bool:
-    """Directory identity by inode, not by spelling."""
+    """Directory identity by inode, not by spelling.
+
+    macOS ships case-insensitive APFS and firmlinks `/Users` into
+    `/System/Volumes/Data/Users`, so `$HOME`, `/users/paris`,
+    `/USERS/PARIS` and the firmlink are one directory with four spellings —
+    and `Path.resolve()` returns whichever it was handed. Comparing text
+    let every variant but the exact one walk through the fence.
+    """
     try:
         sa, sb = a.stat(), b.stat()
     except OSError:
@@ -159,120 +145,128 @@ def _is_same_dir(a: Path, b: Path) -> bool:
     return (sa.st_dev, sa.st_ino) == (sb.st_dev, sb.st_ino)
 
 
-def _spelling(p: Path) -> str:
-    """Last-resort key for a path that does not exist yet.
-
-    NFC + casefold, because the comparison is only reached when neither
-    path can be stat'd and macOS stores filenames in NFD.
-    """
-    import unicodedata
-
-    return unicodedata.normalize("NFC", str(p)).casefold()
-
-
-def _degenerate(d: Path) -> bool:
-    """True when `d` is $HOME or an ancestor of it, however it is spelled.
-
-    Compared by INODE, not by resolved string. macOS ships a
-    case-insensitive APFS volume and firmlinks `/Users` into
-    `/System/Volumes/Data/Users`, so `/users/paris`, `/USERS/PARIS`,
-    `/System/Volumes/Data/Users/paris` and `$HOME` are one directory with
-    four spellings — `Path.resolve()` preserves the spelling it was given
-    and returns four different strings. A string compare therefore passed
-    every one of them straight through the fence and chmodded the real
-    home directory; only the exact spelling was ever refused.
-    """
+def _is_home_or_above(d: Path) -> bool:
     home = Path.home()
     if _is_same_dir(d, home):
         return True
-    for ancestor in home.resolve().parents:
-        if _is_same_dir(d, ancestor):
-            return True
-    # Neither path exists yet (nothing to stat): fall back to a normalized
-    # textual compare, which at least catches case and unicode variants.
-    if not d.exists():
-        try:
-            target, root = _spelling(d.resolve()), _spelling(home.resolve())
-        except OSError:
-            return False
-        if target == root:
-            return True
-        return any(target == _spelling(a) for a in home.resolve().parents)
-    return False
+    return any(_is_same_dir(d, a) for a in home.resolve().parents)
 
 
-def _refuse_degenerate(d: Path, overridden: bool) -> None:
-    """Raise BEFORE any filesystem effect when an override names $HOME or above.
+def _marked(root: Path) -> bool:
+    return (root / STATE_MARKER).is_file()
 
-    Order is the point: an earlier version of this fence lived inside the
-    chmod helper, which ran after spool_dir's five-subdir mkdir loop — the
-    refusal fired, and the directories were already created at the refused
-    location. Every getter must call this before its first mkdir.
+
+def _mark(root: Path) -> None:
+    """Stamp a root as ours. Best effort — a read-only volume must not
+    break sending, and the marker is a safety hint, not a lock."""
+    import json
+
+    marker = root / STATE_MARKER
+    try:
+        marker.write_text(json.dumps(
+            {"tool": "email-mcp", "root_version": STATE_ROOT_VERSION}) + "\n")
+        marker.chmod(0o600)
+    except OSError:
+        pass
+
+
+def _make_ours(d: Path) -> bool:
+    """Create `d` if absent. True when WE created it.
+
+    The whole permission story rests here: a directory this tool creates is
+    ours to mode 0700, and a directory that already existed is never
+    chmodded at all. That makes "email-mcp changed the mode of a directory
+    I did not name" unrepresentable rather than fenced — three release
+    gates in a row found a new way past the fences.
     """
-    if overridden and _degenerate(d):
+    try:
+        d.mkdir(mode=0o700, parents=True, exist_ok=False)
+    except FileExistsError:
+        return False
+    # umask can only clear bits, so mkdir(0o700) may land tighter but never
+    # looser; chmod pins it exactly.
+    d.chmod(0o700)
+    return True
+
+
+def state_root(create: bool = True) -> Path:
+    """The one directory this tool manages: ~/.email-mcp, or EMAIL_MCP_STATE_DIR.
+
+    ONE override replaces the six per-directory ones (spool/plans/graph/
+    fts/audit). Every leaf is derived from this root, so there is a single
+    place to validate and a single thing to relocate — the configuration
+    complexity was itself the defect.
+
+    Relocation onto another volume is supported, including via a symlinked
+    root: the link is followed and the target keeps its own mode. What is
+    refused is an override pointing at a directory that already holds
+    someone else's files without our marker — which is what makes $HOME,
+    /Users and every case-variant of them refusable without comparing a
+    single path string.
+    """
+    raw = os.environ.get("EMAIL_MCP_STATE_DIR", "").strip()
+    root = Path(raw).expanduser() if raw else Path.home() / ".email-mcp"
+    # Collapse `..` TEXTUALLY before validating, so the path we check is the
+    # path we then use. `$HOME/sub/..` names $HOME but cannot be stat'd while
+    # `sub` is absent, so an identity check saw nothing to compare and the
+    # mkdir afterwards created `sub` and marked $HOME. Textual collapse is
+    # the conservative direction here: it can only make us refuse more.
+    root = Path(os.path.normpath(root.absolute()))
+    if not create:
+        return root
+
+    # --- validate BEFORE any filesystem effect -------------------------
+    if _is_home_or_above(root):
         raise StateDirRefused(
-            f"{d} is your home directory or above it — refusing to create "
-            "state there or change its mode. Point the EMAIL_MCP_*_DIR "
-            "override at a directory of its own."
+            f"{root} is your home directory or above it — refusing to manage "
+            "state there. Point EMAIL_MCP_STATE_DIR at a directory of its own."
         )
-    # NOTE: a symlink at ~/.email-mcp is NOT refused. Relocating the state
-    # root onto another volume with a link is a supported shape (see
-    # tests/test_audit.py::test_default_path_never_chmods_a_symlinked_state_root):
-    # the link is followed, the dirs under it are ours to create 0700, and
-    # the link's TARGET keeps its own mode. The rule is "never change modes
-    # behind a link", not "never follow one". A squat AT a managed leaf —
-    # ~/.email-mcp/audit — is a different case and is refused
-    # (AuditDirRefused).
+    if raw and root.exists() and not _marked(root):
+        if any(root.iterdir()):
+            raise StateDirRefused(
+                f"{root} already contains files and is not an email-mcp state "
+                f"directory (no {STATE_MARKER}). Refusing to manage it — point "
+                "EMAIL_MCP_STATE_DIR at a new or empty directory."
+            )
+
+    # --- effects -------------------------------------------------------
+    _make_ours(root)          # pre-existing root keeps its own mode
+    if not _marked(root):
+        _mark(root)
+    return root
 
 
-def _lock_down(d: Path, overridden: bool) -> None:
-    """Tighten a state dir to 0700, and its parent only when we own it.
-
-    ``~/.email-mcp`` is ours to lock down. The parent of an
-    EMAIL_MCP_*_DIR the operator named is NOT: pointing a state dir at
-    ``/somewhere/mine/spool`` must not take ``/somewhere/mine`` to 0700
-    behind their back, and a symlinked parent would land the chmod on its
-    target. Same rule audit_dir already applies.
-    """
-    _refuse_degenerate(d, overridden)  # belt: holds even for a new caller
-    if not overridden and not d.parent.is_symlink():
-        d.parent.chmod(0o700)
-    if not d.is_symlink():
-        d.chmod(0o700)
+def _leaf(name: str, create: bool = True) -> Path:
+    """One managed subdirectory of the state root."""
+    if not create:
+        return state_root(create=False) / name
+    d = state_root(create=True) / name
+    if d.is_symlink():
+        # A link on a leaf WE own is a squat: mkdir and chmod both resolve
+        # through it, and the ledger or the spool would be written into the
+        # target. (A symlinked ROOT is the user's own relocation and is fine.)
+        raise StateDirRefused(
+            f"{d} is a symlink — refusing to create state or set modes "
+            "through it. Remove the link, or relocate the whole root with "
+            "EMAIL_MCP_STATE_DIR."
+        )
+    _make_ours(d)
+    return d
 
 
 def spool_dir(create: bool = True) -> Path:
-    """Root of the scheduled-mail spool (frozen .eml + .json manifests).
+    """Scheduled-mail spool (frozen .eml + .json manifests), <root>/spool.
 
-    Default ~/.email-mcp/spool, override with EMAIL_MCP_SPOOL_DIR. The tree
-    holds fully-composed outgoing mail (bodies + attachments), so it is
-    created 0700 and kept that way.
-
-    Pass create=False to resolve the path without touching the filesystem:
-    read-side callers (doctor) must never create. Without that, a plain
-    `email-mcp doctor` materialised the five spool subdirectories wherever
-    EMAIL_MCP_SPOOL_DIR pointed — including inside ~/Library/Mail.
+    Holds fully-composed outgoing mail, so anything this tool creates here
+    is 0700. create=False resolves the path without touching the disk —
+    read-side callers (doctor) must never create.
     """
-    raw = os.environ.get("EMAIL_MCP_SPOOL_DIR", "").strip()
-    d = Path(raw).expanduser() if raw else Path.home() / ".email-mcp" / "spool"
+    d = _leaf("spool", create=create)
     if create:
-        _refuse_degenerate(d, bool(raw))  # BEFORE the mkdir loop, not after
-        # _lock_down spares `d` itself when it is a link, but this loop runs
-        # BEFORE it and mkdir/chmod resolve straight through — a link
-        # squatting on the spool root had its target's five pre-existing
-        # subdirectories chmodded 0700.
-        linked_root = d.is_symlink()
         for sub in ("pending", "sending", "sent", "failed", "cancelled"):
             s = d / sub
-            if linked_root:
-                continue
-            s.mkdir(parents=True, exist_ok=True)
             if not s.is_symlink():
-                # The subdirs hold composed outgoing mail too — the 0700
-                # parent already blocks traversal, but the invariant is
-                # stated per-directory, so make it true per-directory.
-                s.chmod(0o700)
-        _lock_down(d, bool(raw))
+                _make_ours(s)
     return d
 
 
@@ -281,41 +275,41 @@ def send_max_retries() -> int:
     return int(os.environ.get("EMAIL_MCP_SEND_RETRIES", "5"))
 
 
-def graph_dir() -> Path:
-    """Root of the Graph executor state (per-identity OAuth token caches).
+def attach_dir() -> Path:
+    """Materialised attachment scratch, $TMPDIR/email-mcp (override with
+    EMAIL_MCP_ATTACH_DIR).
 
-    Default ~/.email-mcp/graph, override with EMAIL_MCP_GRAPH_DIR. Token
-    files grant delegated mailbox access, so the dir is created 0700 and
-    kept that way (same pattern as spool_dir).
+    Deliberately NOT under the state root: these are transient extracts of
+    message content that the OS is free to reap, and folding them into the
+    root would make `uninstall --purge` delete them and keep them across
+    reboots. Same permission rule as everything else — 0700 when we create
+    it, untouched when it already exists.
     """
-    raw = os.environ.get("EMAIL_MCP_GRAPH_DIR", "").strip()
-    d = Path(raw).expanduser() if raw else Path.home() / ".email-mcp" / "graph"
-    _refuse_degenerate(d, bool(raw))
-    d.mkdir(parents=True, exist_ok=True)
-    _lock_down(d, bool(raw))
+    raw = os.environ.get("EMAIL_MCP_ATTACH_DIR", "").strip()
+    if raw:
+        d = Path(raw).expanduser()
+    else:
+        tmp = os.environ.get("TMPDIR", "/tmp")
+        d = Path(tmp) / "email-mcp"
+    if _is_home_or_above(d):
+        raise StateDirRefused(
+            f"{d} is your home directory or above it — refusing to write "
+            "attachments there."
+        )
+    _make_ours(d)
     return d
 
 
-# ---------------------------------------------------------------------- #
-# Triage (triage_plan / triage_apply / mailbox_create)                    #
-# ---------------------------------------------------------------------- #
+def graph_dir() -> Path:
+    """Graph executor state (per-identity OAuth token caches), <root>/graph.
+    Token files grant delegated mailbox access."""
+    return _leaf("graph")
 
 
 def plans_dir(create: bool = True) -> Path:
-    """Root of the triage plan store (frozen plan JSONs). Created 0700 —
-    plans carry message metadata.
-
-    Pass create=False to resolve the path without touching the filesystem:
-    read-side callers (doctor) must never create, which also stops a
-    diagnostic from materialising directories wherever EMAIL_MCP_PLANS_DIR
-    happens to point."""
-    raw = os.environ.get("EMAIL_MCP_PLANS_DIR", "").strip()
-    d = Path(raw).expanduser() if raw else Path.home() / ".email-mcp" / "plans"
-    if create:
-        _refuse_degenerate(d, bool(raw))
-        d.mkdir(parents=True, exist_ok=True)
-        _lock_down(d, bool(raw))
-    return d
+    """Triage plan store (frozen plan JSONs), <root>/plans — plans carry
+    message metadata. create=False resolves without touching the disk."""
+    return _leaf("plans", create=create)
 
 
 def triage_max_messages() -> int:
@@ -354,20 +348,10 @@ def triage_verify_interval() -> float:
 
 
 def fts_dir(create: bool = True) -> Path:
-    """Root of the local FTS5 body index. Created 0700 like plans_dir —
-    the index stores extracted message bodies.
-
-    Default ~/.email-mcp/fts, override with EMAIL_MCP_FTS_DIR. Pass
-    create=False to resolve the path without touching the filesystem —
-    read paths (search, --status) must never create the index directory.
-    """
-    raw = os.environ.get("EMAIL_MCP_FTS_DIR", "").strip()
-    d = Path(raw).expanduser() if raw else Path.home() / ".email-mcp" / "fts"
-    if create:
-        _refuse_degenerate(d, bool(raw))
-        d.mkdir(parents=True, exist_ok=True)
-        _lock_down(d, bool(raw))
-    return d
+    """Local FTS5 body index, <root>/fts — it stores extracted message
+    bodies. create=False resolves without touching the disk: read paths
+    (search, --status) must never create the index directory."""
+    return _leaf("fts", create=create)
 
 
 def fts_enabled() -> bool:
@@ -408,7 +392,7 @@ def fts_reconcile_days() -> int:
 # ---------------------------------------------------------------------- #
 
 
-class AuditDirRefused(OSError):
+class AuditDirRefused(StateDirRefused):
     """The ledger directory resolves through a symlink we must not follow.
 
     Raised only by ``audit_dir(create=True)``; ``audit.emit`` catches it
@@ -418,43 +402,18 @@ class AuditDirRefused(OSError):
 
 
 def audit_dir(create: bool = True) -> Path:
-    """Root of the append-only audit ledger (monthly JSONL event files).
-    Created 0700 like plans_dir — events carry recipients and subjects.
-
-    Default ~/.email-mcp/audit, override with EMAIL_MCP_AUDIT_DIR. Pass
-    create=False to resolve the path without touching the filesystem —
-    read paths (query, --status) must never create the ledger directory.
-
-    Symlink discipline mirrors repairs' ``_tree_links``: mkdir and chmod
-    both resolve through a redirection, so a link squatting on the
-    DEFAULT path — the one path this package owns — is refused outright
-    (``AuditDirRefused``) rather than followed onto an arbitrary victim
-    directory. A link the operator named with EMAIL_MCP_AUDIT_DIR is
-    theirs to follow, but its target's mode is still not ours to set.
-    """
-    raw = os.environ.get("EMAIL_MCP_AUDIT_DIR", "").strip()
-    d = Path(raw).expanduser() if raw else Path.home() / ".email-mcp" / "audit"
-    if create:
-        # The fence the first fix missed: audit.emit() calls this on EVERY
-        # mutation, so an unfenced audit_dir let EMAIL_MCP_AUDIT_DIR=/Users
-        # chmod it 0700 and write the ledger there.
-        _refuse_degenerate(d, bool(raw))
-        linked = d.is_symlink()
-        if linked and not raw:
-            raise AuditDirRefused(
-                f"{d} is a symlink — refusing to create or chmod the ledger "
-                "through it; remove the link or set EMAIL_MCP_AUDIT_DIR"
-            )
-        d.mkdir(parents=True, exist_ok=True)
-        if not raw and not d.parent.is_symlink():
-            # Lock down ~/.email-mcp itself. An env-overridden dir's
-            # parent is not ours to chmod (and may refuse — e.g. a
-            # root-owned temp root), which must never cost an event; a
-            # symlinked parent would land the chmod on its target.
-            d.parent.chmod(0o700)
-        if not linked:
-            d.chmod(0o700)
-    return d
+    """Append-only audit ledger (monthly JSONL), <root>/audit — events
+    carry recipients and subjects. create=False resolves without touching
+    the disk; a symlink squatting on the leaf is refused
+    (AuditDirRefused) rather than followed onto a victim directory."""
+    if not create:
+        return _leaf("audit", create=False)
+    try:
+        return _leaf("audit", create=True)
+    except StateDirRefused as e:
+        # Narrower type so audit.emit's existing catch keeps working; it is
+        # a StateDirRefused subclass, so newer catches see it too.
+        raise AuditDirRefused(str(e)) from e
 
 
 def send_max_attach_mb() -> float:

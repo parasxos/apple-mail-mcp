@@ -27,9 +27,9 @@ def _env(monkeypatch, tmp_path, mail_fixture):
         if k.startswith("EMAIL_MCP_"):
             monkeypatch.delenv(k, raising=False)
     monkeypatch.setenv("EMAIL_MCP_MAIL_DIR", str(mail_fixture))
-    monkeypatch.setenv("EMAIL_MCP_SPOOL_DIR", str(tmp_path / "spool"))
-    monkeypatch.setenv("EMAIL_MCP_PLANS_DIR", str(tmp_path / "plans"))
-    monkeypatch.setenv("EMAIL_MCP_FTS_DIR", str(tmp_path / "fts"))
+    monkeypatch.setenv("EMAIL_MCP_STATE_DIR", str(tmp_path))
+    monkeypatch.setenv("EMAIL_MCP_STATE_DIR", str(tmp_path))
+    monkeypatch.setenv("EMAIL_MCP_STATE_DIR", str(tmp_path))
     monkeypatch.setenv("EMAIL_MCP_IDENTITIES",
                        str(tmp_path / "identities.toml"))
     # Post person-clean flip there is no default from_addr; the all-green

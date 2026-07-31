@@ -57,24 +57,22 @@ class Repair:
 
 
 def _state_root() -> Path:
-    return Path.home() / ".email-mcp"
-
-
-def _env_dir(var: str, default: Path) -> Path:
-    raw = os.environ.get(var, "").strip()
-    return Path(raw).expanduser() if raw else default
+    # create=False keeps detect() pure: it resolves the same path the
+    # getters would use without touching the filesystem.
+    from . import config
+    return config.state_root(create=False)
 
 
 def _spool_root() -> Path:
-    return _env_dir("EMAIL_MCP_SPOOL_DIR", _state_root() / "spool")
+    return _state_root() / "spool"
 
 
 def _plans_root() -> Path:
-    return _env_dir("EMAIL_MCP_PLANS_DIR", _state_root() / "plans")
+    return _state_root() / "plans"
 
 
 def _graph_root() -> Path:
-    return _env_dir("EMAIL_MCP_GRAPH_DIR", _state_root() / "graph")
+    return _state_root() / "graph"
 
 
 def _degenerate(path: Path) -> bool:

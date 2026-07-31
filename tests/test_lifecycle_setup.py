@@ -47,18 +47,23 @@ def home(tmp_path, monkeypatch, mail_fixture):
 
 
 @pytest.fixture(autouse=True)
-def fts_dir_guard(home):
-    """Shadow conftest's guard (by name, on purpose): the env pin would
-    point the FTS dir OUTSIDE the fake HOME and defeat the
-    setup-never-creates-it assertion. The fake HOME is the isolation."""
-    return home / ".email-mcp" / "fts"
+def state_root_guard(home, monkeypatch):
+    """Shadow conftest's root guard (by name, on purpose): the env pin and
+    the patched resolver would both point OUTSIDE the fake HOME, defeating
+    the setup-never-creates-it assertions. The fake HOME is the isolation,
+    so let the real default resolution run inside it."""
+    monkeypatch.delenv("EMAIL_MCP_STATE_DIR", raising=False)
+    return home / ".email-mcp"
 
 
 @pytest.fixture(autouse=True)
-def audit_dir_guard(home):
-    """Shadow conftest's guard (same reason): the lifecycle event must
-    land through the real env-driven resolver, inside the fake HOME."""
-    return home / ".email-mcp" / "audit"
+def fts_dir_guard(state_root_guard):
+    return state_root_guard / "fts"
+
+
+@pytest.fixture(autouse=True)
+def audit_dir_guard(state_root_guard):
+    return state_root_guard / "audit"
 
 
 @pytest.fixture(autouse=True)
@@ -173,9 +178,7 @@ def test_state_tree_0700_meta_0600_and_fts_never_created(home):
 # --------------------------------------------------------------------- #
 
 
-@pytest.mark.parametrize("var", ("EMAIL_MCP_SPOOL_DIR", "EMAIL_MCP_PLANS_DIR",
-                                 "EMAIL_MCP_GRAPH_DIR", "EMAIL_MCP_AUDIT_DIR",
-                                 "EMAIL_MCP_FTS_DIR"))
+@pytest.mark.parametrize("var", ("EMAIL_MCP_STATE_DIR",))
 @pytest.mark.parametrize("alias", HOME_ALIASES)
 def test_setup_refuses_state_override_at_home_however_spelled(
     home, monkeypatch, capsys, var, alias,

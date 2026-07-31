@@ -35,6 +35,13 @@ def home(tmp_path, monkeypatch):
     yield h
     audit.set_process("server")  # run_fixes tags "cli"; restore
 
+@pytest.fixture(autouse=True)
+def state_root_guard(home, monkeypatch):
+    """Shadow conftest's root guard by name: conftest PATCHES
+    config.state_root, which would override this module's fake HOME. These
+    tests need the real env-driven resolution inside that HOME."""
+    monkeypatch.delenv("EMAIL_MCP_STATE_DIR", raising=False)
+    return home / ".email-mcp"
 
 @pytest.fixture(autouse=True)
 def fts_dir_guard(home):

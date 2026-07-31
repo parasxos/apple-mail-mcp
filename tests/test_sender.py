@@ -84,7 +84,7 @@ def test_crlf_subject_rejected_on_send_and_schedule(
     assert "header_injection" in str(ei.value)
     assert capture_delivery == []  # {ok:false}, never a traceback or a send
 
-    monkeypatch.setenv("EMAIL_MCP_SPOOL_DIR", str(tmp_path / "spool"))
+    monkeypatch.setenv("EMAIL_MCP_STATE_DIR", str(tmp_path))
     with pytest.raises(sender.SendError) as ei:
         sender.schedule_email(
             to="paris.moschovakos@cern.ch", subject=hostile, body="b",

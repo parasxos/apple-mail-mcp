@@ -138,9 +138,7 @@ _GRAPH_KEYS = frozenset({"tenant", "client_id"})
 # EMAIL_MCP_* variables that redirect state paths; StatePaths.resolve()
 # records which of these are in effect.
 _PATH_ENV_VARS = (
-    "EMAIL_MCP_MAIL_DIR", "EMAIL_MCP_SPOOL_DIR", "EMAIL_MCP_PLANS_DIR",
-    "EMAIL_MCP_GRAPH_DIR", "EMAIL_MCP_AUDIT_DIR", "EMAIL_MCP_FTS_DIR",
-    "EMAIL_MCP_IDENTITIES",
+    "EMAIL_MCP_MAIL_DIR", "EMAIL_MCP_STATE_DIR", "EMAIL_MCP_IDENTITIES",
 )
 
 _FDA_RESTART_NOTE = (
@@ -217,16 +215,16 @@ class StatePaths:
             raw = os.environ.get(var, "").strip()
             return Path(raw).expanduser() if raw else default
 
-        root = Path.home() / ".email-mcp"
+        root = config.state_root(create=False)
         overrides = {
             var: os.environ[var] for var in _PATH_ENV_VARS
             if os.environ.get(var, "").strip()
         }
         return cls(
             root=root,
-            spool=env_dir("EMAIL_MCP_SPOOL_DIR", root / "spool"),
-            plans=env_dir("EMAIL_MCP_PLANS_DIR", root / "plans"),
-            graph=env_dir("EMAIL_MCP_GRAPH_DIR", root / "graph"),
+            spool=root / "spool",
+            plans=root / "plans",
+            graph=root / "graph",
             audit=config.audit_dir(create=False),
             fts=config.fts_dir(create=False),
             identities=config.identities_file(),
@@ -696,16 +694,13 @@ def _degenerate_overrides(paths: "StatePaths") -> list[str]:
     home = Path(os.path.realpath(Path.home()))
     ancestors = {home, *home.parents}
     bad: list[str] = []
-    for var, target in (("EMAIL_MCP_SPOOL_DIR", paths.spool),
-                        ("EMAIL_MCP_PLANS_DIR", paths.plans),
-                        ("EMAIL_MCP_GRAPH_DIR", paths.graph),
-                        ("EMAIL_MCP_AUDIT_DIR", paths.audit),
-                        ("EMAIL_MCP_FTS_DIR", paths.fts)):
-        if var not in paths.env_overrides:
-            continue
-        resolved = Path(os.path.realpath(target))
-        if resolved in ancestors:
-            bad.append(f"{var}={paths.env_overrides[var]} -> {resolved}")
+    if "EMAIL_MCP_STATE_DIR" not in paths.env_overrides:
+        return bad
+    resolved = Path(os.path.realpath(paths.root))
+    if resolved in ancestors:
+        bad.append(
+            f"EMAIL_MCP_STATE_DIR={paths.env_overrides['EMAIL_MCP_STATE_DIR']}"
+            f" -> {resolved}")
     return bad
 
 
@@ -1587,7 +1582,7 @@ def uninstall_plan(purge: bool) -> dict:
     if paths.graph != graph_default and paths.graph.is_dir():
         for token in sorted(paths.graph.glob("*.token.json")):
             print_only.append(
-                f"{token} (EMAIL_MCP_GRAPH_DIR override — never removed; "
+                f"{token} (EMAIL_MCP_STATE_DIR override — never removed; "
                 "delete it yourself)")
 
     if purge:

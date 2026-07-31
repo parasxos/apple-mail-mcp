@@ -179,7 +179,7 @@ def gc(now: datetime | None = None,
 
     ``plan_ids`` narrows the sweep to those plans' files and nothing
     else. The whole-directory sweep is only ours to run when we own the
-    directory: EMAIL_MCP_PLANS_DIR can point at a dir the user also
+    directory: EMAIL_MCP_STATE_DIR can point at a tree the user also
     keeps files in, so a caller that merely wants ITS OWN detected
     claims finalised (repairs, via doctor --fix, which promises never to
     delete user data) passes the ids it detected."""

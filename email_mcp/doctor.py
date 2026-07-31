@@ -431,8 +431,7 @@ def check_audit() -> dict:
 def _graph_token_dir() -> Path:
     """config.graph_dir()'s path WITHOUT its mkdir side effect — doctor
     checks stat, they never create (same purity rule as check_fts)."""
-    raw = os.environ.get("EMAIL_MCP_GRAPH_DIR", "").strip()
-    return Path(raw).expanduser() if raw else Path.home() / ".email-mcp" / "graph"
+    return config.state_root(create=False) / "graph"
 
 
 def _graph_token_report(name: str, path: Path) -> dict:

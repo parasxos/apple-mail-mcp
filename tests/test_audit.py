@@ -21,14 +21,20 @@ from email_mcp import audit
 
 
 @pytest.fixture(autouse=True)
-def audit_dir_guard(tmp_path, monkeypatch):
-    """Point the ledger at a per-test tmp dir — nothing here may ever
-    touch ~/.email-mcp/audit — and reset the process tag afterwards."""
-    d = tmp_path / "audit"
-    monkeypatch.setenv("EMAIL_MCP_AUDIT_DIR", str(d))
-    yield d
-    audit.set_process("server")
+def state_root_guard(tmp_path, monkeypatch):
+    """Shadow conftest's guard: conftest patches config.state_root, which
+    would defeat the real env-driven resolution these tests exercise."""
+    root = tmp_path / "state"
+    monkeypatch.setenv("EMAIL_MCP_STATE_DIR", str(root))
+    return root
 
+
+@pytest.fixture(autouse=True)
+def audit_dir_guard(state_root_guard):
+    """Derived from the pinned ROOT — one root is the whole point. Not
+    pre-created: emit's own mkdir path is part of the attack surface."""
+    yield state_root_guard / "audit"
+    audit.set_process("server")
 
 def _lines(d: Path) -> list[str]:
     out: list[str] = []
@@ -129,7 +135,7 @@ def test_emit_never_raises_and_returns_none_when_unwritable(
 ):
     parent = tmp_path / "ro"
     parent.mkdir()
-    monkeypatch.setenv("EMAIL_MCP_AUDIT_DIR", str(parent / "audit"))
+    monkeypatch.setenv("EMAIL_MCP_STATE_DIR", str(parent))
     parent.chmod(0o500)  # audit dir cannot be created underneath
     try:
         assert audit.emit("send", outcome="sent") is None  # no raise
@@ -138,11 +144,13 @@ def test_emit_never_raises_and_returns_none_when_unwritable(
     assert not (parent / "audit").exists()
 
 
-def test_env_overridden_dir_never_chmods_parent(audit_dir_guard):
-    """Gate regression: with EMAIL_MCP_AUDIT_DIR set, the parent is not
-    ours — chmod'ing it can raise (root-owned temp roots) and would cost
-    the event. Only the default ~/.email-mcp parent gets locked down."""
-    parent = audit_dir_guard.parent
+def test_env_overridden_dir_never_chmods_parent(audit_dir_guard,
+                                                state_root_guard):
+    """Gate regression: the state root's PARENT is never ours — chmod'ing
+    it can raise (root-owned temp roots) and would cost the event. Since
+    v0.11 nothing pre-existing is chmodded at all, so this holds by
+    construction rather than by a fence."""
+    parent = state_root_guard.parent
     parent.chmod(0o755)
     assert audit.emit("send", outcome="sent") is not None
     assert len(_lines(audit_dir_guard)) == 1  # the event landed
@@ -195,7 +203,7 @@ def test_emit_refuses_symlinked_default_ledger_dir(tmp_path, monkeypatch,
     """A link squatting on ~/.email-mcp/audit must cost the event, not the
     victim: mkdir and chmod both follow it, so `doctor --fix` would have
     tightened an arbitrary directory to 0700 and filed the ledger inside."""
-    monkeypatch.delenv("EMAIL_MCP_AUDIT_DIR", raising=False)
+    monkeypatch.delenv("EMAIL_MCP_STATE_DIR", raising=False)
     home = tmp_path / "home"
     (home / ".email-mcp").mkdir(parents=True)
     monkeypatch.setenv("HOME", str(home))
@@ -270,7 +278,7 @@ def test_default_path_never_chmods_a_symlinked_state_root(tmp_path,
     """~/.email-mcp relocated with a link (a supported shape) is followed —
     the ledger dir under it is ours to create 0700 — but chmod resolves
     through the link, so the link's target keeps its own mode."""
-    monkeypatch.delenv("EMAIL_MCP_AUDIT_DIR", raising=False)
+    monkeypatch.delenv("EMAIL_MCP_STATE_DIR", raising=False)
     home = tmp_path / "home"
     home.mkdir()
     monkeypatch.setenv("HOME", str(home))
@@ -448,7 +456,7 @@ def test_detail_fence_strips_bodies_and_secrets_recursively(tmp_path, monkeypatc
     """Audit finding F2: the no-bodies guarantee must be a structural fence,
     not call-site discipline — denylisted keys never reach the ledger, at
     any nesting depth, and the redaction itself is on record."""
-    monkeypatch.setenv("EMAIL_MCP_AUDIT_DIR", str(tmp_path))
+    monkeypatch.setenv("EMAIL_MCP_STATE_DIR", str(tmp_path))
     from email_mcp import audit
     audit.emit(
         "send", outcome="sent", operation_id="op-fence-1",
@@ -459,7 +467,7 @@ def test_detail_fence_strips_bodies_and_secrets_recursively(tmp_path, monkeypatc
             "reason": "ok-to-keep",
         },
     )
-    line = next(tmp_path.glob("*.jsonl")).read_text()
+    line = next((tmp_path / "audit").glob("*.jsonl")).read_text()
     assert "SECRET BODY TEXT" not in line
     assert "tok-123" not in line and "hunter2" not in line
     assert '"keep": "yes"' in line.replace("  ", " ") or '"keep":"yes"' in line
@@ -472,8 +480,8 @@ def test_detail_fence_strips_bodies_and_secrets_recursively(tmp_path, monkeypatc
 def test_plan_finish_survives_malformed_result(tmp_path, monkeypatch):
     """Audit finding F5: a shaped-data surprise in the finish result must
     neither raise out of plans.finish nor lose the plan_finish event."""
-    monkeypatch.setenv("EMAIL_MCP_AUDIT_DIR", str(tmp_path / "audit"))
-    monkeypatch.setenv("EMAIL_MCP_PLANS_DIR", str(tmp_path / "plans"))
+    monkeypatch.setenv("EMAIL_MCP_STATE_DIR", str(tmp_path))
+    monkeypatch.setenv("EMAIL_MCP_STATE_DIR", str(tmp_path))
     from email_mcp import audit, plans
     plan = plans.Plan(
         id=plans.new_id(), created_at=plans.iso(plans.utcnow()),

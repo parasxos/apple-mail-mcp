@@ -37,15 +37,20 @@ SENTINEL = "XSENTINELX-BODY-73c1-never-in-the-ledger"
 
 
 @pytest.fixture(autouse=True)
-def audit_dir_guard(tmp_path, monkeypatch):
-    """Env pin ONLY (shadows conftest's resolver monkeypatch) — the red
-    team runs against the real config.audit_dir. Dir is NOT pre-created:
-    emit's own mkdir path is part of the attack surface."""
-    d = tmp_path / "audit"
-    monkeypatch.setenv("EMAIL_MCP_AUDIT_DIR", str(d))
-    yield d
-    audit.set_process("server")
+def state_root_guard(tmp_path, monkeypatch):
+    """Shadow conftest's guard: conftest patches config.state_root, which
+    would defeat the real env-driven resolution these tests exercise."""
+    root = tmp_path / "state"
+    monkeypatch.setenv("EMAIL_MCP_STATE_DIR", str(root))
+    return root
 
+
+@pytest.fixture(autouse=True)
+def audit_dir_guard(state_root_guard):
+    """Derived from the pinned ROOT — one root is the whole point. Not
+    pre-created: emit's own mkdir path is part of the attack surface."""
+    yield state_root_guard / "audit"
+    audit.set_process("server")
 
 @pytest.fixture
 def send_env(monkeypatch, tmp_path, audit_dir_guard):
@@ -54,12 +59,12 @@ def send_env(monkeypatch, tmp_path, audit_dir_guard):
     for k in list(os.environ):
         if k.startswith("EMAIL_MCP_"):
             monkeypatch.delenv(k, raising=False)
-    monkeypatch.setenv("EMAIL_MCP_AUDIT_DIR", str(audit_dir_guard))
-    monkeypatch.setenv("EMAIL_MCP_FTS_DIR", str(tmp_path / "fts"))
+    monkeypatch.setenv("EMAIL_MCP_STATE_DIR", str(audit_dir_guard.parent))
+    monkeypatch.setenv("EMAIL_MCP_STATE_DIR", str(tmp_path))
     monkeypatch.setenv("EMAIL_MCP_FROM_ADDR", "paris@example.org")
     monkeypatch.setenv("EMAIL_MCP_FROM_NAME", "Paris")
-    monkeypatch.setenv("EMAIL_MCP_SPOOL_DIR", str(tmp_path / "spool"))
-    monkeypatch.setenv("EMAIL_MCP_PLANS_DIR", str(tmp_path / "plans"))
+    monkeypatch.setenv("EMAIL_MCP_STATE_DIR", str(tmp_path))
+    monkeypatch.setenv("EMAIL_MCP_STATE_DIR", str(tmp_path))
     monkeypatch.setenv("EMAIL_MCP_IDENTITIES",
                        str(tmp_path / "no-identities.toml"))
 
@@ -144,7 +149,7 @@ def _mini_plan(summary: str = "mark_read: 2 msg(s)") -> plans.Plan:
 
 
 def _hammer(dir_str: str, src: str, count: int) -> None:
-    os.environ["EMAIL_MCP_AUDIT_DIR"] = dir_str
+    os.environ["EMAIL_MCP_STATE_DIR"] = str(Path(dir_str).parent)
     from email_mcp import audit as aud
     aud.set_process(src)
     for i in range(count):
@@ -155,7 +160,7 @@ def _hammer(dir_str: str, src: str, count: int) -> None:
 
 def _frozen_hammer(dir_str: str, frozen_iso: str, tag: str,
                    count: int) -> None:
-    os.environ["EMAIL_MCP_AUDIT_DIR"] = dir_str
+    os.environ["EMAIL_MCP_STATE_DIR"] = str(Path(dir_str).parent)
     from email_mcp import audit as aud
     from email_mcp import ids as idm
     frozen = datetime.fromisoformat(frozen_iso)
@@ -177,8 +182,7 @@ def _f6_schedule_then_die(audit_dir: str, spool_dir: str,
                           identities: str, send_at: str) -> None:
     """Schedule (mutation lands durably in the spool), then die at the
     exact emit boundary — the documented at-most-once loss window."""
-    os.environ["EMAIL_MCP_AUDIT_DIR"] = audit_dir
-    os.environ["EMAIL_MCP_SPOOL_DIR"] = spool_dir
+    os.environ["EMAIL_MCP_STATE_DIR"] = str(Path(audit_dir).parent)
     os.environ["EMAIL_MCP_IDENTITIES"] = identities
     os.environ["EMAIL_MCP_FROM_ADDR"] = "paris@example.org"
     from email_mcp import audit as aud
@@ -278,7 +282,7 @@ def test_f4_unwritable_ledger_never_blocks_mail(
     ro = tmp_path / "ro"
     ro.mkdir()
     dead = ro / "audit"
-    monkeypatch.setenv("EMAIL_MCP_AUDIT_DIR", str(dead))
+    monkeypatch.setenv("EMAIL_MCP_STATE_DIR", str(dead.parent))
     ro.chmod(0o500)
     try:
         ok = server.tool_send_email(to="paris@example.org",
@@ -340,14 +344,18 @@ def test_f4_unchmodable_0500_dir_drops_events_not_mail(
 
 
 def test_f4_owned_0500_dir_self_heals(audit_dir_guard):
-    """Real resolver on an OWNED 0500 dir: audit_dir(create=True) restores
-    0700, so the event is recorded rather than dropped — chmod accidents
-    on the user's own ledger cost nothing (documented behaviour)."""
-    audit_dir_guard.mkdir()
+    """A pre-existing 0500 ledger dir is NOT silently re-chmodded — since
+    v0.11 only directories this tool created are its to mode. The event is
+    dropped (receipts lost, mail unaffected) and `doctor --fix` repairs the
+    mode on request. The old self-heal was the same surprise-chmod that
+    three release gates kept finding ways to abuse."""
+    audit_dir_guard.mkdir(parents=True)
     audit_dir_guard.chmod(0o500)
-    assert audit.emit("send", outcome="sent") is not None
-    assert stat.S_IMODE(audit_dir_guard.stat().st_mode) == 0o700
-    assert len(_lines(audit_dir_guard)) == 1
+    try:
+        assert audit.emit("send", outcome="sent") is None  # dropped, no raise
+        assert stat.S_IMODE(audit_dir_guard.stat().st_mode) == 0o500
+    finally:
+        audit_dir_guard.chmod(0o700)
 
 
 # --------------------------------------------------------------------- #
@@ -698,24 +706,28 @@ def test_megabyte_single_fields_stay_capped(audit_dir_guard):
             assert key in rec
 
 
-def test_symlinked_audit_dir_works(tmp_path, monkeypatch):
-    target = tmp_path / "real-ledger"
+def test_symlinked_state_root_works(tmp_path, monkeypatch):
+    """Relocating the ROOT with a link is supported (a symlinked managed
+    LEAF is the refused case — see test_config_state_dirs)."""
+    target = tmp_path / "real-state"
     target.mkdir()
     link = tmp_path / "link"
     link.symlink_to(target)
-    monkeypatch.setenv("EMAIL_MCP_AUDIT_DIR", str(link))
+    monkeypatch.setenv("EMAIL_MCP_STATE_DIR", str(link))
     op = audit.emit("send", outcome="sent")
     assert op is not None
-    assert len(list(target.glob("*.jsonl"))) == 1  # landed through the link
+    assert len(list((target / "audit").glob("*.jsonl"))) == 1  # through the link
     assert [e["op"] for e in audit.query()["events"]] == [op]
 
 
 def test_audit_dir_is_a_regular_file(tmp_path, monkeypatch):
     from email_mcp import doctor
 
-    imposter = tmp_path / "audit"
+    root = tmp_path / "state"
+    root.mkdir()
+    imposter = root / "audit"
     imposter.write_text("I am a file, not a directory")
-    monkeypatch.setenv("EMAIL_MCP_AUDIT_DIR", str(imposter))
+    monkeypatch.setenv("EMAIL_MCP_STATE_DIR", str(root))
     assert audit.emit("send", outcome="sent") is None  # dropped, no raise
     assert audit.query() == {"events": [], "files_scanned": 0,
                              "skipped_lines": 0}

@@ -44,8 +44,8 @@ def send_env(monkeypatch, tmp_path):
             monkeypatch.delenv(k, raising=False)
     monkeypatch.setenv("EMAIL_MCP_FROM_ADDR", "paris@example.org")
     monkeypatch.setenv("EMAIL_MCP_FROM_NAME", "Paris")
-    monkeypatch.setenv("EMAIL_MCP_SPOOL_DIR", str(tmp_path / "spool"))
-    monkeypatch.setenv("EMAIL_MCP_PLANS_DIR", str(tmp_path / "plans"))
+    monkeypatch.setenv("EMAIL_MCP_STATE_DIR", str(tmp_path))
+    monkeypatch.setenv("EMAIL_MCP_STATE_DIR", str(tmp_path))
     monkeypatch.setenv("EMAIL_MCP_IDENTITIES",
                        str(tmp_path / "no-identities.toml"))
 

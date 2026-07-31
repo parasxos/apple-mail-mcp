@@ -34,8 +34,8 @@ def _graph_env(monkeypatch, tmp_path):
     for k in list(os.environ):
         if k.startswith("EMAIL_MCP_"):
             monkeypatch.delenv(k, raising=False)
-    monkeypatch.setenv("EMAIL_MCP_GRAPH_DIR", str(tmp_path / "graph"))
-    monkeypatch.setenv("EMAIL_MCP_SPOOL_DIR", str(tmp_path / "spool"))
+    monkeypatch.setenv("EMAIL_MCP_STATE_DIR", str(tmp_path))
+    monkeypatch.setenv("EMAIL_MCP_STATE_DIR", str(tmp_path))
     monkeypatch.setenv(
         "EMAIL_MCP_IDENTITIES", str(tmp_path / "no-identities.toml")
     )
