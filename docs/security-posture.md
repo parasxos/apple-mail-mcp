@@ -92,8 +92,18 @@ FAIL against each.
 
 `chmod` and `mkdir` both resolve through a redirection, so a link
 squatting on a managed path would land the operation on an arbitrary
-victim directory. The rule (design D7) is: **the path AT a link, and every
-path behind one, is off-limits.**
+victim directory. The rule (design D7) is: **modes are never changed at a
+link or behind one.**
+
+Stated precisely, because the absolute phrasing this once carried —
+"every path behind a link is off-limits" — is not what the code does and
+invited a reviewer to report supported behaviour as a breach. Relocating
+the state root by symlinking `~/.email-mcp` onto another volume **is a
+supported shape**: the link is followed, directories under it are ours to
+create `0700`, and the link's target keeps its own mode. What is refused
+is a link squatting on a managed *leaf* we own, such as
+`~/.email-mcp/audit` (`AuditDirRefused`). Following a redirection the user
+chose is not the risk; changing the mode of whatever sits behind it is.
 
 - `repairs._tree_links()` collects symlinks squatting on managed state
   dirs; `_files_not_0600()` / `_dirs_not_0700()` exclude them and every

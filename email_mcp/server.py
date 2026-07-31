@@ -82,6 +82,10 @@ def _to_jsonable(obj: Any) -> Any:
 # can carry a caller's payload back across the wire.
 _MAX_ERROR_CHARS = 2000
 
+# A message id is an Envelope Index ROWID or a minted spool id — tens of
+# bytes. Bounded in the same unit as _clip so the two cannot disagree.
+_MAX_ID_BYTES = 256
+
 
 def _clip(text: str) -> str:
     """Bound one line of failure prose (contract §7).
@@ -199,14 +203,13 @@ def _belt(op_from: str | None = None):
                 text = f"{type(e).__name__}: {e}" if typed else str(e)
             except Exception:
                 return "unexpected internal error (see log)"
-            # §2 calls `error` one-line prose. Some exceptions quote their
-            # input back — an OSError names the whole offending path — so an
-            # oversized argument returns as an oversized envelope on a stdio
-            # transport. The full text is already in the file log.
-            if len(text) > _MAX_ERROR_CHARS:
-                return (text[:_MAX_ERROR_CHARS]
-                        + f"… [truncated, {len(text)} chars; see log]")
-            return text
+            # ONE clip for the whole server. This used to be an inline
+            # character slice, so the belt — the path every one of the 20
+            # tools takes for an uncaught exception — kept returning
+            # character-bounded prose after _clip was made byte-bounded,
+            # and an astral-plane message came back at 4x the size the
+            # validation paths produced.
+            return _clip(text)
 
         def _fail(code: str, error: str, args: tuple, kwargs: dict) -> dict:
             _log.exception("belt[%s]: %s", fn.__name__, code)
@@ -356,10 +359,15 @@ def tool_get_emails_batch(ids: list[str], view: str = "full") -> dict:
     # back for correlation, so 50 ids at the cap × a 60 KB "id" was a 3 MB
     # envelope that the over-cap reject above never sees (50 is AT the cap).
     for pos, id in enumerate(ids):
-        if len(str(id)) > 256:
+        # UTF-8 bytes, matching _clip: 256 astral characters are 1 024 bytes,
+        # which slipped under a byte-measured clip while 50 of them still
+        # made a 300 KB envelope. Every length gate on this path counts the
+        # same unit.
+        size = len(str(id).encode("utf-8"))
+        if size > _MAX_ID_BYTES:
             return {"ok": False, "code": codes.INVALID_INPUT,
-                    "error": f"id at position {pos} is {len(str(id))} "
-                             "characters — not a message id"}
+                    "error": f"id at position {pos} is {size} bytes — "
+                             "not a message id"}
     src = _source()
     emails: list[dict] = []
     errors: list[dict] = []

@@ -198,3 +198,42 @@ def test_attach_dir_refuses_a_degenerate_override(clean_env, monkeypatch):
     monkeypatch.setenv("EMAIL_MCP_ATTACH_DIR", str(ancestor))
     with pytest.raises(config.StateDirRefused):
         config.attach_dir()
+
+
+def test_case_variant_of_home_is_refused(clean_env, monkeypatch, tmp_path):
+    """macOS ships case-insensitive APFS, so $HOME has many spellings.
+
+    The fence compared RESOLVED STRINGS, and resolve() preserves whatever
+    spelling it was handed — so /users/paris, /USERS/PARIS and the
+    /System/Volumes/Data firmlink each named the real home directory while
+    comparing unequal, and every one of them walked straight through.
+    Identity is the inode, not the text.
+    """
+    home = clean_env
+    upper = home.parent / home.name.upper()
+    if not upper.exists() or upper.stat().st_ino != home.stat().st_ino:
+        pytest.skip("filesystem is case-sensitive; the variant is a real path")
+
+    monkeypatch.setenv("EMAIL_MCP_SPOOL_DIR", str(upper))
+    with pytest.raises(config.StateDirRefused):
+        config.spool_dir()
+    assert _mode(home) == 0o755
+    assert not list(home.iterdir())
+
+
+def test_symlinked_default_spool_root_never_chmods_its_target(
+        clean_env, tmp_path):
+    """The subdir loop ran BEFORE the link check and mkdir/chmod resolve
+    through a link, so a squat on the default spool root had its target's
+    five pre-existing subdirectories taken to 0700."""
+    victim = tmp_path / "victim"
+    victim.mkdir()
+    for sub in ("pending", "sending", "sent", "failed", "cancelled"):
+        (victim / sub).mkdir(mode=0o755)
+    (clean_env / ".email-mcp").mkdir()
+    (clean_env / ".email-mcp" / "spool").symlink_to(victim)
+
+    config.spool_dir()
+
+    for sub in ("pending", "sending", "sent", "failed", "cancelled"):
+        assert _mode(victim / sub) == 0o755, f"{sub} chmodded through the link"

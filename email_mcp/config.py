@@ -150,18 +150,55 @@ class StateDirRefused(OSError):
     """
 
 
+def _is_same_dir(a: Path, b: Path) -> bool:
+    """Directory identity by inode, not by spelling."""
+    try:
+        sa, sb = a.stat(), b.stat()
+    except OSError:
+        return False
+    return (sa.st_dev, sa.st_ino) == (sb.st_dev, sb.st_ino)
+
+
+def _spelling(p: Path) -> str:
+    """Last-resort key for a path that does not exist yet.
+
+    NFC + casefold, because the comparison is only reached when neither
+    path can be stat'd and macOS stores filenames in NFD.
+    """
+    import unicodedata
+
+    return unicodedata.normalize("NFC", str(p)).casefold()
+
+
 def _degenerate(d: Path) -> bool:
     """True when `d` is $HOME or an ancestor of it, however it is spelled.
 
-    Resolved, not lexical: `$HOME/sub/..` and `//$HOME` name the same
-    directory while comparing unequal.
+    Compared by INODE, not by resolved string. macOS ships a
+    case-insensitive APFS volume and firmlinks `/Users` into
+    `/System/Volumes/Data/Users`, so `/users/paris`, `/USERS/PARIS`,
+    `/System/Volumes/Data/Users/paris` and `$HOME` are one directory with
+    four spellings — `Path.resolve()` preserves the spelling it was given
+    and returns four different strings. A string compare therefore passed
+    every one of them straight through the fence and chmodded the real
+    home directory; only the exact spelling was ever refused.
     """
-    try:
-        target = d.resolve()
-        home = Path.home().resolve()
-    except OSError:
-        return False
-    return target == home or target in home.parents
+    home = Path.home()
+    if _is_same_dir(d, home):
+        return True
+    for ancestor in home.resolve().parents:
+        if _is_same_dir(d, ancestor):
+            return True
+    # Neither path exists yet (nothing to stat): fall back to a normalized
+    # textual compare, which at least catches case and unicode variants.
+    if not d.exists():
+        try:
+            target, root = _spelling(d.resolve()), _spelling(home.resolve())
+        except OSError:
+            return False
+        if target == root:
+            return True
+        return any(target == _spelling(a) for a in home.resolve().parents)
+    return False
 
 
 def _refuse_degenerate(d: Path, overridden: bool) -> None:
@@ -178,6 +215,14 @@ def _refuse_degenerate(d: Path, overridden: bool) -> None:
             "state there or change its mode. Point the EMAIL_MCP_*_DIR "
             "override at a directory of its own."
         )
+    # NOTE: a symlink at ~/.email-mcp is NOT refused. Relocating the state
+    # root onto another volume with a link is a supported shape (see
+    # tests/test_audit.py::test_default_path_never_chmods_a_symlinked_state_root):
+    # the link is followed, the dirs under it are ours to create 0700, and
+    # the link's TARGET keeps its own mode. The rule is "never change modes
+    # behind a link", not "never follow one". A squat AT a managed leaf —
+    # ~/.email-mcp/audit — is a different case and is refused
+    # (AuditDirRefused).
 
 
 def _lock_down(d: Path, overridden: bool) -> None:
@@ -212,8 +257,15 @@ def spool_dir(create: bool = True) -> Path:
     d = Path(raw).expanduser() if raw else Path.home() / ".email-mcp" / "spool"
     if create:
         _refuse_degenerate(d, bool(raw))  # BEFORE the mkdir loop, not after
+        # _lock_down spares `d` itself when it is a link, but this loop runs
+        # BEFORE it and mkdir/chmod resolve straight through — a link
+        # squatting on the spool root had its target's five pre-existing
+        # subdirectories chmodded 0700.
+        linked_root = d.is_symlink()
         for sub in ("pending", "sending", "sent", "failed", "cancelled"):
             s = d / sub
+            if linked_root:
+                continue
             s.mkdir(parents=True, exist_ok=True)
             if not s.is_symlink():
                 # The subdirs hold composed outgoing mail too — the 0700
