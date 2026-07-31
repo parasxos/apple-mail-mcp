@@ -629,7 +629,11 @@ def run_fixes(*, dry_run: bool = False) -> dict:
         except Exception as e:  # noqa: BLE001 — the fixer must keep
             # working precisely when things are broken
             _log.exception("doctor_fix: %s apply failed", repair.id)
-            msg = f"{type(e).__name__}: {e}"
+            # A deliberate refusal (RuntimeError raised by an apply) is
+            # already a legible sentence; prefixing the class name is
+            # developer noise on an operator surface. Unexpected classes
+            # keep their name, because there the type IS the information.
+            msg = str(e) if type(e) is RuntimeError else f"{type(e).__name__}: {e}"
             failed.append({"repair": repair.id, "finding": finding,
                            "error": msg})
             audit.emit("doctor_fix", outcome="failed", operation_id=op,

@@ -1600,8 +1600,16 @@ def uninstall_plan(purge: bool) -> dict:
         plist = agents_dir / f"{label}.plist"
         if plist.exists():
             remove.append(f"launchd agent {label} ({plist})")
+    # TOTAL, like every peer surface: a preview that raises is useless
+    # precisely when the operator most needs to know what will happen.
+    def _is_link(p: Path) -> bool:
+        try:
+            return p.is_symlink()
+        except OSError:
+            return False
+
     graph_default = root / "graph"
-    if graph_default.is_symlink():
+    if _is_link(graph_default):
         print_only.append(
             f"{graph_default} (symlink — token caches behind it are "
             "never followed; delete them yourself)")
@@ -1615,20 +1623,29 @@ def uninstall_plan(purge: bool) -> dict:
                 "delete it yourself)")
 
     if purge:
-        queued = 0
+        from . import health
+        from . import spool as _spool
+
+        undelivered = ("pending", "sending")
         try:
-            from . import spool as _spool
-            queued = sum(len(_spool.entries(st))
-                         for st in ("pending", "sending"))
+            queued = sum(len(_spool.entries(st)) for st in undelivered)
         except Exception:      # never let a count block the plan
             queued = 0
+        # This is the LAST line an operator reads before typing the
+        # confirmation that deletes the tree irreversibly, and it is the
+        # one place a count is ACTED on rather than merely displayed. A
+        # truncated manifest — real, composed, undelivered mail — used to
+        # remove the warning entirely or undercount it, because this
+        # surface counted without asking whether the count was trustworthy.
+        caveat = health.caveats(spool_states=undelivered)
         note = ""
         if queued:
-            # The ledger already gets an export warning; mail that has not
-            # been SENT yet deserves at least a count, or --purge silently
-            # destroys it.
             note = (f" — INCLUDING {queued} message(s) still queued and "
                     "undelivered")
+        if caveat:
+            note += (" — WARNING: this count is NOT reliable ("
+                     + "; ".join(health.summarize(caveat)[:-1])
+                     + "); more mail may be queued than shown")
         remove.append(f"{root} (state tree: spool, plans, audit ledger, "
                       f"identities.toml, meta.json){note}")
         logs_dir = _logs_dir()

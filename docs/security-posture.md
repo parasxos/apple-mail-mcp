@@ -1003,6 +1003,49 @@ hostile root shapes; the documented migration works literally as written
 with real queued mail surviving and visible; and `uninstall --purge` now
 states how many undelivered messages it is about to destroy.
 
+### v0.11 — tenth and eleventh passes
+
+One PASS, one FAIL. The FAIL found the one reporting surface the shared
+helper had not reached — and it is the destructive one:
+
+- **MAJOR — `uninstall_plan` counted queued mail without asking whether
+  the count was trustworthy.** A truncated manifest removed the
+  queued-mail warning entirely, or undercounted it, on the LAST line an
+  operator reads before typing the confirmation that deletes the tree.
+  Every other surface flagged it. This is the one place a count is ACTED
+  on rather than displayed, so it is the worst possible omission.
+- **MAJOR — `uninstall_plan` was not total**, despite documenting a
+  "side-effect-free preview": an unreadable root raised `PermissionError`
+  out of `graph.is_symlink()` before any refusal was consulted.
+- **MINOR — an unreadable spool LEAF under a readable root was erased,
+  not recorded.** `Path.glob` SWALLOWS a permission error and yields
+  nothing, so the handler written for this never ran and `pending 0` was
+  reported over mail the process was not allowed to see. Now `os.listdir`,
+  which raises — and ABSENT is carefully distinguished from UNREADABLE, so
+  a fresh install with no spool yet stays clean.
+- **MINOR — a filtered query grew a key it never asked for**: under any
+  caveat, `list_scheduled(state="failed")` injected `"pending": []`.
+- **MINOR — the audit CLI never printed `unreadable_files`**, so an
+  unreadable month file looked like an empty ledger.
+- **TRIVIAL — `RuntimeError:` prefixed a deliberate, already-legible
+  refusal** in `doctor --fix` output.
+
+The passing gate independently ran a thirteen-case damage matrix against
+real queued mail (truncated manifest, unreadable manifest, foreign JSON,
+valid-JSON-wrong-fields, marker removed, root 0755/0300/0000, symlinked
+spool leaf, deleted spool, relocated and unset roots) and found **no case
+where mail that still existed on disk could be read as "none"**, zero
+tracebacks in 39 runs, no decoy touched across every symlink and override
+shape, and the documented migration working literally with the mail
+visible at the end.
+
+**One inherent limit, stated rather than fixed:** if you set
+`EMAIL_MCP_STATE_DIR`, queue mail, then UNSET it, every surface reports an
+empty queue for the default root — truthfully, because the tool keeps no
+record of a root it was never told about again. The retired per-directory
+variables are hard-errored precisely because that case IS knowable; this
+one is not.
+
 **Still open, deliberately:** the root TOCTOU (§0 boundary — a local
 attacker with write access to the root's parent can swap a symlink between
 the refusal check and the mkdir; cost is one stray 0600 dotfile, no mode

@@ -15,6 +15,7 @@ moves on. That makes overlapping dispatcher runs double-send-safe.
 from __future__ import annotations
 
 import json
+import os
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
@@ -100,11 +101,24 @@ def entries(state: str) -> list[Entry]:
     out: list[Entry] = []
     unreadable: list[str] = []
     try:
-        manifests = sorted(d.glob("*.json"))
-    except OSError:
-        # Unreadable or refused root: a scan that cannot see the spool
-        # reports nothing rather than raising into a read tool.
+        # os.listdir, NOT Path.glob: pathlib's glob SWALLOWS a permission
+        # error and yields nothing, so an unreadable directory was
+        # indistinguishable from an empty one and this handler never ran.
+        manifests = sorted(d / n for n in os.listdir(d)
+                           if n.endswith(".json"))
+    except FileNotFoundError:
+        # ABSENT is not UNREADABLE. A fresh install has no spool yet, and
+        # "empty" is the honest answer for a directory that does not
+        # exist — flagging it would make every clean install look broken.
         unreadable_manifests[state] = []
+        return out
+    except OSError as e:
+        # A spool we are not allowed to READ is different: storing [] here
+        # erased the difference between "no messages" and "I was not
+        # allowed to check", so every surface downstream reported a clean
+        # `pending 0` over mail it simply could not see.
+        unreadable_manifests[state] = [f"<{state}/ unreadable: "
+                                       f"{e.strerror or e}>"]
         return out
     for manifest in manifests:
         try:

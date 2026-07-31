@@ -793,7 +793,11 @@ def tool_list_scheduled(state: str | None = None, limit: int = 50) -> dict:
     caveat = health.caveats(spool_states=tuple(states))
     if caveat:
         result.update(caveat)
-        result["pending"] = []
+        # Only blank the states this call actually reported — injecting
+        # "pending" into a `state="failed"` query moved the wire shape of
+        # a filtered request.
+        for st in states:
+            result[st] = []
     return result
 
 

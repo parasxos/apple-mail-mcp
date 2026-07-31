@@ -1203,3 +1203,72 @@ def test_configuration_never_re_modes_a_pre_existing_tree(home):
     repairs.run_fixes()
     for sub in ("", "spool", "plans", "audit"):
         assert _mode(root / sub if sub else root) == 0o700
+
+
+def test_the_destructive_preview_warns_when_its_count_is_unreliable(home):
+    """MAJOR: `uninstall_plan` counted queued mail but never asked whether
+    the count was trustworthy — so a truncated manifest silently removed
+    or undercounted the warning on the LAST line an operator reads before
+    an irreversible delete. It is the one surface where a count is ACTED
+    on rather than merely displayed."""
+    from email_mcp import lifecycle, spool
+
+    entry = spool.Entry(
+        id="q1", send_at="2099-01-01T00:00:00+00:00",
+        created_at="2026-01-01T00:00:00+00:00", to=["a@b.c"], cc=[],
+        bcc=[], subject="REAL", attachments=[], message_id="<m@x>")
+    spool.save(b"body", entry)
+    (config.spool_dir() / "pending" / "trunc.json").write_text('{"id":')
+
+    line = next(x for x in lifecycle.uninstall_plan(purge=True)["remove"]
+                if "state tree" in x)
+
+    assert "1 message(s) still queued" in line
+    assert "NOT reliable" in line
+
+
+def test_the_destructive_preview_is_total(home):
+    """MAJOR: documented a "side-effect-free preview", but an unreadable
+    root raised PermissionError out of it — from `graph.is_symlink()`,
+    before any refusal was consulted. A preview that raises is useless
+    exactly when the operator most needs it."""
+    from email_mcp import lifecycle
+
+    config.state_root()
+    (home / ".email-mcp").chmod(0o000)
+    try:
+        plan = lifecycle.uninstall_plan(purge=True)
+        assert isinstance(plan, dict) and "remove" in plan
+    finally:
+        (home / ".email-mcp").chmod(0o700)
+
+
+def test_an_unreadable_spool_leaf_is_recorded_not_erased(home):
+    """MINOR: an unreadable LEAF under a READABLE root stored [] — erasing
+    the difference between "no messages" and "I was not allowed to look",
+    so every surface downstream reported a clean `pending 0`."""
+    from email_mcp import server, spool
+
+    pending = config.spool_dir() / "pending"
+    pending.chmod(0o000)
+    try:
+        assert spool.entries("pending") == []
+        assert spool.unreadable("pending")          # recorded, not erased
+        assert server.tool_list_scheduled()["counts_are_meaningful"] is False
+    finally:
+        pending.chmod(0o700)
+
+
+def test_a_filtered_query_does_not_grow_keys_it_never_asked_for(home):
+    """MINOR: under any caveat the tool injected "pending": [] into a
+    `state="failed"` response, moving the wire shape of a filtered
+    request."""
+    from email_mcp import server
+
+    (config.spool_dir() / "failed" / "bad.json").write_text('{"id":')
+
+    out = server.tool_list_scheduled(state="failed")
+
+    assert out["counts_are_meaningful"] is False
+    assert "pending" not in out
+    assert out["failed"] == []

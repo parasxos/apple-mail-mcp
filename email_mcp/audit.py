@@ -31,6 +31,7 @@ import argparse
 import json
 import os
 import re
+import sys
 from datetime import datetime
 
 from . import config, ids
@@ -350,6 +351,16 @@ def tail(n: int = 20) -> list[dict]:
 # ---------------------------------------------------------------------- #
 
 
+def _warn_unreadable(out: dict) -> None:
+    """Say when the ledger could not be fully read. Printing only the
+    events made an unreadable month file look like an empty one."""
+    names = out.get("unreadable_files")
+    if names:
+        print(f"warning: {len(names)} ledger file(s) could not be read "
+              f"({', '.join(sorted(names))}) — events above are incomplete",
+              file=sys.stderr)
+
+
 def _print_status() -> None:
     root = config.audit_dir(create=False)
     try:
@@ -366,7 +377,9 @@ def _print_status() -> None:
     print(f"dir: {root}")
     span = f" ({months[0][:7]} … {months[-1][:7]})" if months else ""
     print(f"files: {len(months)}{span}")
-    last = query(limit=1)["events"]
+    probe = query(limit=1)
+    _warn_unreadable(probe)
+    last = probe["events"]
     if last:
         print(f"last event: {last[0].get('ts', '-')} "
               f"{last[0].get('event', '?')}/{last[0].get('outcome', '?')}")
@@ -402,6 +415,7 @@ def main(argv: list[str] | None = None) -> int:
     if args.tail is not None:
         for rec in tail(args.tail):
             print(json.dumps(rec, separators=(",", ":"), ensure_ascii=False))
+        _warn_unreadable(query(limit=args.tail))
         return 0
     filters = (args.since, args.until, args.tool, args.event,
                args.plan_id, args.op, args.limit)
@@ -415,6 +429,7 @@ def main(argv: list[str] | None = None) -> int:
     )
     for rec in out["events"]:  # newest first, like the audit tool
         print(json.dumps(rec, separators=(",", ":"), ensure_ascii=False))
+    _warn_unreadable(out)
     return 0
 
 
