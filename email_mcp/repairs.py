@@ -349,6 +349,13 @@ def _detect_meta_missing() -> str | None:
     if not config.marker_path(root).is_file():
         return None                      # not ours; not our stamp to write
     meta = lifecycle.meta_path()
+    if meta.parent != root:
+        # meta.json is the INSTALL stamp and is anchored at ~/.email-mcp by
+        # design (docs/reference.md), so for a relocated root there is
+        # nothing here to stamp — and writing it anyway materialised a
+        # stray ~/.email-mcp directly after a procedure whose whole point
+        # was moving the tree elsewhere.
+        return None
     if meta.exists():
         return None
     return f"{meta} is absent — this state tree carries no version stamp"

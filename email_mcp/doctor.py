@@ -248,6 +248,10 @@ def check_dispatcher() -> dict:
         log_mtime = datetime.fromtimestamp(
             log.stat().st_mtime, tz=timezone.utc).isoformat(timespec="seconds")
     pending = len(spool.entries("pending"))
+    # An uncountable spool must not read as "0 pending, no dispatcher
+    # needed": entries() returns [] for a spool it cannot see, and this
+    # check would then green-light a missing dispatcher over queued mail.
+    countable = not spool.unreadable("pending")
 
     bits = [f"label {LAUNCHD_LABEL}: "
             f"{'installed' if installed else 'NOT installed'}",
@@ -262,7 +266,7 @@ def check_dispatcher() -> dict:
                      "gui/$UID ~/Library/LaunchAgents/<legacy>.plist")
     out: dict = {
         # Not installed only bites once something is waiting to send.
-        "ok": installed or pending == 0,
+        "ok": installed or (pending == 0 and countable),
         "detail": "; ".join(bits),
         "installed": installed,
         "label": LAUNCHD_LABEL,

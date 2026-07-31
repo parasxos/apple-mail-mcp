@@ -1627,25 +1627,37 @@ def uninstall_plan(purge: bool) -> dict:
         from . import spool as _spool
 
         undelivered = ("pending", "sending")
-        try:
-            queued = sum(len(_spool.entries(st)) for st in undelivered)
-        except Exception:      # never let a count block the plan
-            queued = 0
+        # Count the tree that will ACTUALLY be deleted. `--purge` only ever
+        # removes the HARDCODED ~/.email-mcp (design D7), but the scan
+        # resolves through EMAIL_MCP_STATE_DIR — so with the two pointing
+        # at different places this line described mail that would NOT be
+        # deleted and said nothing about mail that WOULD. Read `root`
+        # directly: no resolver, no override, the same path as the rm.
+        queued = 0
+        counted_here = True
+        for state in undelivered:
+            d = root / "spool" / state
+            try:
+                queued += sum(1 for n in os.listdir(d)
+                              if n.endswith(".json"))
+            except FileNotFoundError:
+                continue           # absent is empty
+            except OSError:
+                counted_here = False   # cannot look; say so below
         # This is the LAST line an operator reads before typing the
         # confirmation that deletes the tree irreversibly, and it is the
         # one place a count is ACTED on rather than merely displayed. A
         # truncated manifest — real, composed, undelivered mail — used to
         # remove the warning entirely or undercount it, because this
         # surface counted without asking whether the count was trustworthy.
-        caveat = health.caveats(spool_states=undelivered)
         note = ""
         if queued:
             note = (f" — INCLUDING {queued} message(s) still queued and "
                     "undelivered")
-        if caveat:
-            note += (" — WARNING: this count is NOT reliable ("
-                     + "; ".join(health.summarize(caveat)[:-1])
-                     + "); more mail may be queued than shown")
+        if not counted_here:
+            note += (" — WARNING: this count is NOT reliable (part of "
+                     f"{root} could not be read); more mail may be queued "
+                     "than shown")
         remove.append(f"{root} (state tree: spool, plans, audit ledger, "
                       f"identities.toml, meta.json){note}")
         logs_dir = _logs_dir()
@@ -1797,14 +1809,34 @@ def run_uninstall(purge: bool, assume_yes: bool) -> int:
             left_behind.append(f"launchd agent {label} ({e})")
 
     graph_default = Path.home() / ".email-mcp" / "graph"
-    if graph_default.is_symlink():
+
+    def _is_link(p: Path) -> bool:
+        # Total, exactly as uninstall_plan is: the DESTRUCTIVE path must
+        # not be the one that raises. An unreadable root made this crash
+        # with a traceback after the plan had printed what it would remove,
+        # leaving the operator unable to tell whether the tree was intact.
+        try:
+            return p.is_symlink()
+        except OSError:
+            return False
+
+    if _is_link(graph_default):
         # Deleting *.token.json THROUGH a link would reach whatever
         # directory the link points at — the D7 rule (never follow a
         # redirection) applies to the token sweep too.
         print(f"  left alone: {graph_default} is a symlink — token "
               "caches behind it are never followed; delete them yourself")
-    elif graph_default.is_dir():
-        for token in sorted(graph_default.glob("*.token.json")):
+    elif config.is_dir_safe(graph_default):
+        try:
+            tokens = sorted(graph_default.glob("*.token.json"))
+        except OSError as e:
+            # Unreadable graph dir: report it and carry on. The whole
+            # point of this path is to leave the machine in a KNOWN state,
+            # so it must not be the thing that raises.
+            print(f"  could not scan {graph_default}: {e}", file=sys.stderr)
+            left_behind.append(f"{graph_default} ({e})")
+            tokens = []
+        for token in tokens:
             try:
                 token.unlink()
             except OSError as e:

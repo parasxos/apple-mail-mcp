@@ -1205,26 +1205,73 @@ def test_configuration_never_re_modes_a_pre_existing_tree(home):
         assert _mode(root / sub if sub else root) == 0o700
 
 
-def test_the_destructive_preview_warns_when_its_count_is_unreliable(home):
-    """MAJOR: `uninstall_plan` counted queued mail but never asked whether
-    the count was trustworthy — so a truncated manifest silently removed
-    or undercounted the warning on the LAST line an operator reads before
-    an irreversible delete. It is the one surface where a count is ACTED
-    on rather than merely displayed."""
+def _purge_line(plan: dict) -> str:
+    return next(x for x in plan["remove"] if "state tree" in x)
+
+
+def test_the_destructive_preview_counts_the_tree_it_will_delete(home,
+                                                                monkeypatch,
+                                                                tmp_path):
+    """MAJOR: `--purge` only ever deletes the HARDCODED ~/.email-mcp, but
+    the count resolved through EMAIL_MCP_STATE_DIR. With the two pointing
+    at different places, the last line before an irreversible delete
+    described mail that would NOT be deleted and said nothing about mail
+    that WOULD.
+    """
     from email_mcp import lifecycle, spool
 
-    entry = spool.Entry(
+    for i in (1, 2, 3):
+        spool.save(b"body", spool.Entry(
+            id=f"q{i}", send_at="2099-01-01T00:00:00+00:00",
+            created_at="2026-01-01T00:00:00+00:00", to=["a@b.c"], cc=[],
+            bcc=[], subject=f"REAL {i}", attachments=[],
+            message_id=f"<m{i}@x>"))
+
+    elsewhere = tmp_path / "elsewhere"
+    elsewhere.mkdir()
+    monkeypatch.setenv("EMAIL_MCP_STATE_DIR", str(elsewhere))
+
+    line = _purge_line(lifecycle.uninstall_plan(purge=True))
+
+    assert str(home / ".email-mcp") in line
+    assert "3 message(s) still queued" in line, \
+        "counted the configured root, not the one being deleted"
+
+
+def test_the_destructive_preview_counts_files_not_parsed_entries(home):
+    """A truncated manifest is a FILE that `--purge` will destroy, and it
+    may well be real mail — so the count is of files to be deleted, not of
+    entries that happen to parse. Under-counting here is the dangerous
+    direction."""
+    from email_mcp import lifecycle, spool
+
+    spool.save(b"body", spool.Entry(
         id="q1", send_at="2099-01-01T00:00:00+00:00",
         created_at="2026-01-01T00:00:00+00:00", to=["a@b.c"], cc=[],
-        bcc=[], subject="REAL", attachments=[], message_id="<m@x>")
-    spool.save(b"body", entry)
+        bcc=[], subject="REAL", attachments=[], message_id="<m@x>"))
     (config.spool_dir() / "pending" / "trunc.json").write_text('{"id":')
 
-    line = next(x for x in lifecycle.uninstall_plan(purge=True)["remove"]
-                if "state tree" in x)
+    assert "2 message(s) still queued" in _purge_line(
+        lifecycle.uninstall_plan(purge=True))
 
-    assert "1 message(s) still queued" in line
+
+def test_the_destructive_preview_warns_when_it_cannot_count(home):
+    """And when a directory cannot be listed at all, it says the count is
+    unreliable rather than reporting a confident number."""
+    from email_mcp import lifecycle, spool
+
+    spool.save(b"body", spool.Entry(
+        id="q1", send_at="2099-01-01T00:00:00+00:00",
+        created_at="2026-01-01T00:00:00+00:00", to=["a@b.c"], cc=[],
+        bcc=[], subject="REAL", attachments=[], message_id="<m@x>"))
+    (config.spool_dir() / "sending").chmod(0o000)
+    try:
+        line = _purge_line(lifecycle.uninstall_plan(purge=True))
+    finally:
+        (config.spool_dir() / "sending").chmod(0o700)
+
     assert "NOT reliable" in line
+    assert "more mail may be queued than shown" in line
 
 
 def test_the_destructive_preview_is_total(home):
@@ -1272,3 +1319,64 @@ def test_a_filtered_query_does_not_grow_keys_it_never_asked_for(home):
     assert out["counts_are_meaningful"] is False
     assert "pending" not in out
     assert out["failed"] == []
+
+
+def test_the_uninstall_executor_is_total_like_its_preview(home):
+    """MAJOR: `uninstall_plan` was hardened against an unreadable root;
+    `run_uninstall` — the DESTRUCTIVE half — was not, and raised
+    PermissionError from the identical `graph.is_symlink()` call, after
+    the plan had already printed what it would remove. The operator got a
+    traceback and no way to tell whether the tree was intact."""
+    import subprocess
+    import sys
+
+    config.spool_dir()
+    config.graph_dir()
+    (home / ".email-mcp").chmod(0o000)
+    env = {k: v for k, v in os.environ.items()
+           if not k.startswith("EMAIL_MCP_")}
+    env["HOME"] = str(home)
+    try:
+        p = subprocess.run([sys.executable, "-m", "email_mcp.cli",
+                            "uninstall", "--yes"],
+                           capture_output=True, text=True, env=env)
+    finally:
+        (home / ".email-mcp").chmod(0o700)
+
+    assert "Traceback" not in p.stderr, p.stderr[-400:]
+    assert "PermissionError" not in p.stderr
+
+
+def test_the_meta_stamp_repair_leaves_a_relocated_root_alone(
+        home, monkeypatch, tmp_path):
+    """MINOR: meta.json is the install stamp and is anchored at
+    ~/.email-mcp by design, so for a RELOCATED root there is nothing to
+    stamp — but the repair wrote it anyway, materialising a stray
+    ~/.email-mcp immediately after the documented relocation."""
+    from email_mcp import repairs
+
+    relocated = tmp_path / "relocated"
+    relocated.mkdir()
+    monkeypatch.setenv("EMAIL_MCP_STATE_DIR", str(relocated))
+    config.spool_dir()
+
+    repairs.run_fixes()
+
+    assert not (home / ".email-mcp").exists(), \
+        "materialised a root the operator had moved away from"
+
+
+def test_the_launchd_check_does_not_go_green_over_an_uncountable_spool(
+        home):
+    """MINOR: `pending == 0` read green and green-lit a missing
+    dispatcher, but entries() returns [] for a spool it cannot see."""
+    from email_mcp import doctor
+
+    pending = config.spool_dir() / "pending"
+    pending.chmod(0o000)
+    try:
+        check = doctor.check_dispatcher()
+    finally:
+        pending.chmod(0o700)
+
+    assert check["ok"] is False

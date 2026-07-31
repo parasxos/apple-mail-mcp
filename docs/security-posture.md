@@ -1046,6 +1046,44 @@ record of a root it was never told about again. The retired per-directory
 variables are hard-errored precisely because that case IS knowable; this
 one is not.
 
+### v0.11 — twelfth and thirteenth passes
+
+Both FAILed, and both converged on the same place from different angles:
+the `uninstall` pair.
+
+- **MAJOR — the destructive preview counted the WRONG TREE.** `--purge`
+  only ever deletes the hardcoded `~/.email-mcp` (design D7), but the
+  queued-mail count resolved through `EMAIL_MCP_STATE_DIR`. With the two
+  pointing at different places, the last line before an irreversible
+  delete described mail that would NOT be deleted and said nothing about
+  three real messages that WOULD. It now counts `root` directly — no
+  resolver, no override, the same path as the `rm` — and counts FILES
+  rather than parseable entries, because a truncated manifest is still a
+  file the purge destroys and under-counting is the dangerous direction.
+- **MAJOR — the EXECUTOR was not total, though the PREVIEW had just been
+  made so.** An unreadable root raised `PermissionError` out of
+  `run_uninstall`'s `graph.is_symlink()` (and again out of its token
+  glob), after the plan had already printed what it would remove — a
+  traceback on the destructive command, leaving the operator unable to
+  tell whether the tree was intact, half-gone or gone. The preview/executor
+  split is the sibling pattern once more.
+- **MINOR — the `meta_missing` repair materialised a root the operator had
+  moved away from.** `meta.json` is the install stamp, anchored at
+  `~/.email-mcp` by design, so a relocated root has nothing to stamp — the
+  repair wrote it anyway, creating a stray `~/.email-mcp` immediately
+  after the documented relocation.
+- **MINOR — the launchd check went green over an uncountable spool.**
+  `pending == 0` green-lit a missing dispatcher, but `entries()` returns
+  `[]` for a spool it cannot see.
+
+Between them the two gates also confirmed, independently: 660 tests in
+three environments (one of them on Python 3.13); a seventeen-scenario
+enumeration in which no reporting surface raised and none reported clean
+over data it could not see; absent correctly distinguished from unreadable
+in seven directory shapes; the healthy response shape byte-unchanged; no
+decoy touched; and the documented migration working literally with the
+mail visible at the end.
+
 **Still open, deliberately:** the root TOCTOU (§0 boundary — a local
 attacker with write access to the root's parent can swap a symlink between
 the refusal check and the mkdir; cost is one stray 0600 dotfile, no mode
