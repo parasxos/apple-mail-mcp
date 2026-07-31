@@ -149,14 +149,19 @@ def cmd_doctor(rest: list[str]) -> int:
 
 
 def _package_version() -> str:
-    from importlib.metadata import PackageNotFoundError, version
+    """The version of the code actually executing.
 
-    try:
-        return version("email-mcp")
-    except PackageNotFoundError:  # running from a plain checkout
-        from . import __version__
+    Read straight off the module rather than via importlib.metadata: the
+    latter resolves against the *interpreter*, so a stale editable install
+    reports its own number while newer source runs — and `lifecycle` stamps
+    this value into ~/.email-mcp/meta.json, making the wrong one durable and
+    invisible. The module literal travels with the source, so bare checkout,
+    `pip install -e .` and `pipx install` all agree (pyproject derives the
+    distribution metadata from this same literal — see [tool.setuptools.dynamic]).
+    """
+    from . import __version__
 
-        return __version__
+    return __version__
 
 
 def _state_version() -> int:

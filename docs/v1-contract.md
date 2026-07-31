@@ -44,7 +44,7 @@ Conformance is staged deliberately:
 | 7 | `get_attachment` | R | `{ok: true, attachment}` — envelope since v0.11 (was bare dict) | `{ok: false, code, error}` | belt: coded failures | **v0.11** — shipped |
 | 8 | `refresh_mail` | R | `{ok, before, after, new_messages, …}` (hardened since v0.4) | `{ok: false, error, error_code?, code?}` — the raw osascript number now carries its mapped string `code` (§3.3) | none needed (already total) | **v0.11** — shipped |
 | 9 | `list_scheduled` | R | `{ok: true, dispatcher_installed, …states}` | `{ok: false, code: invalid_input, error}` on unknown state | belt on crash paths | **v0.11** — shipped |
-| 10 | `doctor` | R | `{ok, read_only, checks, audit}` — **`ok` reports environment health**, not tool failure (documented exception to §2); `audit` is the ledger check as a top-level sibling of `checks` | already total | gained the `audit` check | **v0.11** |
+| 10 | `doctor` | R | `{ok, read_only, checks, audit}` — **`ok` reports environment health**, not tool failure (documented exception to §2); `audit` is the ledger check as a top-level sibling of `checks` | already total | gained the `audit` check | **v0.10** |
 | 11 | `audit` | R | `{ok: true, events, files_scanned, skipped_lines}` | `{ok: false, code, error, fix?}` | **new tool** — born conformant | **v0.10** |
 | 12 | `send_email` | W | `{ok: true, message_id, to, cc, bcc, subject, attachments, bootstrapped}` | `{ok: false, code, error}` — every SendError site coded per §3.4 | audit `send` event on every terminal outcome | **v0.11** — shipped |
 | 13 | `reply_email` | W | same as send_email | same | audit `reply` event | **v0.11** — shipped |

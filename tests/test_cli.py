@@ -370,3 +370,17 @@ def test_cli_version_reports_the_running_source_version(capsys):
 
     assert cli.main(["version"]) == 0
     assert f"email-mcp {email_mcp.__version__}" in capsys.readouterr().out
+
+
+def test_package_version_ignores_a_stale_installed_distribution(monkeypatch):
+    """A stale editable install must not win over the running source.
+
+    lifecycle stamps _package_version() into ~/.email-mcp/meta.json, so
+    resolving through importlib.metadata (which answers for the interpreter,
+    not the source on sys.path) makes a wrong number durable and invisible.
+    """
+    import importlib.metadata as md
+    import email_mcp
+
+    monkeypatch.setattr(md, "version", lambda name: "0.0.1-stale")
+    assert cli._package_version() == email_mcp.__version__
