@@ -264,6 +264,21 @@ def fts_dir_guard(tmp_path_factory, monkeypatch) -> Path:
 
 
 @pytest.fixture(autouse=True)
+def log_file_guard(tmp_path_factory, monkeypatch) -> Path:
+    """Point the debug log at a per-test tmp file for EVERY test (mirrors the
+    fts/audit guards).
+
+    Without this the suite appends to the developer's REAL
+    ~/Library/Logs/email-mcp.log, and any test running under a *relative*
+    $HOME resolves it relative to cwd — which is how a stray
+    `relhome/Library/Logs/email-mcp.log` appeared inside the repo and came
+    within one `git add -A` of being committed."""
+    d = tmp_path_factory.mktemp("logs")
+    monkeypatch.setenv("EMAIL_MCP_LOG_FILE", str(d / "email-mcp.log"))
+    return d / "email-mcp.log"
+
+
+@pytest.fixture(autouse=True)
 def audit_dir_guard(tmp_path_factory, monkeypatch) -> Path:
     """Point the audit ledger at a per-test tmp dir for EVERY test — nothing
     in the suite may ever touch (or create) ~/.email-mcp/audit (mirrors the

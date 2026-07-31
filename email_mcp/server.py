@@ -22,7 +22,7 @@ from dataclasses import asdict, is_dataclass
 from datetime import datetime, timezone
 from typing import Any
 
-from . import audit, codes
+from . import __version__, audit, codes, ids
 from .config import source_name
 from .log import get_logger
 from .sender import SendError, reply_email, schedule_email, send_email
@@ -78,6 +78,51 @@ def _to_jsonable(obj: Any) -> Any:
 # ---------------------------------------------------------------------- #
 
 
+# Generous for genuine one-line prose, small enough that no failure envelope
+# can carry a caller's payload back across the wire.
+_MAX_ERROR_CHARS = 2000
+
+
+def _classify(e: BaseException) -> tuple[str, bool]:
+    """Map an exception to its §3 code, and whether the prose should name the
+    exception type.
+
+    THE single class→code map: the belt and `get_emails_batch`'s per-id loop
+    both go through here, so one store fault cannot yield two different codes
+    depending on which tool the caller happened to use (contract §3: "a code
+    means the same thing on every tool that uses it"). Order matters — each
+    clause below is a subclass of a later one.
+    """
+    if isinstance(e, UnicodeDecodeError):
+        # A ValueError subclass, but NOT the caller's fault: MCP arguments
+        # arrive as valid str, so undecodable bytes come from the store or a
+        # bug (audit finding F6).
+        return codes.INTERNAL_ERROR, True
+    if isinstance(e, ValueError):
+        return codes.INVALID_INPUT, False
+    if isinstance(e, (KeyError, IndexError)):
+        # LookupError subclasses, but sources signal unknown ids with bare
+        # LookupError — a KeyError/IndexError here is an internal container
+        # miss, not a caller reference that wasn't found (F6).
+        return codes.INTERNAL_ERROR, True
+    if isinstance(e, LookupError):
+        return codes.NOT_FOUND, False
+    if isinstance(e, sqlite3.ProgrammingError):
+        # A DatabaseError sibling of OperationalError, but it means our own
+        # SQL or parameter binding is wrong (closed connection, wrong
+        # placeholder count) — a bug, not an unreadable store.
+        return codes.INTERNAL_ERROR, True
+    if isinstance(e, (FileNotFoundError, PermissionError, sqlite3.DatabaseError)):
+        # The store (or its SQLite index) is not readable — missing Mail
+        # setup, missing Full Disk Access, locked or corrupt index (§3.5).
+        # DatabaseError, not just OperationalError: a junk Envelope Index
+        # raises "file is not a database" as a bare DatabaseError on some
+        # paths and OperationalError on others, and one store must not
+        # yield two codes.
+        return codes.MAIL_UNAVAILABLE, False
+    return codes.INTERNAL_ERROR, True
+
+
 def _belt(op_from: str | None = None):
     """No exception escapes a dict-returning tool to the MCP wire: known
     caller-fixable classes map to coded envelopes, anything else is the
@@ -101,9 +146,17 @@ def _belt(op_from: str | None = None):
             `__name__` — raises still gets an envelope.
             """
             try:
-                return f"{type(e).__name__}: {e}" if typed else str(e)
+                text = f"{type(e).__name__}: {e}" if typed else str(e)
             except Exception:
                 return "unexpected internal error (see log)"
+            # §2 calls `error` one-line prose. Some exceptions quote their
+            # input back — an OSError names the whole offending path — so an
+            # oversized argument returns as an oversized envelope on a stdio
+            # transport. The full text is already in the file log.
+            if len(text) > _MAX_ERROR_CHARS:
+                return (text[:_MAX_ERROR_CHARS]
+                        + f"… [truncated, {len(text)} chars; see log]")
+            return text
 
         def _fail(code: str, error: str, args: tuple, kwargs: dict) -> dict:
             _log.exception("belt[%s]: %s", fn.__name__, code)
@@ -115,7 +168,12 @@ def _belt(op_from: str | None = None):
                                .arguments.get(op_from)
                 except TypeError:
                     value = None
-                if value:
+                # Only echo an id we could actually have minted. The raw
+                # argument is the caller's CLAIM, not proof the artifact
+                # exists — echoing it unfiltered violated §2 ("never minted
+                # *for* a failure") and put the caller's own 60 KB string
+                # back on the wire inside the failure envelope.
+                if value and ids.is_minted_id(str(value)):
                     out["operation_id"] = str(value)
             return out
 
@@ -129,27 +187,13 @@ def _belt(op_from: str | None = None):
                 # from the store or a bug (audit finding F6).
                 return _fail(codes.INTERNAL_ERROR,
                              _msg(e, typed=True), args, kwargs)
-            except ValueError as e:
-                return _fail(codes.INVALID_INPUT, _msg(e), args, kwargs)
-            except (KeyError, IndexError) as e:
-                # LookupError subclasses, but sources signal unknown ids
-                # with bare LookupError/ValueError (apple_mail.get /
-                # .attachment) — a KeyError/IndexError reaching the belt
-                # is an internal container miss, not a caller reference
-                # that wasn't found (audit finding F6).
-                return _fail(codes.INTERNAL_ERROR,
-                             _msg(e, typed=True), args, kwargs)
-            except LookupError as e:
-                return _fail(codes.NOT_FOUND, _msg(e), args, kwargs)
-            except (FileNotFoundError, PermissionError,
-                    sqlite3.OperationalError) as e:
-                # The store (or its SQLite index) is not readable —
-                # missing Mail setup, missing Full Disk Access, locked or
-                # corrupt index (contract §3.5, audit finding F6).
-                return _fail(codes.MAIL_UNAVAILABLE, _msg(e), args, kwargs)
             except Exception as e:
-                return _fail(codes.INTERNAL_ERROR,
-                             _msg(e, typed=True), args, kwargs)
+                # BaseException is deliberately NOT caught: SystemExit,
+                # KeyboardInterrupt and GeneratorExit are control flow, not
+                # tool failures, and swallowing them would make Ctrl-C and
+                # interpreter shutdown unobservable. §7 names the carve-out.
+                code, typed = _classify(e)
+                return _fail(code, _msg(e, typed=typed), args, kwargs)
         return wrapper
     return deco
 
@@ -261,15 +305,16 @@ def tool_get_emails_batch(ids: list[str], view: str = "full") -> dict:
     errors: list[dict] = []
     for id in ids:
         # Per-id failures are data inside the ok envelope (§2); each entry
-        # carries the same code the single-read belt would have used.
+        # carries the same code the single-read belt would have used —
+        # literally, via the shared class map, so a store fault cannot be
+        # invalid_input here and internal_error through get_email (§3).
         try:
             emails.append(_shape_email(src.get(str(id)), view))
-        except ValueError as e:
-            errors.append({"id": str(id), "code": codes.INVALID_INPUT,
-                           "error": str(e)})
-        except LookupError as e:
-            errors.append({"id": str(id), "code": codes.NOT_FOUND,
-                           "error": str(e)})
+        except Exception as e:
+            code, typed = _classify(e)
+            errors.append({"id": str(id), "code": code,
+                           "error": f"{type(e).__name__}: {e}" if typed
+                                    else str(e)})
     return {"ok": True, "view": view, "emails": emails, "errors": errors}
 
 
@@ -451,12 +496,6 @@ _SEND_PREFIX_CODES: tuple[tuple[str, str], ...] = (
     ("`body` is empty", codes.INVALID_INPUT),
     ("invalid send_at", codes.INVALID_SEND_AT),
     ("send_at is in the past", codes.SEND_AT_IN_PAST),
-    # smtp's (still) unprefixed secret-source errors — the §3.4 known gap.
-    ("`security` CLI not found", codes.CREDENTIALS_UNAVAILABLE),
-    ("Keychain read for", codes.CREDENTIALS_UNAVAILABLE),
-    ("Keychain item", codes.CREDENTIALS_UNAVAILABLE),
-    ("`op` CLI not found", codes.CREDENTIALS_UNAVAILABLE),
-    ("1Password read for", codes.CREDENTIALS_UNAVAILABLE),
 )
 _SEND_LANE_CODES: tuple[tuple[str, str], ...] = (
     ("transport unavailable:", codes.TRANSPORT_UNAVAILABLE),
@@ -471,6 +510,16 @@ _SEND_LANE_CODES: tuple[tuple[str, str], ...] = (
     ("bad transport params", codes.IDENTITY_MISCONFIGURED),
     ("needs a secret source", codes.IDENTITY_MISCONFIGURED),
     ("`command` is empty.", codes.IDENTITY_MISCONFIGURED),
+    # smtp's secret-source errors. Matched by substring, not prefix: they
+    # now carry the §3.4 `[identity/smtp]` lane prefix, and older
+    # unprefixed prose must keep mapping too. They sit LAST so a preflight
+    # wrapper ("… transport unavailable: <credential prose>") still reads
+    # as transport_unavailable — that needle is checked first.
+    ("`security` CLI not found", codes.CREDENTIALS_UNAVAILABLE),
+    ("Keychain read for", codes.CREDENTIALS_UNAVAILABLE),
+    ("Keychain item", codes.CREDENTIALS_UNAVAILABLE),
+    ("`op` CLI not found", codes.CREDENTIALS_UNAVAILABLE),
+    ("1Password read for", codes.CREDENTIALS_UNAVAILABLE),
 )
 
 
@@ -945,6 +994,21 @@ def tool_audit(
 # ---------------------------------------------------------------------- #
 
 
+def _stamp_server_version(mcp) -> None:
+    """Advertise OUR version in the initialize handshake's serverInfo.
+
+    FastMCP has no `version=` parameter (checked across mcp 1.2–1.29): it
+    builds the low-level Server without one, and that Server's
+    create_initialization_options() then falls back to
+    importlib.metadata.version("mcp") — so every client is told the MCP
+    *library's* version, which silently changes with whichever mcp the user
+    resolved. The low-level object is the only place the value lives.
+    """
+    low = getattr(mcp, "_mcp_server", None)
+    if low is not None and hasattr(low, "version"):
+        low.version = __version__
+
+
 def _build_mcp_server():
     """Build the FastMCP Server: twenty tools, or exactly the eleven
     read-side tools when EMAIL_MCP_READ_ONLY=1 — the mutating nine are
@@ -954,6 +1018,7 @@ def _build_mcp_server():
     from .config import read_only
 
     mcp = FastMCP("apple-mail")
+    _stamp_server_version(mcp)
     ro = read_only()
 
     @mcp.tool()

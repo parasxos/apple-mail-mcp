@@ -130,9 +130,18 @@ class SmtpTransport:
         self._prefix = f"[{identity}/{self.name}]"
 
     def _secret(self) -> str:
-        if self.op:
-            return _read_op(self.op)
-        return _read_keychain(self.keychain, self.username)
+        """Read the app password, naming the lane on failure.
+
+        The readers are identity-agnostic module seams (tests monkeypatch
+        them), so the `[identity/smtp]` prefix contract §3.4 promises on
+        secret-source prose is applied here, where the identity is known.
+        """
+        try:
+            if self.op:
+                return _read_op(self.op)
+            return _read_keychain(self.keychain, self.username)
+        except SendError as e:
+            raise SendError(f"{self._prefix} {e}") from e
 
     @property
     def _secret_ref(self) -> str:
@@ -199,7 +208,9 @@ class SmtpTransport:
         try:
             self._secret()
         except SendError as e:
-            self.last_ensure_error = str(e)
+            # sender._transport_unavailable prepends the lane itself; strip
+            # ours so the caller's line does not say it twice.
+            self.last_ensure_error = str(e).removeprefix(self._prefix).lstrip()
             return False
         try:
             with socket.create_connection((self.host, self.port), timeout=10):

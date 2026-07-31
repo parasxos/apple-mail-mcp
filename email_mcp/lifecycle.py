@@ -79,6 +79,7 @@ from pathlib import Path
 from typing import Callable
 
 from . import audit, config, doctor, ids
+from .identities import KNOWN_FIELDS, NAME_RE
 from .log import get_logger
 from .transports import DRIVERS, SendError
 
@@ -95,8 +96,9 @@ STATE_VERSION = 1
 MIGRATIONS: tuple[tuple[int, Callable[[dict], dict]], ...] = ()
 
 # Identity names become graph/<name>.token.json — this regex is a path
-# traversal fence, not cosmetics. Table/param keys get the same charset.
-_NAME_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
+# traversal fence, not cosmetics. Shared with identities.load(), which
+# re-applies it to hand-edited files. Table/param keys get the same charset.
+_NAME_RE = NAME_RE
 _KEY_RE = re.compile(r"^[A-Za-z0-9_-]+$")
 # The compose-time header-injection fence (sender._CTL_RE): CR/LF/NUL in
 # a header-bound value smuggles extra headers. The wizard refuses them at
@@ -112,6 +114,26 @@ _SECRET_KEYS = frozenset({
     "access_token", "refresh_token", "api_key", "credential",
     "credentials",
 })
+
+# `op` and `keychain` are the only fields allowed to NAME a secret, which
+# makes them the likeliest place a real one lands: the wizard's own prompt
+# says "op://vault/item/field", and a pasted app password answers it just
+# as readily. Both are therefore validated by SHAPE — anything that is not
+# a well-formed reference is treated as the credential itself.
+# 1Password item names may contain spaces ("op://Personal/gmail app
+# password/password"); the field part may be a section/field pair, hence
+# 3-4 segments.
+_OP_SEGMENT = r"[^/\s][^/\x00-\x1f]*"
+_OP_REF_RE = re.compile(rf"^op://{_OP_SEGMENT}(?:/{_OP_SEGMENT}){{2,3}}$")
+# A Keychain service name is a label the user chose (the wizard offers
+# email-mcp-<identity>). Whitespace and password punctuation are not part
+# of that vocabulary, but are part of every pasted credential.
+_KEYCHAIN_ITEM_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._@+-]{0,127}$")
+
+# [name.graph] carries the public-client app registration only. The device
+# -code flow has no client secret by design, so a secret-shaped key here
+# is a smuggling attempt, not a config option.
+_GRAPH_KEYS = frozenset({"tenant", "client_id"})
 
 # EMAIL_MCP_* variables that redirect state paths; StatePaths.resolve()
 # records which of these are in effect.
@@ -246,6 +268,15 @@ class Answers:
             raise ValueError(
                 f"unknown answer key(s) {unknown}; valid: {sorted(known)}")
         answers = cls(**data)
+        for name in ("read_only", "skip_permissions", "install_dispatcher",
+                     "install_fts_agent", "self_send"):
+            value = getattr(answers, name)
+            if not isinstance(value, bool):
+                # The string "false" is TRUTHY: a JSON answers file that
+                # spelled a flag as text would silently arm it — and for
+                # skip_permissions that means skipping every red check.
+                raise ValueError(
+                    f"{name} must be true or false, not {value!r}")
         if answers.identity_action not in {"keep", "add"}:
             raise ValueError(
                 f"identity_action must be 'keep' or 'add', "
@@ -316,6 +347,111 @@ def _fence_secret_keys(name: str, table: dict) -> None:
             _fence_secret_keys(f"{name}.{key}", value)
 
 
+def _reference_problem(key: str, value: str) -> str:
+    """Why `value` is not a usable secret REFERENCE for `key` — "" when it
+    is one.
+
+    The prose never echoes the value: if this fence is doing its job the
+    value is a live credential, and the caller prints what it returns.
+    """
+    if key == "op":
+        if not _OP_REF_RE.fullmatch(value):
+            return ("`op` must be a 1Password secret reference of the form "
+                    "op://<vault>/<item>/<field>")
+        return ""
+    if value.lower().startswith("op://"):
+        return ("`keychain` names a macOS Keychain item, not a 1Password "
+                "reference — move that value to `op`")
+    if not _KEYCHAIN_ITEM_RE.fullmatch(value):
+        return ("`keychain` must be a Keychain item name (letters, digits "
+                "and .-_@+, no spaces), not a secret")
+    return ""
+
+
+def _fence_secret_refs(name: str, table: dict) -> None:
+    """Refuse a reference field that does not have a reference's shape.
+
+    An empty value is left to the driver-specific "smtp needs a secret
+    REFERENCE" fence, which explains the remedy better.
+    """
+    for key in ("op", "keychain"):
+        value = str(table.get(key, "")).strip()
+        if not value:
+            continue
+        problem = _reference_problem(key, value)
+        if problem:
+            raise SetupError(
+                f"identity [{name}]: {problem}. Nothing was written, and "
+                "the value is not repeated here in case it IS the "
+                "credential. Store the app password once with `security "
+                "add-generic-password -s <item> -a <account> -w` (or in "
+                "1Password) and name the reference here — identities.toml "
+                "never holds the secret itself."
+            )
+
+
+def _driver_keys(driver: str) -> frozenset[str] | None:
+    """The driver-parameter keys `driver` actually accepts, read off its
+    transport constructor — derived rather than listed so the fence cannot
+    drift from the drivers it guards. None when a transport takes
+    ``**kwargs`` and therefore constrains nothing.
+
+    `identity` is excluded: get_transport() injects it, and a table key of
+    that name would collide with the injected one.
+    """
+    import importlib
+    import inspect
+
+    module_path, class_name = DRIVERS[driver].split(":", 1)
+    try:
+        cls = getattr(importlib.import_module(module_path), class_name)
+        params = inspect.signature(cls.__init__).parameters
+    except (ImportError, AttributeError, TypeError, ValueError):
+        return None
+    if any(p.kind is p.VAR_KEYWORD for p in params.values()):
+        return None
+    return frozenset(
+        n for n, p in params.items()
+        if n not in ("self", "identity") and p.kind is not p.VAR_POSITIONAL
+    )
+
+
+def _fence_unknown_keys(name: str, table: dict, driver: str) -> None:
+    """Allowlist the keys of one identity block: identity fields plus the
+    driver's own parameters.
+
+    A denylist of secret-looking NAMES cannot win — `smtp_password`,
+    `pw`, `apikey` and every other spelling would sail past it and land on
+    disk in plaintext. Inverting it means a key this codebase never reads
+    is refused by construction, whatever it is called.
+    """
+    legal = _driver_keys(driver)
+    if legal is None:
+        return
+    unknown = sorted(
+        str(k) for k in table if str(k) not in KNOWN_FIELDS and str(k)
+        not in legal
+    )
+    if unknown:
+        raise SetupError(
+            f"identity [{name}]: key(s) {unknown} are not read by the "
+            f"{driver!r} driver — refusing to write settings nothing "
+            "consumes (a misspelled secret key would sit there in "
+            "plaintext forever). Legal keys: "
+            f"{sorted(KNOWN_FIELDS | legal)}."
+        )
+    graph = table.get("graph")
+    if isinstance(graph, dict):
+        stray = sorted(str(k) for k in graph if str(k) not in _GRAPH_KEYS)
+        if stray:
+            raise SetupError(
+                f"identity [{name}.graph]: key(s) {stray} are not part of "
+                "the Graph app registration. Only "
+                f"{sorted(_GRAPH_KEYS)} are read — the device-code flow "
+                "is a PUBLIC client and has no client secret."
+            )
+
+
 def _validate_tables(tables: dict[str, dict], default: str) -> None:
     if not tables:
         raise SetupError("no identities to write.")
@@ -345,6 +481,8 @@ def _validate_tables(tables: dict[str, dict], default: str) -> None:
             raise SetupError(
                 f"identity [{name}] has missing or unknown driver "
                 f"{driver!r}. Available: {sorted(DRIVERS)}")
+        _fence_unknown_keys(name, table, driver)
+        _fence_secret_refs(name, table)
         if driver == "smtp" and not (
                 str(table.get("keychain", "")).strip()
                 or str(table.get("op", "")).strip()):
@@ -548,16 +686,25 @@ def _degenerate_overrides(paths: "StatePaths") -> list[str]:
     target AND ``chmod 0700`` its PARENT, so an override at ``$HOME``
     means chmodding ``/Users`` (and growing five spool subdirs in the
     home directory). Setup refuses instead — no state path may manage a
-    directory that contains the user's home."""
-    home = Path.home()
+    directory that contains the user's home.
+
+    Both sides go through ``os.path.realpath`` first. pathlib keeps
+    ``..`` segments and a leading ``//`` verbatim, so a value compare on
+    the raw paths sees ``$HOME/sub/..`` and ``//$HOME`` as ordinary
+    directories while the filesystem sees ``$HOME`` — the fence has to
+    compare what mkdir/chmod will actually act on."""
+    home = Path(os.path.realpath(Path.home()))
     ancestors = {home, *home.parents}
     bad: list[str] = []
-    for var, resolved in (("EMAIL_MCP_SPOOL_DIR", paths.spool),
-                          ("EMAIL_MCP_PLANS_DIR", paths.plans),
-                          ("EMAIL_MCP_GRAPH_DIR", paths.graph),
-                          ("EMAIL_MCP_AUDIT_DIR", paths.audit),
-                          ("EMAIL_MCP_FTS_DIR", paths.fts)):
-        if var in paths.env_overrides and resolved in ancestors:
+    for var, target in (("EMAIL_MCP_SPOOL_DIR", paths.spool),
+                        ("EMAIL_MCP_PLANS_DIR", paths.plans),
+                        ("EMAIL_MCP_GRAPH_DIR", paths.graph),
+                        ("EMAIL_MCP_AUDIT_DIR", paths.audit),
+                        ("EMAIL_MCP_FTS_DIR", paths.fts)):
+        if var not in paths.env_overrides:
+            continue
+        resolved = Path(os.path.realpath(target))
+        if resolved in ancestors:
             bad.append(f"{var}={paths.env_overrides[var]} -> {resolved}")
     return bad
 
@@ -661,12 +808,23 @@ def _ask_identity_block(name: str = "") -> tuple[str, dict]:
         if username != table["from_addr"]:
             table["username"] = username
         source = _ask_choice("secret source", ["keychain", "op"], "keychain")
-        if source == "keychain":
-            table["keychain"] = _ask("Keychain item name",
-                                     f"email-mcp-{name}")
-        else:
-            table["op"] = _ask_required(
-                "1Password secret reference (op://vault/item/field)")
+        while True:
+            if source == "keychain":
+                value = _ask("Keychain item name", f"email-mcp-{name}").strip()
+            else:
+                value = _ask_required(
+                    "1Password secret reference (op://vault/item/field)"
+                ).strip()
+            problem = _reference_problem(source, value)
+            if not problem:
+                break
+            # Re-ask here rather than let write_identities kill the run:
+            # this prompt is precisely where a real app password gets
+            # pasted, and the answer is never echoed back.
+            print(f"  refused — {problem}")
+            print("  (the answer is not repeated here in case it is the "
+                  "password itself)")
+        table[source] = value
     else:  # pipe
         table["command"] = _ask("delivery command",
                                 "/usr/sbin/sendmail -t -i")
@@ -1328,15 +1486,29 @@ def purge_state() -> Path | None:
     removed here; callers print them instead.
 
     Fences, each raising :class:`PurgeRefused` with nothing removed:
-    ``Path.home()`` must be an absolute path other than ``/`` and the
-    root's direct parent; the root must not be a symlink (``os.lstat``
+    ``Path.home()`` must be absolute and must not realpath to ``/``, and
+    the root's direct parent; the root must not be a symlink (``os.lstat``
     — the link is never followed) and must be a real directory. Removal
     is ``shutil.rmtree``, whose macOS implementation is fd-based and
     does not follow directory symlinks inside the tree. Returns the
-    removed root, or None when it was already absent (idempotent)."""
-    home = Path.home()
+    removed root, or None when it was already absent (idempotent).
+
+    Unlike a tripped fence, an undeletable entry INSIDE the tree raises
+    OSError with the tree partly removed; callers report that as an
+    incomplete uninstall, never as a traceback."""
+    raw_home = Path.home()
+    # Absoluteness is judged on the RAW value: realpath would silently
+    # anchor a relative $HOME to the cwd and hand it back looking fine.
+    if not raw_home.is_absolute():
+        raise PurgeRefused(
+            f"$HOME resolves to {str(raw_home)!r} — refusing to purge")
+    # Only then realpath, because the "/" fence below is a value compare
+    # and pathlib preserves ".." and a leading "//": HOME=/.. reads as a
+    # directory under root, and HOME=$X/sub/.. would aim the rmtree one
+    # level above the string it was derived from.
+    home = Path(os.path.realpath(raw_home))
     root = home / ".email-mcp"  # HARDCODED: env overrides never move this
-    if not home.is_absolute() or home == Path("/"):
+    if home == Path("/"):
         raise PurgeRefused(
             f"$HOME resolves to {str(home)!r} — refusing to purge")
     if root.parent != home:  # unreachable by construction; belt anyway
@@ -1359,12 +1531,20 @@ def purge_state() -> Path | None:
     return root
 
 
+def _logs_dir() -> Path:
+    return Path.home() / "Library" / "Logs"
+
+
 def _purge_logs() -> list[Path]:
     """Unlink ``~/Library/Logs/email-mcp*.log`` (config.log_file's
-    default home). unlink never recurses, so a symlinked log costs only
-    the link itself."""
+    default home). unlink never recurses, so a symlinked log file costs
+    only the link itself — but a symlinked Logs DIRECTORY is a
+    redirection, and the D7 rule the graph token sweep applies holds
+    here too: refuse, never glob through it."""
     removed: list[Path] = []
-    logs = Path.home() / "Library" / "Logs"
+    logs = _logs_dir()
+    if logs.is_symlink():
+        return removed
     for path in sorted(logs.glob("email-mcp*.log")):
         try:
             path.unlink()
@@ -1413,9 +1593,14 @@ def uninstall_plan(purge: bool) -> dict:
     if purge:
         remove.append(f"{root} (state tree: spool, plans, audit ledger, "
                       "identities.toml, meta.json)")
-        for log in sorted((home / "Library" / "Logs")
-                          .glob("email-mcp*.log")):
-            remove.append(str(log))
+        logs_dir = _logs_dir()
+        if logs_dir.is_symlink():
+            print_only.append(
+                f"{logs_dir} (symlink — logs behind it are never "
+                "followed; delete them yourself)")
+        else:
+            for log in sorted(logs_dir.glob("email-mcp*.log")):
+                remove.append(str(log))
         for var, raw in sorted(paths.env_overrides.items()):
             print_only.append(
                 f"{var}={raw} (env-overridden path — never removed; "
@@ -1479,7 +1664,11 @@ def run_uninstall(purge: bool, assume_yes: bool) -> int:
     removal (with --purge those are the ledger's last words — hence the
     receipts-export hint in the plan) → both agents out (legacy labels
     included) → token caches deleted → with --purge the fenced
-    :func:`purge_state` plus the log files."""
+    :func:`purge_state` plus the log files.
+
+    Exit 1 when anything the plan listed under ``remove:`` survived the
+    run: a left-behind agent keeps RUNNING, so "complete" would be a
+    lie. The failures are named on stderr."""
     audit.set_process("cli")
     from . import dispatcher, fts
 
@@ -1526,8 +1715,13 @@ def run_uninstall(purge: bool, assume_yes: bool) -> int:
         "print_only": plan["print_only"],
     })
 
-    for agent_uninstall in (dispatcher.uninstall_launchd,
-                            fts.uninstall_launchd):
+    # What we PROMISED to remove but could not: the run is not a success
+    # just because it survived — an agent left behind keeps running.
+    left_behind: list[str] = []
+
+    for label, agent_uninstall in (
+            (dispatcher.LAUNCHD_LABEL, dispatcher.uninstall_launchd),
+            (fts.LAUNCHD_LABEL, fts.uninstall_launchd)):
         try:
             print(f"  {agent_uninstall()}")
         except OSError as e:
@@ -1537,6 +1731,7 @@ def run_uninstall(purge: bool, assume_yes: bool) -> int:
             print(f"  launchd agent removal failed ({e}) — remove the "
                   "plists under ~/Library/LaunchAgents yourself",
                   file=sys.stderr)
+            left_behind.append(f"launchd agent {label} ({e})")
 
     graph_default = Path.home() / ".email-mcp" / "graph"
     if graph_default.is_symlink():
@@ -1551,22 +1746,38 @@ def run_uninstall(purge: bool, assume_yes: bool) -> int:
                 token.unlink()
             except OSError as e:
                 print(f"  could not remove {token}: {e}", file=sys.stderr)
+                left_behind.append(f"{token} ({e})")
                 continue
             print(f"  removed {token}")
 
     if purge:
+        root_path = Path.home() / ".email-mcp"
         try:
             root = purge_state()
         except PurgeRefused as e:
             print(f"email-mcp uninstall: purge refused: {e}",
                   file=sys.stderr)
             return 1
-        if root is None:
-            print(f"  {Path.home() / '.email-mcp'} already absent")
+        except OSError as e:
+            # A fenced rmtree that runs into an undeletable subtree
+            # leaves a HALF-removed state tree — the one outcome the
+            # user must be told about, and never as a traceback.
+            _log.warning("uninstall: purge failed partway: %s", e)
+            print(f"email-mcp uninstall: purge incomplete ({e}) — "
+                  f"{root_path} is partly removed; delete the rest "
+                  "yourself", file=sys.stderr)
+            left_behind.append(f"{root_path} (partly removed: {e})")
         else:
-            print(f"  removed {root}")
+            if root is None:
+                print(f"  {root_path} already absent")
+            else:
+                print(f"  removed {root}")
         for log_path in _purge_logs():
             print(f"  removed {log_path}")
+    if left_behind:
+        print("uninstall INCOMPLETE — still present: "
+              + "; ".join(left_behind), file=sys.stderr)
+        return 1
     print("uninstall complete." + ("" if purge else
           " State kept — `email-mcp uninstall --purge` removes it."))
     return 0
@@ -1574,8 +1785,8 @@ def run_uninstall(purge: bool, assume_yes: bool) -> int:
 
 def run_uninstall_cli(argv: list[str] | None = None) -> int:
     """``email-mcp uninstall [--purge] [--yes]`` → exit 0 on completion,
-    1 when aborted or refused, 2 on usage errors (including no terminal
-    for the typed confirmation without --yes)."""
+    1 when aborted, refused, or left incomplete, 2 on usage errors
+    (including no terminal for the typed confirmation without --yes)."""
     parser = argparse.ArgumentParser(
         prog="email-mcp uninstall",
         description="Remove the launchd agents and Graph token caches; "

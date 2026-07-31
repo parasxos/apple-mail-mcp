@@ -233,7 +233,10 @@ def test_purge_refuses_symlinked_root(home, tmp_path, capsys):
     root = home / ".email-mcp"
     root.symlink_to(victim)
 
-    with pytest.raises(lifecycle.PurgeRefused, match="symlink"):
+    # "refusing to follow", not "symlink": this test's own name puts the
+    # word "symlink" in tmp_path, so it appears in every interpolated
+    # path and would match whichever fence happened to fire.
+    with pytest.raises(lifecycle.PurgeRefused, match="refusing to follow"):
         lifecycle.purge_state()
     assert root.is_symlink()  # the link itself was not removed either
     assert (victim / "data.txt").read_text() == "precious"
@@ -293,16 +296,36 @@ def test_purge_env_override_at_home_survives(home, monkeypatch):
             / "Envelope Index").exists()
 
 
-def test_purge_paranoia_fences_home_and_slash(monkeypatch):
-    """Degenerate $HOME values must refuse before lstat, let alone
-    rmtree: HOME=/ would make the target /.email-mcp; HOME= (empty)
-    resolves to / via expanduser's fallback."""
-    monkeypatch.setenv("HOME", "/")
-    with pytest.raises(lifecycle.PurgeRefused, match="refusing"):
+@pytest.mark.parametrize("raw_home", ["/", "", "//", "/..", "/../.."])
+def test_purge_paranoia_fences_home_at_root_however_spelled(
+    monkeypatch, raw_home,
+):
+    """A $HOME that names the filesystem root must refuse before lstat,
+    let alone rmtree — target /.email-mcp. HOME= (empty) resolves to /
+    via expanduser's fallback; the rest reach it through ".." and "//"
+    segments that pathlib carries around verbatim, so the fence has to
+    compare the realpath, not the spelling."""
+    monkeypatch.setenv("HOME", raw_home)
+    with pytest.raises(lifecycle.PurgeRefused, match="refusing to purge"):
         lifecycle.purge_state()
-    monkeypatch.setenv("HOME", "")
-    with pytest.raises(lifecycle.PurgeRefused, match="refusing"):
+
+
+def test_purge_refuses_relative_home_without_resolving_it(
+    tmp_path, monkeypatch,
+):
+    """A relative $HOME is nonsense and stays refused. It is judged on
+    the RAW value on purpose: realpath would anchor it to the cwd and
+    hand back a plausible-looking absolute path, turning a refusal into
+    a purge of whatever ./relhome/.email-mcp happens to be."""
+    victim = tmp_path / "relhome" / ".email-mcp"
+    victim.mkdir(parents=True)
+    (victim / "meta.json").write_text("{}")
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("HOME", "relhome")
+
+    with pytest.raises(lifecycle.PurgeRefused, match="refusing to purge"):
         lifecycle.purge_state()
+    assert (victim / "meta.json").exists()
 
 
 def test_purge_already_absent_is_idempotent(home):
@@ -440,3 +463,78 @@ def test_no_terminal_without_yes_exits_2(home, capsys):
     # And through the real dispatch, as the frozen test hits it:
     assert cli.main(["uninstall", "--purge"]) == 2
     assert estate["root"].exists()
+
+
+# --------------------------------------------------------------------- #
+# partial failure: "complete" must not be a lie                          #
+# --------------------------------------------------------------------- #
+
+
+def test_purge_with_undeletable_subtree_reports_instead_of_raising(
+    home, tool_shims, capsys,
+):
+    """An undeletable subtree (0500 dir holding a file) makes rmtree
+    raise partway. The CLI never dumps a traceback as UX: it says the
+    purge is incomplete, does NOT claim completion, and exits 1."""
+    estate = _install_estate(home)
+    locked = estate["root"] / "spool" / "pending"
+    locked.mkdir(parents=True, exist_ok=True)
+    (locked / "stuck.json").write_text("{}")
+    locked.chmod(0o500)
+    try:
+        assert cli.main(["uninstall", "--purge", "--yes"]) == 1
+        captured = capsys.readouterr()
+        assert "purge incomplete" in captured.err
+        assert "INCOMPLETE" in captured.err
+        assert "uninstall complete." not in captured.out
+        assert estate["root"].exists()  # the half-deleted tree is named
+    finally:
+        locked.chmod(0o700)
+
+
+def test_purge_refuses_a_symlinked_logs_dir(home, tool_shims, capsys):
+    """~/Library/Logs redirected at someone else's directory: the log
+    sweep follows the same D7 rule as the graph token sweep — refuse,
+    never glob through the link. The victim's own email-mcp.log lives."""
+    victim = home / "victim-logs"
+    victim.mkdir()
+    (victim / "email-mcp.log").write_text("someone else's log")
+    estate = _install_estate(home)
+    logs = estate["logs"]
+    (logs / "email-mcp.log").unlink()
+    (logs / "unrelated.log").unlink()
+    logs.rmdir()
+    logs.symlink_to(victim)
+
+    # The preview says so BEFORE the confirmation, not after the fact.
+    plan = lifecycle.uninstall_plan(purge=True)
+    assert any(str(logs) in line and "never followed" in line
+               for line in plan["print_only"])
+    assert not any("email-mcp.log" in line for line in plan["remove"])
+
+    assert cli.main(["uninstall", "--purge", "--yes"]) == 0
+    assert (victim / "email-mcp.log").read_text() == "someone else's log"
+    assert logs.is_symlink()  # the link itself was not removed either
+    assert not estate["root"].exists()  # the real purge still happened
+
+
+def test_uninstall_without_launchctl_exits_nonzero(
+    home, tmp_path, monkeypatch, capsys,
+):
+    """launchctl missing: the plists are printed under "remove:" and
+    then survive. Reporting success would leave the agents RUNNING after
+    a "successful" uninstall — exit 1 and name what is still there."""
+    estate = _install_estate(home)
+    empty = tmp_path / "no-tools"
+    empty.mkdir()
+    monkeypatch.setenv("PATH", str(empty))
+
+    assert cli.main(["uninstall", "--yes"]) == 1
+    captured = capsys.readouterr()
+    assert "uninstall complete." not in captured.out
+    assert "INCOMPLETE" in captured.err
+    assert "launchd" in captured.err
+    for label in (dispatcher.LAUNCHD_LABEL, fts.LAUNCHD_LABEL):
+        assert (estate["agents"] / f"{label}.plist").exists(), label
+    # The rest of the run still happened: token caches are gone.
+    assert not estate["token"].exists()

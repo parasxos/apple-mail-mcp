@@ -13,18 +13,27 @@ name = "email-mcp"
 dynamic = ["version"]
 description = "Local MCP server exposing Apple Mail read access + guarded sending for Claude Code."
 readme = "README.md"
-requires-python = ">=3.10"
+# 3.11, not 3.10: identities.py and lifecycle.py import `tomllib`, which is
+# stdlib only from 3.11 (PEP 680). On 3.10 pip installs happily and then
+# `import email_mcp.server` dies with ModuleNotFoundError — a false install
+# promise. Lowering this again means adding a `tomli` fallback first.
+requires-python = ">=3.11"
 keywords = ["mcp", "model-context-protocol", "apple-mail", "email", "macos", "claude"]
 classifiers = [
     "Development Status :: 4 - Beta",
     "Environment :: MacOS X",
     "Intended Audience :: Developers",
+    # Classifier form, not PEP 639 `license = "MIT"`: the dev venv's setuptools
+    # (65.5) rejects the PEP 639 keys outright, and tests/test_cli.py parses
+    # this file with that same installed setuptools. Switch to the expression
+    # form once the floor in [build-system] can be raised to setuptools>=77.
+    "License :: OSI Approved :: MIT License",
     "Operating System :: MacOS",
     "Programming Language :: Python :: 3",
-    "Programming Language :: Python :: 3.10",
     "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
     "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
     "Topic :: Communications :: Email",
 ]
 dependencies = [
@@ -43,6 +52,10 @@ Issues = "https://github.com/parasxos/email-mcp/issues"
 [project.optional-dependencies]
 dev = [
     "pytest>=7",
+    # test_cli.py re-derives the dynamic version through setuptools' own
+    # config machinery. Python 3.12+ venvs no longer ship setuptools, so it
+    # is a real test dependency, not an ambient one.
+    "setuptools>=68",
 ]
 
 [project.scripts]
@@ -50,6 +63,10 @@ email-mcp = "email_mcp.cli:main"
 
 [tool.setuptools]
 packages = ["email_mcp", "email_mcp.sources", "email_mcp.transports"]
+# Stated explicitly rather than left to setuptools' default LICEN[CS]E* glob:
+# the wheel must carry the licence text, not just a classifier, or a vendoring
+# consumer has nothing to redistribute alongside the code.
+license-files = ["LICENSE"]
 
 [tool.setuptools.dynamic]
 # Build-time derivation: setuptools statically parses the literal out of

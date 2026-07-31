@@ -110,6 +110,21 @@ def _scan_tree_for(home: Path, needle: bytes) -> list[Path]:
             if p.is_file() and needle in p.read_bytes()]
 
 
+def _spell_home(home: Path, alias: str) -> str:
+    """$HOME written three ways. Only "plain" is what a value compare on
+    unresolved paths recognises: pathlib preserves a ".." segment and a
+    leading "//" verbatim, so the other two name the same directory while
+    reading as somewhere else entirely."""
+    if alias == "dotdot":
+        return f"{home}/sub/.."
+    if alias == "double-slash":
+        return f"/{home}"
+    return str(home)
+
+
+HOME_ALIASES = ("plain", "dotdot", "double-slash")
+
+
 def _write_answers(tmp_path: Path, data: dict) -> Path:
     path = tmp_path / "answers.json"
     path.write_text(json.dumps(data))
@@ -151,6 +166,35 @@ def test_state_tree_0700_meta_0600_and_fts_never_created(home):
     # The FTS index is derived state: setup with fts_choice=defer must
     # not create even its directory — --build is the only builder.
     assert not (root / "fts").exists()
+
+
+# --------------------------------------------------------------------- #
+# state_dirs: the degenerate-override fence, however $HOME is spelled    #
+# --------------------------------------------------------------------- #
+
+
+@pytest.mark.parametrize("var", ("EMAIL_MCP_SPOOL_DIR", "EMAIL_MCP_PLANS_DIR",
+                                 "EMAIL_MCP_GRAPH_DIR", "EMAIL_MCP_AUDIT_DIR",
+                                 "EMAIL_MCP_FTS_DIR"))
+@pytest.mark.parametrize("alias", HOME_ALIASES)
+def test_setup_refuses_state_override_at_home_however_spelled(
+    home, monkeypatch, capsys, var, alias,
+):
+    """Pointing any state dir at $HOME must block the run, and the three
+    spellings of $HOME are one fence, not three: the config getters
+    ``chmod 0700`` the dir they create, so a bypass retightens the home
+    directory itself and (for the spool) grows five state subdirs in it.
+    Blocked at state_dirs means nothing was created at all."""
+    home.chmod(0o755)
+    monkeypatch.setenv(var, _spell_home(home, alias))
+
+    assert lifecycle.run_setup_cli(["--answers", str(FIXTURE)]) == 1
+    out = capsys.readouterr().out
+    assert "setup blocked at state_dirs" in out
+    assert var in out and "refusing to build state" in out
+    assert (home.stat().st_mode & 0o777) == 0o755  # $HOME not retightened
+    assert not any((home / s).exists() for s in SPOOL_STATES)
+    assert not (home / ".email-mcp").exists()
 
 
 # --------------------------------------------------------------------- #
@@ -413,3 +457,143 @@ def test_no_terminal_without_answers_exits_2(home, capsys):
     assert "setup" in captured.err and "L3" in captured.err
     # And through the real dispatch, as MCP clients would hit it:
     assert cli.main(["setup"]) == 2
+
+
+# --------------------------------------------------------------------- #
+# identity: references have a SHAPE, and the key set is closed           #
+# --------------------------------------------------------------------- #
+
+
+def _smtp_answers(tmp_path: Path, **extra) -> Path:
+    """One smtp identity, host supplied — so the only fences left in play
+    are the ones each test is aiming at."""
+    return _write_answers(tmp_path, {
+        "identity_action": "add",
+        "identities": [{
+            "name": "leaky", "from_addr": "x@example.org",
+            "driver": "smtp", "host": "smtp.example.org", **extra,
+        }],
+    })
+
+
+@pytest.mark.parametrize("key,pin", [
+    ("op", "op://<vault>/<item>/<field>"),
+    ("keychain", "no spaces"),
+])
+def test_password_pasted_at_a_reference_prompt_is_refused(
+    home, tmp_path, capsys, key, pin,
+):
+    """The wizard asks for a *reference* ("op://vault/item/field") and a
+    real app password answers that prompt just as readily. Both reference
+    fields are therefore validated by shape: `op`/`keychain` naming
+    something that is not a reference is treated as the credential itself
+    — refused, never written, and never echoed back into stdout (where it
+    would land in a terminal scrollback and the user's next paste)."""
+    sentinel = "hunter2 SENTINEL app pw"  # whitespace: fails both shapes
+    rc = lifecycle.run_setup_cli(
+        ["--answers", str(_smtp_answers(tmp_path, **{key: sentinel}))])
+    assert rc == 1
+    out = capsys.readouterr().out
+    assert "setup blocked at identity" in out
+    assert pin in out  # pin WHICH fence rejected it
+    assert sentinel not in out
+    assert not (home / ".email-mcp" / "identities.toml").exists()
+    assert _scan_tree_for(home, sentinel.encode()) == []
+
+
+@pytest.mark.parametrize("key,value", [
+    # 1Password item names may contain spaces — the shape fence must not
+    # cost a real reference.
+    ("op", "op://Personal/email-mcp gmail app password/password"),
+    ("keychain", "email-mcp-gmail"),
+])
+def test_wellformed_references_are_still_written(home, tmp_path, key, value):
+    """The other half of the fence: it refuses non-references, not
+    everything. Without this a fence that rejected unconditionally would
+    look identical from the test above."""
+    import tomllib
+
+    rc = lifecycle.run_setup_cli(
+        ["--answers", str(_smtp_answers(tmp_path, **{key: value}))])
+    assert rc == 0
+    data = tomllib.loads(
+        (home / ".email-mcp" / "identities.toml").read_text())
+    assert data["leaky"][key] == value
+
+
+@pytest.mark.parametrize("key", [
+    "smtp_password", "pass", "pw", "apppassword", "auth_token", "apikey",
+    "client_secret_value",
+])
+def test_unknown_identity_key_refused_whatever_its_spelling(
+    home, tmp_path, capsys, key,
+):
+    """A denylist of secret-looking names cannot win: every spelling here
+    slips past one. The key set is an ALLOWLIST (identity fields + the
+    driver's own constructor parameters), so a key this codebase never
+    reads is refused whatever it is called — with a valid `keychain`
+    reference supplied so no other fence can be the one that fires."""
+    sentinel = "hunter2-KEY-SENTINEL"
+    rc = lifecycle.run_setup_cli(["--answers", str(_smtp_answers(
+        tmp_path, keychain="email-mcp-leaky", **{key: sentinel}))])
+    assert rc == 1
+    out = capsys.readouterr().out
+    assert f"'{key}'" in out and "not read by the 'smtp' driver" in out
+    assert sentinel not in out
+    assert not (home / ".email-mcp" / "identities.toml").exists()
+    assert _scan_tree_for(home, sentinel.encode()) == []
+
+
+def test_graph_subtable_refuses_a_client_secret(home, tmp_path, capsys):
+    """[name.graph] is a public-client app registration: tenant and
+    client_id, nothing else. `client_secret` there is not a config option
+    the device-code flow forgot — it is a secret value."""
+    sentinel = "hunter2-GRAPH-SENTINEL"
+    answers = _write_answers(tmp_path, {
+        "identity_action": "add",
+        "identities": [{
+            "name": "work", "from_addr": "x@example.org", "driver": "pipe",
+            "command": "/usr/bin/true", "executor": "graph",
+            "graph": {"tenant": "t", "client_id": "c",
+                      "client_secret": sentinel},
+        }],
+    })
+    assert lifecycle.run_setup_cli(["--answers", str(answers)]) == 1
+    out = capsys.readouterr().out
+    assert "'client_secret'" in out
+    assert "Graph app registration" in out
+    assert sentinel not in out
+    assert _scan_tree_for(home, sentinel.encode()) == []
+
+
+def test_hand_edited_identity_name_refused_at_load(home):
+    """The write-side name fence (above) only helps files the wizard
+    wrote. identities.toml is hand-editable, and the name is interpolated
+    into graph/<name>.token.json — so load() re-applies the same regex.
+    Lives beside the setup fence because they are one guarantee."""
+    from email_mcp import graph, identities
+
+    root = home / ".email-mcp"
+    root.mkdir()
+    escaping = "../../../e3-outside/pwned"
+    (root / "identities.toml").write_text(textwrap.dedent(f"""\
+        default = "ok"
+
+        [ok]
+        from_addr = "a@example.org"
+        driver = "pipe"
+        command = "/usr/bin/true"
+
+        ["{escaping}"]
+        from_addr = "b@example.org"
+        driver = "pipe"
+        command = "/usr/bin/true"
+    """))
+
+    with pytest.raises(identities.IdentityError) as ei:
+        identities.load()
+    assert escaping in str(ei.value)
+    # Why it matters: that name really does leave the state dir.
+    token = graph._token_path(
+        identities.Identity(name=escaping, from_addr="b@example.org"))
+    assert not str(token.resolve()).startswith(str((root / "graph").resolve()))

@@ -10,6 +10,10 @@ one os.write on an O_APPEND fd opened per event — lines never interleave —
 and each emit resolves the monthly path from its own timestamp, which
 dissolves the month-rollover race.
 
+The writer never follows a symlink onto a victim: the ledger directory is
+fenced in config.audit_dir and the month file is opened O_NOFOLLOW and
+chmodded through its own fd.
+
 Emit-failure policy: log-and-continue, absolute. emit() NEVER raises; an
 unwritable ledger must never block mail. Events never contain message
 bodies; subject is capped at 200 chars; an oversize event sheds fields in
@@ -37,6 +41,11 @@ _log = get_logger()
 SCHEMA_VERSION = 1
 MAX_EVENT_BYTES = 16384
 SUBJECT_MAX_CHARS = 200
+
+# O_NOFOLLOW is POSIX-only; where it is missing the flag degrades to 0 and
+# the ledger keeps its other properties (append atomicity, single write).
+_LEDGER_FLAGS = (os.O_RDWR | os.O_CREAT | os.O_APPEND
+                 | getattr(os, "O_NOFOLLOW", 0))
 
 _ENVELOPE = ("v", "ts", "op", "src", "event", "outcome")
 # Schema v1's closed optional-field vocabulary (contract §6); anything
@@ -133,7 +142,10 @@ def emit(
         # Month resolved from this event's own ts: no rollover race.
         path = config.audit_dir() / f"{ts[:7]}.jsonl"
         # O_RDWR (not O_WRONLY) so the torn-tail probe below can pread.
-        fd = os.open(path, os.O_RDWR | os.O_CREAT | os.O_APPEND, 0o600)
+        # O_NOFOLLOW: nobody but this writer names a YYYY-MM.jsonl, so a
+        # link there is a squatter — open fails (ELOOP) rather than
+        # appending an event to, and tightening the mode of, its target.
+        fd = os.open(path, _LEDGER_FLAGS, 0o600)
         try:
             # Torn-tail heal: a previous crash/short write can leave the
             # file without a trailing newline; appending straight after it
@@ -146,10 +158,16 @@ def emit(
             if size and os.pread(fd, 1, size - 1) != b"\n":
                 line = b"\n" + line
             os.write(fd, line + b"\n")
+            # launchd agents run with a permissive umask. fchmod, not
+            # chmod: it names the fd we just wrote, so no re-resolution
+            # of the path (and no link) can stand between the two.
+            os.fchmod(fd, 0o600)
         finally:
             os.close(fd)
-        os.chmod(path, 0o600)  # launchd agents run with a permissive umask
         return op
+    except config.AuditDirRefused as e:
+        _log.warning("audit: emit(%s) dropped — %s", event, e)
+        return None
     except Exception:
         _log.warning("audit: emit(%s) failed; event dropped", event,
                      exc_info=True)

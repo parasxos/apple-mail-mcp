@@ -11,6 +11,8 @@ from __future__ import annotations
 
 import logging
 
+import pytest
+
 from email_mcp import server
 
 
@@ -104,18 +106,36 @@ def test_unexpected_exception_returns_internal_error_and_logs_traceback(
 
 
 def test_triage_apply_belt_carries_plan_id_operation_id(monkeypatch):
+    """A plan id that a plan really could carry threads to the ledger's op.
+
+    The ids must be minted-SHAPED (`plans.new_id` is `ids.new_id`): §2 says
+    operation_id is never minted *for* a failure, so the belt echoes an
+    argument only when it looks like an id this package produced. The old
+    synthetic "P-123" fixture passed while the belt reflected any argument
+    at all, including a caller's 60 KB string.
+    """
+    from email_mcp import ids
+
     monkeypatch.setattr(server, "_SOURCE", object())
 
     def _boom(src, plan_id):
         raise RuntimeError("exploded mid-apply")
 
     monkeypatch.setattr(server, "apply_plan", _boom)
-    out = server.tool_triage_apply(plan_id="P-123")
-    assert out["ok"] is False and out["code"] == "internal_error"
-    assert out["operation_id"] == "P-123"  # threads to the ledger's op
 
-    out2 = server.tool_triage_apply("P-9")  # positional binding too
-    assert out2["operation_id"] == "P-9"
+    plan_id = ids.new_id()
+    out = server.tool_triage_apply(plan_id=plan_id)
+    assert out["ok"] is False and out["code"] == "internal_error"
+    assert out["operation_id"] == plan_id  # threads to the ledger's op
+
+    other = ids.new_id()
+    out2 = server.tool_triage_apply(other)  # positional binding too
+    assert out2["operation_id"] == other
+
+    # …and an id shape we never mint is a reference to nothing.
+    out3 = server.tool_triage_apply("P-123")
+    assert out3["ok"] is False
+    assert "operation_id" not in out3
 
 
 # --------------------------------------------------------------------- #
@@ -374,3 +394,272 @@ def test_belt_survives_an_exception_whose_message_cannot_be_rendered():
         raise ValueError("a perfectly ordinary problem")
 
     assert ordinary()["error"] == "a perfectly ordinary problem"
+
+
+# --------------------------------------------------------------------- #
+# Wire audit: a corrupt Envelope Index is ONE code across all 20 tools   #
+# --------------------------------------------------------------------- #
+
+
+@pytest.fixture
+def junk_index(tmp_path, monkeypatch):
+    """A Mail tree whose Envelope Index is not a SQLite file at all."""
+    mail_dir = tmp_path / "V10"
+    (mail_dir / "MailData").mkdir(parents=True)
+    (mail_dir / "MailData" / "Envelope Index").write_bytes(
+        b"this is not a database at all" * 64)
+    monkeypatch.setenv("EMAIL_MCP_MAIL_DIR", str(mail_dir))
+    monkeypatch.setenv("EMAIL_MCP_SOURCE", "apple")
+    monkeypatch.setattr(server, "_SOURCE", None)  # force the lazy build
+    return mail_dir
+
+
+def test_corrupt_index_reads_as_mail_unavailable_on_every_tool(junk_index):
+    """The live audit found ONE store yielding TWO codes: sqlite3 raises a
+    bare DatabaseError ("file is not a database") on some paths and an
+    OperationalError on others, and the belt caught only the latter — so
+    list_mailboxes/list_recent/get_attachment said internal_error while
+    search/get said mail_unavailable. §3.5 makes mail_unavailable the
+    single honest answer: the store is unreadable."""
+    calls = {
+        "search_emails": lambda: server.tool_search_emails(query="x"),
+        "get_email": lambda: server.tool_get_email("100"),
+        "get_emails_batch": lambda: server.tool_get_emails_batch(["100"]),
+        "get_thread": lambda: server.tool_get_thread("7001"),
+        "list_mailboxes": lambda: server.tool_list_mailboxes(),
+        "list_recent": lambda: server.tool_list_recent(),
+        "get_attachment": lambda: server.tool_get_attachment("100", "1.2"),
+    }
+    got = {}
+    for name, call in calls.items():
+        server._SOURCE = None
+        out = call()
+        got[name] = out.get("code") if out.get("ok") is False else "OK"
+    assert set(got.values()) == {"mail_unavailable"}, got
+
+
+def test_corrupt_index_never_reads_as_an_empty_thread(junk_index):
+    """get_thread returned {ok: true, thread: []} on the junk store:
+    _probe_columns swallowed the DatabaseError per table, so
+    _have('messages','conversation_id') was False and thread() reported a
+    broken store as an empty conversation."""
+    out = server.tool_get_thread("7001")
+    assert out["ok"] is False
+    assert out.get("thread") is None
+
+
+def _partial_conn(readable: set[str]):
+    """A connection whose PRAGMA table_info RAISES for every table outside
+    `readable` — the shape of version drift that actually errors (a merely
+    absent table returns no rows and no exception)."""
+    import sqlite3
+
+    class _Cur:
+        def execute(self, sql):
+            table = sql.split("(", 1)[1].rstrip(")")
+            if table not in readable:
+                raise sqlite3.DatabaseError(f"no such table: {table}")
+            self._rows = [(0, "ROWID", "INTEGER", 0, None, 1)]
+            return self
+
+        def fetchall(self):
+            return self._rows
+
+    class _Conn:
+        def cursor(self):
+            return _Cur()
+
+    return _Conn()
+
+
+def test_probe_columns_degrades_per_table_but_not_when_all_fail(
+    mail_fixture,
+):
+    """Per-table degradation for genuine version drift must survive; ONLY
+    the nothing-came-back case may raise."""
+    import sqlite3
+
+    from email_mcp.sources.apple_mail import AppleMailSource
+
+    src = AppleMailSource(mail_base=mail_fixture)
+
+    src._conn = _partial_conn({"messages", "mailboxes"})
+    cols = src._probe_columns()  # must NOT raise
+    assert cols["messages"] == {"ROWID"}
+    assert cols["conversations"] == set()  # drifted away → degraded
+
+    src._conn = _partial_conn(set())
+    with pytest.raises(sqlite3.DatabaseError):
+        src._probe_columns()
+
+
+def test_sqlite_programming_error_is_internal_error_not_the_store(
+    monkeypatch,
+):
+    """ProgrammingError is a DatabaseError sibling, but it means OUR SQL or
+    binding is wrong — a bug here, never an unreadable Mail store."""
+    import sqlite3
+
+    class BadSql:
+        def search(self, q):
+            raise sqlite3.ProgrammingError(
+                "Incorrect number of bindings supplied")
+
+    monkeypatch.setattr(server, "_SOURCE", BadSql())
+    out = server.tool_search_emails(query="x")
+    assert out["ok"] is False and out["code"] == "internal_error"
+
+
+def test_missing_local_emlx_is_not_found_not_mail_unavailable(
+    mail_fixture, monkeypatch
+):
+    """Message 200 exists in the index but was never downloaded (the
+    ordinary IMAP case). §3.5 files a vanished attachment under not_found;
+    the store itself is perfectly readable."""
+    from email_mcp.sources.apple_mail import AppleMailSource
+
+    monkeypatch.setattr(server, "_SOURCE",
+                        AppleMailSource(mail_base=mail_fixture))
+    out = server.tool_get_attachment("200", "1.2")
+    assert out["ok"] is False and out["code"] == "not_found"
+
+    # The readable store still serves its neighbours.
+    assert server.tool_get_email("100")["ok"] is True
+
+
+# --------------------------------------------------------------------- #
+# serverInfo.version is OURS, not the mcp library's                     #
+# --------------------------------------------------------------------- #
+
+
+def test_server_advertises_the_package_version_on_the_wire():
+    """FastMCP takes no version=, so the low-level Server fell back to
+    importlib.metadata.version("mcp") — clients were told the MCP library's
+    version (1.29.0, or whatever resolved), never 0.11.0."""
+    import importlib.metadata
+
+    from email_mcp import __version__
+
+    mcp = server._build_mcp_server()
+    opts = mcp._mcp_server.create_initialization_options()
+    assert opts.server_name == "apple-mail"
+    assert opts.server_version == __version__
+    assert opts.server_version != importlib.metadata.version("mcp")
+
+
+# --------------------------------------------------------------------- #
+# §3.4: the smtp secret-source lane prefix (the shipped-late promise)    #
+# --------------------------------------------------------------------- #
+
+
+def test_smtp_secret_errors_carry_the_lane_prefix_and_still_code(
+    monkeypatch,
+):
+    from email_mcp.transports import smtp as smtp_mod
+    from email_mcp.transports import SendError
+
+    t = smtp_mod.SmtpTransport(host="smtp.gmail.com", keychain="email-mcp-g",
+                               identity="gmail", from_addr="g@example.org")
+
+    def _no_cli(item, account):
+        raise SendError("`security` CLI not found — the smtp driver needs "
+                        "macOS.")
+
+    monkeypatch.setattr(smtp_mod, "_read_keychain", _no_cli)
+    with pytest.raises(SendError) as ei:
+        t._secret()
+    prose = str(ei.value)
+    assert prose.startswith("[gmail/smtp] ")
+    assert "`security` CLI not found" in prose
+    # …and the prefixed prose keeps its §3.4 code.
+    assert server._send_code(SendError(prose)) == "credentials_unavailable"
+
+    # ensure() feeds sender._transport_unavailable, which prepends the lane
+    # itself — the stash must not carry a second copy.
+    assert t.ensure() is False
+    assert not t.last_ensure_error.startswith("[gmail/smtp]")
+
+    # op lane too
+    t2 = smtp_mod.SmtpTransport(host="smtp.gmail.com", op="op://v/i/password",
+                                identity="work", from_addr="w@example.org")
+    monkeypatch.setattr(
+        smtp_mod, "_read_op",
+        lambda ref: (_ for _ in ()).throw(
+            SendError("1Password read for 'op://v/i/password' failed "
+                      "(op exit 1)")))
+    with pytest.raises(SendError) as ei2:
+        t2._secret()
+    assert str(ei2.value).startswith("[work/smtp] ")
+    assert server._send_code(SendError(str(ei2.value))) == \
+        "credentials_unavailable"
+
+
+def test_failure_envelopes_are_bounded_and_do_not_reflect_the_caller():
+    """§2/§7: a hostile argument must not come back as a hostile envelope.
+
+    `triage_apply` with a 60 000-character plan_id used to return a
+    120 KB envelope — the OSError names the whole offending path, and
+    operation_id echoed the raw argument verbatim — straight onto a stdio
+    transport, for an operation that minted nothing.
+    """
+    import json
+
+    out = server.tool_triage_apply("A" * 60000)
+
+    assert out["ok"] is False
+    assert len(json.dumps(out)) < 4000
+    assert "truncated" in out["error"]
+    # §2: never minted *for* a failure. Nothing was created, so nothing threads.
+    assert "operation_id" not in out
+
+
+def test_operation_id_is_echoed_only_for_minted_shaped_ids():
+    """The raw argument is the caller's claim, not proof of an artifact."""
+    from email_mcp import ids
+
+    for bogus in ("A" * 60000, "a\x00b\x07c", "not-an-id", ""):
+        out = server.tool_triage_apply(bogus)
+        assert "operation_id" not in out, f"echoed {bogus[:20]!r}"
+
+    assert ids.is_minted_id(ids.new_id())
+    assert not ids.is_minted_id("20260731T123552Z-nothex000000")
+    assert not ids.is_minted_id("20260731T123552Z-3793a80f72f3 ")
+
+
+def test_batch_and_single_read_agree_on_every_code():
+    """§3: a code means the same thing on every tool that uses it.
+
+    The batch loop mapped ValueError->invalid_input and LookupError->
+    not_found with no carve-outs, while the belt routes UnicodeDecodeError
+    and KeyError to internal_error — so one store fault yielded two
+    different codes depending on which tool the caller used.
+    """
+    import sqlite3
+
+    class Poison:
+        def __init__(self, exc):
+            self.exc = exc
+
+        def get(self, id):
+            raise self.exc
+
+    cases = [
+        UnicodeDecodeError("utf-8", b"\xff", 0, 1, "bad"),
+        KeyError("internal container miss"),
+        IndexError("internal index miss"),
+        LookupError("no such message"),
+        ValueError("bad id"),
+        sqlite3.DatabaseError("file is not a database"),
+        sqlite3.OperationalError("database is locked"),
+    ]
+    original = server._SOURCE
+    try:
+        for exc in cases:
+            server._SOURCE = Poison(exc)
+            batch = server.tool_get_emails_batch(["100"])
+            single = server.tool_get_email("100")
+            assert batch["errors"][0]["code"] == single["code"], (
+                f"{type(exc).__name__}: batch={batch['errors'][0]['code']} "
+                f"single={single['code']}")
+    finally:
+        server._SOURCE = original

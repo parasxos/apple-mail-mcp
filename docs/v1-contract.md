@@ -9,7 +9,7 @@ only after v1.0 — breaking = v2 (§8).*
 
 Sections: 1 scope + conformance table · 2 envelope semantics · 3 the one
 error-code namespace · 4 idempotency + retry · 5 caps + TTLs · 6 audit event
-schema v1 · 7 wire safety · 8 versioning.
+schema v1 · 7 wire safety · 8 versioning · 9 known limitations.
 
 ---
 
@@ -84,7 +84,11 @@ Every tool that returns an object speaks one envelope:
   spool id). It is the same id the audit ledger's `op` field carries (§6),
   so a failed operation can be threaded to its ledger events in one lookup.
   It is never minted *for* a failure: a validation reject that touched
-  nothing carries no `operation_id`.
+  nothing carries no `operation_id`. Enforced structurally — a caller-supplied
+  argument is echoed only when it has the exact shape of a minted id
+  (`<UTC stamp>-<12 hex>`, `ids.is_minted_id`), so a typo or a hostile
+  60 KB string is a reference to nothing and is dropped rather than
+  reflected.
 
 Rules:
 
@@ -255,7 +259,11 @@ recovered after 10 minutes (attempt consumed — the outcome was unknown).
 
 ## 5. Caps and TTLs (live config defaults)
 
-Caps REJECT, never truncate. Values below are the defaults of
+Caps on caller-supplied work REJECT, never truncate: an over-cap
+selection or batch is refused outright. Two rows below are NOT of that
+kind and do truncate, deliberately — the FTS hit cap (informational,
+derived state: newest hits kept) and the audit event/subject caps, whose
+shedding order is specified in §6. Values below are the defaults of
 `email_mcp/config.py` at v0.10; env overrides in parentheses.
 
 | Limit | Default | Knob |
@@ -286,8 +294,9 @@ Caps REJECT, never truncate. Values below are the defaults of
 The ledger indexes the truths already frozen elsewhere (plan files, spool
 manifests, Message-IDs) — it does not create truth. Storage: append-only
 monthly JSONL, `~/.email-mcp/audit/YYYY-MM.jsonl`, dir 0700, files 0600.
-ONE event per mutation. Two writer processes exist (server + launchd
-dispatcher); each emit is a single `os.write` on an
+ONE event per mutation. Three writer processes exist (server, launchd
+dispatcher, and — since v0.11 — the lifecycle/doctor CLI, see the
+`src` values below); each emit is a single `os.write` on an
 `O_RDWR|O_CREAT|O_APPEND` fd resolved per event (RDWR so the tail probe can `pread`; `O_APPEND` carries the atomicity), so lines never interleave
 and month rollover has no race.
 
@@ -379,13 +388,27 @@ gains an `audit` check (dir exists, perms, writability).
   code never print; logging goes through `log.get_logger()` to the log
   file. (The audit CLI and dispatcher `main()` print by design — they are
   separate entry points whose stdout is not the MCP wire.)
-- **No exception crosses the wire.** Every tool is total — all 20,
-  including the formerly array-shaped `get_thread`/`list_mailboxes`/
-  `list_recent`: any path that could raise is either handled with a
-  specific code or caught by a belt that logs the full traceback and
-  returns `{ok: false, code: "internal_error", error, fix: "run doctor"}`.
+- **No `Exception` crosses the wire.** Every tool is total against the
+  `Exception` hierarchy — all 20, including the formerly array-shaped
+  `get_thread`/`list_mailboxes`/`list_recent`: any path that could raise is
+  either handled with a specific code or caught by a belt that logs the full
+  traceback and returns
+  `{ok: false, code: "internal_error", error, fix: "run doctor"}`.
   (The v0.10 carve-out that excused those three retired when they gained
-  envelopes at v0.11 — verified by live poisoned-source probes.)
+  envelopes at v0.11 — verified by live poisoned-source probes.) The belt's
+  own message rendering is guarded too: an exception whose `__str__` or type
+  name raises still returns an envelope.
+  **The carve-out, stated deliberately:** the belt catches `Exception`, not
+  `BaseException`. `SystemExit`, `KeyboardInterrupt` and `GeneratorExit` are
+  control flow, not tool failures — swallowing them would make Ctrl-C and
+  interpreter shutdown unobservable, which is worse than the traceback. A
+  library that calls `sys.exit()` inside a tool can therefore still terminate
+  the server; that is a bug in the library, and the process dies loudly
+  rather than lying about it.
+- **Failure envelopes are bounded.** `error` is truncated past 2 000
+  characters (the full text goes to the log). Some exceptions quote their
+  input back — an `OSError` names the whole offending path — so an oversized
+  argument would otherwise return as an oversized envelope on the transport.
 - Every tool return is JSON-serializable (dataclasses/datetimes converted
   at the boundary).
 - **Secrets never appear in envelopes, logs, or audit events.** Secret
@@ -432,3 +455,38 @@ gains an `audit` check (dir exists, perms, writability).
 - Spool manifests and plan files keep their compatibility story (older
   manifests without `identity`/`executor` fields keep working via
   defaults) — the ledger never requires migrating them.
+
+## 9. Known limitations
+
+This contract binds the **wire**: shapes, codes, idempotency, caps,
+receipts. It says nothing about the tool's *destructive surface* — the
+lifecycle paths that create, chmod and delete directories on your Mac,
+and the wizard that writes a file next to your credentials. That surface
+has its own document, and it is the one to read before trusting this tool
+with a real mailbox:
+
+**`docs/security-posture.md`** — what is fenced and by which mutation-proven
+test; every red-team finding deliberately NOT fixed, with its blast radius
+stated plainly; the threat-model boundary (this is a personal tool running
+as you — where the fences stop being meaningful); and the exact command to
+re-run the adversarial suite.
+
+The limitations that touch THIS contract's guarantees are named at their
+own rows and repeated here so they are not missed:
+
+- **Scheduled delivery is at-least-once, not exactly-once** (§4,
+  `schedule_email`): the crash window between transport handoff and the
+  `sending`→`sent` rename re-delivers. Dedupe on the frozen `Message-ID`.
+- **Audit events are at-most-once per mutation** (§6): the ledger is an
+  index of truth, never a second source of it. Absence of an event is not
+  proof a mutation did not happen.
+- **Secret *references* may appear in error prose** (§7): a Keychain item
+  name or an `op://` path can reach a transcript or the log file. Secret
+  *values* never leave the driver, and that is pinned by a sentinel test.
+- **`doctor`'s `ok` reports environment health, not tool failure** (§2,
+  §1 row 10) — the one documented exception to the envelope rule.
+
+`docs/security-posture.md` also carries findings this contract does not
+cover at all (env-driven path overrides, symlink discipline, config-file
+denial of service). Those are outside the wire, but they are not outside
+the tool.

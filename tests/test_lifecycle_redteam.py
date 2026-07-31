@@ -445,23 +445,36 @@ def test_setup_launchd_step_degrades_without_launchctl(
     assert "install failed" in capsys.readouterr().out
 
 
-def test_uninstall_purge_completes_without_launchctl(
+def test_uninstall_purge_degrades_without_launchctl(
     home, no_launchctl, capsys,
 ):
     """launchctl missing must not abort uninstall --purge with a
     traceback: the agent step degrades (reported on stderr), tokens and
-    the fenced purge still run, Mail survives."""
+    the fenced purge still run, Mail survives.
+
+    It must also not claim success. The plists stay on disk, so the agents
+    keep running after the uninstall — reporting `uninstall complete.` and
+    exiting 0 told the user the opposite of what happened. Exit 1, and name
+    what was left behind.
+    """
     estate = _install_estate(home)
 
     rc = cli.main(["uninstall", "--purge", "--yes"])
 
-    assert rc == 0
+    assert rc == 1
     assert not estate["root"].exists()
     assert (estate["mail"] / "V10" / "MailData"
             / "Envelope Index").read_text() == "mail-store-sentinel"
     captured = capsys.readouterr()
     assert "removal failed" in captured.err
     assert "Traceback" not in captured.err + captured.out
+    # The claim must match the disk: both plists really are still there,
+    # and the incomplete report names each one.
+    assert "uninstall complete." not in captured.out
+    assert "INCOMPLETE" in captured.err
+    for label in (dispatcher.LAUNCHD_LABEL, fts.LAUNCHD_LABEL):
+        assert (estate["agents"] / f"{label}.plist").exists()
+        assert label in captured.err
 
 
 def test_run_fixes_degrades_without_launchctl(home, no_launchctl):

@@ -136,6 +136,21 @@ def send_delivery_cmd() -> str:
     return os.environ.get("EMAIL_MCP_DELIVERY_CMD", "/usr/sbin/sendmail").strip()
 
 
+def _lock_down(d: Path, overridden: bool) -> None:
+    """Tighten a state dir to 0700, and its parent only when we own it.
+
+    ``~/.email-mcp`` is ours to lock down. The parent of an
+    EMAIL_MCP_*_DIR the operator named is NOT: pointing a state dir at
+    ``/somewhere/mine/spool`` must not take ``/somewhere/mine`` to 0700
+    behind their back, and a symlinked parent would land the chmod on its
+    target. Same rule audit_dir already applies.
+    """
+    if not overridden and not d.parent.is_symlink():
+        d.parent.chmod(0o700)
+    if not d.is_symlink():
+        d.chmod(0o700)
+
+
 def spool_dir() -> Path:
     """Root of the scheduled-mail spool (frozen .eml + .json manifests).
 
@@ -147,8 +162,7 @@ def spool_dir() -> Path:
     d = Path(raw).expanduser() if raw else Path.home() / ".email-mcp" / "spool"
     for sub in ("pending", "sending", "sent", "failed", "cancelled"):
         (d / sub).mkdir(parents=True, exist_ok=True)
-    d.parent.chmod(0o700)
-    d.chmod(0o700)
+    _lock_down(d, bool(raw))
     return d
 
 
@@ -167,8 +181,7 @@ def graph_dir() -> Path:
     raw = os.environ.get("EMAIL_MCP_GRAPH_DIR", "").strip()
     d = Path(raw).expanduser() if raw else Path.home() / ".email-mcp" / "graph"
     d.mkdir(parents=True, exist_ok=True)
-    d.parent.chmod(0o700)
-    d.chmod(0o700)
+    _lock_down(d, bool(raw))
     return d
 
 
@@ -183,8 +196,7 @@ def plans_dir() -> Path:
     raw = os.environ.get("EMAIL_MCP_PLANS_DIR", "").strip()
     d = Path(raw).expanduser() if raw else Path.home() / ".email-mcp" / "plans"
     d.mkdir(parents=True, exist_ok=True)
-    d.parent.chmod(0o700)
-    d.chmod(0o700)
+    _lock_down(d, bool(raw))
     return d
 
 
@@ -235,8 +247,7 @@ def fts_dir(create: bool = True) -> Path:
     d = Path(raw).expanduser() if raw else Path.home() / ".email-mcp" / "fts"
     if create:
         d.mkdir(parents=True, exist_ok=True)
-        d.parent.chmod(0o700)
-        d.chmod(0o700)
+        _lock_down(d, bool(raw))
     return d
 
 
@@ -278,6 +289,15 @@ def fts_reconcile_days() -> int:
 # ---------------------------------------------------------------------- #
 
 
+class AuditDirRefused(OSError):
+    """The ledger directory resolves through a symlink we must not follow.
+
+    Raised only by ``audit_dir(create=True)``; ``audit.emit`` catches it
+    and drops the event with a warning, so a squatting link costs receipts
+    — never a mutation (contract §6, emit-failure policy).
+    """
+
+
 def audit_dir(create: bool = True) -> Path:
     """Root of the append-only audit ledger (monthly JSONL event files).
     Created 0700 like plans_dir — events carry recipients and subjects.
@@ -285,17 +305,32 @@ def audit_dir(create: bool = True) -> Path:
     Default ~/.email-mcp/audit, override with EMAIL_MCP_AUDIT_DIR. Pass
     create=False to resolve the path without touching the filesystem —
     read paths (query, --status) must never create the ledger directory.
+
+    Symlink discipline mirrors repairs' ``_tree_links``: mkdir and chmod
+    both resolve through a redirection, so a link squatting on the
+    DEFAULT path — the one path this package owns — is refused outright
+    (``AuditDirRefused``) rather than followed onto an arbitrary victim
+    directory. A link the operator named with EMAIL_MCP_AUDIT_DIR is
+    theirs to follow, but its target's mode is still not ours to set.
     """
     raw = os.environ.get("EMAIL_MCP_AUDIT_DIR", "").strip()
     d = Path(raw).expanduser() if raw else Path.home() / ".email-mcp" / "audit"
     if create:
+        linked = d.is_symlink()
+        if linked and not raw:
+            raise AuditDirRefused(
+                f"{d} is a symlink — refusing to create or chmod the ledger "
+                "through it; remove the link or set EMAIL_MCP_AUDIT_DIR"
+            )
         d.mkdir(parents=True, exist_ok=True)
-        if not raw:
+        if not raw and not d.parent.is_symlink():
             # Lock down ~/.email-mcp itself. An env-overridden dir's
             # parent is not ours to chmod (and may refuse — e.g. a
-            # root-owned temp root), which must never cost an event.
+            # root-owned temp root), which must never cost an event; a
+            # symlinked parent would land the chmod on its target.
             d.parent.chmod(0o700)
-        d.chmod(0o700)
+        if not linked:
+            d.chmod(0o700)
     return d
 
 

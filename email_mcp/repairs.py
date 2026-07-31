@@ -83,9 +83,15 @@ def _degenerate(path: Path) -> bool:
     Repairs never manage such a path: mkdir would scatter spool
     subdirectories through the home directory and chmod 0700 would
     retighten the home directory itself — neither is this fixer's to do.
+
+    Both sides go through ``os.path.realpath`` first: pathlib keeps
+    ``..`` segments and a leading ``//`` verbatim, so a raw value compare
+    waves ``$HOME/sub/..`` and ``//$HOME`` through while mkdir and chmod
+    land squarely on ``$HOME``.
     """
-    home = Path.home()
-    return path == home or path in home.parents
+    home = Path(os.path.realpath(Path.home()))
+    resolved = Path(os.path.realpath(path))
+    return resolved == home or resolved in home.parents
 
 
 def _state_dirs() -> list[Path]:
@@ -421,10 +427,10 @@ def _apply_stranded_sending() -> str:
     return "recovery pass: stranded claim(s) finalised (retries exhausted)"
 
 
-def _detect_stale_plan_claims() -> str | None:
+def _stale_plan_claim_ids() -> list[str]:
     root = _plans_root()
     if not root.is_dir():
-        return None
+        return []
     cutoff = ids.utcnow() - timedelta(
         seconds=2 * config.triage_ttl_seconds())
     stale: list[str] = []
@@ -436,6 +442,11 @@ def _detect_stale_plan_claims() -> str | None:
             continue
         if mtime < cutoff:
             stale.append(path.name[: -len(".json.applying")])
+    return stale
+
+
+def _detect_stale_plan_claims() -> str | None:
+    stale = _stale_plan_claim_ids()
     if not stale:
         return None
     return (f"{len(stale)} stale apply claim(s) in plans/: "
@@ -443,9 +454,14 @@ def _detect_stale_plan_claims() -> str | None:
 
 
 def _apply_stale_plan_claims() -> str:
-    removed = plans.gc()
-    return (f"plans.gc(): stale claim(s) finalised as failed "
-            f"(plan_finish on record); {removed} aged file(s) removed")
+    # SCOPED to the claims detect() found: an unscoped plans.gc() also
+    # prunes every *.json* older than 7 days in the plans dir, and with
+    # EMAIL_MCP_PLANS_DIR aimed at a directory the user keeps their own
+    # files in that is deleting user data — which this registry never does.
+    stale = _stale_plan_claim_ids()
+    plans.gc(plan_ids=stale)
+    return (f"plans.gc(): {len(stale)} stale claim(s) finalised as "
+            "failed (plan_finish on record)")
 
 
 # --------------------------------------------------------------------- #

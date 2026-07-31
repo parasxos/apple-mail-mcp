@@ -11,6 +11,7 @@ setup keeps working without a file.
 """
 from __future__ import annotations
 
+import re
 import tomllib
 from dataclasses import dataclass, field
 
@@ -18,11 +19,18 @@ from . import config
 from .transports import DRIVERS, SendError
 
 # TOML keys that map to Identity fields; everything else in a block is a
-# driver parameter and lands in `params`.
-_KNOWN_FIELDS = {
+# driver parameter and lands in `params`. Public because the setup wizard
+# validates against the same set — one definition, no drift.
+KNOWN_FIELDS = {
     "from_addr", "from_name", "driver", "allowlist", "allow_all", "bcc_self",
     "executor", "graph",
 }
+
+# An identity name is interpolated into graph/<name>.token.json
+# (graph._token_path), so it is a path-traversal fence, not cosmetics. The
+# setup wizard enforces it at write time; load() enforces it again because
+# identities.toml is a hand-editable file the wizard need never have seen.
+NAME_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
 
 # Schedule executors an identity may name: the local launchd spool
 # (default, universal) or Exchange-side deferred send via Microsoft Graph.
@@ -133,6 +141,14 @@ def load() -> tuple[dict[str, Identity], str]:
     identities: dict[str, Identity] = {}
     seen_from: dict[str, str] = {}
     for name, t in tables.items():
+        if not NAME_RE.fullmatch(name):
+            raise IdentityError(
+                f"{path}: identity name {name!r} must match "
+                f"{NAME_RE.pattern} — the name becomes "
+                "graph/<name>.token.json, so anything else escapes the "
+                "state dir. Rename the table (and any spool manifest that "
+                "referenced it)."
+            )
         from_addr = str(t.get("from_addr", "")).strip()
         if not from_addr:
             raise IdentityError(
@@ -190,7 +206,7 @@ def load() -> tuple[dict[str, Identity], str]:
             from_addr=from_addr,
             from_name=str(t.get("from_name", "")).strip(),
             driver=driver,
-            params={k: v for k, v in t.items() if k not in _KNOWN_FIELDS},
+            params={k: v for k, v in t.items() if k not in KNOWN_FIELDS},
             allowlist=allowlist,
             allow_all=bool(t.get("allow_all", False)),
             bcc_self=bool(t.get("bcc_self", True)),

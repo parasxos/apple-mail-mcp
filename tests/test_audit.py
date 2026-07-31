@@ -7,6 +7,7 @@ the autouse fixture below isolates every test in THIS file.
 from __future__ import annotations
 
 import json
+import logging
 import multiprocessing
 import os
 import random
@@ -154,6 +155,154 @@ def test_emit_file_and_dir_permissions(audit_dir_guard):
     assert len(files) == 1
     assert stat.S_IMODE(audit_dir_guard.stat().st_mode) == 0o700
     assert stat.S_IMODE(files[0].stat().st_mode) == 0o600
+
+
+# ---------------------------------------------------------------------- #
+# symlink discipline — the writer must never act through a redirection    #
+# ---------------------------------------------------------------------- #
+
+
+@pytest.fixture
+def email_mcp_warnings():
+    """The email_mcp logger has propagate=False (stdout is the wire), so
+    caplog never sees it — attach a collector directly."""
+    records: list[logging.LogRecord] = []
+
+    class _Collector(logging.Handler):
+        def emit(self, record):  # noqa: D102
+            if record.levelno >= logging.WARNING:
+                records.append(record)
+
+    handler = _Collector()
+    logging.getLogger("email_mcp").addHandler(handler)
+    yield records
+    logging.getLogger("email_mcp").removeHandler(handler)
+
+
+def _victim_dir(tmp_path: Path) -> tuple[Path, Path]:
+    """A 0755 directory holding one file, standing in for whatever a
+    planted link points at. Returns (dir, its file)."""
+    victim = tmp_path / "victim"
+    victim.mkdir()
+    keep = victim / "keep.txt"
+    keep.write_text("victim content")
+    victim.chmod(0o755)
+    return victim, keep
+
+
+def test_emit_refuses_symlinked_default_ledger_dir(tmp_path, monkeypatch,
+                                                   email_mcp_warnings):
+    """A link squatting on ~/.email-mcp/audit must cost the event, not the
+    victim: mkdir and chmod both follow it, so `doctor --fix` would have
+    tightened an arbitrary directory to 0700 and filed the ledger inside."""
+    monkeypatch.delenv("EMAIL_MCP_AUDIT_DIR", raising=False)
+    home = tmp_path / "home"
+    (home / ".email-mcp").mkdir(parents=True)
+    monkeypatch.setenv("HOME", str(home))
+    victim, keep = _victim_dir(tmp_path)
+    link = home / ".email-mcp" / "audit"
+    link.symlink_to(victim)
+
+    assert audit.emit("send", outcome="sent") is None  # dropped, no raise
+
+    assert stat.S_IMODE(victim.stat().st_mode) == 0o755
+    assert list(victim.glob("*.jsonl")) == []
+    assert sorted(p.name for p in victim.iterdir()) == ["keep.txt"]
+    assert keep.read_text() == "victim content"
+    assert link.is_symlink() and os.readlink(link) == str(victim)
+    # Degraded to a warning, never an exception (contract §6).
+    assert any("symlink" in r.getMessage() for r in email_mcp_warnings)
+
+
+def test_emit_refuses_symlinked_month_file(audit_dir_guard, tmp_path):
+    """Nobody but the writer names a YYYY-MM.jsonl, so a link there is a
+    squatter: O_NOFOLLOW must refuse it rather than append the event to
+    the target and fchmod the target to 0600."""
+    from email_mcp import ids
+
+    audit_dir_guard.mkdir(parents=True)
+    audit_dir_guard.chmod(0o700)
+    victim = tmp_path / "notes.txt"
+    victim.write_text("victim content")
+    victim.chmod(0o644)
+    month = audit_dir_guard / f"{ids.iso(ids.utcnow())[:7]}.jsonl"
+    month.symlink_to(victim)
+
+    assert audit.emit("send", outcome="sent") is None  # dropped, no raise
+
+    assert victim.read_text() == "victim content"
+    assert stat.S_IMODE(victim.stat().st_mode) == 0o644
+    assert month.is_symlink()
+
+
+def test_emit_chmods_the_fd_it_wrote_not_the_path(audit_dir_guard, tmp_path):
+    """0600 is set through the open fd, so a link swapped onto the month
+    path between the write and the chmod cannot redirect it — the window a
+    path-based chmod leaves to the second writer process."""
+    from email_mcp import ids
+
+    audit_dir_guard.mkdir(parents=True)
+    audit_dir_guard.chmod(0o700)
+    victim = tmp_path / "notes.txt"
+    victim.write_text("victim content")
+    victim.chmod(0o644)
+    month = audit_dir_guard / f"{ids.iso(ids.utcnow())[:7]}.jsonl"
+    real_write = os.write
+
+    def swapping_write(fd, data):
+        n = real_write(fd, data)
+        month.unlink()                 # the attacker's window
+        month.symlink_to(victim)
+        return n
+
+    os.write = swapping_write  # narrow window: only emit runs under it
+    try:
+        assert audit.emit("send", outcome="sent") is not None
+    finally:
+        os.write = real_write
+
+    assert stat.S_IMODE(victim.stat().st_mode) == 0o644
+    assert victim.read_text() == "victim content"
+
+
+def test_default_path_never_chmods_a_symlinked_state_root(tmp_path,
+                                                          monkeypatch):
+    """~/.email-mcp relocated with a link (a supported shape) is followed —
+    the ledger dir under it is ours to create 0700 — but chmod resolves
+    through the link, so the link's target keeps its own mode."""
+    monkeypatch.delenv("EMAIL_MCP_AUDIT_DIR", raising=False)
+    home = tmp_path / "home"
+    home.mkdir()
+    monkeypatch.setenv("HOME", str(home))
+    victim, keep = _victim_dir(tmp_path)
+    (home / ".email-mcp").symlink_to(victim)
+
+    assert audit.emit("send", outcome="sent") is not None
+
+    assert stat.S_IMODE(victim.stat().st_mode) == 0o755  # target untouched
+    assert keep.read_text() == "victim content"
+    ledger = victim / "audit"
+    assert stat.S_IMODE(ledger.stat().st_mode) == 0o700  # ours, so ours to set
+    assert len(_lines(ledger)) == 1
+
+
+def test_env_overridden_symlinked_dir_never_chmods_its_target(tmp_path,
+                                                              monkeypatch):
+    """An operator who points EMAIL_MCP_AUDIT_DIR at a link chose to follow
+    it, so the event still lands — but the mode of whatever it points at is
+    not ours to set (chmod resolves through the link)."""
+    target = tmp_path / "real-ledger"
+    target.mkdir()
+    target.chmod(0o755)
+    link = tmp_path / "link"
+    link.symlink_to(target)
+    monkeypatch.setenv("EMAIL_MCP_AUDIT_DIR", str(link))
+
+    assert audit.emit("send", outcome="sent") is not None
+    assert len(_lines(target)) == 1
+    assert stat.S_IMODE(target.stat().st_mode) == 0o755  # target untouched
+    files = list(target.glob("*.jsonl"))
+    assert stat.S_IMODE(files[0].stat().st_mode) == 0o600  # the file is ours
 
 
 def test_set_process_tags_src(audit_dir_guard):

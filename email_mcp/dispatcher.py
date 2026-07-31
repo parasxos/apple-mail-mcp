@@ -495,7 +495,12 @@ def _plist_content() -> str:
 
 def _remove_legacy_plists() -> list[str]:
     """Boot out and delete every LEGACY_LABELS agent. Returns the labels
-    actually found (loaded or on disk); best-effort, never raises."""
+    actually found (loaded or on disk). A launchctl that refuses or
+    reports nothing loaded is tolerated (returncode is only read as
+    "was it there"), but a MISSING launchctl raises OSError like every
+    other launchctl call here — callers must not report a removal they
+    could not verify, and both of ours (install_launchd's caller,
+    uninstall's agent loop) turn that into a reported failure."""
     uid = os.getuid()
     removed: list[str] = []
     for label in LEGACY_LABELS:

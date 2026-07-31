@@ -120,6 +120,21 @@ def _make_tree(home: Path) -> Path:
     return home / ".email-mcp"
 
 
+def _spell_home(home: Path, alias: str) -> str:
+    """$HOME written three ways. Only "plain" is what a value compare on
+    unresolved paths recognises: pathlib preserves a ".." segment and a
+    leading "//" verbatim, so the other two name the same directory while
+    reading as somewhere else entirely."""
+    if alias == "dotdot":
+        return f"{home}/sub/.."
+    if alias == "double-slash":
+        return f"/{home}"
+    return str(home)
+
+
+HOME_ALIASES = ("plain", "dotdot", "double-slash")
+
+
 def _plant_stranded(home: Path, minutes_ago: int = 30) -> str:
     """A claim abandoned in sending/ well past STALE_SENDING_MINUTES."""
     sid = "20260101T000000Z-deadbeef0001"
@@ -199,6 +214,33 @@ def test_state_file_perms_chmod_0600(home):
     for f in (ident, ledger, token):
         assert (f.stat().st_mode & 0o777) == 0o600, f
     assert "state_file_perms" in _applied_ids(result)
+
+
+# EMAIL_MCP_AUDIT_DIR is absent on purpose: config.audit_dir(create=True)
+# chmods the ledger dir 0700 whenever an event is written, so an audit
+# override at $HOME retightens the home directory no matter what this
+# registry decides — nothing here could prove the fence either way.
+@pytest.mark.parametrize("var", ("EMAIL_MCP_SPOOL_DIR", "EMAIL_MCP_PLANS_DIR",
+                                 "EMAIL_MCP_GRAPH_DIR"))
+@pytest.mark.parametrize("alias", HOME_ALIASES)
+def test_degenerate_override_at_home_however_spelled_is_dropped(
+    home, monkeypatch, var, alias,
+):
+    """A state dir pointed at $HOME is never managed here, and the three
+    spellings of $HOME are one fence: mkdir would scatter spool
+    subdirectories through the home directory and chmod 0700 would
+    retighten the home directory itself. The default tree still heals."""
+    home.chmod(0o755)
+    monkeypatch.setenv(var, _spell_home(home, alias))
+
+    result = repairs.run_fixes()
+    assert result["failed"] == []
+    assert (home.stat().st_mode & 0o777) == 0o755  # $HOME not retightened
+    assert not any((home / s).exists() for s in SPOOL_STATES)
+    real_home = Path(os.path.realpath(home))
+    assert not any(Path(os.path.realpath(d)) == real_home
+                   for d in repairs._state_dirs())
+    assert (home / ".email-mcp").is_dir()  # the default tree still healed
 
 
 # --------------------------------------------------------------------- #
@@ -399,3 +441,29 @@ def test_dry_run_touches_nothing(home, launchctl_shim):
     assert plist.read_text() == "stale"
     # detect may only PROBE launchd (print); never bootout/bootstrap.
     assert all(c.startswith("print") for c in _calls(launchctl_shim))
+
+
+def test_fix_pass_never_writes_the_ledger_through_a_symlinked_audit_dir(
+    home, launchctl_shim, tmp_path
+):
+    """The repair registry refuses to chmod through a symlinked state dir —
+    and the doctor_fix events RECORDING that refusal must not defeat it.
+    emit's own mkdir/chmod/open would otherwise follow the same link."""
+    victim = tmp_path / "victim"
+    victim.mkdir()
+    keep = victim / "keep.txt"
+    keep.write_text("victim content")
+    victim.chmod(0o755)
+    root = home / ".email-mcp"
+    root.mkdir()
+    (root / "audit").symlink_to(victim)
+
+    result = repairs.run_fixes()
+
+    assert (victim.stat().st_mode & 0o777) == 0o755   # never chmodded
+    assert sorted(p.name for p in victim.iterdir()) == ["keep.txt"]
+    assert keep.read_text() == "victim content"
+    assert (root / "audit").is_symlink()
+    # The pass still ran and still flagged the link, without a single event.
+    assert "state_dir_perms" in {f["repair"] for f in result["failed"]}
+    assert audit.query()["events"] == []

@@ -16,6 +16,7 @@ import json
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from typing import Iterable
 
 from . import audit, config, ids
 
@@ -170,15 +171,28 @@ def all_plans() -> list[Plan]:
     return out
 
 
-def gc(now: datetime | None = None) -> int:
+def gc(now: datetime | None = None,
+       plan_ids: Iterable[str] | None = None) -> int:
     """Housekeeping, called lazily from build_plan/apply_plan: drop plan
     files older than 7 days; finalise a stale .applying (crashed apply)
-    as failed after 2x TTL so its plan id stops reading as in-flight."""
+    as failed after 2x TTL so its plan id stops reading as in-flight.
+
+    ``plan_ids`` narrows the sweep to those plans' files and nothing
+    else. The whole-directory sweep is only ours to run when we own the
+    directory: EMAIL_MCP_PLANS_DIR can point at a dir the user also
+    keeps files in, so a caller that merely wants ITS OWN detected
+    claims finalised (repairs, via doctor --fix, which promises never to
+    delete user data) passes the ids it detected."""
     now = now or utcnow()
+    scope = None if plan_ids is None else set(plan_ids)
     removed = 0
     horizon = now - timedelta(days=7)
     stale = now - timedelta(seconds=2 * config.triage_ttl_seconds())
     for path in config.plans_dir().glob("*.json*"):
+        if scope is not None:
+            head, sep, _ = path.name.partition(".json")
+            if not sep or head not in scope:
+                continue
         try:
             mtime = datetime.fromtimestamp(path.stat().st_mtime, tz=timezone.utc)
         except OSError:
