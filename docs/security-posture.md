@@ -213,11 +213,17 @@ fully-composed outgoing messages with bodies and attachments; plans hold
 message metadata; the ledger holds recipients and subjects; the graph dir
 holds OAuth token caches that grant delegated mailbox access.
 
-**Since v0.11 there is exactly one configurable location for all of it.**
+**Since v0.11 there is exactly one configurable location for the state
+this tool generates.**
 `EMAIL_MCP_STATE_DIR` names a single root (default `~/.email-mcp`), and
 `spool`, `plans`, `graph`, `fts` and `audit` are derived from it as fixed
-leaf names. The five per-directory overrides are retired (§1.6.5). Only
-`attach_dir` sits outside — deliberately, under `$TMPDIR`, because
+leaf names. The five per-directory overrides are retired (§1.6.5).
+
+Three things sit outside the root, and saying so is part of the claim
+being true. `identities.toml` is CONFIG you author, with its own variable
+(`EMAIL_MCP_IDENTITIES`); `meta.json` is the install stamp and stays
+anchored at `~/.email-mcp` whatever the root is; and `attach_dir` sits
+outside — deliberately, under `$TMPDIR`, because
 materialised attachments are transient extracts the OS may reap, and
 folding them into the root would make `uninstall --purge` delete them and
 make them survive reboots.
@@ -341,7 +347,7 @@ changes **no** mode. The read-side guarantee is about state and modes; the
 log is neither, and this paragraph exists so nobody has to discover the
 difference by auditing.
 
-*Proven by* — `tests/test_config_state_dirs.py` (39 tests): created-only
+*Proven by* — `tests/test_config_state_dirs.py`: created-only
 modes, marker semantics, refusal without any filesystem effect (mode *and*
 contents unchanged), root/leaf symlink behaviour, read-side purity,
 `doctor --fix` repairing on request.
@@ -433,9 +439,11 @@ closed the `EMAIL_MCP_SPOOL_DIR=$HOME` case but **not** the worse one: the
 target itself was still chmodded, so pointing the override at `/Users`
 still produced `chmod 0700 /Users`. A release gate checked only the first
 scenario and reported the finding closed; it was not. The fence now also
-refuses outright — `config.StateDirRefused` is raised when an overridden
-state dir resolves to `$HOME` or above, comparing **resolved** paths so
-`$HOME/sub/..` and `//$HOME` cannot walk past it.
+refuses outright — `config.StateDirRefused` is raised when the state root
+resolves to `$HOME` or above, compared by **inode identity** (`st_dev`,
+`st_ino`) rather than by spelling, so `$HOME/sub/..`, `//$HOME`, case
+variants on APFS and the `/System/Volumes/Data` firmlink are all one
+fence.
 
 **It took three passes to actually close, and the record of that is part
 of the disclosure.** Pass one fenced four getters and missed

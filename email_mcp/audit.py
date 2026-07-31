@@ -265,8 +265,15 @@ def query(
         limit = 50
     limit = max(1, min(limit, 500))
 
-    root = config.audit_dir(create=False)
-    if not root.is_dir():
+    # A read must answer, never raise: an unreadable or refused root makes
+    # even the is_dir() probe throw (mode 000), and "no events" is the
+    # honest answer for a ledger this process cannot see.
+    try:
+        root = config.audit_dir(create=False)
+        readable = root.is_dir()
+    except OSError:
+        readable = False
+    if not readable:
         return {"events": [], "files_scanned": 0, "skipped_lines": 0}
 
     events: list[dict] = []
@@ -335,7 +342,12 @@ def tail(n: int = 20) -> list[dict]:
 
 def _print_status() -> None:
     root = config.audit_dir(create=False)
-    if not root.is_dir():
+    try:
+        readable = root.is_dir()
+    except OSError as e:
+        print(f"dir: {root} (unreadable: {e.strerror})")
+        return
+    if not readable:
         print(f"dir: {root} (absent — no events recorded yet)")
         return
     months = sorted(

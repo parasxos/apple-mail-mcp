@@ -56,15 +56,18 @@ iso = ids.iso
 new_id = ids.new_id
 
 
-def _paths(state: str, id: str) -> tuple[Path, Path]:
-    d = config.spool_dir() / state
+def _paths(state: str, id: str, *, create: bool = False) -> tuple[Path, Path]:
+    """Resolve one entry's (.eml, .json). create=False by DEFAULT: reading a
+    manifest must not materialise the spool tree, and load()/read_eml() are
+    reads. Only save() — which is about to write — passes create=True."""
+    d = config.spool_dir(create=create) / state
     return d / f"{id}.eml", d / f"{id}.json"
 
 
 def save(raw: bytes, entry: Entry) -> None:
     """Write .eml + .json into pending/ (tmp-then-rename, so a crashed
     writer never leaves a half-visible message)."""
-    eml, manifest = _paths("pending", entry.id)
+    eml, manifest = _paths("pending", entry.id, create=True)
     for path, data in ((eml, raw), (manifest, _dumps(entry))):
         tmp = path.with_suffix(path.suffix + ".tmp")
         tmp.write_bytes(data)
@@ -95,7 +98,13 @@ def entries(state: str) -> list[Entry]:
     # nothing, which is the honest answer for "what is queued".
     d = config.spool_dir(create=False) / state
     out = []
-    for manifest in sorted(d.glob("*.json")):
+    try:
+        manifests = sorted(d.glob("*.json"))
+    except OSError:
+        # Unreadable or refused root: a scan that cannot see the spool
+        # reports nothing rather than raising into a read tool.
+        return out
+    for manifest in manifests:
         try:
             out.append(Entry(**json.loads(manifest.read_bytes())))
         except (json.JSONDecodeError, TypeError, OSError):

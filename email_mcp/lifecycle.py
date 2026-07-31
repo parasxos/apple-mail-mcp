@@ -228,7 +228,10 @@ class StatePaths:
             audit=config.audit_dir(create=False),
             fts=config.fts_dir(create=False),
             identities=config.identities_file(),
-            meta=root / "meta.json",
+            # meta_path(), NOT root/"meta.json": meta.json is anchored to
+            # ~/.email-mcp (the install stamp), so reporting it under a
+            # relocated root named a file that does not exist.
+            meta=meta_path(),
             env_overrides=overrides,
         )
 
@@ -1581,10 +1584,10 @@ def uninstall_plan(purge: bool) -> dict:
         print_only.append(
             f"{graph_default} (symlink — token caches behind it are "
             "never followed; delete them yourself)")
-    elif graph_default.is_dir():
+    elif config.is_dir_safe(graph_default):
         for token in sorted(graph_default.glob("*.token.json")):
             remove.append(str(token))
-    if paths.graph != graph_default and paths.graph.is_dir():
+    if paths.graph != graph_default and config.is_dir_safe(paths.graph):
         for token in sorted(paths.graph.glob("*.token.json")):
             print_only.append(
                 f"{token} (EMAIL_MCP_STATE_DIR override — never removed; "

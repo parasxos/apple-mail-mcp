@@ -549,8 +549,12 @@ def uninstall_launchd() -> str:
 
 
 def status() -> dict:
+    # create=False: `--status` is a documented read-only overview. Resolving
+    # with create=True made *diagnosing* claim the state root — marker and
+    # all — so `doctor`'s honest "created on first use" depended on whether
+    # the user had run the overview first.
     return {
-        "spool": str(config.spool_dir()),
+        "spool": str(config.spool_dir(create=False)),
         "launchd_plist": str(_plist_path()),
         "launchd_installed": _plist_path().exists(),
         "counts": {s: len(spool.entries(s)) for s in spool.STATES},

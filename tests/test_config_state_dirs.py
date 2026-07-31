@@ -635,3 +635,161 @@ def test_a_missing_parent_is_refused_not_created_world_readable(
     deep.parent.mkdir(parents=True)
     root = config.state_root()
     assert _mode(root) == 0o700
+
+
+# --------------------------------------------------------------------- #
+# gate-4 round 3 — findings from the completed independent audits        #
+# --------------------------------------------------------------------- #
+
+
+def test_no_read_side_command_creates_or_marks_the_state_tree(
+        home, monkeypatch):
+    """MAJOR: `dispatcher --status` — a documented read-only overview —
+    resolved config.spool_dir() with create=True, so *diagnosing* claimed
+    the state root, marker and all. Three sibling leaks were found with
+    it: spool.load / read_eml, plans.load / all_plans / gc, and
+    fts._log_path (which built <root>/fts to format a plist string).
+
+    The whole read surface, in one place, so the next one cannot hide.
+    """
+    from email_mcp import (audit, dispatcher, doctor, fts, lifecycle,
+                           plans, server, spool)
+
+    dispatcher.status()
+    doctor.run()
+    audit.query()
+    fts.status()
+    fts._log_path()
+    for state in spool.STATES:
+        spool.entries(state)
+    spool.load("pending", "nope")
+    plans.all_plans()
+    plans.load("nope")
+    plans.gc(plan_ids=[])
+    lifecycle.StatePaths.resolve()
+    lifecycle.uninstall_plan(purge=True)
+    server.tool_list_scheduled()
+    server.tool_audit()
+
+    assert not (home / ".email-mcp").exists(), \
+        "a read-side operation created the state tree"
+
+
+def test_doctor_fix_never_chmods_an_identities_file_outside_the_root(
+        home, monkeypatch, tmp_path):
+    """MAJOR: EMAIL_MCP_IDENTITIES was entirely unfenced, and
+    `doctor --fix` chmodded whatever it named — measured on a decoy
+    ~/.zshrc going 644 -> 600. Naming a path as "my identities file" is
+    not consent to have its mode changed, and a stale or mistyped value
+    points it at something else entirely.
+
+    This was the last live instance of "email-mcp changed the mode of
+    something I did not name".
+    """
+    from email_mcp import repairs
+
+    decoy = home / ".zshrc"
+    decoy.write_text("export PATH=...\n")
+    decoy.chmod(0o644)
+    monkeypatch.setenv("EMAIL_MCP_IDENTITIES", str(decoy))
+
+    repairs.run_fixes()
+
+    assert _mode(decoy) == 0o644, "chmodded a file the user did not name"
+    assert decoy not in repairs._state_files()
+
+
+def test_doctor_fix_still_repairs_the_identities_file_inside_the_root(
+        home):
+    """The fence must be targeted, not a blanket opt-out: the real
+    identities.toml, in the managed root, is still repaired."""
+    from email_mcp import repairs
+
+    root = home / ".email-mcp"
+    root.mkdir()
+    ident = root / "identities.toml"
+    ident.write_text("default = 'x'\n")
+    ident.chmod(0o644)
+
+    result = repairs.run_fixes()
+
+    assert _mode(ident) == 0o600
+    assert "state_file_perms" in [a["repair"] for a in result["applied"]]
+
+
+def test_every_read_path_degrades_over_an_unreadable_root(
+        home, monkeypatch, tmp_path):
+    """MINOR: a mode-000 root made even the stat probes raise, so
+    audit.query, spool.entries, fts.status, plans.all_plans and
+    uninstall planning threw PermissionError out of functions documented
+    as total. A read must ANSWER."""
+    from email_mcp import (audit, dispatcher, doctor, fts, lifecycle,
+                           plans, server, spool)
+
+    root = tmp_path / "opaque"
+    root.mkdir()
+    (root / "foreign.txt").write_text("theirs")
+    root.chmod(0o000)
+    monkeypatch.setenv("EMAIL_MCP_STATE_DIR", str(root))
+    try:
+        assert "cannot be read" in (config.state_root_refusal() or "")
+        assert audit.query()["events"] == []
+        assert fts.status()["state"] == "absent"
+        assert plans.all_plans() == []
+        for state in spool.STATES:
+            assert spool.entries(state) == []
+        dispatcher.status()
+        lifecycle.uninstall_plan(purge=True)
+        assert doctor.run()["checks"]["state_root"]["ok"] is False
+        assert server.tool_audit()["ok"] is True
+    finally:
+        root.chmod(0o700)
+
+    assert (root / "foreign.txt").read_text() == "theirs"
+    assert sorted(p.name for p in root.iterdir()) == ["foreign.txt"]
+
+
+def test_a_default_root_that_is_a_regular_file_is_refused(home):
+    """MINOR: the `if not explicit: return None` short-circuit ran BEFORE
+    the non-directory check, so only an explicitly named root got it. A
+    stray file at ~/.email-mcp escaped as a raw NotADirectoryError from
+    whichever getter ran first."""
+    (home / ".email-mcp").write_text("i am a file")
+
+    reason = config.state_root_refusal()
+    assert reason is not None and "not a directory" in reason
+    for getter in LEAF_GETTERS:
+        with pytest.raises(config.StateDirRefused):
+            getattr(config, getter)()
+    assert (home / ".email-mcp").read_text() == "i am a file"
+
+
+def test_state_paths_reports_the_meta_json_that_is_actually_written(
+        home, monkeypatch, tmp_path):
+    """MINOR: StatePaths.resolve() reported <root>/meta.json while
+    write_meta() wrote ~/.email-mcp/meta.json, so with a relocated root
+    the reported path named a file that did not exist."""
+    from email_mcp import lifecycle
+
+    relocated = tmp_path / "elsewhere"
+    relocated.mkdir()
+    monkeypatch.setenv("EMAIL_MCP_STATE_DIR", str(relocated))
+    lifecycle.write_meta({"state_version": 1})
+
+    assert lifecycle.StatePaths.resolve().meta == lifecycle.meta_path()
+    assert lifecycle.StatePaths.resolve().meta.is_file()
+
+
+def test_the_migration_message_names_the_adoption_step(home, monkeypatch):
+    """MAJOR (usability): the runtime message told the user to move their
+    contents into the new root — which then makes it non-empty and
+    unmarked, and therefore refused. Following the message literally was
+    a dead end, and `doctor --fix` did not rescue it. The message now
+    names the marker and points at the full procedure."""
+    monkeypatch.setenv("EMAIL_MCP_SPOOL_DIR", "/tmp/whatever")
+
+    msg = config.retired_state_var_error()
+    assert msg is not None
+    assert config.STATE_MARKER in msg
+    assert "doctor --fix" in msg
+    assert "docs/reference.md" in msg

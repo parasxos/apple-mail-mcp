@@ -154,7 +154,14 @@ class FtsIndex:
             "last_sync_at": None,
             "last_reconcile_at": None,
         }
-        if not path.exists():
+        try:
+            present = path.exists()
+        except OSError:
+            # Unreadable or refused root: "not built" is the honest answer
+            # for an index this process cannot even stat (check_fts is a
+            # SOFT hook — index trouble must never redden doctor further).
+            present = False
+        if not present:
             out["remedy"] = "python -m email_mcp.fts --build"
             return out
         try:
@@ -602,7 +609,10 @@ def _plist_path() -> Path:
 
 
 def _log_path() -> Path:
-    return config.fts_dir().parent / "fts.log"
+    # create=False: this only renders a path into a plist. Creating here
+    # built <root>/fts — DERIVED state that only `--build` may create — and
+    # the root with it, as a side effect of formatting a string.
+    return config.fts_dir(create=False).parent / "fts.log"
 
 
 def _plist_content() -> str:

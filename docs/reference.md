@@ -266,9 +266,27 @@ default, or wherever `EMAIL_MCP_STATE_DIR` points:
 ├── graph/                  ← Graph OAuth token caches
 ├── fts/                    ← body index (built by `python -m email_mcp.fts --build`)
 ├── audit/                  ← append-only ledger, YYYY-MM.jsonl
-├── identities.toml         ← 0600 (path overridable with EMAIL_MCP_IDENTITIES)
-└── meta.json               ← 0600
+└── (see below — identities.toml and meta.json are NOT under the root)
 ```
+
+**Two files are deliberately not under the state root**, and the tool will
+not pretend otherwise:
+
+| File | Location | Why |
+|---|---|---|
+| `identities.toml` | `~/.email-mcp/identities.toml`, or wherever `EMAIL_MCP_IDENTITIES` points | Your sending configuration is not state the tool generates; it is config you author, with its own variable. |
+| `meta.json` | `~/.email-mcp/meta.json` — always, regardless of `EMAIL_MCP_STATE_DIR` | The install stamp records that setup ran on this machine, so it is anchored to the home directory, not to a relocatable data root. |
+
+So relocating the root relocates the **generated state** (spool, plans,
+graph, fts, audit) — not your identities file and not the install stamp.
+If you relocate the root and expect `identities.toml` to move with it, it
+will not; point `EMAIL_MCP_IDENTITIES` at the new location yourself.
+
+One consequence worth stating: `doctor --fix` will only chmod
+`identities.toml` when it sits inside a directory the tool manages (the
+default `~/.email-mcp`, or the configured root). A file named by
+`EMAIL_MCP_IDENTITIES` anywhere else is reported if its mode is loose, but
+never modified — naming a path is not consent to have its mode changed.
 
 `get_attachment` blobs are the one exception: they go to
 `$TMPDIR/email-mcp` (`EMAIL_MCP_ATTACH_DIR`), deliberately outside the

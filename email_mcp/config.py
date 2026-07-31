@@ -172,8 +172,12 @@ def retired_state_var_error() -> str | None:
         "telling you (scheduled mail would still be in the old directory, "
         "and nothing would be delivering it). Unset "
         f"{'it' if len(retired) == 1 else 'them'} and set "
-        "EMAIL_MCP_STATE_DIR to the parent directory instead, moving the "
-        "existing contents there first."
+        "EMAIL_MCP_STATE_DIR to the parent directory instead. Moving "
+        "existing contents into it makes that directory non-empty and "
+        "unmarked, which is refused in turn — adopt it deliberately by "
+        f"writing the {STATE_MARKER} marker, then run `email-mcp doctor "
+        "--fix` for the modes. Full procedure: docs/reference.md, "
+        "'Migrating from the per-directory variables'."
     )
 
 
@@ -200,8 +204,29 @@ def _is_home_or_above(d: Path) -> bool:
     return any(_is_same_dir(d, a) for a in home.resolve().parents)
 
 
+def is_dir_safe(p: Path) -> bool:
+    """`p.is_dir()` that cannot raise.
+
+    A refused or unreadable state root (mode 000) makes even a stat throw,
+    and read paths must ANSWER rather than raise — "not a directory I can
+    see" is the honest result. Used by every read-side probe that stats a
+    path derived from the root.
+    """
+    try:
+        return p.is_dir()
+    except OSError:
+        return False
+
+
 def _marked(root: Path) -> bool:
-    return (root / STATE_MARKER).is_file()
+    """True when the ownership marker is present. TOTAL: a root we cannot
+    stat into (mode 000) is simply "not marked" — this is consulted from
+    state_root_refusal(), which is documented pure and total, and an
+    unreadable root must produce a REFUSAL there, not a PermissionError."""
+    try:
+        return (root / STATE_MARKER).is_file()
+    except OSError:
+        return False
 
 
 def _mark(root: Path) -> None:
@@ -303,14 +328,19 @@ def state_root_refusal() -> str | None:
         return (f"{root} is your home directory or above it — refusing to "
                 "manage state there. Point EMAIL_MCP_STATE_DIR at a "
                 "directory of its own.")
+    # A non-directory squatting on the root is refused whether or not the
+    # user named it: the default ~/.email-mcp can be a stray file too, and
+    # that used to escape as a raw NotADirectoryError from the first getter
+    # rather than as a refusal.
+    if root.exists() and not root.is_dir() and not root.is_symlink():
+        return (f"{root} exists and is not a directory — refusing to manage "
+                "it. Move it aside, or point EMAIL_MCP_STATE_DIR at a "
+                "directory.")
     if not explicit:
-        # The DEFAULT root is never refused for its contents: ~/.email-mcp
+        # The DEFAULT root is never refused for its CONTENTS: ~/.email-mcp
         # predates the marker, and every v0.10 install has one full of our
         # own files. Adopting it is the upgrade path (see docs/reference).
         return None
-    if root.exists() and not root.is_dir() and not root.is_symlink():
-        return (f"{root} exists and is not a directory — refusing to manage "
-                "it. Point EMAIL_MCP_STATE_DIR at a directory.")
     if not root.exists() and not root.parent.is_dir():
         # We create the root, never a chain of directories above it: those
         # would land at the process umask (0755) and belong to nobody.

@@ -230,6 +230,36 @@ def _apply_state_dir_perms() -> str:
     return "chmod 0700: " + ", ".join(fixed)
 
 
+def _managed_identities_file() -> Path | None:
+    """The identities TOML, but ONLY when it is one of ours to mode.
+
+    EMAIL_MCP_IDENTITIES can name any path, and naming a file as "my
+    identities file" is not consent to have its mode changed — a stale or
+    mistyped value pointed `doctor --fix` at an arbitrary file and it
+    chmodded it 0600 (measured on a decoy ~/.zshrc: 644 -> 600). That was
+    the last live instance of the class v0.11 exists to remove: "email-mcp
+    changed the mode of something I did not name".
+
+    So the fixer touches it only inside a directory it manages — the
+    default ~/.email-mcp or the configured state root. Anywhere else,
+    `doctor` still REPORTS a loose mode on a credential-bearing file; it
+    just does not silently retighten a file of the user's own choosing.
+    """
+    ident = config.identities_file()
+    if not ident.is_file():
+        return None
+    owned = {Path.home() / ".email-mcp"}
+    if not config.state_root_refusal():
+        owned.add(config.state_root(create=False))
+    for parent in owned:
+        try:
+            if ident.parent.samefile(parent):
+                return ident
+        except OSError:
+            continue
+    return None
+
+
 def _state_files() -> list[Path]:
     """The secret-adjacent files the tree owns: the identities TOML,
     ledger months, Graph token caches. All must be 0600. A symlinked
@@ -238,12 +268,11 @@ def _state_files() -> list[Path]:
     the redirection (the symlinked-dir repair flags the root itself)."""
     links = _tree_links()
     files: list[Path] = []
-    ident = config.identities_file()
-    if ident.is_file() and not _off_limits(ident, links):
+    ident = _managed_identities_file()
+    if ident is not None and not _off_limits(ident, links):
         files.append(ident)
     if config.state_root_refusal():
         # A refused root owns no files either — same gate as _state_dirs.
-        # identities.toml stays: it is resolved independently of the root.
         return files
     for root, pattern in ((config.audit_dir(create=False), "*.jsonl"),
                           (_graph_root(), "*.token.json")):

@@ -68,12 +68,15 @@ iso = ids.iso
 new_id = ids.new_id
 
 
-def _path(plan_id: str) -> Path:
-    return config.plans_dir() / f"{plan_id}.json"
+def _path(plan_id: str, *, create: bool = False) -> Path:
+    """create=False by DEFAULT: resolving a plan's path is a read, and
+    load() must not materialise the plan store just to look for a file
+    that may not exist. Only save() — about to write — passes True."""
+    return config.plans_dir(create=create) / f"{plan_id}.json"
 
 
-def _claim_path(plan_id: str) -> Path:
-    return config.plans_dir() / f"{plan_id}.json.applying"
+def _claim_path(plan_id: str, *, create: bool = False) -> Path:
+    return config.plans_dir(create=create) / f"{plan_id}.json.applying"
 
 
 def _revive(data: dict) -> Plan:
@@ -84,7 +87,7 @@ def _revive(data: dict) -> Plan:
 
 
 def save(plan: Plan) -> None:
-    path = _path(plan.id)
+    path = _path(plan.id, create=True)
     tmp = path.with_suffix(path.suffix + ".tmp")
     tmp.write_bytes(json.dumps(asdict(plan), indent=2).encode())
     tmp.rename(path)
@@ -106,7 +109,7 @@ def claim(plan_id: str) -> Plan | None:
     already applied/finished, or unknown id (caller disambiguates via
     load()). A finished plan's file is renamed back untouched."""
     try:
-        _path(plan_id).rename(_claim_path(plan_id))
+        _path(plan_id).rename(_claim_path(plan_id, create=True))
     except FileNotFoundError:
         return None
     try:
@@ -163,7 +166,11 @@ def expire(plan: Plan) -> None:
 
 def all_plans() -> list[Plan]:
     out = []
-    for path in sorted(config.plans_dir().glob("*.json")):
+    try:
+        found = sorted(config.plans_dir(create=False).glob("*.json"))
+    except OSError:
+        return []
+    for path in found:
         try:
             out.append(_revive(json.loads(path.read_bytes())))
         except (json.JSONDecodeError, TypeError, OSError):
@@ -188,7 +195,10 @@ def gc(now: datetime | None = None,
     removed = 0
     horizon = now - timedelta(days=7)
     stale = now - timedelta(seconds=2 * config.triage_ttl_seconds())
-    for path in config.plans_dir().glob("*.json*"):
+    # create=False: a sweep over a store that does not exist finds
+    # nothing, which is the honest answer — it must not create the store
+    # in order to garbage-collect it.
+    for path in config.plans_dir(create=False).glob("*.json*"):
         if scope is not None:
             head, sep, _ = path.name.partition(".json")
             if not sep or head not in scope:
