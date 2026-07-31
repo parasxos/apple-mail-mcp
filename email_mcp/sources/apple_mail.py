@@ -1,7 +1,8 @@
 """Apple Mail source.
 
-Reads the Envelope Index SQLite database in immutable mode and resolves
-message bodies from `.emlx` files on demand. No writes. No network.
+Reads the Envelope Index SQLite database read-only (`mode=ro`, honoring
+WAL — see `_connect_readonly`) and resolves message bodies from `.emlx`
+files on demand. No writes. No network.
 
 Designed to be safe against the Mail.app version drift documented in the
 plan: every column we read is verified via PRAGMA at startup, and missing

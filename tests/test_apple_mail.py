@@ -216,14 +216,19 @@ def test_readonly_open_reads_wal_snapshot_beside_a_live_writer(tmp_path):
         ro = _connect_readonly(db)
         # Reads the last COMMITTED snapshot (1), not the writer's pending 2.
         assert [r[0] for r in ro.execute("SELECT x FROM t")] == [1]
-        # And it is genuinely read-only: writes are refused.
+        # And it is genuinely read-only: writes are refused. match= matters —
+        # the writer holds a transaction, so a bare OperationalError would also
+        # be satisfied by "database is locked", which is a different property.
         import pytest
-        with pytest.raises(sqlite3.OperationalError):
+        with pytest.raises(sqlite3.OperationalError, match="readonly"):
             ro.execute("INSERT INTO t VALUES (3)")
         ro.close()
         # After the writer commits, a fresh ro connection sees both rows —
         # the property freshness_snapshot() relies on.
         writer.commit()
+        # The rows live in the uncheckpointed -wal sidecar: this is precisely
+        # what `immutable=1` could not see, so it is the regression guard.
+        assert (tmp_path / "Envelope Index-wal").exists()
         ro2 = _connect_readonly(db)
         assert [r[0] for r in ro2.execute("SELECT x FROM t ORDER BY x")] == [1, 2]
         ro2.close()

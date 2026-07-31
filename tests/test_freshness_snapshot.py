@@ -18,7 +18,9 @@ def test_freshness_snapshot_reports_total_and_newest(mail_fixture):
     assert parsed.tzinfo is not None
     assert parsed == datetime.fromtimestamp(1714700000, tz=timezone.utc)
     assert snap["newest_subject"] == "EMCI production update"
-    assert "ops-bot@cern.ch" in snap["newest_from"]
+    # Exact, not substring: this is the only assertion anywhere pinning
+    # freshness_snapshot's "{comment} <{address}>" rendering.
+    assert snap["newest_from"] == "DCS Ops <ops-bot@cern.ch>"
 
 
 def test_freshness_snapshot_handles_empty_db(tmp_path):

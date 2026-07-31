@@ -321,16 +321,52 @@ def test_doctor_rejects_unknown_flags_exit_2(capsys):
     assert "email-mcp doctor" in capsys.readouterr().err
 
 
-def test_package_version_sources_agree():
-    """__init__.__version__ and pyproject's version must match — the CLI
-    reports __version__ on the documented bare-checkout path and stamps it
-    into meta.json (v0.11 audit finding F-NEW-2)."""
-    import re
+def _pyproject_text() -> str:
     from pathlib import Path
+
+    return (Path(__file__).resolve().parent.parent / "pyproject.toml").read_text()
+
+
+def test_pyproject_declares_no_second_version_literal():
+    """The version lives in exactly one place: email_mcp/__init__.py.
+
+    v0.11 audit finding F-NEW-2 was pyproject saying 0.11.0 while the module
+    said 0.10.0 — two literals for one fact, disagreeing precisely where it
+    is hardest to see (installed package vs bare checkout, then stamped into
+    ~/.email-mcp/meta.json). Asserting the two are *equal* would only detect
+    the drift; declaring the version dynamic makes it unrepresentable. This
+    test fails if anyone reintroduces the second literal.
+    """
+    import re
+
+    text = _pyproject_text()
+    assert not re.search(r'(?m)^version\s*=\s*"', text), (
+        "pyproject.toml has a hardcoded [project] version again — it must "
+        "stay dynamic and derive from email_mcp.__version__"
+    )
+    assert re.search(r'(?m)^dynamic\s*=\s*\[\s*"version"\s*\]', text)
+    assert re.search(r'(?m)^version\s*=\s*\{\s*attr\s*=\s*"email_mcp\.__version__"', text)
+
+
+def test_setuptools_expands_the_dynamic_version_to_the_module_literal():
+    """The declaration is not merely well-formed — setuptools really resolves
+    it, so the wheel metadata carries the module's literal."""
+    from pathlib import Path
+    import warnings
     import email_mcp
 
-    pyproject = (Path(__file__).resolve().parent.parent / "pyproject.toml").read_text()
-    m = re.search(r'^version = "([^"]+)"', pyproject, re.MULTILINE)
-    assert m, "no version in pyproject.toml"
-    assert email_mcp.__version__ == m.group(1), (
-        f"__init__.__version__={email_mcp.__version__} != pyproject {m.group(1)}")
+    root = Path(__file__).resolve().parent.parent
+    from setuptools.config.pyprojecttoml import read_configuration
+
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        cfg = read_configuration(root / "pyproject.toml", expand=True)
+    assert cfg["project"]["version"] == email_mcp.__version__
+
+
+def test_cli_version_reports_the_running_source_version(capsys):
+    """`email-mcp version` must report the version of the code executing."""
+    import email_mcp
+
+    assert cli.main(["version"]) == 0
+    assert f"email-mcp {email_mcp.__version__}" in capsys.readouterr().out

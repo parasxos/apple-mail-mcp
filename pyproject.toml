@@ -4,7 +4,13 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "email-mcp"
-version = "0.11.0"
+# Never hardcode the version here. It is derived from
+# email_mcp/__init__.py:__version__ (see [tool.setuptools.dynamic] below).
+# A literal in two places is exactly how 0.11.0-in-metadata /
+# 0.10.0-in-module happened, and the two disagree where it is hardest to
+# see: an installed package reports one number, a bare checkout the other,
+# and `email-mcp setup` stamps whichever it saw into ~/.email-mcp/meta.json.
+dynamic = ["version"]
 description = "Local MCP server exposing Apple Mail read access + guarded sending for Claude Code."
 readme = "README.md"
 requires-python = ">=3.10"
@@ -44,6 +50,12 @@ email-mcp = "email_mcp.cli:main"
 
 [tool.setuptools]
 packages = ["email_mcp", "email_mcp.sources", "email_mcp.transports"]
+
+[tool.setuptools.dynamic]
+# Build-time derivation: setuptools statically parses the literal out of
+# email_mcp/__init__.py and stamps it into the wheel metadata. No import,
+# so this resolves without the runtime dependencies installed.
+version = {attr = "email_mcp.__version__"}
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
