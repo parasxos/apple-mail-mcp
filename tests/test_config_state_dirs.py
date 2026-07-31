@@ -968,8 +968,11 @@ def test_dispatcher_status_says_so_when_the_root_is_refused(
 
     report = dispatcher.status()
 
-    assert report["counts"]["pending"] == 0          # honest scan…
-    assert report["counts_are_meaningful"] is False  # …but flagged
+    assert report["counts_are_meaningful"] is False
+    # counts are dropped, not left readable-as-zero: `jq .counts.pending`
+    # would otherwise still print 0 next to a flag it never looks at.
+    assert report["counts"] is None
+    assert report["pending"] == []
     assert "already contains files" in report["state_root_refused"]
 
 
@@ -991,3 +994,141 @@ def test_adopted_root_gets_a_version_stamp(home):
     meta = lifecycle.read_meta()
     assert meta["state_version"] == lifecycle.STATE_VERSION
     assert (root / "spool" / "pending" / "keep.json").exists()
+
+
+# --------------------------------------------------------------------- #
+# gate-4 round 5 — the two concurrent audits, second pair                #
+# --------------------------------------------------------------------- #
+
+
+def test_state_reporting_tools_flag_a_refused_root(home, monkeypatch,
+                                                   tmp_path):
+    """MAJOR: `list_scheduled` answered {"ok": true, "pending": []} against
+    a refused root — the same false-green as dispatcher --status, one layer
+    up, on the surface the MODEL and the user actually see when they ask
+    "is my mail queued?". config.py's own comment names list_scheduled as
+    the motivating example and then closed only the retired-variable
+    entry point.
+
+    Note this is deliberately NOT a blanket belt gate: tools that read
+    Apple Mail rather than our state are unaffected by a refused root and
+    must keep working.
+    """
+    from email_mcp import server
+
+    foreign = tmp_path / "foreign"
+    foreign.mkdir()
+    (foreign / "other-tool.db").write_text("theirs")
+    monkeypatch.setenv("EMAIL_MCP_STATE_DIR", str(foreign))
+
+    sched = server.tool_list_scheduled()
+    assert sched["counts_are_meaningful"] is False
+    assert "already contains files" in sched["state_root_refused"]
+
+    aud = server.tool_audit()
+    assert aud["events_are_complete"] is False
+    assert "state_root_refused" in aud
+
+
+def test_unreadable_manifests_make_dispatcher_counts_untrustworthy(home):
+    """MAJOR: a truncated manifest — what a crash or ENOSPC leaves
+    mid-save — is real queued mail that entries() skips. `--status` showed
+    `pending 0` at exit 0 and disagreed with doctor, which named it. The
+    counts lie for TWO reasons, and the fix had covered only the first."""
+    from email_mcp import dispatcher
+
+    (config.spool_dir() / "pending" / "truncated.json").write_text(
+        '{"id": "x1", "send_at":')
+
+    report = dispatcher.status()
+
+    assert report["counts_are_meaningful"] is False
+    assert report["counts"] is None
+    assert report["unreadable_manifests"]["pending"] == ["truncated.json"]
+
+
+def test_doctor_reports_a_symlinked_spool_state_subdir(home, tmp_path):
+    """MAJOR: with a link on <root>/spool/pending, every schedule_email is
+    refused — yet doctor certified the tree `ok`. The designated
+    pre-flight tool must not go green on a tree that cannot accept mail."""
+    from email_mcp import doctor
+
+    victim = tmp_path / "victim"
+    victim.mkdir()
+    root = config.state_root()
+    (root / "spool").mkdir()
+    (root / "spool" / "pending").symlink_to(victim)
+
+    check = doctor.check_spool_plans()
+
+    assert check["ok"] is False
+    assert "symlink" in check["detail"]
+    assert "scheduling will be refused" in check["detail"]
+
+
+def test_attach_dir_never_writes_through_a_symlink(home, tmp_path,
+                                                   monkeypatch):
+    """MINOR: _make_ours correctly declined to CHMOD a symlinked attach
+    dir, but the extracted attachment content still landed in the target.
+    "Never write through a link" is the rule everywhere else."""
+    victim = tmp_path / "victim"
+    victim.mkdir(mode=0o755)
+    link = tmp_path / "link"
+    link.symlink_to(victim)
+    monkeypatch.setenv("EMAIL_MCP_ATTACH_DIR", str(link))
+
+    with pytest.raises(config.StateDirRefused, match="symlink"):
+        config.attach_dir()
+
+    assert list(victim.iterdir()) == []
+    assert _mode(victim) == 0o755
+
+
+def test_identities_writer_creates_no_unnamed_parent_directories(
+        home, tmp_path, monkeypatch):
+    """MINOR: `parents=True` on an operator-named EMAIL_MCP_IDENTITIES
+    built every missing intermediate at the process umask — the shape
+    config._make_ours refuses and documents against. The DEFAULT path
+    inside ~/.email-mcp stays ours to create."""
+    from email_mcp import lifecycle
+
+    deep = tmp_path / "a" / "b" / "c" / "identities.toml"
+    monkeypatch.setenv("EMAIL_MCP_IDENTITIES", str(deep))
+
+    ident = {"work": {"from_addr": "a@b.c", "driver": "pipe",
+                      "command": "/usr/sbin/sendmail -t -i"}}
+    with pytest.raises(lifecycle.SetupError, match="does not exist"):
+        lifecycle.write_identities(ident, default="work")
+    assert not (tmp_path / "a").exists()
+
+
+def test_doctor_renders_oserrors_legibly_not_as_reprs(home, monkeypatch):
+    """MINOR: `check crashed: NotADirectoryError(20, 'Not a directory')`
+    named no path and offered no fix."""
+    from email_mcp import doctor
+
+    imposter = home / "regfile"
+    imposter.write_text("x")
+    monkeypatch.setenv("EMAIL_MCP_STATE_DIR", str(imposter))
+
+    report = doctor.run()
+    detail = report["checks"]["spool_plans"]["detail"]
+    assert "NotADirectoryError(" not in detail
+    assert "Not a directory" in detail
+
+
+def test_purge_counts_the_queued_mail_it_is_about_to_destroy(home):
+    """INFO->fixed: --purge warned about the audit ledger but deleted
+    undelivered mail without ever saying how much."""
+    from email_mcp import lifecycle, spool
+
+    entry = spool.Entry(
+        id="q1", send_at="2099-01-01T00:00:00+00:00",
+        created_at="2026-01-01T00:00:00+00:00", to=["a@b.c"], cc=[],
+        bcc=[], subject="REAL QUEUED", attachments=[], message_id="<m@x>")
+    spool.save(b"body", entry)
+
+    plan = lifecycle.uninstall_plan(purge=True)
+
+    assert any("still queued and undelivered" in line
+               for line in plan["remove"])

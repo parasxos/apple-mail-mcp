@@ -774,12 +774,24 @@ def tool_list_scheduled(state: str | None = None, limit: int = 50) -> dict:
         return {"ok": False, "code": codes.INVALID_INPUT,
                 "error": f"unknown state {state!r} (want one of {spool.STATES})"}
     out = {s: [_to_jsonable(e) for e in spool.entries(s)][-limit:] for s in states}
-    return {
+    result = {
         "ok": True,
         "dispatcher_installed": _plist_path().exists(),
         "dispatcher_label": LAUNCHD_LABEL,
         **out,
     }
+    # This tool ANSWERS "is my mail queued?", and spool.entries honestly
+    # returns [] for a spool it may not manage — so against a refused root
+    # the answer was a confident empty queue, indistinguishable from
+    # "nothing scheduled". The mail is real and undelivered. Say so.
+    # (Same shape as dispatcher.status(); a blanket belt gate would be
+    # wrong — tools that read Apple Mail, not our state, are unaffected by
+    # a refused root and must keep working.)
+    refusal = config.state_root_refusal()
+    if refusal is not None:
+        result["state_root_refused"] = refusal
+        result["counts_are_meaningful"] = False
+    return result
 
 
 def _triage_err(e: TriageError) -> dict:
@@ -1073,7 +1085,15 @@ def tool_audit(
     out = audit.query(since=since, until=until, tool=tool, event=event,
                       plan_id=plan_id, operation_id=operation_id,
                       limit=limit)
-    return {"ok": True, **out}
+    result = {"ok": True, **out}
+    # Same rule as list_scheduled: an empty ledger and an UNREADABLE ledger
+    # must not look alike. Costs receipts rather than mail, so the query
+    # still answers — it just stops implying the ledger is empty.
+    refusal = config.state_root_refusal()
+    if refusal is not None:
+        result["state_root_refused"] = refusal
+        result["events_are_complete"] = False
+    return result
 
 
 # ---------------------------------------------------------------------- #

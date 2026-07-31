@@ -261,6 +261,35 @@ COMMANDS: dict[str, Callable[[list[str]], int]] = {
 }
 
 
+_HELP = """usage: email-mcp [subcommand] [options]
+
+Local MCP server for Apple Mail. With no arguments it serves the MCP
+stdio protocol (this is what a client registration invokes).
+
+subcommands:
+  serve       run the MCP stdio server (same as bare `email-mcp`)
+  setup       first-run wizard: permissions, state tree, identity, agents
+  doctor      run every diagnostic check; --fix repairs the safe ones,
+              --fix --dry-run reports them and touches nothing
+  update      re-run setup steps against an existing install
+  uninstall   remove agents and token caches; --purge also deletes state
+  audit       read the append-only audit ledger
+  fts         build/sync/inspect the body index
+  graph       Microsoft Graph device-code auth and token cache
+  dispatcher  scheduled-send pass; --status for a spool overview
+  version     package version and on-disk state version
+
+Legacy server flags (--selftest, --send-test, --doctor, ...) are still
+forwarded verbatim: `email-mcp --selftest`.
+
+Full reference: docs/reference.md
+"""
+
+
+def _print_help() -> None:
+    print(_HELP, end="")
+
+
 def _unknown_command(cmd: str) -> int:
     """argparse-standard error (usage + invalid choice listing COMMANDS,
     exit 2) for a first token that is neither a flag nor a subcommand."""
@@ -291,6 +320,14 @@ def main(argv: list[str] | None = None) -> int:
             return 2
         if not argv:
             return _run_server([])
+        if argv[0] in ("-h", "--help"):
+            # Bare `email-mcp` serves, and a leading dash forwards to the
+            # server's legacy flag surface — but that made --help document
+            # a DIFFERENT program, listing --selftest/--send-test and no
+            # subcommands at all. An operator's first move on a broken
+            # machine has to be able to find `doctor`.
+            _print_help()
+            return 0
         if argv[0].startswith("-"):
             return _run_server(argv)
         handler = COMMANDS.get(argv[0])

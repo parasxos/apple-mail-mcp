@@ -912,6 +912,50 @@ exercised by `tests/test_config_state_dirs.py` (now 66 tests) and
 findings in this area survived earlier passes, and it is why every fix
 above ships with a test in that file.
 
+### v0.11 — sixth and seventh passes (a second concurrent pair)
+
+Both auditors returned FAIL again, and both MAJORs were the *sibling* of a
+defect the previous round had fixed on one branch only. That pattern is the
+lesson of this gate and is recorded as such:
+
+- **MAJOR — `list_scheduled` and `audit` reported confident empties against
+  a refused root.** Round five fixed `dispatcher --status`; the MCP tools —
+  the surface the model and the user actually see — still answered
+  `{"ok": true, "pending": []}`. `config.py`'s own comment names
+  `list_scheduled` as the motivating example and says the rejection "has to
+  fail closed on every entry point"; it had closed one. Both tools now
+  carry the refusal. Deliberately NOT a blanket belt gate: tools that read
+  Apple Mail rather than our state are unaffected by a refused root and
+  must keep working.
+- **MAJOR — an unreadable manifest still made `--status` lie.** The counts
+  can be wrong for TWO reasons — a root we may not manage, and manifests we
+  cannot parse — and the flag covered only the first. A truncated manifest
+  (what a crash or ENOSPC leaves mid-save) is real queued mail; `--status`
+  showed `pending 0`, exit 0, while `doctor` named it. `counts` is now
+  dropped to `null` rather than left readable-as-zero, and the exit is 1.
+- **MAJOR — `doctor` certified a symlinked spool state subdirectory as
+  healthy.** The write path refuses it (round five), so every
+  `schedule_email` failed — while the designated pre-flight tool said `ok`.
+  Fails closed, so no mail leaked; the defect was diagnostic blindness.
+- **MINOR — `attach_dir` wrote through a symlink.** `_make_ours` declined
+  to chmod the target, but the extracted attachment content still landed
+  inside it.
+- **MINOR — the identities writer created unnamed parents at umask.**
+  `parents=True` on an operator-named `EMAIL_MCP_IDENTITIES` built every
+  missing intermediate at 0755 — the shape `_make_ours` refuses. The
+  default path inside `~/.email-mcp` stays ours to create.
+- **MINOR — a default root that is a symlink TO A FILE tracebacked.** The
+  non-directory check exempted symlinks, so a link to a regular file
+  reached a bare `NotADirectoryError`. A link to a DIRECTORY still passes,
+  which is the relocation shape we mean to support.
+- **MINOR — `email-mcp --help` documented a different program**, printing
+  the server's legacy flags and listing no subcommands: an operator on a
+  broken machine could not discover `doctor` from the help.
+- **MINOR — `doctor` leaked exception reprs** (`check crashed:
+  NotADirectoryError(20, …)`), naming no path and offering no fix.
+- **INFO — `--purge` destroyed queued mail without counting it.** It warned
+  about the audit ledger; undelivered messages now get a count too.
+
 **Still open, deliberately:** the root TOCTOU (§0 boundary — a local
 attacker with write access to the root's parent can swap a symlink between
 the refusal check and the mkdir; cost is one stray 0600 dotfile, no mode

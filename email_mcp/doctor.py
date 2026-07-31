@@ -301,6 +301,19 @@ def check_spool_plans() -> dict:
             problems.append(f"{label} dir {d} is mode {mode:o} (want 700)")
             fixes.append(f"chmod 700 {d}")
 
+    # A symlink on one of the five spool state subdirectories is refused at
+    # write time (config.spool_dir), so scheduling fails outright — but
+    # this check never looked, and reported green. The designated
+    # pre-flight tool must not certify a tree that cannot accept mail.
+    linked = [str(spool_root / sub) for sub in spool.STATES
+              if (spool_root / sub).is_symlink()]
+    if linked:
+        problems.append(
+            "spool state dir(s) are symlinks, so scheduling will be refused: "
+            + ", ".join(linked))
+        fixes.append("remove the link(s), or relocate the whole tree with "
+                     "EMAIL_MCP_STATE_DIR")
+
     counts = {s: len(spool.entries(s)) for s in spool.STATES}
     # entries() skips a manifest it cannot parse so a foreign file never
     # breaks a read — but a silent skip made "pending 0" mean both "nothing
@@ -573,6 +586,16 @@ def _guarded(name: str, fn) -> dict:
     that blows up becomes a red entry, never a crashed tool."""
     try:
         return fn()
+    except OSError as e:
+        # An OSError has a readable story (strerror + filename); the bare
+        # repr — "check crashed: NotADirectoryError(20, 'Not a directory')"
+        # — told an operator nothing and named no path.
+        _log.exception("doctor: check %s failed", name)
+        where = f" ({e.filename})" if getattr(e, "filename", None) else ""
+        return {"ok": False,
+                "detail": f"{e.strerror or e}{where}",
+                "fix": "run `email-mcp doctor` again after fixing the path "
+                       "above; `--fix` repairs the safe cases"}
     except Exception as e:
         _log.exception("doctor check %s crashed", name)
         return {"ok": False, "detail": f"check crashed: {e!r}"}

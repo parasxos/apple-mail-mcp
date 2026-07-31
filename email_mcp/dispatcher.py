@@ -581,9 +581,24 @@ def status() -> dict:
             for e in spool.entries("pending")
         ],
     }
+    # Two independent ways the counts can lie, and BOTH must flag: a root
+    # we may not manage (above), and manifests we could not parse. A
+    # truncated manifest — what a crash or ENOSPC leaves mid-save — is real
+    # queued mail that entries() skips, so `pending 0` meant "nothing
+    # queued" and "a message we cannot read" alike. doctor named these
+    # already; the command an operator actually runs did not.
+    unreadable = {st: spool.unreadable(st) for st in spool.STATES}
+    unreadable = {st: names for st, names in unreadable.items() if names}
+    if refusal is not None or unreadable:
+        out["counts_are_meaningful"] = False
+        # Drop the zeros rather than leave `jq .counts.pending` reading 0
+        # next to a flag it will not look at.
+        out["counts"] = None
+        out["pending"] = []
     if refusal is not None:
         out["state_root_refused"] = refusal
-        out["counts_are_meaningful"] = False
+    if unreadable:
+        out["unreadable_manifests"] = unreadable
     return out
 
 
@@ -606,11 +621,17 @@ def main() -> int:
         report = status()
         json.dump(report, sys.stdout, indent=2)
         sys.stdout.write("\n")
-        if report.get("state_root_refused"):
-            print(f"email-mcp dispatcher: {report['state_root_refused']}",
-                  file=sys.stderr)
-            print("email-mcp dispatcher: the counts above are NOT "
-                  "meaningful — run `email-mcp doctor`.", file=sys.stderr)
+        if report.get("counts_are_meaningful") is False:
+            if report.get("state_root_refused"):
+                print(f"email-mcp dispatcher: "
+                      f"{report['state_root_refused']}", file=sys.stderr)
+            if report.get("unreadable_manifests"):
+                for st, names in sorted(report["unreadable_manifests"].items()):
+                    print(f"email-mcp dispatcher: {st}/: cannot read "
+                          f"{', '.join(sorted(names))} — queued mail may be "
+                          "present but uncounted", file=sys.stderr)
+            print("email-mcp dispatcher: the counts are NOT meaningful — "
+                  "run `email-mcp doctor`.", file=sys.stderr)
             return 1
         return 0
     if args.install_launchd:

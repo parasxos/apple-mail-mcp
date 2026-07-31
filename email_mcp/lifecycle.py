@@ -178,6 +178,9 @@ def write_meta(meta: dict) -> Path:
     """Write meta.json atomically: tmp in the same directory, chmod 0600,
     then rename over the target (the graph token-cache discipline)."""
     path = meta_path()
+    # ~/.email-mcp is a directory we name and own, so creating it here is
+    # ours to do (unlike an operator-named EMAIL_MCP_IDENTITIES path — see
+    # write_identities).
     path.parent.mkdir(parents=True, exist_ok=True)
     path.parent.chmod(0o700)
     tmp = path.with_name(f"{path.name}.{os.getpid()}.tmp")
@@ -552,7 +555,19 @@ def write_identities(
             n += 1
         shutil.copy2(path, backup)  # mode-preserved backup BEFORE clobber
 
-    path.parent.mkdir(parents=True, exist_ok=True)
+    # The DEFAULT identities path lives in ~/.email-mcp, which is ours to
+    # create. An operator-named EMAIL_MCP_IDENTITIES is not: `parents=True`
+    # there built every missing intermediate at the process umask —
+    # directories the user never named, made by a mail tool, at 0755. That
+    # is exactly the shape config._make_ours refuses.
+    default_parent = Path.home() / ".email-mcp"
+    if path.parent == default_parent:
+        path.parent.mkdir(parents=True, exist_ok=True)
+    elif not path.parent.is_dir():
+        raise SetupError(
+            f"{path.parent} does not exist. Create it yourself, or point "
+            "EMAIL_MCP_IDENTITIES inside an existing directory."
+        )
     tmp = path.with_name(f"{path.name}.{os.getpid()}.tmp")
     tmp.write_text(text, encoding="utf-8")
     tmp.chmod(0o600)
@@ -1594,8 +1609,22 @@ def uninstall_plan(purge: bool) -> dict:
                 "delete it yourself)")
 
     if purge:
+        queued = 0
+        try:
+            from . import spool as _spool
+            queued = sum(len(_spool.entries(st))
+                         for st in ("pending", "sending"))
+        except Exception:      # never let a count block the plan
+            queued = 0
+        note = ""
+        if queued:
+            # The ledger already gets an export warning; mail that has not
+            # been SENT yet deserves at least a count, or --purge silently
+            # destroys it.
+            note = (f" — INCLUDING {queued} message(s) still queued and "
+                    "undelivered")
         remove.append(f"{root} (state tree: spool, plans, audit ledger, "
-                      "identities.toml, meta.json)")
+                      f"identities.toml, meta.json){note}")
         logs_dir = _logs_dir()
         if logs_dir.is_symlink():
             print_only.append(

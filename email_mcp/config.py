@@ -346,10 +346,16 @@ def state_root_refusal() -> str | None:
     # user named it: the default ~/.email-mcp can be a stray file too, and
     # that used to escape as a raw NotADirectoryError from the first getter
     # rather than as a refusal.
-    if root.exists() and not root.is_dir() and not root.is_symlink():
-        return (f"{root} exists and is not a directory — refusing to manage "
-                "it. Move it aside, or point EMAIL_MCP_STATE_DIR at a "
-                "directory.")
+    if root.exists() and not root.is_dir():
+        # is_symlink() is deliberately NOT an exemption here: a link that
+        # resolves to a regular FILE is still "not a directory", and
+        # excluding links let it through to a bare NotADirectoryError from
+        # the first mkdir. A link to a DIRECTORY passes is_dir() and stays
+        # supported (relocation), which is the shape we mean to allow.
+        via = " (via a symlink)" if root.is_symlink() else ""
+        return (f"{root} exists and is not a directory{via} — refusing to "
+                "manage it. Move it aside, or point EMAIL_MCP_STATE_DIR at "
+                "a directory.")
     if not root.exists() and root.is_symlink():
         # A dangling link is neither refused nor usable: the guards here are
         # gated on exists(), which is False for a broken link, so the tool
@@ -530,6 +536,15 @@ def attach_dir() -> Path:
         raise StateDirRefused(
             f"{d} is your home directory or above it — refusing to write "
             "attachments there."
+        )
+    if d.is_symlink():
+        # Never write through a link — the rule every other managed path
+        # enforces. _make_ours correctly declines to CHMOD the target, but
+        # the extracted attachment content still landed inside it.
+        raise StateDirRefused(
+            f"{d} is a symlink — refusing to write attachments through it. "
+            "Remove the link, or point EMAIL_MCP_ATTACH_DIR at a real "
+            "directory."
         )
     if not d.exists() and not d.parent.is_dir():
         # §1.7, degradation not tracebacks: the same shape on the state root
