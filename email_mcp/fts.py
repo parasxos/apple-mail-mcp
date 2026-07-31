@@ -664,10 +664,13 @@ def install_launchd() -> str:
 
 def uninstall_launchd() -> str:
     plist = _plist_path()
+    existed = plist.exists()   # report what happened, not what was intended
     subprocess.run(["launchctl", "bootout", f"gui/{os.getuid()}", str(plist)],
                    capture_output=True)
     if plist.exists():
         plist.unlink()
+    if not existed:
+        return f"no {LAUNCHD_LABEL} agent installed (nothing to remove)"
     return f"removed {LAUNCHD_LABEL}"
 
 

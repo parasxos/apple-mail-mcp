@@ -235,6 +235,12 @@ def _mark(root: Path) -> None:
     import json
 
     marker = root / STATE_MARKER
+    if marker.is_symlink():
+        # _marked() reads False for a DANGLING link (is_file() is False), so
+        # we would arrive here and write_text() would follow it — stamping a
+        # 0600 file wherever it pointed, outside the root we are adopting.
+        # Same rule as every managed path: never write through a link.
+        return
     try:
         marker.write_text(json.dumps(
             {"tool": "email-mcp", "root_version": STATE_ROOT_VERSION}) + "\n")
@@ -479,8 +485,23 @@ def spool_dir(create: bool = True) -> Path:
     if create:
         for sub in ("pending", "sending", "sent", "failed", "cancelled"):
             s = d / sub
-            if not s.is_symlink():
-                _make_ours(s)
+            if s.is_symlink():
+                # REFUSE, do not skip. Skipping recognised the squat and
+                # then used it: spool_dir() returned normally, the link
+                # stayed live, and spool.save() wrote the frozen RFC-822
+                # message AND its manifest — full body, recipients,
+                # subject — into whatever the link pointed at, with doctor
+                # reporting green. The leaf one level up is refused for
+                # exactly this reason; these five are where the mail
+                # actually lands, so they need the same rule, not a
+                # weaker one.
+                raise StateDirRefused(
+                    f"{s} is a symlink — refusing to create state or set "
+                    "modes through it. Outgoing mail is written here. "
+                    "Remove the link, or relocate the whole root with "
+                    "EMAIL_MCP_STATE_DIR."
+                )
+            _make_ours(s)
     return d
 
 
@@ -509,6 +530,15 @@ def attach_dir() -> Path:
         raise StateDirRefused(
             f"{d} is your home directory or above it — refusing to write "
             "attachments there."
+        )
+    if not d.exists() and not d.parent.is_dir():
+        # §1.7, degradation not tracebacks: the same shape on the state root
+        # is a refusal with a fix, and _make_ours catches only
+        # FileExistsError, so this used to escape as a bare FileNotFoundError.
+        raise StateDirRefused(
+            f"{d.parent} does not exist, so {d} cannot be created. Create "
+            "the parent yourself, or point EMAIL_MCP_ATTACH_DIR inside an "
+            "existing directory."
         )
     _make_ours(d)
     return d

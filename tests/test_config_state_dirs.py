@@ -847,3 +847,147 @@ def test_the_ownership_marker_is_held_to_0600(home):
     repairs.run_fixes()
 
     assert _mode(marker) == 0o600
+
+
+# --------------------------------------------------------------------- #
+# gate-4 round 4 — two concurrent independent audits                     #
+# --------------------------------------------------------------------- #
+
+
+@pytest.mark.parametrize("sub", ("pending", "sending", "sent", "failed",
+                                 "cancelled"))
+def test_symlinked_spool_state_subdir_is_refused(home, tmp_path, sub):
+    """MAJOR: the five spool state subdirectories are where outgoing mail
+    actually lands, and a symlink on one was RECOGNISED AND SKIPPED rather
+    than refused — `if not s.is_symlink(): _make_ours(s)`. spool_dir()
+    returned normally, the link stayed live, and spool.save() wrote the
+    frozen RFC-822 message AND its manifest — full body, recipients,
+    subject — into whatever the link pointed at, with doctor green.
+
+    The leaf one level up is refused for exactly this reason. These five
+    needed the same rule, not a weaker one.
+    """
+    victim = tmp_path / "victim"
+    victim.mkdir(mode=0o755)
+    (victim / "keep.txt").write_text("theirs")
+    root = home / ".email-mcp"
+    (root / "spool").mkdir(parents=True)
+    (root / "spool" / sub).symlink_to(victim)
+
+    with pytest.raises(config.StateDirRefused, match="symlink"):
+        config.spool_dir()
+
+    assert sorted(p.name for p in victim.iterdir()) == ["keep.txt"]
+    assert _mode(victim) == 0o755
+
+
+def test_no_outgoing_mail_can_be_written_through_a_spool_symlink(
+        home, tmp_path):
+    """The same defect at the layer that matters: prove the message bytes
+    cannot reach the victim, not merely that a getter raises."""
+    from email_mcp import spool
+
+    victim = tmp_path / "victim"
+    victim.mkdir()
+    root = home / ".email-mcp"
+    (root / "spool").mkdir(parents=True)
+    (root / "spool" / "pending").symlink_to(victim)
+
+    entry = spool.Entry(
+        id="abc123", send_at="2099-01-01T00:00:00+00:00",
+        created_at="2026-01-01T00:00:00+00:00", to=["victim@example.org"],
+        cc=[], bcc=[], subject="SECRET SUBJECT", attachments=[],
+        message_id="<m@x>")
+    with pytest.raises(config.StateDirRefused):
+        spool.save(b"From: me\nSubject: SECRET SUBJECT\n\nbody bytes", entry)
+
+    assert list(victim.iterdir()) == []
+
+
+def test_marker_is_never_written_through_a_dangling_symlink(
+        home, tmp_path):
+    """MINOR: _marked() reads False for a DANGLING link (is_file() is
+    False), so state_root() went on to _mark(), whose write_text followed
+    the link and stamped a 0600 file outside the root being adopted."""
+    outside = tmp_path / "outside-file"
+    root = home / ".email-mcp"
+    root.mkdir()
+    config.marker_path(root).symlink_to(outside)
+
+    config.state_root()
+
+    assert not outside.exists(), "wrote the marker through a link"
+
+
+def test_attach_dir_refuses_a_missing_parent_instead_of_tracebacking(
+        home, tmp_path):
+    """MINOR: the identical shape on the state root is a legible refusal,
+    but attach_dir raised a bare FileNotFoundError — _make_ours catches
+    only FileExistsError. §1.7: degradation, not tracebacks."""
+    import os as _os
+
+    _os.environ["EMAIL_MCP_ATTACH_DIR"] = str(tmp_path / "no" / "such" / "att")
+    try:
+        with pytest.raises(config.StateDirRefused, match="does not exist"):
+            config.attach_dir()
+    finally:
+        del _os.environ["EMAIL_MCP_ATTACH_DIR"]
+    assert not (tmp_path / "no").exists()
+
+
+def test_unreadable_manifests_are_reported_not_silently_dropped(home):
+    """MINOR: entries() skipped a manifest it could not parse with no
+    counter and no warning, so `pending 0` meant BOTH "nothing queued" and
+    "a queued message we cannot read" — indistinguishable to the operator
+    asking where their mail went."""
+    from email_mcp import doctor, spool
+
+    pending = config.spool_dir() / "pending"
+    (pending / "bad.json").write_text('{"id": "x", "to": ["a@b.c"]}')
+
+    assert spool.entries("pending") == []          # scan still survives
+    assert spool.unreadable("pending") == ["bad.json"]
+
+    check = doctor.check_spool_plans()
+    assert check["ok"] is False
+    assert "unreadable manifest" in check["detail"]
+    assert "bad.json" in check["detail"]
+
+
+def test_dispatcher_status_says_so_when_the_root_is_refused(
+        home, monkeypatch, tmp_path):
+    """MAJOR: `--status` is the command an operator runs to ask "is my
+    queued mail moving?". Against a root doctor refuses it exited 0 with a
+    serene `"pending": 0` — indistinguishable from "nothing queued"."""
+    from email_mcp import dispatcher
+
+    foreign = tmp_path / "foreign"
+    foreign.mkdir()
+    (foreign / "theirs.txt").write_text("not ours")
+    monkeypatch.setenv("EMAIL_MCP_STATE_DIR", str(foreign))
+
+    report = dispatcher.status()
+
+    assert report["counts"]["pending"] == 0          # honest scan…
+    assert report["counts_are_meaningful"] is False  # …but flagged
+    assert "already contains files" in report["state_root_refused"]
+
+
+def test_adopted_root_gets_a_version_stamp(home):
+    """MINOR: adoption via `doctor --fix` (or the documented migration)
+    wrote the ownership marker but never a meta.json, while a fresh setup
+    always does — leaving every UPGRADED user unstamped, which is exactly
+    the population a future state_version migration must identify."""
+    from email_mcp import lifecycle, repairs
+
+    root = home / ".email-mcp"
+    (root / "spool" / "pending").mkdir(parents=True, mode=0o755)
+    (root / "spool" / "pending" / "keep.json").write_text("{}")
+    root.chmod(0o755)
+
+    result = repairs.run_fixes()
+
+    assert "meta_missing" in [a["repair"] for a in result["applied"]]
+    meta = lifecycle.read_meta()
+    assert meta["state_version"] == lifecycle.STATE_VERSION
+    assert (root / "spool" / "pending" / "keep.json").exists()

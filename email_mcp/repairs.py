@@ -330,6 +330,43 @@ def _apply_state_file_perms() -> str:
 
 
 # --------------------------------------------------------------------- #
+# repair 3b: meta.json missing on an adopted root                        #
+# --------------------------------------------------------------------- #
+
+
+def _detect_meta_missing() -> str | None:
+    """A root adopted by `doctor --fix` or by the documented migration got
+    the ownership marker but never a `meta.json`, while a fresh `setup`
+    always writes one. That left every UPGRADED user unstamped — precisely
+    the population a future state_version migration has to identify."""
+    if config.state_root_refusal():
+        return None
+    from . import lifecycle
+
+    root = _state_root()
+    if not root.is_dir():
+        return None                      # nothing adopted yet
+    if not config.marker_path(root).is_file():
+        return None                      # not ours; not our stamp to write
+    meta = lifecycle.meta_path()
+    if meta.exists():
+        return None
+    return f"{meta} is absent — this state tree carries no version stamp"
+
+
+def _apply_meta_missing() -> str:
+    from . import lifecycle
+
+    meta = lifecycle.read_meta()
+    now = ids.iso(ids.utcnow())
+    meta.setdefault("created_at", now)
+    meta["state_version"] = lifecycle.STATE_VERSION
+    meta["updated_at"] = now
+    path = lifecycle.write_meta(meta)
+    return f"wrote {path} (state_version {lifecycle.STATE_VERSION})"
+
+
+# --------------------------------------------------------------------- #
 # repair 4: a regular file squatting on the audit ledger directory       #
 # --------------------------------------------------------------------- #
 
@@ -528,6 +565,9 @@ REPAIRS: tuple[Repair, ...] = (
     Repair("state_file_perms",
            "tighten identities/ledger/token file modes to 0600",
            _detect_state_file_perms, _apply_state_file_perms),
+    Repair("meta_missing",
+           "stamp state_version into meta.json on an adopted root",
+           _detect_meta_missing, _apply_meta_missing),
     Repair("audit_path_is_file",
            "rename aside a file squatting on the audit ledger dir",
            _detect_audit_path_is_file, _apply_audit_path_is_file),

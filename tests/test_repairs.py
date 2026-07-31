@@ -27,6 +27,11 @@ from email_mcp import audit, dispatcher, ids, repairs, spool
 
 REPAIR_IDS = [
     "state_dir_missing", "state_dir_perms", "state_file_perms",
+    # meta_missing (v0.11): adoption via `doctor --fix` or the documented
+    # migration wrote the ownership marker but never a meta.json, leaving
+    # every UPGRADED user unstamped — the population a future
+    # state_version migration has to identify.
+    "meta_missing",
     "audit_path_is_file", "legacy_launchd", "launchd_stale",
     "stranded_sending", "stale_plan_claims",
 ]
@@ -469,7 +474,9 @@ def test_dry_run_touches_nothing(home, launchctl_shim):
                    "legacy_launchd", "launchd_stale"}
     healthy = {s["repair"] for s in result["skipped"]
                if s["reason"] == "healthy"}
-    assert healthy == {"stranded_sending", "stale_plan_claims"}
+    assert healthy == {"stranded_sending", "stale_plan_claims",
+                       # unmarked root in this fixture: not ours to stamp
+                       "meta_missing"}
     # Every finding is attached, nothing was touched:
     assert all(s["finding"] for s in result["skipped"]
                if s["repair"] in dry)

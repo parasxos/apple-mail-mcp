@@ -97,19 +97,38 @@ def entries(state: str) -> list[Entry]:
     # spool wherever the state root pointed. A missing dir simply globs to
     # nothing, which is the honest answer for "what is queued".
     d = config.spool_dir(create=False) / state
-    out = []
+    out: list[Entry] = []
+    unreadable: list[str] = []
     try:
         manifests = sorted(d.glob("*.json"))
     except OSError:
         # Unreadable or refused root: a scan that cannot see the spool
         # reports nothing rather than raising into a read tool.
+        unreadable_manifests[state] = []
         return out
     for manifest in manifests:
         try:
             out.append(Entry(**json.loads(manifest.read_bytes())))
         except (json.JSONDecodeError, TypeError, OSError):
-            continue  # half-written or foreign file; never crash the scan
+            # Never crash the scan — but never lose the fact either. A
+            # manifest that does not parse was silently dropped from every
+            # count, so `pending 0` was indistinguishable between "nothing
+            # queued" and "a message we cannot read". doctor surfaces this.
+            unreadable.append(manifest.name)
+            continue
+    unreadable_manifests[state] = unreadable
     return out
+
+
+# Names of manifests the last entries() scan could not parse, per state.
+# Read by doctor; deliberately not an exception — a foreign file in the
+# spool must not break a read, only be reported.
+unreadable_manifests: dict[str, list[str]] = {}
+
+
+def unreadable(state: str) -> list[str]:
+    """Manifests in `state` that entries() could not parse, newest scan."""
+    return list(unreadable_manifests.get(state, []))
 
 
 def find(id: str) -> tuple[str, Entry] | None:

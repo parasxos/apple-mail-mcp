@@ -302,6 +302,19 @@ def check_spool_plans() -> dict:
             fixes.append(f"chmod 700 {d}")
 
     counts = {s: len(spool.entries(s)) for s in spool.STATES}
+    # entries() skips a manifest it cannot parse so a foreign file never
+    # breaks a read — but a silent skip made "pending 0" mean both "nothing
+    # queued" and "a queued message we cannot read". Say which.
+    bad = {s: spool.unreadable(s) for s in spool.STATES}
+    bad = {s: names for s, names in bad.items() if names}
+    if bad:
+        total = sum(len(n) for n in bad.values())
+        where = "; ".join(f"{s}/: {', '.join(sorted(n))}"
+                          for s, n in sorted(bad.items()))
+        problems.append(f"{total} unreadable manifest(s) not counted above "
+                        f"({where})")
+        fixes.append("inspect those files; a half-written manifest can be "
+                     "removed, a foreign file does not belong in the spool")
     now = spool.utcnow()
     stranded: list[str] = []
     for e in spool.entries("sending"):

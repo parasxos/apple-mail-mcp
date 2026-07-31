@@ -857,6 +857,61 @@ Everything below was reproduced before it was fixed:
 - **INFO — `_MAX_ERROR_CHARS` measured bytes.** Renamed `_MAX_ERROR_BYTES`;
   behaviour was already correct.
 
+### v0.11 — fourth and fifth passes (two concurrent independent audits)
+
+Two auditors ran simultaneously against the same commit with different
+briefs — one on code and test quality, one on operator journeys. Both
+returned FAIL, with a different MAJOR each:
+
+- **MAJOR — a symlinked spool STATE SUBDIRECTORY was skipped, not
+  refused.** `spool_dir()` did `if not s.is_symlink(): _make_ours(s)` over
+  `pending/ sending/ sent/ failed/ cancelled/` — recognising the squat and
+  then using it. `spool.save()` wrote the frozen RFC-822 message *and* its
+  manifest — full body, recipients, subject — into whatever the link
+  pointed at, while `doctor` reported green. The leaf one level up
+  (`<root>/spool`) had been refused for exactly this reason since the
+  start; the five directories the mail actually lands in had the weaker
+  rule. Now refused, per-subdirectory, with a test for each.
+- **MAJOR — `dispatcher --status` was false-green against a refused root.**
+  It is the command an operator runs to ask "is my queued mail moving?",
+  and it exited 0 with `"pending": 0` for `$HOME`, a foreign directory, a
+  regular file, a dangling link, a missing parent and a 0300 root — six for
+  six — while `doctor` refused all six. The honest empty scan inherited the
+  silence without the guard's message. It now carries
+  `state_root_refused` + `counts_are_meaningful: false` and exits 1.
+- **MINOR — the marker was written THROUGH a dangling link.** `_marked()`
+  reads False for a broken link, so `_mark()` followed it and stamped a
+  0600 file outside the root being adopted.
+- **MINOR — unreadable manifests vanished from every count.** A `*.json`
+  in the spool that did not parse was skipped with no counter and no
+  warning, so `pending 0` meant both "nothing queued" and "a queued message
+  we cannot read". `doctor` now names them.
+- **MINOR — adoption never wrote `meta.json`.** A root adopted by
+  `doctor --fix` or by the documented migration carried the marker but no
+  version stamp, while a fresh `setup` always writes one — leaving exactly
+  the upgraded population a future `state_version` migration must identify
+  unstamped. New `meta_missing` repair.
+- **MINOR — `attach_dir` tracebacked on a missing parent** where the
+  identical shape on the root is a refusal.
+- **MINOR — `uninstall` claimed removals that never happened**, printing
+  "nothing found" and then "removed com.email-mcp.dispatcher".
+- **MINOR — `doctor --fix --dry-run` printed repairs and then "nothing to
+  fix"**, telling an operator both that there is work and that there is
+  none.
+
+One thing the audits *settled* rather than found: `spool.Entry` is
+field-identical between v0.10 and v0.11 (17 fields, zero diff), so a v0.10
+manifest — full or pre-0.7 shape — loads and counts correctly under v0.11.
+Had that not held, every upgraded user's queued mail would have reported as
+`pending 0`.
+
+The audits also measured the evidence base honestly: `tests/conftest.py`
+patches `config.state_root` for every test, so the real resolver is
+exercised by `tests/test_config_state_dirs.py` (now 66 tests) and
+`test_schema_snapshot.py` — not by all 635. That concentration is why
+findings in this area survived earlier passes, and it is why every fix
+above ships with a test in that file.
+
 **Still open, deliberately:** the root TOCTOU (§0 boundary — a local
 attacker with write access to the root's parent can swap a symlink between
 the refusal check and the mkdir; cost is one stray 0600 dotfile, no mode

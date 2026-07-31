@@ -98,7 +98,8 @@ def _render_fixes(before: dict, fixes: dict, after: dict) -> None:
     for s in fixes["skipped"]:
         if s.get("reason") != "healthy":
             print(f"skip   {s['repair']}: {s['reason']}")
-    if not (fixes["applied"] or fixes["failed"]):
+    would = [s for s in fixes["skipped"] if s.get("reason") != "healthy"]
+    if not (fixes["applied"] or fixes["failed"] or would):
         print("nothing to fix")
     _render_doctor(after)
 

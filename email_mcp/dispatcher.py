@@ -540,11 +540,20 @@ def install_launchd() -> str:
 def uninstall_launchd() -> str:
     removed_legacy = _remove_legacy_plists()
     plist = _plist_path()
+    # Report what actually happened. This said "removed <label>"
+    # unconditionally, so an uninstall that had just printed "nothing
+    # found" went on to claim two removals — self-contradictory, and it
+    # hides a bootout that silently did nothing.
+    existed = plist.exists()
     subprocess.run(["launchctl", "bootout", f"gui/{os.getuid()}", str(plist)],
                    capture_output=True)
     if plist.exists():
         plist.unlink()
     note = f" (+ legacy: {', '.join(removed_legacy)})" if removed_legacy else ""
+    if not existed and not removed_legacy:
+        return f"no {LAUNCHD_LABEL} agent installed (nothing to remove)"
+    if not existed:
+        return f"removed legacy: {', '.join(removed_legacy)}"
     return f"removed {LAUNCHD_LABEL}{note}"
 
 
@@ -553,7 +562,13 @@ def status() -> dict:
     # with create=True made *diagnosing* claim the state root — marker and
     # all — so `doctor`'s honest "created on first use" depended on whether
     # the user had run the overview first.
-    return {
+    # A refused root makes every count below a LIE by omission: the scan
+    # honestly returns [] for a spool it cannot see, and `--status` is the
+    # command an operator runs to ask "is my queued mail moving?". Reporting
+    # a serene `"pending": 0` against a root `doctor` refuses to manage is
+    # the worst possible answer — indistinguishable from "nothing queued".
+    refusal = config.state_root_refusal()
+    out = {
         "spool": str(config.spool_dir(create=False)),
         "launchd_plist": str(_plist_path()),
         "launchd_installed": _plist_path().exists(),
@@ -566,6 +581,10 @@ def status() -> dict:
             for e in spool.entries("pending")
         ],
     }
+    if refusal is not None:
+        out["state_root_refused"] = refusal
+        out["counts_are_meaningful"] = False
+    return out
 
 
 def main() -> int:
@@ -584,8 +603,15 @@ def main() -> int:
         print(f"email-mcp dispatcher: {retired}", file=sys.stderr)
         return 2
     if args.status:
-        json.dump(status(), sys.stdout, indent=2)
+        report = status()
+        json.dump(report, sys.stdout, indent=2)
         sys.stdout.write("\n")
+        if report.get("state_root_refused"):
+            print(f"email-mcp dispatcher: {report['state_root_refused']}",
+                  file=sys.stderr)
+            print("email-mcp dispatcher: the counts above are NOT "
+                  "meaningful — run `email-mcp doctor`.", file=sys.stderr)
+            return 1
         return 0
     if args.install_launchd:
         print(install_launchd())
