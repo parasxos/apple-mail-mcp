@@ -232,18 +232,25 @@ def test_identity_name_traversal_rejected_nothing_touched(home, tmp_path):
     assert events[0]["detail"]["blocked"] == "identity"
 
 
-def test_secret_value_key_refused_and_never_on_disk(home, tmp_path):
+def test_secret_value_key_refused_and_never_on_disk(home, tmp_path, capsys):
     sentinel = "hunter2-SENTINEL-VALUE"
     answers = _write_answers(tmp_path, {
         "identity_action": "add",
         "identities": [{
             "name": "leaky", "from_addr": "x@example.org",
             "driver": "smtp", "host": "smtp.example.org",
+            # A VALID secret reference, so the "smtp needs a reference" fence
+            # is satisfied and _fence_secret_keys is the only thing left that
+            # can reject this identity. Without it the test passes even with
+            # the sentinel disabled — it fired on the wrong fence.
+            "keychain": "email-mcp-leaky",
             "password": sentinel,
         }],
     })
     rc = lifecycle.run_setup_cli(["--answers", str(answers)])
     assert rc == 1
+    # Pin WHICH fence rejected it, not merely that something did.
+    assert "'password' refused" in capsys.readouterr().out
     assert not (home / ".email-mcp" / "identities.toml").exists()
     # The value must be unreachable in EVERY file setup wrote (meta,
     # ledger, anything) — not merely absent from identities.toml.
