@@ -44,7 +44,7 @@ Conformance is staged deliberately:
 | 7 | `get_attachment` | R | `{ok: true, attachment}` — envelope since v0.11 (was bare dict) | `{ok: false, code, error}` | belt: coded failures | **v0.11** — shipped |
 | 8 | `refresh_mail` | R | `{ok, before, after, new_messages, …}` (hardened since v0.4) | `{ok: false, error, error_code?, code?}` — the raw osascript number now carries its mapped string `code` (§3.3) | none needed (already total) | **v0.11** — shipped |
 | 9 | `list_scheduled` | R | `{ok: true, dispatcher_installed, …states}` | `{ok: false, code: invalid_input, error}` on unknown state | belt on crash paths | **v0.11** — shipped |
-| 10 | `doctor` | R | `{ok, read_only, checks}` — **`ok` reports environment health**, not tool failure (documented exception to §2) | already total | gains the `audit` check | **v0.10** |
+| 10 | `doctor` | R | `{ok, read_only, checks, audit}` — **`ok` reports environment health**, not tool failure (documented exception to §2); `audit` is the ledger check as a top-level sibling of `checks` | already total | gained the `audit` check | **v0.11** |
 | 11 | `audit` | R | `{ok: true, events, files_scanned, skipped_lines}` | `{ok: false, code, error, fix?}` | **new tool** — born conformant | **v0.10** |
 | 12 | `send_email` | W | `{ok: true, message_id, to, cc, bcc, subject, attachments, bootstrapped}` | `{ok: false, code, error}` — every SendError site coded per §3.4 | audit `send` event on every terminal outcome | **v0.11** — shipped |
 | 13 | `reply_email` | W | same as send_email | same | audit `reply` event | **v0.11** — shipped |
@@ -157,8 +157,8 @@ tool-level code:
 | `no_result` | the script produced no line for this id |
 | `batch_timeout` | osascript was killed at the deadline; verification may still confirm the message independently |
 
-`get_emails_batch`'s `errors[]` entries are `{id, error}` prose today; they
-gain an `errors[].code` (from `not_found`/`invalid_input`) at v0.11.
+`get_emails_batch`'s `errors[]` entries are `{id, code, error}` as of v0.11
+(`code` from `not_found`/`invalid_input`).
 
 ### 3.3 osascript numeric map
 
@@ -379,14 +379,13 @@ gains an `audit` check (dir exists, perms, writability).
   code never print; logging goes through `log.get_logger()` to the log
   file. (The audit CLI and dispatcher `main()` print by design — they are
   separate entry points whose stdout is not the MCP wire.)
-- **No exception crosses the wire.** Every tool is total: any path that
-  could raise is either handled with a specific code or caught by a belt
-  that logs the full traceback and returns
-  `{ok: false, code: "internal_error", error, fix: "run doctor"}`.
-  *v0.10 carve-out (audit finding F1):* the three array-shaped tools
-  (`get_thread`, `list_mailboxes`, `list_recent`) are un-belted until their
-  v0.11 envelope migration — §1 rows 4-6 govern; this sentence becomes
-  absolute at v0.11.
+- **No exception crosses the wire.** Every tool is total — all 20,
+  including the formerly array-shaped `get_thread`/`list_mailboxes`/
+  `list_recent`: any path that could raise is either handled with a
+  specific code or caught by a belt that logs the full traceback and
+  returns `{ok: false, code: "internal_error", error, fix: "run doctor"}`.
+  (The v0.10 carve-out that excused those three retired when they gained
+  envelopes at v0.11 — verified by live poisoned-source probes.)
 - Every tool return is JSON-serializable (dataclasses/datetimes converted
   at the boundary).
 - **Secrets never appear in envelopes, logs, or audit events.** Secret

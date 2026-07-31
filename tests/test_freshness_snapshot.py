@@ -10,15 +10,15 @@ def test_freshness_snapshot_reports_total_and_newest(mail_fixture):
     src = AppleMailSource(mail_base=mail_fixture)
     snap = src.freshness_snapshot()
 
-    assert snap["total"] == 6  # six rows in the fixture, none deleted
-    # Newest by date_sent is ROWID 400/401 at 1714750000 — same timestamp,
-    # SQLite picks one. Both share subject 5 ("[isocpp-lib] ...").
+    assert snap["total"] == 4  # four rows in the fixture, none deleted
+    # Newest by date_sent is ROWID 101 (1714700000): "EMCI production update"
+    # from DCS Ops <ops-bot@cern.ch>.
     assert snap["newest_date"] is not None
     parsed = datetime.fromisoformat(snap["newest_date"])
     assert parsed.tzinfo is not None
-    assert parsed == datetime.fromtimestamp(1714750000, tz=timezone.utc)
-    assert snap["newest_subject"].startswith("[isocpp-lib]")
-    assert "lib@lists.isocpp.org" in snap["newest_from"]
+    assert parsed == datetime.fromtimestamp(1714700000, tz=timezone.utc)
+    assert snap["newest_subject"] == "EMCI production update"
+    assert "ops-bot@cern.ch" in snap["newest_from"]
 
 
 def test_freshness_snapshot_handles_empty_db(tmp_path):

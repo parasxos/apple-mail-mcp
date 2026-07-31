@@ -319,3 +319,18 @@ def test_doctor_fix_json_shape_is_before_fixes_after(monkeypatch, capsys):
 def test_doctor_rejects_unknown_flags_exit_2(capsys):
     assert cli.main(["doctor", "--bogus"]) == 2
     assert "email-mcp doctor" in capsys.readouterr().err
+
+
+def test_package_version_sources_agree():
+    """__init__.__version__ and pyproject's version must match — the CLI
+    reports __version__ on the documented bare-checkout path and stamps it
+    into meta.json (v0.11 audit finding F-NEW-2)."""
+    import re
+    from pathlib import Path
+    import email_mcp
+
+    pyproject = (Path(__file__).resolve().parent.parent / "pyproject.toml").read_text()
+    m = re.search(r'^version = "([^"]+)"', pyproject, re.MULTILINE)
+    assert m, "no version in pyproject.toml"
+    assert email_mcp.__version__ == m.group(1), (
+        f"__init__.__version__={email_mcp.__version__} != pyproject {m.group(1)}")
