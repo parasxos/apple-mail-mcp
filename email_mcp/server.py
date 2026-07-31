@@ -92,6 +92,19 @@ def _belt(op_from: str | None = None):
     def deco(fn):
         sig = inspect.signature(fn)
 
+        def _msg(e: BaseException, typed: bool = False) -> str:
+            """Render an exception without ever raising.
+
+            The belt is the last line of defence (contract §7: every tool is
+            total), so its own message formatting must not be the thing that
+            escapes. An exception whose `__str__` — or whose metaclass
+            `__name__` — raises still gets an envelope.
+            """
+            try:
+                return f"{type(e).__name__}: {e}" if typed else str(e)
+            except Exception:
+                return "unexpected internal error (see log)"
+
         def _fail(code: str, error: str, args: tuple, kwargs: dict) -> dict:
             _log.exception("belt[%s]: %s", fn.__name__, code)
             out: dict = {"ok": False, "code": code, "error": error,
@@ -115,9 +128,9 @@ def _belt(op_from: str | None = None):
                 # arguments arrive as valid str — undecodable bytes come
                 # from the store or a bug (audit finding F6).
                 return _fail(codes.INTERNAL_ERROR,
-                             f"{type(e).__name__}: {e}", args, kwargs)
+                             _msg(e, typed=True), args, kwargs)
             except ValueError as e:
-                return _fail(codes.INVALID_INPUT, str(e), args, kwargs)
+                return _fail(codes.INVALID_INPUT, _msg(e), args, kwargs)
             except (KeyError, IndexError) as e:
                 # LookupError subclasses, but sources signal unknown ids
                 # with bare LookupError/ValueError (apple_mail.get /
@@ -125,18 +138,18 @@ def _belt(op_from: str | None = None):
                 # is an internal container miss, not a caller reference
                 # that wasn't found (audit finding F6).
                 return _fail(codes.INTERNAL_ERROR,
-                             f"{type(e).__name__}: {e}", args, kwargs)
+                             _msg(e, typed=True), args, kwargs)
             except LookupError as e:
-                return _fail(codes.NOT_FOUND, str(e), args, kwargs)
+                return _fail(codes.NOT_FOUND, _msg(e), args, kwargs)
             except (FileNotFoundError, PermissionError,
                     sqlite3.OperationalError) as e:
                 # The store (or its SQLite index) is not readable —
                 # missing Mail setup, missing Full Disk Access, locked or
                 # corrupt index (contract §3.5, audit finding F6).
-                return _fail(codes.MAIL_UNAVAILABLE, str(e), args, kwargs)
+                return _fail(codes.MAIL_UNAVAILABLE, _msg(e), args, kwargs)
             except Exception as e:
                 return _fail(codes.INTERNAL_ERROR,
-                             f"{type(e).__name__}: {e}", args, kwargs)
+                             _msg(e, typed=True), args, kwargs)
         return wrapper
     return deco
 

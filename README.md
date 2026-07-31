@@ -5,7 +5,7 @@ An MCP server that gives Claude direct access to Mail.app on your Mac — read a
 
 ![version](https://img.shields.io/badge/version-v0.11.0-blue)
 ![tools](https://img.shields.io/badge/MCP%20tools-20-brightgreen)
-![tests](https://img.shields.io/badge/tests-451%20passing-success)
+![tests](https://img.shields.io/badge/tests-452%20passing-success)
 ![platform](https://img.shields.io/badge/platform-macOS%20%2B%20Mail.app-orange)
 
 ## Install
@@ -138,7 +138,7 @@ Every claim above with a number was measured on a live 305k-message store; the f
 
 ## Status
 
-**v0.11.0** — 20 tools, 451 tests passing, live-calibrated end-to-end (full-body search on a 305k store, send, schedule via launchd and Exchange Graph, triage, doctor). v0.10 put the promises in writing — [`docs/v1-contract.md`](docs/v1-contract.md) — and added the audit ledger; v0.11 finishes wire conformance (every tool speaks the coded envelope, output surface frozen by snapshot) and adds the lifecycle CLI (`setup` / `doctor --fix` / `update` / `uninstall`). The contract is additive-only from v1.0: codes and event types only grow, breaking means v2. Personal project, built for one Mac — the read layer and triage port anywhere Mail.app runs.
+**v0.11.0** — 20 tools, 452 tests passing, live-calibrated end-to-end (full-body search on a 305k store, send, schedule via launchd and Exchange Graph, triage, doctor). v0.10 put the promises in writing — [`docs/v1-contract.md`](docs/v1-contract.md) — and added the audit ledger; v0.11 finishes wire conformance (every tool speaks the coded envelope, output surface frozen by snapshot) and adds the lifecycle CLI (`setup` / `doctor --fix` / `update` / `uninstall`). The contract is additive-only from v1.0: codes and event types only grow, breaking means v2. Personal project, built for one Mac — the read layer and triage port anywhere Mail.app runs.
 
 ## See also
 

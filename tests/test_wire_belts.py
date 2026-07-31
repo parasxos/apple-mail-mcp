@@ -334,3 +334,43 @@ def test_cancel_scheduled_failures_carry_codes(monkeypatch):
     out = server.tool_cancel_scheduled("S-2")  # dispatcher won the race
     assert out["ok"] is False and out["code"] == "invalid_input"
     assert out["operation_id"] == "S-2"
+
+
+def test_belt_survives_an_exception_whose_message_cannot_be_rendered():
+    """§7 says every tool is total — including when the belt's OWN message
+    formatting is what raises.
+
+    `f"{type(e).__name__}: {e}"` ran inside the except handler and outside
+    any guard, so an exception with an exploding `__str__` (or a metaclass
+    with an exploding `__name__`) replaced the envelope with a bare
+    ToolError carrying no ok, no code and no fix.
+    """
+    class ExplodingStr(Exception):
+        def __str__(self):
+            raise RuntimeError("__str__ itself explodes")
+
+    class ExplodingName(type):
+        @property
+        def __name__(cls):
+            raise RuntimeError("type name explodes")
+
+    class NastyType(Exception, metaclass=ExplodingName):
+        pass
+
+    for exc in (ExplodingStr(), NastyType("boom")):
+        @server._belt()
+        def poisoned() -> dict:
+            raise exc
+
+        out = poisoned()
+        assert out["ok"] is False
+        assert out["code"] == "internal_error"
+        assert out["fix"] == "run doctor"
+        assert isinstance(out["error"], str) and out["error"]
+
+    # An ordinary exception must still report its real message verbatim.
+    @server._belt()
+    def ordinary() -> dict:
+        raise ValueError("a perfectly ordinary problem")
+
+    assert ordinary()["error"] == "a perfectly ordinary problem"
