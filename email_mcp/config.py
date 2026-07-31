@@ -60,6 +60,7 @@ def attach_dir() -> Path:
     else:
         tmp = os.environ.get("TMPDIR", "/tmp")
         d = Path(tmp) / "email-mcp"
+    _refuse_degenerate(d, bool(raw))
     d.mkdir(parents=True, exist_ok=True)
     return d
 
@@ -163,6 +164,22 @@ def _degenerate(d: Path) -> bool:
     return target == home or target in home.parents
 
 
+def _refuse_degenerate(d: Path, overridden: bool) -> None:
+    """Raise BEFORE any filesystem effect when an override names $HOME or above.
+
+    Order is the point: an earlier version of this fence lived inside the
+    chmod helper, which ran after spool_dir's five-subdir mkdir loop — the
+    refusal fired, and the directories were already created at the refused
+    location. Every getter must call this before its first mkdir.
+    """
+    if overridden and _degenerate(d):
+        raise StateDirRefused(
+            f"{d} is your home directory or above it — refusing to create "
+            "state there or change its mode. Point the EMAIL_MCP_*_DIR "
+            "override at a directory of its own."
+        )
+
+
 def _lock_down(d: Path, overridden: bool) -> None:
     """Tighten a state dir to 0700, and its parent only when we own it.
 
@@ -172,12 +189,7 @@ def _lock_down(d: Path, overridden: bool) -> None:
     behind their back, and a symlinked parent would land the chmod on its
     target. Same rule audit_dir already applies.
     """
-    if overridden and _degenerate(d):
-        raise StateDirRefused(
-            f"{d} is your home directory or above it — refusing to create "
-            "state there or change its mode. Point the EMAIL_MCP_*_DIR "
-            "override at a directory of its own."
-        )
+    _refuse_degenerate(d, overridden)  # belt: holds even for a new caller
     if not overridden and not d.parent.is_symlink():
         d.parent.chmod(0o700)
     if not d.is_symlink():
@@ -199,6 +211,7 @@ def spool_dir(create: bool = True) -> Path:
     raw = os.environ.get("EMAIL_MCP_SPOOL_DIR", "").strip()
     d = Path(raw).expanduser() if raw else Path.home() / ".email-mcp" / "spool"
     if create:
+        _refuse_degenerate(d, bool(raw))  # BEFORE the mkdir loop, not after
         for sub in ("pending", "sending", "sent", "failed", "cancelled"):
             s = d / sub
             s.mkdir(parents=True, exist_ok=True)
@@ -225,6 +238,7 @@ def graph_dir() -> Path:
     """
     raw = os.environ.get("EMAIL_MCP_GRAPH_DIR", "").strip()
     d = Path(raw).expanduser() if raw else Path.home() / ".email-mcp" / "graph"
+    _refuse_degenerate(d, bool(raw))
     d.mkdir(parents=True, exist_ok=True)
     _lock_down(d, bool(raw))
     return d
@@ -246,6 +260,7 @@ def plans_dir(create: bool = True) -> Path:
     raw = os.environ.get("EMAIL_MCP_PLANS_DIR", "").strip()
     d = Path(raw).expanduser() if raw else Path.home() / ".email-mcp" / "plans"
     if create:
+        _refuse_degenerate(d, bool(raw))
         d.mkdir(parents=True, exist_ok=True)
         _lock_down(d, bool(raw))
     return d
@@ -297,6 +312,7 @@ def fts_dir(create: bool = True) -> Path:
     raw = os.environ.get("EMAIL_MCP_FTS_DIR", "").strip()
     d = Path(raw).expanduser() if raw else Path.home() / ".email-mcp" / "fts"
     if create:
+        _refuse_degenerate(d, bool(raw))
         d.mkdir(parents=True, exist_ok=True)
         _lock_down(d, bool(raw))
     return d
@@ -367,6 +383,10 @@ def audit_dir(create: bool = True) -> Path:
     raw = os.environ.get("EMAIL_MCP_AUDIT_DIR", "").strip()
     d = Path(raw).expanduser() if raw else Path.home() / ".email-mcp" / "audit"
     if create:
+        # The fence the first fix missed: audit.emit() calls this on EVERY
+        # mutation, so an unfenced audit_dir let EMAIL_MCP_AUDIT_DIR=/Users
+        # chmod it 0700 and write the ledger there.
+        _refuse_degenerate(d, bool(raw))
         linked = d.is_symlink()
         if linked and not raw:
             raise AuditDirRefused(

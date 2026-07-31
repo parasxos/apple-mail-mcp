@@ -676,3 +676,31 @@ def test_batch_and_single_read_agree_on_every_code():
                 f"single={single['code']}")
     finally:
         server._SOURCE = original
+
+
+def test_batch_rejects_oversized_ids_without_echoing_them():
+    """50 ids AT the cap × a 60 KB "id" was a 3 MB envelope: per-id errors[]
+    echo each id back for correlation, and the over-cap reject never fires
+    at exactly 50. A real id is a ROWID or a minted spool id — never
+    hundreds of characters — so length-validate before the loop, naming the
+    position rather than reflecting the value."""
+    import json
+
+    out = server.tool_get_emails_batch(["B" * 60000] * 50, view="minimal")
+    assert out["ok"] is False and out["code"] == "invalid_input"
+    assert len(json.dumps(out)) < 500
+    assert "position 0" in out["error"]
+    assert "B" * 100 not in json.dumps(out)
+
+
+def test_clip_bounds_wire_bytes_not_characters():
+    """2 000 astral-plane characters JSON-escape to ~24 KB of ASCII — a
+    character cap bounds the prose while leaving the wire payload §7
+    actually promises unbounded. The clip measures UTF-8 bytes."""
+    import json
+
+    out = server.tool_get_email("x", view="\U0001F600" * 60000)
+    assert out["ok"] is False
+    assert len(json.dumps(out)) < 16000
+    # And the truncation must not have split a codepoint into garbage.
+    out["error"].encode("utf-8")  # raises on a broken surrogate

@@ -78,7 +78,7 @@ def _synthesized() -> Identity:
     if not from_addr:
         raise IdentityError(
             "no sending identity configured — create "
-            "~/.email-mcp/identities.toml (see docs/reference.md, "
+            "~/.email-mcp/identities.toml (see https://github.com/parasxos/email-mcp/blob/main/docs/reference.md, "
             "'Identities & transports') or set EMAIL_MCP_FROM_ADDR."
         )
     return Identity(
@@ -198,7 +198,7 @@ def load() -> tuple[dict[str, Identity], str]:
                     f'{path}: identity [{name}] has executor = "graph" but '
                     f"[{name}.graph] is missing {missing} — set the tenant "
                     "and public-client application id proven by "
-                    "tools/graph_probe.py (see docs/graph-probe.md)."
+                    "tools/graph_probe.py from the repo (see https://github.com/parasxos/email-mcp/blob/main/docs/graph-probe.md)."
                 )
 
         identities[name] = Identity(

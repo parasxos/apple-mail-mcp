@@ -91,10 +91,19 @@ def _clip(text: str) -> str:
     `cannot cancel {id}` — so a 60 KB argument returns as a 60 KB envelope
     on a stdio transport unless every construction site is bounded. Clipping
     only inside the belt closed one door and left twenty open.
+
+    Measured in UTF-8 BYTES, not characters: 2 000 astral-plane characters
+    JSON-escape to ~24 KB of ASCII, so a character cap bounds the prose
+    while leaving the wire payload unbounded — the thing §7 actually
+    promises. `errors="ignore"` drops a split trailing codepoint cleanly.
     """
-    if not isinstance(text, str) or len(text) <= _MAX_ERROR_CHARS:
+    if not isinstance(text, str):
         return text
-    return text[:_MAX_ERROR_CHARS] + f"… [truncated, {len(text)} chars; see log]"
+    raw = text.encode("utf-8")
+    if len(raw) <= _MAX_ERROR_CHARS:
+        return text
+    cut = raw[:_MAX_ERROR_CHARS].decode("utf-8", errors="ignore")
+    return cut + f"… [truncated, {len(text)} chars; see log]"
 
 
 def _bound(result):
@@ -111,11 +120,16 @@ def _bound(result):
     if result.get("ok") is False and isinstance(result.get("error"), str):
         result["error"] = _clip(result["error"])
     # get_emails_batch reports per-id failures as data inside ok: true.
+    # Clip the `id` too: it is str(caller_argument), echoed once per entry —
+    # 50 ids at the batch cap × a 60 KB id was a 3 MB envelope that §5's
+    # over-cap reject never sees because 50 is AT the cap, not over it.
     entries = result.get("errors")
     if isinstance(entries, list):
         for entry in entries:
-            if isinstance(entry, dict) and isinstance(entry.get("error"), str):
-                entry["error"] = _clip(entry["error"])
+            if isinstance(entry, dict):
+                for key in ("error", "id"):
+                    if isinstance(entry.get(key), str):
+                        entry[key] = _clip(entry[key])
     return result
 
 
@@ -336,6 +350,16 @@ def tool_get_emails_batch(ids: list[str], view: str = "full") -> dict:
         return {"ok": False, "code": codes.INVALID_INPUT,
                 "error": f"{len(ids)} ids exceeds the batch cap of "
                          f"{_BATCH_MAX_IDS} — split the request"}
+    # Length-validate BEFORE the loop, reporting position rather than
+    # echoing the value: a real id is an Envelope Index ROWID or a minted
+    # spool id, never hundreds of characters. Per-id errors[] echo each id
+    # back for correlation, so 50 ids at the cap × a 60 KB "id" was a 3 MB
+    # envelope that the over-cap reject above never sees (50 is AT the cap).
+    for pos, id in enumerate(ids):
+        if len(str(id)) > 256:
+            return {"ok": False, "code": codes.INVALID_INPUT,
+                    "error": f"id at position {pos} is {len(str(id))} "
+                             "characters — not a message id"}
     src = _source()
     emails: list[dict] = []
     errors: list[dict] = []

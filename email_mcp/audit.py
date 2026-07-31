@@ -165,7 +165,10 @@ def emit(
         finally:
             os.close(fd)
         return op
-    except config.AuditDirRefused as e:
+    except (config.AuditDirRefused, config.StateDirRefused) as e:
+        # A refused ledger location (symlink squat, override at $HOME or
+        # above) costs receipts, never a mutation — same emit-failure
+        # policy as any other drop.
         _log.warning("audit: emit(%s) dropped — %s", event, e)
         return None
     except Exception:

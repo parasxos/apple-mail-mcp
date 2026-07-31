@@ -278,7 +278,7 @@ def _graph_cfg(ident) -> tuple[str, str]:
         raise GraphError(
             f"[{_name(ident)}/graph] identity has no usable graph config — "
             f"set tenant and client_id in [{_name(ident)}.graph] in "
-            f"{config.identities_file()} (see docs/graph-probe.md)."
+            f"{config.identities_file()} (see https://github.com/parasxos/email-mcp/blob/main/docs/graph-probe.md)."
         )
     return tenant, client_id
 

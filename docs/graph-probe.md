@@ -44,7 +44,7 @@ python3 tools/graph_probe.py --tenant cern.ch --client-id <APP_ID>
 python3 tools/graph_probe.py --tenant cern.ch --client-id <APP_ID> --live
 ```
 
-Any Python 3.10+ works; no venv or install needed (stdlib only).
+Any Python 3.11+ works; no venv or install needed (stdlib only).
 
 **Tenant.** `cern.ch` resolves as the tenant domain. If it doesn't, fetch the
 tenant GUID from

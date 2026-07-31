@@ -38,6 +38,23 @@ def clean_env(monkeypatch, tmp_path):
     return home
 
 
+@pytest.fixture(autouse=True)
+def audit_dir_guard(clean_env):
+    """Shadow conftest's guard (by name, on purpose — the test_audit.py
+    pattern): conftest pins the config.audit_dir RESOLVER to a tmp dir,
+    which would bypass the very fence these tests exercise. The fake HOME
+    from clean_env is the isolation."""
+    return clean_env / ".email-mcp" / "audit"
+
+
+@pytest.fixture(autouse=True)
+def fts_dir_guard(clean_env):
+    """Shadow conftest's fts guard too: it sets EMAIL_MCP_FTS_DIR, and
+    fixture ordering would re-set it AFTER clean_env's wipe — turning the
+    default-path test into an override test."""
+    return clean_env / ".email-mcp" / "fts"
+
+
 GETTERS = ("spool_dir", "graph_dir", "plans_dir", "fts_dir")
 
 
@@ -111,9 +128,16 @@ def test_override_at_or_above_home_is_refused(clean_env, monkeypatch, getter):
     for spelling in (str(home), f"{home}/sub/..", str(ancestor)):
         monkeypatch.setenv(var, spelling)
         before = _mode(ancestor)
+        contents = set(p.name for p in ancestor.iterdir())
         with pytest.raises(config.StateDirRefused):
             getattr(config, getter)()
         assert _mode(ancestor) == before, f"{spelling} changed the mode anyway"
+        # Contents too, not just mode: an earlier fence ran AFTER spool_dir's
+        # subdir mkdir loop, so the refusal fired with five directories
+        # already created at the refused location — and a release gate that
+        # measured only the mode reported that defect closed.
+        assert set(p.name for p in ancestor.iterdir()) == contents, (
+            f"{spelling} created entries before refusing")
 
 
 def test_read_side_resolution_never_creates(clean_env, tmp_path, monkeypatch):
@@ -130,3 +154,47 @@ def test_read_side_resolution_never_creates(clean_env, tmp_path, monkeypatch):
 
     assert resolved == target
     assert not target.exists()
+
+
+def test_audit_dir_refuses_a_degenerate_override_before_any_effect(
+        clean_env, monkeypatch):
+    """audit_dir was the getter the first fence pass missed entirely —
+    and audit.emit() calls it on EVERY mutation, so an unfenced ledger
+    meant EMAIL_MCP_AUDIT_DIR=/Users chmodded it and wrote 2026-MM.jsonl
+    into it on the first send."""
+    ancestor = clean_env.parent
+    for spelling in (str(clean_env), f"{clean_env}/sub/..", str(ancestor)):
+        monkeypatch.setenv("EMAIL_MCP_AUDIT_DIR", spelling)
+        before = _mode(ancestor)
+        contents = set(p.name for p in ancestor.iterdir())
+        with pytest.raises(config.StateDirRefused):
+            config.audit_dir(create=True)
+        assert _mode(ancestor) == before
+        assert set(p.name for p in ancestor.iterdir()) == contents
+
+
+def test_emit_drops_the_event_when_the_ledger_location_is_refused(
+        clean_env, monkeypatch):
+    """The emit-failure policy: a refused ledger costs receipts, never a
+    mutation. emit must return None with nothing written — not raise into
+    the mutation that called it."""
+    from email_mcp import audit
+
+    ancestor = clean_env.parent
+    monkeypatch.setenv("EMAIL_MCP_AUDIT_DIR", str(ancestor))
+    before_mode = _mode(ancestor)
+
+    op = audit.emit("send", outcome="sent", operation_id="x")
+
+    assert op is None
+    assert _mode(ancestor) == before_mode
+    assert not list(ancestor.glob("*.jsonl"))
+
+
+def test_attach_dir_refuses_a_degenerate_override(clean_env, monkeypatch):
+    """attach_dir has no chmod, but mkdir at $HOME-or-above is still not
+    ours to do — it was the last unfenced state-dir getter."""
+    ancestor = clean_env.parent
+    monkeypatch.setenv("EMAIL_MCP_ATTACH_DIR", str(ancestor))
+    with pytest.raises(config.StateDirRefused):
+        config.attach_dir()

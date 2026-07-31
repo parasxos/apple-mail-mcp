@@ -302,9 +302,30 @@ refuses outright — `config.StateDirRefused` is raised when an overridden
 state dir resolves to `$HOME` or above, comparing **resolved** paths so
 `$HOME/sub/..` and `//$HOME` cannot walk past it.
 
-**Verified:** with `EMAIL_MCP_SPOOL_DIR` pointed at the parent of a
-throwaway `$HOME`, the getter raises and the directory stays `0755`.
-Regression tests: `tests/test_config_state_dirs.py`.
+**It took three passes to actually close, and the record of that is part
+of the disclosure.** Pass one fenced four getters and missed
+`config.audit_dir()` entirely — the getter `audit.emit()` calls on *every
+mutation*, so `EMAIL_MCP_AUDIT_DIR=/Users` still chmodded `/Users` **and
+wrote the ledger month-file into it** on the first send. Pass one also
+placed `spool_dir`'s check *after* its five-subdir mkdir loop, so the
+refusal fired with `pending/ sending/ sent/ failed/ cancelled` already
+created at the refused location. A second release gate caught both by
+testing on the installed wheel rather than reading the diff.
+
+**The fence now covers, by name:** `spool_dir`, `plans_dir`, `graph_dir`,
+`fts_dir`, `audit_dir`, and `attach_dir` (no chmod there, but a mkdir at
+`$HOME` or above is still refused). In every getter the check runs
+**before the first mkdir** (`config._refuse_degenerate`). A refused ledger
+follows the emit-failure policy: the event is dropped with a logged
+warning — receipts are lost, mail is never blocked.
+
+**What is measured, not merely claimed** (regression tests:
+`tests/test_config_state_dirs.py`): for each getter × each spelling
+(`$HOME`, `$HOME/sub/..`, the parent of `$HOME`) — the refusal is raised,
+the target's **mode** is unchanged, **and its contents are unchanged** (no
+directory, no ledger file created before the refusal fired). The
+contents assertion exists because a gate that measured only the mode
+declared this closed while the mkdir still landed.
 
 **Residual:** a refusal is an exception, so a server or dispatcher started
 with a degenerate override fails loudly instead of running degraded. That
