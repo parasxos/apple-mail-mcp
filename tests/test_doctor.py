@@ -15,6 +15,7 @@ from email_mcp import doctor, identities, server
 from email_mcp.transports import SendError
 
 CHECK_NAMES = {
+    "state_root",  # added at v0.11: a refused root went unreported
     "mail_store", "automation", "accessibility", "identities",
     "transports", "dispatcher", "spool_plans", "fts", "graph",
     "audit",  # folded into checks at v0.11 (contract §1 row 10)
@@ -27,9 +28,7 @@ def _env(monkeypatch, tmp_path, mail_fixture):
         if k.startswith("EMAIL_MCP_"):
             monkeypatch.delenv(k, raising=False)
     monkeypatch.setenv("EMAIL_MCP_MAIL_DIR", str(mail_fixture))
-    monkeypatch.setenv("EMAIL_MCP_STATE_DIR", str(tmp_path))
-    monkeypatch.setenv("EMAIL_MCP_STATE_DIR", str(tmp_path))
-    monkeypatch.setenv("EMAIL_MCP_STATE_DIR", str(tmp_path))
+    monkeypatch.setenv("EMAIL_MCP_STATE_DIR", str(tmp_path / "state"))
     monkeypatch.setenv("EMAIL_MCP_IDENTITIES",
                        str(tmp_path / "identities.toml"))
     # Post person-clean flip there is no default from_addr; the all-green

@@ -117,16 +117,36 @@ def send_delivery_cmd() -> str:
 class StateDirRefused(OSError):
     """The chosen state root is not a directory this tool may manage.
 
-    Raised BEFORE any filesystem effect. Two things make a root refusable:
-    it is $HOME or an ancestor of it, or an override names an existing
-    directory that already holds someone else's files and carries no
-    ownership marker.
+    Raised BEFORE any filesystem effect. What makes a root refusable: it is
+    $HOME or an ancestor of it; an override names an existing directory
+    that already holds someone else's files and carries no ownership
+    marker; a non-directory squats on it; or a retired per-directory
+    variable is still set (see RETIRED_STATE_VARS).
     """
 
 
 STATE_MARKER = ".email-mcp-root"
 STATE_ROOT_VERSION = 1
 _LEAVES = ("spool", "plans", "graph", "fts", "audit")
+
+# The five per-directory overrides EMAIL_MCP_STATE_DIR replaced in v0.11.
+#
+# Migration policy: REJECTED, never ignored. Silently ignoring them would
+# relocate live state without saying so — a user with
+# EMAIL_MCP_SPOOL_DIR=/Volumes/big/spool would find scheduled mail apparently
+# vanished (it is in the old directory, undelivered, and the dispatcher is
+# now looking somewhere else). Refusing costs one startup error and a one-line
+# fix; ignoring costs mail that looks lost. See docs/reference.md.
+RETIRED_STATE_VARS = (
+    "EMAIL_MCP_SPOOL_DIR", "EMAIL_MCP_PLANS_DIR", "EMAIL_MCP_GRAPH_DIR",
+    "EMAIL_MCP_FTS_DIR", "EMAIL_MCP_AUDIT_DIR",
+)
+
+
+def retired_state_vars() -> list[str]:
+    """Retired per-directory variables that are still set, sorted."""
+    return sorted(v for v in RETIRED_STATE_VARS
+                  if os.environ.get(v, "").strip())
 
 
 def _is_same_dir(a: Path, b: Path) -> bool:
@@ -189,10 +209,82 @@ def _make_ours(d: Path) -> bool:
     return True
 
 
+def _configured_root() -> tuple[Path, bool]:
+    """(root, explicit) — the configured state root and whether the user
+    named it. No filesystem effects; no validation."""
+    raw = os.environ.get("EMAIL_MCP_STATE_DIR", "").strip()
+    root = Path(raw).expanduser() if raw else Path.home() / ".email-mcp"
+    # Collapse `..` TEXTUALLY before validating, so the path we check is the
+    # path we then use. `$HOME/sub/..` names $HOME but cannot be stat'd while
+    # `sub` is absent, so an identity check saw nothing to compare and the
+    # mkdir afterwards created `sub` and marked $HOME. Textual collapse is
+    # the conservative direction here: it can only make us refuse more.
+    return Path(os.path.normpath(root.absolute())), bool(raw)
+
+
+def state_root_refusal() -> str | None:
+    """Why the configured state root may not be managed, or None.
+
+    PURE: it stats, it never creates. This is the single definition of
+    "refusable", so a caller can ask WITHOUT triggering the write that
+    would raise — which is what read-side and repair-side code needs.
+
+    Resolving a refusable root used to be possible through
+    ``state_root(create=False)``: the create flag short-circuited before
+    the checks, handed back ``$HOME``, and ``doctor --fix`` then created
+    ``$HOME/spool`` from it. Validation belongs to resolution; only the
+    EFFECT is conditional on `create`.
+    """
+    retired = retired_state_vars()
+    if retired:
+        return (
+            f"{', '.join(retired)} {'is' if len(retired) == 1 else 'are'} "
+            "retired — v0.11 derives spool, plans, graph, fts and audit from "
+            "ONE root. Ignoring the variable would relocate live state "
+            "without telling you (scheduled mail would still be in the old "
+            "directory, and nothing would be delivering it). Unset "
+            f"{'it' if len(retired) == 1 else 'them'} and set "
+            "EMAIL_MCP_STATE_DIR to the parent directory instead, moving the "
+            "existing contents there first."
+        )
+    root, explicit = _configured_root()
+    if _is_home_or_above(root):
+        return (f"{root} is your home directory or above it — refusing to "
+                "manage state there. Point EMAIL_MCP_STATE_DIR at a "
+                "directory of its own.")
+    if not explicit:
+        # The DEFAULT root is never refused for its contents: ~/.email-mcp
+        # predates the marker, and every v0.10 install has one full of our
+        # own files. Adopting it is the upgrade path (see docs/reference).
+        return None
+    if root.exists() and not root.is_dir() and not root.is_symlink():
+        return (f"{root} exists and is not a directory — refusing to manage "
+                "it. Point EMAIL_MCP_STATE_DIR at a directory.")
+    if root.exists() and not _marked(root):
+        try:
+            # The marker is OURS, so it is not "someone else's files" —
+            # counting it made a freshly adopted root look foreign.
+            others = any(p.name != STATE_MARKER for p in root.iterdir())
+        except OSError:
+            others = False     # unreadable: the effects below fail loudly
+        # Re-read the marker before refusing. Two writers exist (server and
+        # the launchd dispatcher), and they race on the first mutation
+        # after a root is configured: one can pass the _marked() check
+        # above, have the other adopt the root underneath it, and then see
+        # that adoption as foreign content. The refusal has to be based on
+        # the marker as it stands AFTER the scan, not before it.
+        if others and not _marked(root):
+            return (f"{root} already contains files and is not an email-mcp "
+                    f"state directory (no {STATE_MARKER}). Refusing to manage "
+                    "it — point EMAIL_MCP_STATE_DIR at a new or empty "
+                    "directory.")
+    return None
+
+
 def state_root(create: bool = True) -> Path:
     """The one directory this tool manages: ~/.email-mcp, or EMAIL_MCP_STATE_DIR.
 
-    ONE override replaces the six per-directory ones (spool/plans/graph/
+    ONE override replaces the five per-directory ones (spool/plans/graph/
     fts/audit). Every leaf is derived from this root, so there is a single
     place to validate and a single thing to relocate — the configuration
     complexity was itself the defect.
@@ -203,31 +295,21 @@ def state_root(create: bool = True) -> Path:
     someone else's files without our marker — which is what makes $HOME,
     /Users and every case-variant of them refusable without comparing a
     single path string.
+
+    ``create=False`` resolves the path and touches NOTHING. It is total by
+    design: uninstall planning, ``doctor`` and ``audit.query`` must be able
+    to name the configured root even when it is refusable. Ask
+    :func:`state_root_refusal` for the verdict; anything that intends to
+    WRITE must go through ``create=True``, which raises.
     """
-    raw = os.environ.get("EMAIL_MCP_STATE_DIR", "").strip()
-    root = Path(raw).expanduser() if raw else Path.home() / ".email-mcp"
-    # Collapse `..` TEXTUALLY before validating, so the path we check is the
-    # path we then use. `$HOME/sub/..` names $HOME but cannot be stat'd while
-    # `sub` is absent, so an identity check saw nothing to compare and the
-    # mkdir afterwards created `sub` and marked $HOME. Textual collapse is
-    # the conservative direction here: it can only make us refuse more.
-    root = Path(os.path.normpath(root.absolute()))
+    root, _ = _configured_root()
     if not create:
         return root
 
     # --- validate BEFORE any filesystem effect -------------------------
-    if _is_home_or_above(root):
-        raise StateDirRefused(
-            f"{root} is your home directory or above it — refusing to manage "
-            "state there. Point EMAIL_MCP_STATE_DIR at a directory of its own."
-        )
-    if raw and root.exists() and not _marked(root):
-        if any(root.iterdir()):
-            raise StateDirRefused(
-                f"{root} already contains files and is not an email-mcp state "
-                f"directory (no {STATE_MARKER}). Refusing to manage it — point "
-                "EMAIL_MCP_STATE_DIR at a new or empty directory."
-            )
+    reason = state_root_refusal()
+    if reason:
+        raise StateDirRefused(reason)
 
     # --- effects -------------------------------------------------------
     _make_ours(root)          # pre-existing root keeps its own mode

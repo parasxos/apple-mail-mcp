@@ -45,7 +45,7 @@ from pathlib import Path
 
 import pytest
 
-from email_mcp import audit, cli, dispatcher, fts, lifecycle, repairs
+from email_mcp import audit, cli, config, dispatcher, fts, lifecycle, repairs
 from email_mcp.transports import SendError
 
 FIXTURE_DIR = Path(__file__).parent / "fixtures"
@@ -249,9 +249,9 @@ def test_setup_refuses_state_override_at_home(home, monkeypatch, capsys, var):
 
 def test_doctor_fix_refuses_state_override_at_home(home, monkeypatch):
     """Same fence on the repair side: `doctor --fix` must not mkdir the
-    spool states into $HOME nor chmod $HOME (or its parent) because an
-    override points there."""
-    monkeypatch.setenv("EMAIL_MCP_SPOOL_DIR", str(home))
+    spool states into $HOME nor chmod $HOME (or its parent) because
+    EMAIL_MCP_STATE_DIR points there."""
+    monkeypatch.setenv("EMAIL_MCP_STATE_DIR", str(home))
     home.chmod(0o755)  # deliberately "wrong" for a state dir
     parent_mode = home.parent.stat().st_mode & 0o777
 
@@ -261,10 +261,9 @@ def test_doctor_fix_refuses_state_override_at_home(home, monkeypatch):
     assert (home.parent.stat().st_mode & 0o777) == parent_mode
     for junk in SPOOL_STATES:
         assert not (home / junk).exists()
-    # The real state root is still healed — the fence is targeted, not a
-    # blanket opt-out.
-    assert (home / ".email-mcp").is_dir()
-    assert not [f for f in result["failed"]]
+    assert not (home / "spool").exists() and not (home / "audit").exists()
+    # run_fixes must survive the refusal rather than crash on it.
+    assert isinstance(result["failed"], list)
 
 
 # --------------------------------------------------------------------- #
@@ -536,17 +535,28 @@ def test_doctor_fix_never_acts_through_symlinked_state_dir(home, tmp_path):
     assert (victim_file.stat().st_mode & 0o777) == 0o644
 
 
-def test_run_fixes_with_unwritable_audit_dir_never_raises(
+def test_run_fixes_with_uncreatable_state_root_never_raises(
     home, tmp_path, monkeypatch,
 ):
-    """EMAIL_MCP_AUDIT_DIR under a read-only parent: the mkdir repair
-    fails, the failure is REPORTED, the emit is dropped silently, and
-    run_fixes returns instead of raising."""
+    """EMAIL_MCP_STATE_DIR under a read-only PARENT: the root cannot be
+    created, the mkdir repair fails, the failure is REPORTED, the
+    doctor_fix emit is dropped silently, and run_fixes returns instead of
+    raising — the fixer has to keep working precisely when things are
+    broken.
+
+    Replaces the retired EMAIL_MCP_AUDIT_DIR variant: the ledger has no
+    override of its own, so the un-creatable case is now reached through
+    the root. The fault is put on the PARENT deliberately — a root that
+    merely has the wrong MODE is something `doctor --fix` may legitimately
+    repair (and then the tree does get built), which would not exercise
+    the un-creatable path at all.
+    """
     _install_estate(home)
     ro = tmp_path / "ro"
     ro.mkdir()
-    dead = ro / "audit"
-    monkeypatch.setenv("EMAIL_MCP_AUDIT_DIR", str(dead))
+    root = ro / "state"          # never created: the parent is read-only
+    dead = root / "audit"
+    monkeypatch.setenv("EMAIL_MCP_STATE_DIR", str(root))
     ro.chmod(0o500)
     try:
         result = repairs.run_fixes()
@@ -555,7 +565,8 @@ def test_run_fixes_with_unwritable_audit_dir_never_raises(
 
     failed_ids = {f["repair"] for f in result["failed"]}
     assert "state_dir_missing" in failed_ids
-    assert not dead.exists()
+    assert not root.exists() and not dead.exists()
+    assert list(ro.iterdir()) == []   # nothing created under the frozen parent
 
 
 # --------------------------------------------------------------------- #

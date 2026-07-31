@@ -248,3 +248,251 @@ def test_create_false_resolves_without_touching_the_disk(home, getter):
 
     assert d.parent == home / ".email-mcp"
     assert not (home / ".email-mcp").exists()
+
+
+# --------------------------------------------------------------------- #
+# v0.11 gate-4 regressions — each of these is a defect this gate found   #
+# --------------------------------------------------------------------- #
+
+
+def test_marker_alone_does_not_make_a_root_look_foreign(
+        home, monkeypatch, tmp_path):
+    """The ownership marker is OURS. Counting it as "someone else's files"
+    made a root this tool had just adopted refusable.
+
+    Found as a two-process flake: the marker is written between the
+    _marked() probe and the directory scan, so the scan saw exactly one
+    entry — our own marker — and refused.
+    """
+    vol = tmp_path / "ext"
+    vol.mkdir()
+    (vol / config.STATE_MARKER).write_text("")   # marker only, and EMPTY
+    monkeypatch.setenv("EMAIL_MCP_STATE_DIR", str(vol))
+
+    assert config.state_root_refusal() is None
+    assert config.state_root() == vol
+
+
+def test_root_adopted_between_probe_and_scan_is_not_refused(
+        home, monkeypatch, tmp_path):
+    """The same race, forced deterministically: the marker appears after
+    the _marked() probe and before the scan. The refusal must be based on
+    the marker as it stands AFTER the scan — server and the launchd
+    dispatcher genuinely race here on the first mutation.
+    """
+    vol = tmp_path / "ext"
+    vol.mkdir()
+    (vol / "spool").mkdir()          # the other process's first leaf
+    monkeypatch.setenv("EMAIL_MCP_STATE_DIR", str(vol))
+
+    real_iterdir = Path.iterdir
+
+    def adopting_iterdir(self):
+        # Stand in for the other writer finishing its adoption inside the
+        # window between the marker probe and this scan.
+        if self == vol and not (vol / config.STATE_MARKER).exists():
+            (vol / config.STATE_MARKER).write_text("{}\n")
+        return real_iterdir(self)
+
+    monkeypatch.setattr(Path, "iterdir", adopting_iterdir)
+
+    assert config.state_root_refusal() is None
+    assert config.state_root() == vol
+
+
+def test_refusal_still_fires_for_genuinely_foreign_content(
+        home, monkeypatch, tmp_path):
+    """The race fix must not have opened the hole it was narrowing: a
+    directory holding a file that is NOT our marker is still refused."""
+    docs = tmp_path / "Documents"
+    docs.mkdir(mode=0o755)
+    (docs / "thesis.txt").write_text("irreplaceable")
+    monkeypatch.setenv("EMAIL_MCP_STATE_DIR", str(docs))
+
+    assert config.state_root_refusal() is not None
+    with pytest.raises(config.StateDirRefused):
+        config.state_root()
+    assert (docs / "thesis.txt").read_text() == "irreplaceable"
+
+
+def test_create_false_never_yields_a_root_the_write_path_would_refuse(
+        home, monkeypatch):
+    """`state_root(create=False)` short-circuited BEFORE validating, so it
+    handed back $HOME — and `doctor --fix` built $HOME/spool out of it.
+    The path stays resolvable (uninstall and doctor must be able to NAME
+    it), but the refusal is now askable without triggering the write."""
+    monkeypatch.setenv("EMAIL_MCP_STATE_DIR", str(home))
+
+    assert config.state_root(create=False) == home   # still total
+    assert config.state_root_refusal() is not None   # and still refused
+    with pytest.raises(config.StateDirRefused):
+        config.state_root()
+
+
+def test_doctor_fix_never_creates_state_under_a_refused_root(
+        home, monkeypatch):
+    """The defect that regression above describes, at the layer it bit:
+    `doctor --fix` resolved <root>/spool from an unvalidated root and
+    mkdir'd it. Nothing may be created under a refused root."""
+    from email_mcp import repairs
+
+    monkeypatch.setenv("EMAIL_MCP_STATE_DIR", str(home))
+    before = sorted(p.name for p in home.iterdir())
+    home_mode = _mode(home)
+
+    result = repairs.run_fixes()
+
+    assert sorted(p.name for p in home.iterdir()) == before
+    assert _mode(home) == home_mode
+    for leaf in ("spool", "plans", "graph", "audit", "fts"):
+        assert not (home / leaf).exists()
+    assert isinstance(result["failed"], list)   # reported, never raised
+
+
+def test_a_root_that_is_a_file_is_refused_before_any_effect(
+        home, monkeypatch, tmp_path):
+    """A non-directory squatting on the root: refused with a readable
+    reason instead of a NotADirectoryError from somewhere deeper."""
+    imposter = tmp_path / "not-a-dir"
+    imposter.write_text("I am a file")
+    monkeypatch.setenv("EMAIL_MCP_STATE_DIR", str(imposter))
+
+    assert "not a directory" in (config.state_root_refusal() or "")
+    with pytest.raises(config.StateDirRefused):
+        config.state_root()
+    assert imposter.read_text() == "I am a file"
+
+
+def test_setup_never_chmods_pre_existing_spool_subdirectories(
+        home, monkeypatch, capsys):
+    """`setup` used to chmod 0700 over the five spool state subdirectories
+    unconditionally, which re-introduced the surprise-chmod the created-only
+    rule exists to remove. Configuration never re-modes what it did not
+    create — `doctor` reports it, `doctor --fix` repairs it."""
+    from email_mcp import lifecycle
+
+    (home / ".email-mcp" / "spool" / "pending").mkdir(parents=True,
+                                                      mode=0o755)
+    monkeypatch.setattr(lifecycle, "read_meta", lambda: {})
+    monkeypatch.setattr(lifecycle, "write_meta", lambda meta: None)
+
+    result = lifecycle._step_state_dirs({})
+
+    assert result.status == "ok"
+    assert _mode(home / ".email-mcp" / "spool" / "pending") == 0o755
+    # The ones it DID create are still 0700.
+    assert _mode(home / ".email-mcp" / "spool" / "sending") == 0o700
+
+
+def test_doctor_fix_repairs_a_pre_existing_mode_on_request(home):
+    """The other half of the contract: what configuration refuses to do
+    silently, `doctor --fix` does explicitly."""
+    from email_mcp import repairs
+
+    (home / ".email-mcp").mkdir(mode=0o755)
+    config.spool_dir()
+    assert _mode(home / ".email-mcp") == 0o755   # untouched by config
+
+    finding = repairs._detect_state_dir_perms()
+    assert finding and "not 0700" in finding
+    result = repairs.run_fixes()
+
+    assert "state_dir_perms" in [a["repair"] for a in result["applied"]]
+    assert _mode(home / ".email-mcp") == 0o700
+
+
+def test_doctor_is_read_only_over_a_completely_absent_state_tree(home):
+    """Read-side purity, end to end: a full doctor run over a fresh HOME
+    creates nothing at all."""
+    from email_mcp import doctor
+
+    doctor.check_spool_plans()
+    doctor.check_audit()
+    doctor.check_fts()
+    doctor.check_graph()
+
+    assert not (home / ".email-mcp").exists()
+
+
+def test_no_filesystem_effect_precedes_a_refusal(home, monkeypatch, tmp_path):
+    """Refusal happens BEFORE any effect — for every managed getter, not
+    just the root's own."""
+    docs = tmp_path / "Documents"
+    docs.mkdir(mode=0o755)
+    (docs / "thesis.txt").write_text("irreplaceable")
+    monkeypatch.setenv("EMAIL_MCP_STATE_DIR", str(docs))
+    before = sorted(p.name for p in docs.iterdir())
+
+    for getter in LEAF_GETTERS:
+        with pytest.raises(config.StateDirRefused):
+            getattr(config, getter)()
+
+    assert sorted(p.name for p in docs.iterdir()) == before
+    assert _mode(docs) == 0o755
+    assert (docs / "thesis.txt").read_text() == "irreplaceable"
+
+
+def test_clean_home_with_no_mail_store_degrades_and_creates_nothing(
+        home, monkeypatch, tmp_path):
+    """Clean-HOME execution: no ~/Library/Mail, no inherited EMAIL_MCP_*.
+
+    Every read surface must answer (as a coded envelope or an empty
+    result), nothing may traceback, and no state directory may appear. The
+    v0.11 gate ran the whole suite this way precisely because the developer
+    machine has a populated Mail store and a live ~/.email-mcp, so a code
+    path that quietly depends on either passes there and fails for a new
+    user on first launch.
+    """
+    from email_mcp import audit, doctor, fts, server, spool
+
+    assert not (home / "Library" / "Mail").exists()
+
+    assert audit.query() == {"events": [], "files_scanned": 0,
+                             "skipped_lines": 0}
+    assert spool.entries("pending") == []
+    assert fts.status()["state"] == "absent"
+
+    report = doctor.run()
+    assert isinstance(report["ok"], bool)
+    assert report["checks"]["state_root"]["ok"] is True   # absent ≠ broken
+    assert report["checks"]["mail_store"]["ok"] is False  # honestly red
+
+    out = server.tool_list_scheduled()
+    assert out["ok"] is True
+    assert all(out[s] == [] for s in ("pending", "sending", "sent",
+                                      "failed", "cancelled"))
+    out = server.tool_audit()
+    assert out["ok"] is True and out["events"] == []
+
+    assert not (home / ".email-mcp").exists()
+
+
+def test_the_package_never_resolves_a_path_out_of_its_own_directory():
+    """Wheel-installed behaviour: an installed package has no tests/,
+    docs/, tools/ or pyproject.toml beside it.
+
+    A module that walks up from ``__file__`` works in an editable install
+    and dies in a wheel — the whole class of "it worked in the checkout"
+    packaging bug. Only actual path arithmetic counts: the word "docs" is a
+    JSON key in the FTS status dict and says nothing about the filesystem,
+    so this matches code, not prose.
+    """
+    import ast
+    import email_mcp
+    from pathlib import Path
+
+    pkg = Path(email_mcp.__file__).parent
+    offenders: list[str] = []
+    for py in sorted(pkg.rglob("*.py")):
+        tree = ast.parse(py.read_text(encoding="utf-8"), str(py))
+        for node in ast.walk(tree):
+            # Path(__file__).parent.parent … — one .parent lands in the
+            # package directory, two leaves it.
+            if not (isinstance(node, ast.Attribute) and node.attr == "parent"):
+                continue
+            inner = node.value
+            if isinstance(inner, ast.Attribute) and inner.attr == "parent":
+                offenders.append(f"{py.relative_to(pkg)}:{node.lineno}")
+    assert not offenders, (
+        "package walks above its own directory (works in an editable "
+        "install, breaks in a wheel): " + ", ".join(offenders))

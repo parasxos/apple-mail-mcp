@@ -498,7 +498,7 @@ def test_sandbox_lane_refuses_commands_and_env_naming_the_real_estate(
     with pytest.raises(runner.UnsafeAction, match="names the real state root"):
         ctx.sh(["rm", "-rf", str(estate / "spool")])
     with pytest.raises(runner.UnsafeAction, match="points into the real state"):
-        ctx.env({"EMAIL_MCP_SPOOL_DIR": str(estate / "spool")})
+        ctx.env({"EMAIL_MCP_STATE_DIR": str(estate / "spool")})
 
     env = ctx.env()
     assert env["HOME"] == str(ctx.sandbox_home)

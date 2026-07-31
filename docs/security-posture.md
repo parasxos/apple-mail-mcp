@@ -206,20 +206,134 @@ An unwritable ledger costs the `doctor_fix` events, never the repairs.
 `test_doctor_fix_refuses_state_override_at_home`
 (`tests/test_lifecycle_redteam.py`).
 
-### 1.6 State-dir mode discipline
+### 1.6 One state root, and the created-only chmod rule
 
 Everything the tool owns holds mail-derived data: the spool holds
 fully-composed outgoing messages with bodies and attachments; plans hold
 message metadata; the ledger holds recipients and subjects; the graph dir
-holds OAuth token caches that grant delegated mailbox access. All state
-directories are created and kept at **0700** — including the five spool
-subdirectories, which were `0755` until this was measured; `identities.toml`,
-ledger months and token caches at **0600**. One qualification, stated rather
-than assumed: when a state directory is itself a **symlink**, its mode is
-left alone. Chmod follows links, so tightening it would change the mode of
-whatever the link points at — a directory this tool does not own. `write_meta()` and the token-cache
-writer use the same discipline: tmp file in the same directory, chmod,
-atomic rename.
+holds OAuth token caches that grant delegated mailbox access.
+
+**Since v0.11 there is exactly one configurable location for all of it.**
+`EMAIL_MCP_STATE_DIR` names a single root (default `~/.email-mcp`), and
+`spool`, `plans`, `graph`, `fts` and `audit` are derived from it as fixed
+leaf names. The five per-directory overrides are retired (§1.6.5). Only
+`attach_dir` sits outside — deliberately, under `$TMPDIR`, because
+materialised attachments are transient extracts the OS may reap, and
+folding them into the root would make `uninstall --purge` delete them and
+make them survive reboots.
+
+This is not a tidier spelling of the old model. It is the reason the old
+class of finding is gone: with one root there is a single place to
+validate and a single thing to relocate. Three release gates in a row had
+found a *different* way past the per-directory fences — a getter nobody
+had fenced, a fence that ran after the mkdir it was guarding, a path
+comparison that missed every spelling of `$HOME` on a case-insensitive
+volume. The configuration surface was itself the defect, so it was removed
+rather than fenced harder.
+
+#### 1.6.1 Created-only chmod
+
+**A directory this tool creates is 0700. A directory that already existed
+is never chmodded at all.** That is the whole rule, and it lives in one
+function (`config._make_ours`): `mkdir(exist_ok=False)` succeeds → we made
+it → `chmod 0700`; `FileExistsError` → it was already there → we touch
+nothing.
+
+"email-mcp changed the mode of a directory I did not name" is therefore
+**unrepresentable**, not fenced. Nothing on the configuration path — not
+`setup`, not the first send, not the dispatcher — re-modes an existing
+directory. Files the tool writes are 0600 (`identities.toml`, ledger
+months, token caches, `meta.json`, the root marker); `write_meta()` and the
+token-cache writer use tmp-in-the-same-directory, chmod, atomic rename.
+
+The counterpart matters as much as the rule: a loose mode is still a
+**finding**. `doctor` reports it (`state_root`, `spool_plans`, `audit`
+checks) and `doctor --fix` repairs it — on explicit request. What
+configuration will not do silently, the fixer will do openly.
+
+#### 1.6.2 The ownership marker
+
+A managed root carries `.email-mcp-root` (0600, JSON, `root_version 1`).
+It is written when the root is adopted and is a **safety hint, not a
+lock** — writing it is best effort, so a read-only volume cannot break
+sending.
+
+It answers one question: *may this tool manage this directory?*
+
+#### 1.6.3 A non-empty unmarked root is refused
+
+If `EMAIL_MCP_STATE_DIR` names an **existing** directory that holds files
+and carries no marker, the tool refuses (`config.StateDirRefused`) —
+**before any filesystem effect**. This is what makes `$HOME`, `/Users` and
+every case-variant and firmlink of them refusable without comparing a
+single path string. (`$HOME` and its ancestors are *also* refused
+explicitly, by inode identity, so an empty home directory is refused too.)
+
+Three qualifications, stated rather than assumed:
+
+- The **default** root (`~/.email-mcp`, no variable set) is never refused
+  for its contents. Every v0.10 install has one, full of our own files and
+  with no marker; adopting it is the upgrade path.
+- The marker itself does **not** count as foreign content. Counting it made
+  a root the tool had just adopted look foreign — see §1.6.4.
+- An **empty** directory is a valid relocation target: relocating onto
+  another volume is supported and is why the rule is "must be ours", not
+  "must be under `$HOME`".
+
+#### 1.6.4 The adoption race (found and fixed at the v0.11 gate)
+
+Two writers exist by design — the MCP server and the launchd dispatcher.
+The refusal check was `_marked(root)` … then `any(root.iterdir())`, and
+those are two separate syscalls. On the first mutation after a root was
+configured, one process could pass the marker probe, have the *other*
+process adopt the root underneath it, and then read that adoption — the
+marker file itself — as "someone else's files". The mutation was refused.
+
+Reproduced at roughly 1 run in 20 under load with two concurrent writers;
+the cost was a dropped audit event or a failed `schedule_email`, on a
+correctly configured system.
+
+Fixed by excluding the marker from the emptiness scan **and** re-reading
+the marker after the scan: the refusal is based on the marker as it stands
+*after* the content is observed, not before.
+
+*Proven by* — `test_marker_alone_does_not_make_a_root_look_foreign`,
+`test_root_adopted_between_probe_and_scan_is_not_refused`,
+`test_refusal_still_fires_for_genuinely_foreign_content`
+(`tests/test_config_state_dirs.py`).
+
+#### 1.6.5 Symlinks: a chosen root may be one, a managed leaf may not
+
+- **Root symlink → followed, target's mode untouched.** Relocating
+  `~/.email-mcp` (or `EMAIL_MCP_STATE_DIR`) with a link is a supported
+  shape. The link is followed and the leaves are created under it, but the
+  target keeps its own mode — we did not create it, so §1.6.1 applies.
+- **Leaf symlink → refused.** A link squatting on `<root>/spool`,
+  `<root>/audit`, etc. is a squat, not a choice: `mkdir` and `chmod` both
+  resolve through it, so the ledger or the spool would be written into an
+  arbitrary victim directory and its mode tightened. `StateDirRefused`.
+
+A refused ledger follows the emit-failure policy: the event is dropped
+with a logged warning. Receipts are lost; mail is never blocked.
+
+#### 1.6.6 Read-side purity
+
+Every managed getter takes `create=False`, which **resolves the path and
+touches nothing**. `doctor`, `audit.query()`, `spool.entries()`,
+`fts.status()` and `uninstall` planning all use it. A plain `doctor` over a
+completely absent state tree creates nothing at all.
+
+`state_root(create=False)` is **total** — it never raises, because
+uninstall planning and `doctor` must be able to *name* a root even when it
+is refusable. But it no longer hands out an unvalidated path to code that
+then writes: ask `config.state_root_refusal()` (pure; stats, never
+creates) for the verdict, and anything intending to write goes through
+`create=True`, which raises. See §2.3.
+
+*Proven by* — `tests/test_config_state_dirs.py` (39 tests): created-only
+modes, marker semantics, refusal without any filesystem effect (mode *and*
+contents unchanged), root/leaf symlink behaviour, read-side purity,
+`doctor --fix` repairing on request.
 
 ### 1.7 Degradation, not tracebacks
 
@@ -322,25 +436,43 @@ refusal fired with `pending/ sending/ sent/ failed/ cancelled` already
 created at the refused location. A second release gate caught both by
 testing on the installed wheel rather than reading the diff.
 
-**The fence now covers, by name:** `spool_dir`, `plans_dir`, `graph_dir`,
-`fts_dir`, `audit_dir`, and `attach_dir` (no chmod there, but a mkdir at
-`$HOME` or above is still refused). In every getter the check runs
-**before the first mkdir** (`config._refuse_degenerate`). A refused ledger
-follows the emit-failure policy: the event is dropped with a logged
-warning — receipts are lost, mail is never blocked.
+**v0.11 stopped fencing this and deleted the surface instead.** There are
+no per-directory overrides left to point at `$HOME`. One variable names one
+root; the root is validated once, before any effect; and nothing
+pre-existing is ever chmodded, so "the fence missed a getter" has no
+meaning any more. §1.6 states the model that replaced this one.
 
-**What is measured, not merely claimed** (regression tests:
-`tests/test_config_state_dirs.py`): for each getter × each spelling
-(`$HOME`, `$HOME/sub/..`, the parent of `$HOME`) — the refusal is raised,
-the target's **mode** is unchanged, **and its contents are unchanged** (no
-directory, no ledger file created before the refusal fired). The
-contents assertion exists because a gate that measured only the mode
-declared this closed while the mkdir still landed.
+**Two defects in the replacement were found by the v0.11 gate itself**, and
+the record of that belongs here:
+
+1. **`state_root(create=False)` short-circuited before validating.** The
+   `create` flag was meant to skip the *effect*; it skipped the *checks*
+   too. So the read-side resolver handed back `$HOME` as a state root, and
+   `doctor --fix` — which resolved `<root>/spool` from it and then wrote —
+   created `$HOME/spool`, `$HOME/plans`, `$HOME/graph`, `$HOME/audit`. The
+   exact scattering this section was written about, reintroduced through
+   the read-side door. Validation now belongs to resolution: only the
+   effect is conditional on `create`, `state_root_refusal()` is the single
+   pure definition of "refusable", and `repairs` creates through the
+   production getters rather than a parallel `mkdir`+`chmod` of its own.
+2. **The adoption race** — see §1.6.4.
+
+**What is measured, not merely claimed** (`tests/test_config_state_dirs.py`):
+for each spelling of `$HOME` (`$HOME`, `$HOME/sub/..`, `//$HOME`, case
+variants) and for each managed getter — the refusal is raised, the
+target's **mode** is unchanged, **and its contents are unchanged** (no
+directory, no ledger file created before the refusal fired). The contents
+assertion exists because a gate that measured only the mode declared this
+closed while the mkdir still landed. `doctor --fix` over a refused root is
+asserted to leave `$HOME` byte-for-byte and mode-for-mode as it found it.
 
 **Residual:** a refusal is an exception, so a server or dispatcher started
-with a degenerate override fails loudly instead of running degraded. That
-is the intended trade — the alternative is a mail tool silently changing
-the mode of a directory the user did not name.
+with a refusable root fails loudly instead of running degraded. That is the
+intended trade — the alternative is a mail tool silently changing the mode
+of a directory the user did not name. `doctor` reports the refusal (the
+`state_root` check) rather than leaving the tool mysteriously inert; before
+v0.11's gate it did not, and a refused configuration produced a **green**
+doctor while every mutation dropped its receipts.
 
 ### 2.4 OPEN (major) — `identities.toml` as a FIFO hangs every lifecycle command forever
 
@@ -367,27 +499,32 @@ is not an attacker but a botched shell redirection or a restore tool.
 clear `IdentityError` when the path is not a regular file) closes it
 without changing any success path.
 
-### 2.5 OPEN (minor) — `config.audit_dir()`'s symlink refusal is check-then-act
+### 2.5 CLOSED — the ledger's symlink refusal was check-then-act
 
-```
-linked = d.is_symlink()      # probe
-...
-d.mkdir(parents=True, exist_ok=True)
-if not linked:
-    d.chmod(0o700)           # act
-```
+The old shape probed `d.is_symlink()`, then `mkdir(exist_ok=True)`, then
+`chmod` if the probe said "not a link" — so a path swapped to a symlink
+between probe and `chmod` landed the `chmod` on the link's target.
 
-A path swapped to a symlink between the probe and the `chmod` lands the
-`chmod` on the link's target.
+**Closed by construction in v0.11, not by tightening the window.** A leaf
+is created with `mkdir(exist_ok=False)`, and the `chmod` happens **only on
+the branch where that `mkdir` succeeded** — i.e. only for a directory that
+did not exist a syscall earlier and that we therefore created ourselves. A
+link cannot be swapped onto a path that `mkdir` just created; if the swap
+wins the race, `mkdir` raises `FileExistsError` and no `chmod` runs at all.
+There is no probe to invalidate.
 
-**Blast radius:** `chmod 0700` on one attacker-chosen directory, requiring
-a same-machine race against a process that is already running as you.
-Tightening, not loosening. This is a textbook TOCTOU, and it is here for
-the textbook reason: `pathlib` has no `chmod`-on-fd. The fix is
-`os.open(..., O_NOFOLLOW|O_DIRECTORY)` + `os.fchmod`.
+**Residual (minor, accepted):** a *symlinked leaf that already exists* is
+detected with `is_symlink()` and refused, which is still a probe — but the
+act it guards is a refusal, not a `chmod`. Losing that race means the tool
+proceeds to `mkdir(exist_ok=False)` on the swapped path, which fails. The
+failure mode is a dropped event, never a `chmod` through the link.
 
-**Status:** not fenced; accepted as low-value relative to §0 if it stays
-unfixed.
+**Related, still open:** the ledger month-file is opened `O_NOFOLLOW` and
+its mode set with `os.fchmod` **on the fd it just wrote** — so a link
+swapped onto the month path between the write and the chmod cannot
+redirect it. That is the `os.open`/`fchmod` fix this entry used to ask for,
+applied where a second writer actually races
+(`test_emit_chmods_the_fd_it_wrote_not_the_path`).
 
 ### 2.6 OPEN (minor) — `~/Library/LaunchAgents` is still followed when it is a symlink
 
@@ -423,16 +560,21 @@ validate and store the same value) is the correct fix and is a one-line
 change; it is called out so it does not get lost. Left open deliberately
 rather than papered over.
 
-### 2.8 ACCEPTED — inconsistent chmod policy across the state getters
+### 2.8 CLOSED — chmod policy is now uniform across every state getter
 
-`config.audit_dir()` deliberately skips the `chmod` when the operator named
-a symlink with `EMAIL_MCP_AUDIT_DIR` ("its target's mode is not ours to
-set"). `spool_dir()`, `plans_dir()`, `graph_dir()` and `fts_dir()` do not
-make that distinction — they chmod the target and the parent
-unconditionally, symlink or not.
+The five getters used to disagree: `audit_dir()` skipped the `chmod` for an
+operator-named symlink while `spool_dir()`, `plans_dir()`, `graph_dir()`
+and `fts_dir()` chmodded the target and its parent unconditionally.
 
-**Blast radius:** subsumed by §2.3. Fixing §2.3 in the getters is the
-natural place to make the policy uniform.
+There is now **one** implementation. Every leaf goes through
+`config._leaf()` → `config._make_ours()`, so the created-only rule (§1.6.1)
+and the leaf-symlink refusal (§1.6.5) apply identically to all five, and no
+getter chmods a parent at all. `attach_dir()` — the one managed directory
+outside the root — uses the same `_make_ours()`.
+
+*Proven by* — the `LEAF_GETTERS` parametrisation in
+`tests/test_config_state_dirs.py` runs the mode, symlink and
+purity assertions across all five getters rather than one.
 
 ### 2.9 ACCEPTED — secret *references* appear in error prose
 
@@ -452,12 +594,24 @@ and `tests/test_audit_redteam.py::test_f5_body_sentinel_grep_is_empty` pin
 the value side of this: a sentinel credential planted in the flow is
 grepped for across every file the tool writes, and must not appear.
 
-### 2.10 ACCEPTED — the documented event-loss window
+### 2.10 ACCEPTED — the documented event-loss window (audit-loss policy)
 
-The audit ledger is an **index of truth, not a second source of it**. A
-process killed between a durable mutation and its `emit()` loses that one
-event; while the ledger directory is unwritable, events are dropped and the
-drop is logged. Events are therefore **at-most-once per mutation**.
+The audit ledger is an **index of truth, not a second source of it**.
+Events are **at-most-once per mutation**. Three ways an event is lost:
+
+1. the process is killed between a durable mutation and its `emit()`;
+2. the ledger directory is unwritable (0500, full disk, absent parent);
+3. the ledger location is **refused** — a symlinked `<root>/audit` leaf, a
+   refusable root, a retired variable still set.
+
+**In all three the mutation stands and the receipt is dropped.** `emit()`
+never raises; it logs one warning per dropped event. An audit failure must
+never block or undo an email mutation, and it never does — including for
+the refusal cases, which are caught inside `emit()` and degraded to the
+same drop-and-log. The one thing that *is* blocked by a refused root is a
+mutation which needs the root for its own durability (`schedule_email`
+needs somewhere to freeze the message) — that is an inability to mutate,
+not an audit failure vetoing a mutation.
 
 **Blast radius:** absence of an event is never proof that a mutation did
 not happen. If you are reconciling what was sent, the primary artifacts —
@@ -466,6 +620,13 @@ Items — are authoritative; the ledger is the index.
 
 This is contract §6 and it is deliberate: the alternative (block the send
 until the receipt is durable) makes an unwritable disk into an outage.
+
+*Proven by* — `test_f4_unwritable_ledger_never_blocks_mail` (0500 ledger
+leaf: send, schedule, plan build and mailbox create all return their normal
+results, five events dropped, five warnings, not one byte written),
+`test_f6_kill_between_mutation_and_emit` (SIGKILL at the emit boundary:
+the spool entry is durable and deliverable, the event is absent, and
+neither `doctor` nor the audit tool crashes over the gap).
 
 ### 2.11 ACCEPTED — scheduled delivery is at-least-once
 
@@ -483,14 +644,17 @@ These are design commitments, not incidental behavior:
 
 - **`~/Library/Mail` is never written.** All mail mutation goes through
   Mail.app's own scripting interface or through a transport; the store is
-  read-only to this tool. The one way this was falsifiable has been closed:
-  pointing `EMAIL_MCP_SPOOL_DIR` at the mail store made a plain
+  read-only to this tool. The one way this was falsifiable has been closed
+  twice over: pointing `EMAIL_MCP_SPOOL_DIR` at the mail store made a plain
   `email-mcp doctor` — no `--fix` — create the five spool subdirectories
   inside it and take it `0755 → 0700`, because the read-side check called a
   getter that creates. The state-dir getters now take `create=False`, and
   every read path (`doctor`, `spool.entries`, the dispatcher's log-path
-  resolution) uses it. Verified: `doctor` against a mail-store-pointed
-  spool dir now creates nothing and leaves the mode untouched.
+  resolution) uses it. Since v0.11 the variable that aimed it there does
+  not exist, aiming `EMAIL_MCP_STATE_DIR` at a mail store is refused (it is
+  non-empty and unmarked), and nothing pre-existing is chmodded even if a
+  path did reach a getter. Verified: `doctor` over a completely absent
+  state tree in a pristine `HOME` creates nothing.
 - **Keychain and 1Password items are never deleted.** `uninstall` prints
   the `security delete-generic-password` commands and stops.
 - **`triage_plan` cannot delete.** `delete` through `triage_plan` raises
@@ -510,7 +674,8 @@ These are design commitments, not incidental behavior:
 ## 4. How to re-run the attacks
 
 ```
-.venv/bin/python -m pytest tests/test_lifecycle_redteam.py \
+.venv/bin/python -m pytest tests/test_config_state_dirs.py \
+                          tests/test_lifecycle_redteam.py \
                           tests/test_audit_redteam.py \
                           tests/test_lifecycle_uninstall.py \
                           tests/test_repairs.py \
@@ -519,10 +684,11 @@ These are design commitments, not incidental behavior:
 
 | File | Covers |
 |---|---|
-| `tests/test_lifecycle_redteam.py` | purge fences, `$HOME` state overrides, symlinked state dirs/graph dir, identity-name traversal, backup-before-clobber, credential sentinel, launchctl-absent degradation |
-| `tests/test_audit_redteam.py` | two-process append integrity, torn/corrupt lines, unwritable and unchmodable ledger, body sentinel, month rollover, single-`os.write` atomicity, symlinked and file-squatted ledger paths |
-| `tests/test_lifecycle_uninstall.py` | the `EMAIL_MCP_SPOOL_DIR=$HOME` headline case, uninstall planning, print-only env overrides |
-| `tests/test_repairs.py` | the frozen repair registry (id pin), detect purity, apply behavior |
+| `tests/test_config_state_dirs.py` | the whole §1.6 model: created-only chmod, marker semantics, refusal of a non-empty unmarked root (mode *and* contents unchanged), the adoption race, root/leaf symlinks, read-side purity, `create=False` totality, `doctor --fix` on request |
+| `tests/test_lifecycle_redteam.py` | purge fences, a state root at `$HOME`, symlinked state dirs/graph dir, identity-name traversal, backup-before-clobber, credential sentinel, launchctl-absent degradation, un-creatable root |
+| `tests/test_audit_redteam.py` | two-process append integrity, torn/corrupt lines, unwritable ledger leaf, body sentinel, month rollover, single-`os.write` atomicity, symlinked and file-squatted ledger paths, kill-at-the-emit-boundary |
+| `tests/test_lifecycle_uninstall.py` | the `EMAIL_MCP_STATE_DIR=$HOME` headline case, uninstall planning, print-only env overrides |
+| `tests/test_repairs.py` | the frozen repair registry (id pin), detect purity, apply behavior, retired-variable rejection |
 | `tests/test_wire_belts.py` | poisoned sources on every tool; exceptions whose `__str__` or type name itself raises |
 
 The `tests/test_lifecycle_redteam.py` module docstring names the exact
@@ -530,10 +696,20 @@ mutation used to prove each guard (break the guard, observe the test fail,
 restore). If you add a guard, add its mutation there — a test that passes
 whether or not the code is correct is worse than no test.
 
-**The findings in §2.3–§2.6 are reproducible by hand, not by the suite** —
-they were found after those tests were written and have no test yet.
-That is stated here rather than hidden: the suite passing is not the same
-as the surface being clean.
+**Every §1.6 regression in this pass was verified by reverting the fix and
+observing the test fail** — seven of them, against the pre-fix source. Two
+of the findings (§2.3.1, §1.6.4) were found *by* running the suite in
+environments the repo checkout does not exercise: a pristine `HOME`, an
+installed wheel on a different Python, and the suite under load and in
+randomised order. The suite passing in one environment is not the same as
+the surface being clean.
+
+**Run it in more than one place.** The v0.11 gate ran the full suite four
+ways — repo checkout, pristine `HOME` (no `~/Library/Mail`, no inherited
+`EMAIL_MCP_*`), installed wheel in a clean venv on Python 3.12, and three
+randomised orderings — and the wheel run is what surfaced a cross-module
+test-isolation leak (`audit.set_process("cli")` escaping `run_fixes`) that
+alphabetical ordering had been hiding.
 
 ---
 
@@ -543,3 +719,31 @@ This file is updated whenever a finding is opened, closed, or accepted.
 An accepted risk that later gets fixed moves to §1 with its test named; an
 open finding that gets fenced does the same. Items are never deleted —
 a reader comparing releases should be able to see what changed its status.
+
+### v0.11 — one state root
+
+- **§1.6 rewritten.** The per-directory model it described is gone. New:
+  single root, ownership marker, created-only chmod, refusal of a non-empty
+  unmarked root, root-symlink-followed / leaf-symlink-refused, read-side
+  purity, `doctor` vs `doctor --fix`.
+- **§2.3 CLOSED → replaced.** The degenerate-override fence has nothing
+  left to fence; the surface was deleted. Two defects in the *replacement*
+  were found by this gate and are recorded there: `state_root(create=False)`
+  skipping validation (so `doctor --fix` created `$HOME/spool`), and the
+  two-writer adoption race (§1.6.4).
+- **§2.5 OPEN → CLOSED.** The check-then-act `chmod` is gone by
+  construction: the `chmod` only runs on the branch where `mkdir`
+  succeeded.
+- **§2.8 ACCEPTED → CLOSED.** One `_make_ours()` for every getter; the
+  policy cannot be inconsistent because there is only one of it.
+- **§2.10 expanded** into the full audit-loss policy, naming all three loss
+  causes and the guarantee that none of them blocks or undoes a mutation.
+- **New:** `doctor` gained a `state_root` check. A refused configuration
+  previously produced a *green* doctor while every mutation dropped its
+  receipts.
+- **New:** the five retired `EMAIL_MCP_*_DIR` variables are **rejected**,
+  not ignored — see `docs/reference.md`, "Migrating from the per-directory
+  variables". Ignoring them would silently relocate live state.
+- **Known residual risks after this pass:** §2.1, §2.2, §2.4 (major, open),
+  §2.6, §2.7, §2.9, §2.10, §2.11 are unchanged by v0.11 and remain as
+  stated.

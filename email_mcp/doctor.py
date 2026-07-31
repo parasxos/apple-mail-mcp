@@ -283,7 +283,7 @@ def check_spool_plans() -> dict:
 
     # Resolve only — doctor checks stat, it never creates (the purity rule
     # _graph_token_dir and check_fts already follow). Creating here let a
-    # read-only diagnostic build a spool tree wherever EMAIL_MCP_SPOOL_DIR
+    # read-only diagnostic build a spool tree wherever the state root
     # pointed, ~/Library/Mail included.
     spool_root = config.spool_dir(create=False)
     plans_root = config.plans_dir(create=False)
@@ -503,7 +503,45 @@ def check_graph() -> dict:
 # ---------------------------------------------------------------------- #
 
 
+def check_state_root() -> dict:
+    """The configured state root is one this tool may manage.
+
+    A refused root is not a cosmetic problem: every mutation drops its
+    receipts, scheduling has nowhere to freeze a message, and the triage
+    plan store is unreachable. Without this check the doctor went GREEN in
+    exactly that state — the resolver refuses at write time, and no
+    read-side check ever asked why the tree was absent.
+
+    Read-only, like every check: it asks config for the refusal reason,
+    which stats and never creates.
+    """
+    root = config.state_root(create=False)
+    reason = config.state_root_refusal()
+    if reason:
+        out = {"ok": False, "detail": reason, "root": str(root)}
+        if config.retired_state_vars():
+            out["fix"] = ("unset " + ", ".join(config.retired_state_vars())
+                          + "; set EMAIL_MCP_STATE_DIR instead")
+        else:
+            out["fix"] = ("unset EMAIL_MCP_STATE_DIR, or point it at a new "
+                          "or empty directory of its own")
+        return out
+    if not root.exists():
+        return {"ok": True, "root": str(root),
+                "detail": f"{root} — created on first use"}
+    mode = root.stat().st_mode & 0o777
+    marked = (root / config.STATE_MARKER).is_file()
+    detail = f"{root} (mode {mode:o}{'' if marked else ', unmarked'})"
+    if mode != 0o700:
+        return {"ok": False, "root": str(root),
+                "detail": detail + " — wants 700; state holds recipients, "
+                                   "subjects and token caches",
+                "fix": f"email-mcp doctor --fix   # chmod 700 {root}"}
+    return {"ok": True, "root": str(root), "detail": detail}
+
+
 _CHECKS = (
+    ("state_root", check_state_root),
     ("mail_store", check_mail_store),
     ("automation", check_automation),
     ("accessibility", check_accessibility),

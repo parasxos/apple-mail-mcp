@@ -268,6 +268,24 @@ def fts_dir_guard(state_root_guard) -> Path:
 
 
 @pytest.fixture(autouse=True)
+def audit_process_guard():
+    """Restore audit's process tag around EVERY test.
+
+    ``audit.set_process`` is module-global, and anything that runs
+    ``repairs.run_fixes()`` or a lifecycle command sets it to "cli" and
+    leaves it there. The next test to assert ``src == "server"`` then fails
+    — but only in some orderings, which is how it stayed hidden: in the
+    repo the modules that set it happen to sort after the modules that
+    assert it. Restoring here makes the suite order-independent.
+    """
+    from email_mcp import audit
+
+    before = audit._PROCESS
+    yield
+    audit.set_process(before)
+
+
+@pytest.fixture(autouse=True)
 def state_root_guard(tmp_path_factory, monkeypatch) -> Path:
     """Point the ENTIRE state tree at a per-test tmp root for EVERY test.
 

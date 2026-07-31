@@ -714,16 +714,21 @@ def _step_state_dirs(facts: dict) -> StepResult:
             "state_dirs", "blocked",
             "refusing to build state under your home directory (or above "
             "it): " + "; ".join(degenerate) + " — creating the tree there "
-            "would chmod 0700 that directory's PARENT and scatter spool "
-            "subdirectories in it. Unset the variable or point it at a "
-            "dedicated directory.")
-    # The config getters mkdir + chmod 0700 (and spool creates its five
-    # state subdirs — with umask modes, so they are tightened here to the
-    # 0700 the repairs registry considers healthy). The FTS dir is
-    # deliberately NOT among them: derived state, --build only.
-    spool_root = config.spool_dir()
-    for sub in spool.STATES:
-        (spool_root / sub).chmod(0o700)
+            "would scatter spool subdirectories in it. Unset the variable "
+            "or point it at a dedicated directory.")
+    # Every other reason the root may not be managed (an override at a
+    # directory that already holds someone else's files, a non-directory
+    # squatting on it) comes from the resolver itself, so setup reports
+    # exactly what the write path would refuse instead of crashing on it.
+    refusal = config.state_root_refusal()
+    if refusal:
+        return StepResult("state_dirs", "blocked", refusal)
+    # The config getters create the tree: 0700 for what they create, and
+    # NOTHING for what already existed — setup does not re-mode a
+    # directory the user (or another tool) made. `doctor` reports a wrong
+    # mode and `doctor --fix` repairs it, on request. The FTS dir is
+    # deliberately absent here: derived state, --build only.
+    config.spool_dir()   # root + spool + its five state subdirectories
     config.plans_dir()
     config.graph_dir()
     config.audit_dir()

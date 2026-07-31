@@ -223,31 +223,66 @@ def test_state_file_perms_chmod_0600(home):
     assert "state_file_perms" in _applied_ids(result)
 
 
-# EMAIL_MCP_AUDIT_DIR is absent on purpose: config.audit_dir(create=True)
-# chmods the ledger dir 0700 whenever an event is written, so an audit
-# override at $HOME retightens the home directory no matter what this
-# registry decides — nothing here could prove the fence either way.
-@pytest.mark.parametrize("var", ("EMAIL_MCP_SPOOL_DIR", "EMAIL_MCP_PLANS_DIR",
-                                 "EMAIL_MCP_GRAPH_DIR"))
 @pytest.mark.parametrize("alias", HOME_ALIASES)
 def test_degenerate_override_at_home_however_spelled_is_dropped(
-    home, monkeypatch, var, alias,
+    home, monkeypatch, alias,
 ):
-    """A state dir pointed at $HOME is never managed here, and the three
+    """A state root pointed at $HOME is never managed here, and the three
     spellings of $HOME are one fence: mkdir would scatter spool
     subdirectories through the home directory and chmod 0700 would
-    retighten the home directory itself. The default tree still heals."""
+    retighten the home directory itself.
+
+    Since v0.11 there is one variable to point (the five per-directory
+    ones are rejected outright), and the refusal is absolute: with the
+    root refused NOTHING is managed — including ~/.email-mcp, which is not
+    the configured root in this scenario. `doctor` reports the refusal;
+    it is not silently worked around.
+    """
     home.chmod(0o755)
-    monkeypatch.setenv(var, _spell_home(home, alias))
+    monkeypatch.setenv("EMAIL_MCP_STATE_DIR", _spell_home(home, alias))
 
     result = repairs.run_fixes()
     assert result["failed"] == []
     assert (home.stat().st_mode & 0o777) == 0o755  # $HOME not retightened
     assert not any((home / s).exists() for s in SPOOL_STATES)
-    real_home = Path(os.path.realpath(home))
-    assert not any(Path(os.path.realpath(d)) == real_home
-                   for d in repairs._state_dirs())
-    assert (home / ".email-mcp").is_dir()  # the default tree still healed
+    assert repairs._state_dirs() == []             # nothing is managed
+    assert not (home / ".email-mcp").exists()      # nor is the default tree
+    # …and the doctor says why, instead of going green over it.
+    from email_mcp import doctor
+    check = doctor.check_state_root()
+    assert check["ok"] is False and "home directory" in check["detail"]
+
+
+@pytest.mark.parametrize("var", ("EMAIL_MCP_SPOOL_DIR", "EMAIL_MCP_PLANS_DIR",
+                                 "EMAIL_MCP_GRAPH_DIR", "EMAIL_MCP_FTS_DIR",
+                                 "EMAIL_MCP_AUDIT_DIR"))
+def test_retired_per_directory_override_is_rejected_not_ignored(
+    home, monkeypatch, var, tmp_path,
+):
+    """Migration policy: the five retired variables are REJECTED.
+
+    Ignoring one silently relocates live state — a user with
+    EMAIL_MCP_SPOOL_DIR=/Volumes/big/spool would find scheduled mail
+    apparently gone (still spooled in the old directory, with nothing
+    delivering it). Refusing costs one legible error.
+    """
+    from email_mcp import audit, config, doctor
+
+    elsewhere = tmp_path / "elsewhere"
+    elsewhere.mkdir()
+    monkeypatch.setenv(var, str(elsewhere))
+
+    reason = config.state_root_refusal()
+    assert reason is not None and var in reason and "retired" in reason
+    with pytest.raises(config.StateDirRefused, match="retired"):
+        config.state_root()
+
+    check = doctor.check_state_root()
+    assert check["ok"] is False and var in check["fix"]
+    # Fail closed everywhere, and never by crashing a mutation.
+    assert audit.emit("send", outcome="sent") is None
+    assert not (home / ".email-mcp").exists()
+    assert list(elsewhere.iterdir()) == []
 
 
 # --------------------------------------------------------------------- #

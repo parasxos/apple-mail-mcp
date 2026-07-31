@@ -54,17 +54,21 @@ def audit_dir_guard(state_root_guard):
 
 @pytest.fixture
 def send_env(monkeypatch, tmp_path, audit_dir_guard):
-    """Documented defaults + isolated spool/plans/fts, audit re-pinned
-    after the EMAIL_MCP_* wipe (mirrors tests/test_audit_hooks.py)."""
+    """Documented defaults + the whole state tree isolated under ONE root,
+    re-pinned after the EMAIL_MCP_* wipe (mirrors tests/test_audit_hooks.py).
+
+    The root is ``audit_dir_guard.parent``, NOT ``tmp_path``: tmp_path also
+    holds the mail fixture (V10/) and the identities file, and a non-empty
+    unmarked directory named by EMAIL_MCP_STATE_DIR is refused before any
+    filesystem effect — which would leave every mutation in this module
+    without a spool, a plan store or a ledger.
+    """
     for k in list(os.environ):
         if k.startswith("EMAIL_MCP_"):
             monkeypatch.delenv(k, raising=False)
     monkeypatch.setenv("EMAIL_MCP_STATE_DIR", str(audit_dir_guard.parent))
-    monkeypatch.setenv("EMAIL_MCP_STATE_DIR", str(tmp_path))
     monkeypatch.setenv("EMAIL_MCP_FROM_ADDR", "paris@example.org")
     monkeypatch.setenv("EMAIL_MCP_FROM_NAME", "Paris")
-    monkeypatch.setenv("EMAIL_MCP_STATE_DIR", str(tmp_path))
-    monkeypatch.setenv("EMAIL_MCP_STATE_DIR", str(tmp_path))
     monkeypatch.setenv("EMAIL_MCP_IDENTITIES",
                        str(tmp_path / "no-identities.toml"))
 
@@ -276,14 +280,25 @@ def test_f4_unwritable_ledger_never_blocks_mail(
     send_env, delivered, mail_fixture, tmp_path, monkeypatch,
     email_mcp_warnings,
 ):
-    """Hostile parent (0500, ledger dir absent — the un-mkdir-able case):
+    """The ledger — and ONLY the ledger — is unwritable (0500 leaf):
     send/schedule/triage/mailbox flows all return their normal results,
-    every emit returns None, and each dropped event logs ONE warning."""
+    every emit returns None, and each dropped event logs ONE warning.
+
+    Under the single-root model the fault has to be planted on the LEAF.
+    Making the whole root 0500 (what this test did while spool/plans/audit
+    had independent overrides) no longer isolates the ledger: the spool
+    lives under the same root, so scheduling would fail for want of
+    somewhere to freeze the message — a real inability to mutate, not an
+    audit failure blocking a mutation. The contract under test is the
+    latter, so the root stays healthy and the ledger alone is broken.
+    """
     ro = tmp_path / "ro"
     ro.mkdir()
+    monkeypatch.setenv("EMAIL_MCP_STATE_DIR", str(ro))
+    config.state_root()          # adopt the root (stamps the marker)
     dead = ro / "audit"
-    monkeypatch.setenv("EMAIL_MCP_STATE_DIR", str(dead.parent))
-    ro.chmod(0o500)
+    dead.mkdir()
+    dead.chmod(0o500)            # pre-existing → never re-chmodded by us
     try:
         ok = server.tool_send_email(to="paris@example.org",
                                     subject="f4-send", body="b")
@@ -313,10 +328,13 @@ def test_f4_unwritable_ledger_never_blocks_mail(
         assert mb["ok"] is True
 
         assert audit.emit("send", outcome="sent") is None  # direct probe
+        # Pre-existing mode survives: nothing on the mutation path ever
+        # "heals" a directory it did not create.
+        assert stat.S_IMODE(dead.stat().st_mode) == 0o500
     finally:
-        ro.chmod(0o700)
+        dead.chmod(0o700)
 
-    assert not dead.exists()  # nothing was ever written
+    assert list(dead.iterdir()) == []   # not one byte of ledger was written
     dropped = [r for r in email_mcp_warnings
                if "audit: emit" in r.getMessage()]
     # exactly ONE warning per dropped event: send, schedule, plan_create,
@@ -725,9 +743,12 @@ def test_audit_dir_is_a_regular_file(tmp_path, monkeypatch):
 
     root = tmp_path / "state"
     root.mkdir()
+    monkeypatch.setenv("EMAIL_MCP_STATE_DIR", str(root))
+    config.state_root()   # adopt FIRST: otherwise the imposter file alone
+    # makes the root non-empty and unmarked, and the refusal — not the
+    # squatting file — is what emit would be reporting.
     imposter = root / "audit"
     imposter.write_text("I am a file, not a directory")
-    monkeypatch.setenv("EMAIL_MCP_STATE_DIR", str(root))
     assert audit.emit("send", outcome="sent") is None  # dropped, no raise
     assert audit.query() == {"events": [], "files_scanned": 0,
                              "skipped_lines": 0}

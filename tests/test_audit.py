@@ -1,8 +1,8 @@
 """Audit ledger core (email_mcp.audit + email_mcp.ids) — v0.10 S1.
 
-The suite-wide EMAIL_MCP_AUDIT_DIR guard moves to conftest.py at S2 (when
-server/dispatcher hooks start emitting from other test files); until then
-the autouse fixture below isolates every test in THIS file.
+Every test here runs against the REAL env-driven resolver: the autouse
+fixtures below pin EMAIL_MCP_STATE_DIR at a per-test tmp root and derive
+the ledger from it, shadowing conftest's patched resolver by name.
 """
 from __future__ import annotations
 
@@ -218,16 +218,20 @@ def test_emit_refuses_symlinked_default_ledger_dir(tmp_path, monkeypatch,
     assert sorted(p.name for p in victim.iterdir()) == ["keep.txt"]
     assert keep.read_text() == "victim content"
     assert link.is_symlink() and os.readlink(link) == str(victim)
-    # Degraded to a warning, never an exception (contract §6).
-    assert any("symlink" in r.getMessage() for r in email_mcp_warnings)
+    # Degraded to a warning, never an exception (contract §6). Match the
+    # diagnosis rather than the word "symlink" — pytest names its tmp dir
+    # after the test, so "symlink" is in every path logged here.
+    assert any("refusing to create state or set modes through it"
+               in r.getMessage() for r in email_mcp_warnings)
 
 
 def test_emit_refuses_symlinked_month_file(audit_dir_guard, tmp_path):
     """Nobody but the writer names a YYYY-MM.jsonl, so a link there is a
     squatter: O_NOFOLLOW must refuse it rather than append the event to
     the target and fchmod the target to 0600."""
-    from email_mcp import ids
+    from email_mcp import config, ids
 
+    config.state_root()   # adopt before planting the leaf (see below)
     audit_dir_guard.mkdir(parents=True)
     audit_dir_guard.chmod(0o700)
     victim = tmp_path / "notes.txt"
@@ -247,8 +251,14 @@ def test_emit_chmods_the_fd_it_wrote_not_the_path(audit_dir_guard, tmp_path):
     """0600 is set through the open fd, so a link swapped onto the month
     path between the write and the chmod cannot redirect it — the window a
     path-based chmod leaves to the second writer process."""
-    from email_mcp import ids
+    from email_mcp import config, ids
 
+    # Adopt the root BEFORE planting the ledger dir under it: an explicitly
+    # overridden root that already holds files and carries no ownership
+    # marker is refused before any effect, so without this the emit under
+    # test would never reach its write — and the assertions below would
+    # hold vacuously.
+    config.state_root()
     audit_dir_guard.mkdir(parents=True)
     audit_dir_guard.chmod(0o700)
     victim = tmp_path / "notes.txt"
@@ -294,23 +304,61 @@ def test_default_path_never_chmods_a_symlinked_state_root(tmp_path,
     assert len(_lines(ledger)) == 1
 
 
-def test_env_overridden_symlinked_dir_never_chmods_its_target(tmp_path,
-                                                              monkeypatch):
-    """An operator who points EMAIL_MCP_AUDIT_DIR at a link chose to follow
-    it, so the event still lands — but the mode of whatever it points at is
-    not ours to set (chmod resolves through the link)."""
-    target = tmp_path / "real-ledger"
+def test_env_overridden_symlinked_root_never_chmods_its_target(tmp_path,
+                                                               monkeypatch):
+    """An operator who points EMAIL_MCP_STATE_DIR at a link chose to follow
+    it (relocating the whole tree onto another volume is the supported
+    shape), so events still land — but the mode of whatever it points at is
+    not ours to set: chmod resolves through the link, and we did not create
+    the target.
+
+    Replaces the retired EMAIL_MCP_AUDIT_DIR variant of this test: the
+    ledger has no override of its own any more, so the only way to aim it
+    at a link is to relocate the root.
+    """
+    target = tmp_path / "real-state"
     target.mkdir()
     target.chmod(0o755)
     link = tmp_path / "link"
     link.symlink_to(target)
-    monkeypatch.setenv("EMAIL_MCP_AUDIT_DIR", str(link))
+    monkeypatch.setenv("EMAIL_MCP_STATE_DIR", str(link))
 
     assert audit.emit("send", outcome="sent") is not None
-    assert len(_lines(target)) == 1
+
+    ledger = target / "audit"
+    assert len(_lines(ledger)) == 1                      # followed the link
     assert stat.S_IMODE(target.stat().st_mode) == 0o755  # target untouched
-    files = list(target.glob("*.jsonl"))
+    assert stat.S_IMODE(ledger.stat().st_mode) == 0o700  # WE made the leaf
+    files = list(ledger.glob("*.jsonl"))
     assert stat.S_IMODE(files[0].stat().st_mode) == 0o600  # the file is ours
+
+
+def test_symlinked_ledger_leaf_is_refused_under_an_overridden_root(
+    tmp_path, monkeypatch, email_mcp_warnings,
+):
+    """The leaf counterpart: a link squatting on <root>/audit is refused
+    even when the root itself was named by the operator. A relocated ROOT
+    is a choice; a redirected LEAF is a squat."""
+    from email_mcp import config
+
+    root = tmp_path / "state"
+    root.mkdir()
+    monkeypatch.setenv("EMAIL_MCP_STATE_DIR", str(root))
+    config.state_root()   # adopt: otherwise the link alone makes the root
+    # non-empty and unmarked, and the ROOT refusal — not the leaf one —
+    # is what stops the emit.
+    victim, keep = _victim_dir(tmp_path)
+    (root / "audit").symlink_to(victim)
+
+    assert audit.emit("send", outcome="sent") is None  # dropped, no raise
+
+    assert stat.S_IMODE(victim.stat().st_mode) == 0o755
+    assert sorted(p.name for p in victim.iterdir()) == ["keep.txt"]
+    assert keep.read_text() == "victim content"
+    # Match the diagnosis, not the word "symlink": pytest names its tmp dir
+    # after the test, so "symlink" appears in every path this test logs.
+    assert any("refusing to create state or set modes through it"
+               in r.getMessage() for r in email_mcp_warnings)
 
 
 def test_set_process_tags_src(audit_dir_guard):
@@ -322,7 +370,7 @@ def test_set_process_tags_src(audit_dir_guard):
 
 def _hammer(dir_str: str, src: str, count: int) -> None:
     """Spawned-process worker: emit `count` events into the given ledger."""
-    os.environ["EMAIL_MCP_AUDIT_DIR"] = dir_str
+    os.environ["EMAIL_MCP_STATE_DIR"] = str(Path(dir_str).parent)
     from email_mcp import audit as aud
     aud.set_process(src)
     for i in range(count):
@@ -420,8 +468,9 @@ def test_query_prunes_months_and_filters_fields(audit_dir_guard):
 
 
 def test_query_absent_dir_returns_empty(tmp_path, monkeypatch):
-    missing = tmp_path / "never-created"
-    monkeypatch.setenv("EMAIL_MCP_AUDIT_DIR", str(missing))
+    root = tmp_path / "never-created"
+    missing = root / "audit"
+    monkeypatch.setenv("EMAIL_MCP_STATE_DIR", str(root))
     assert audit.query() == {
         "events": [], "files_scanned": 0, "skipped_lines": 0,
     }

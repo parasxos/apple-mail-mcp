@@ -77,7 +77,10 @@ def _graph_root() -> Path:
 
 def _degenerate(path: Path) -> bool:
     """True when a resolved state path IS the home directory or an
-    ancestor of it (an EMAIL_MCP_*_DIR pointed at ``$HOME`` or ``/``).
+    ancestor of it (EMAIL_MCP_STATE_DIR pointed at ``$HOME`` or ``/``).
+
+    Belt to :func:`config.state_root_refusal`, which already refuses such a
+    root: this catches a path that somehow resolved past it.
     Repairs never manage such a path: mkdir would scatter spool
     subdirectories through the home directory and chmod 0700 would
     retighten the home directory itself — neither is this fixer's to do.
@@ -95,18 +98,22 @@ def _degenerate(path: Path) -> bool:
 def _state_dirs() -> list[Path]:
     """Every directory the state tree owns, root first (creation order).
 
+    EMPTY when the configured root is refusable: a root this tool may not
+    manage has no managed directories, so no repair may create, chmod or
+    even name one under it. Asking the resolver for the reason is what
+    keeps this honest — ``state_root(create=False)`` hands back the path
+    whatever it is, and building ``<root>/spool`` from an unvalidated root
+    is exactly how ``doctor --fix`` came to create ``$HOME/spool``.
+
     The FTS dir is DERIVED state: it is listed only when an index file
     already exists (i.e. the dir is live) — repairs never create it, and
     ``python -m email_mcp.fts --build`` remains the only builder.
-    Degenerate env overrides (``$HOME`` and above) are dropped: see
-    :func:`_degenerate`.
     """
+    if config.state_root_refusal():
+        return []
     spool_root = _spool_root()
     dirs = [_state_root(), spool_root]
-    if not _degenerate(spool_root):
-        # A spool override at $HOME must not drag its five state
-        # subdirectories into the home directory either.
-        dirs += [spool_root / s for s in spool.STATES]
+    dirs += [spool_root / s for s in spool.STATES]
     dirs += [_plans_root(), config.audit_dir(create=False), _graph_root()]
     from . import fts  # lazy, like doctor's checks
     if fts.db_path().exists():
@@ -151,15 +158,21 @@ def _detect_state_dir_missing() -> str | None:
 
 
 def _apply_state_dir_missing() -> str:
-    created: list[str] = []
-    for d in _missing_state_dirs():
-        if d.exists():
-            continue
-        d.mkdir(parents=True, exist_ok=True)
-        # chmod the dir itself only: an env-overridden dir's parents are
-        # not ours to touch (config.audit_dir's rule).
-        d.chmod(0o700)
-        created.append(str(d))
+    missing = _missing_state_dirs()
+    if not missing:
+        return "nothing to create"
+    # Create through the PRODUCTION getters rather than a parallel
+    # mkdir+chmod: root validation, the ownership marker, the created-only
+    # chmod rule and the leaf-symlink refusal are defined once, in config,
+    # and a repair that reimplemented them drifted from them. Anything
+    # they raise is caught by run_fixes and reported.
+    config.spool_dir()   # root + spool + its five state subdirectories
+    config.plans_dir()
+    config.graph_dir()
+    config.audit_dir()
+    created = [str(d) for d in missing if d.is_dir()]
+    if not created:
+        return "nothing to create"
     return "created 0700: " + ", ".join(created)
 
 
@@ -228,6 +241,10 @@ def _state_files() -> list[Path]:
     ident = config.identities_file()
     if ident.is_file() and not _off_limits(ident, links):
         files.append(ident)
+    if config.state_root_refusal():
+        # A refused root owns no files either — same gate as _state_dirs.
+        # identities.toml stays: it is resolved independently of the root.
+        return files
     for root, pattern in ((config.audit_dir(create=False), "*.jsonl"),
                           (_graph_root(), "*.token.json")):
         if (root.is_dir() and not root.is_symlink()
@@ -453,9 +470,9 @@ def _detect_stale_plan_claims() -> str | None:
 
 def _apply_stale_plan_claims() -> str:
     # SCOPED to the claims detect() found: an unscoped plans.gc() also
-    # prunes every *.json* older than 7 days in the plans dir, and with
-    # EMAIL_MCP_PLANS_DIR aimed at a directory the user keeps their own
-    # files in that is deleting user data — which this registry never does.
+    # prunes every *.json* older than 7 days in the plans dir, and a user
+    # who keeps their own files alongside a relocated plan store would have
+    # them deleted — which this registry never does.
     stale = _stale_plan_claim_ids()
     plans.gc(plan_ids=stale)
     return (f"plans.gc(): {len(stale)} stale claim(s) finalised as "

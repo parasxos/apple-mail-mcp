@@ -147,13 +147,20 @@ def test_scoped_gc_ignores_a_non_plan_prefix_match(home):
 def test_stale_claim_repair_spares_unrelated_files_in_the_plans_dir(
     home, tmp_path, monkeypatch,
 ):
-    """The finding: EMAIL_MCP_PLANS_DIR aimed at a directory the user
-    also keeps files in. run_fixes must finalise the stale claim it
-    detected and delete NOTHING else — repairs never delete user data."""
+    """The finding: a plans directory the user also keeps files in.
+    run_fixes must finalise the stale claim it detected and delete NOTHING
+    else — repairs never delete user data.
+
+    v0.11 reaches that shape through the ROOT (EMAIL_MCP_PLANS_DIR is
+    retired): the user's file sits in <root>/plans next to the claim.
+    plans.gc()'s unscoped sweep would unlink every *.json* older than
+    seven days there, which is why the repair passes the ids it detected.
+    """
     _make_tree(home)
-    shared = tmp_path / "shared-plans"
-    shared.mkdir()
-    monkeypatch.setenv("EMAIL_MCP_PLANS_DIR", str(shared))
+    relocated = tmp_path / "relocated-state"
+    relocated.mkdir()
+    monkeypatch.setenv("EMAIL_MCP_STATE_DIR", str(relocated))
+    shared = config.plans_dir()          # <root>/plans, created 0700
 
     claim = _claim(shared / "p1.json.applying", "p1",
                    age_seconds=2 * TTL_SECONDS + 300)

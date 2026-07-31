@@ -222,6 +222,7 @@ The tests build a fake `~/Library/Mail/V10` tree in `tmp_path` — they don't re
 |---|---|---|
 | `EMAIL_MCP_MAIL_DIR` | newest `~/Library/Mail/V*` | Override Mail.app base directory. |
 | `EMAIL_MCP_SOURCE` | `apple` | Source adapter to load (Phase 2: gmail, imap, …). |
+| `EMAIL_MCP_STATE_DIR` | `~/.email-mcp` | **The one state root.** `spool`, `plans`, `graph`, `fts` and `audit` are derived from it. See [State directory](#state-directory) — a directory we create is 0700, one that already existed is never chmodded, and a non-empty directory without our marker is refused. |
 | `EMAIL_MCP_READ_ONLY` | `0` | `1` registers only the ten read-side tools — the widest trust envelope for demos, reviews and new users. |
 | `EMAIL_MCP_MAX_BODY_BYTES` | `2000000` | Cap on body returned per `get_email`. |
 | `EMAIL_MCP_ATTACH_DIR` | `$TMPDIR/email-mcp` | Where `get_attachment` writes blobs. |
@@ -231,9 +232,7 @@ The tests build a fake `~/Library/Mail/V10` tree in `tmp_path` — they don't re
 | `EMAIL_MCP_SEND_ALLOWLIST` | (From: addr) | Comma-separated addresses sending may reach while the guard is on. |
 | `EMAIL_MCP_BCC_SELF` | `1` | Bcc the From: address on every send for a record. |
 | `EMAIL_MCP_MAX_ATTACH_MB` | `20` | Total attachment budget per outgoing message (file bytes, pre-base64). |
-| `EMAIL_MCP_SPOOL_DIR` | `~/.email-mcp/spool` | Scheduled-send spool root (created 0700). |
 | `EMAIL_MCP_SEND_RETRIES` | `5` | Delivery attempts per scheduled message before parking in `failed/`. |
-| `EMAIL_MCP_PLANS_DIR` | `~/.email-mcp/plans` | Triage plan store (created 0700). |
 | `EMAIL_MCP_TRIAGE_MAX` | `200` | Message cap per triage plan (bigger selections rejected). |
 | `EMAIL_MCP_TRIAGE_DELETE_MAX` | `50` | Tighter cap per delete plan (`triage_plan_delete`). |
 | `EMAIL_MCP_TRIAGE_TTL` | `600` | Seconds a draft plan stays applicable. |
@@ -245,7 +244,6 @@ The tests build a fake `~/Library/Mail/V10` tree in `tmp_path` — they don't re
 | `EMAIL_MCP_DELIVERY_CMD` | `/usr/sbin/sendmail` | Remote delivery command. |
 | `EMAIL_MCP_SSH_BOOTSTRAP` | *(empty)* | Optional command that re-establishes a cold socket headlessly (`tools/lxplus_mail_master.sh` is a documented example). |
 | `EMAIL_MCP_IDENTITIES` | `~/.email-mcp/identities.toml` | Identity routing file (see [Identities & transports](#identities--transports)); absent → one identity synthesized from the env vars above (needs `EMAIL_MCP_FROM_ADDR`). |
-| `EMAIL_MCP_FTS_DIR` | `~/.email-mcp/fts` | FTS body-index directory (created 0700 by build paths only). |
 | `EMAIL_MCP_FTS_ENABLED` | `1` | `0` disables FTS body hits in `search_emails` (snippet-only search). |
 | `EMAIL_MCP_FTS_MAX_HITS` | `2000` | Cap on FTS rowid hits folded into one search (newest kept). |
 | `EMAIL_MCP_FTS_INLINE_BATCH` | `500` | Max documents the inline (search-time) incremental pass indexes. |
@@ -254,6 +252,121 @@ The tests build a fake `~/Library/Mail/V10` tree in `tmp_path` — they don't re
 | `EMAIL_MCP_FTS_RECONCILE_DAYS` | `7` | How often `--sync` folds in a full rowid-set reconciliation. |
 | `EMAIL_MCP_LOG_FILE` | `~/Library/Logs/email-mcp.log` | Debug log path; `off` disables file logging. |
 | `EMAIL_MCP_LOG_LEVEL` | `INFO` | Log verbosity. |
+
+## State directory
+
+Everything the tool owns lives under **one root** — `~/.email-mcp` by
+default, or wherever `EMAIL_MCP_STATE_DIR` points:
+
+```
+<root>/                     ← 0700 if we created it; marked .email-mcp-root
+├── .email-mcp-root         ← ownership marker, 0600
+├── spool/                  ← scheduled mail: pending sending sent failed cancelled
+├── plans/                  ← triage plans
+├── graph/                  ← Graph OAuth token caches
+├── fts/                    ← body index (built by `python -m email_mcp.fts --build`)
+├── audit/                  ← append-only ledger, YYYY-MM.jsonl
+├── identities.toml         ← 0600 (path overridable with EMAIL_MCP_IDENTITIES)
+└── meta.json               ← 0600
+```
+
+`get_attachment` blobs are the one exception: they go to
+`$TMPDIR/email-mcp` (`EMAIL_MCP_ATTACH_DIR`), deliberately outside the
+root, because they are transient extracts the OS may reap — folding them in
+would make `uninstall --purge` delete them and make them survive reboots.
+
+**The rules, in full.** All of them are enforced in `email_mcp/config.py`
+and measured in `tests/test_config_state_dirs.py`.
+
+1. **Created-only chmod.** A directory this tool creates is `0700`. A
+   directory that already existed is **never** chmodded — not by `setup`,
+   not by the first send, not by the dispatcher. Files we write are `0600`.
+2. **Ownership marker.** A managed root carries `.email-mcp-root` (0600,
+   JSON, `root_version 1`). Writing it is best effort — a read-only volume
+   must not break sending — so it is a safety hint, not a lock.
+3. **A non-empty unmarked root is refused.** If `EMAIL_MCP_STATE_DIR` names
+   an existing directory that holds files and has no marker, the tool
+   refuses **before touching anything**. An empty directory is fine
+   (relocation is supported). The **default** `~/.email-mcp` is never
+   refused for its contents — that is the upgrade path from v0.10, which
+   had no marker.
+4. **`$HOME` and above are refused** outright, compared by inode so every
+   spelling (`$HOME/sub/..`, `//$HOME`, case variants, firmlinks) is one
+   fence.
+5. **A symlinked root is followed; a symlinked leaf is refused.**
+   Relocating the whole tree with a link is a supported shape — the link is
+   followed and the target keeps its own mode. A link squatting on
+   `<root>/spool` or `<root>/audit` is a squat and is refused: `mkdir` and
+   `chmod` both resolve through it.
+6. **Read paths never create.** `doctor`, `audit.query()`,
+   `spool.entries()`, `fts.status()` and `uninstall` planning all resolve
+   with `create=False`, which touches nothing. A `doctor` run against a
+   machine with no state tree creates no state tree.
+7. **`doctor` reports, `doctor --fix` repairs.** Configuration never
+   silently repairs a permission. A loose mode on a pre-existing directory
+   is a *finding*: `email-mcp doctor` shows it, `email-mcp doctor --fix`
+   chmods it — on request. That is also the only thing that will tighten a
+   directory you created yourself.
+
+### Migrating from the per-directory variables
+
+v0.11 retired five variables:
+
+| Retired | Replacement |
+|---|---|
+| `EMAIL_MCP_SPOOL_DIR` | `EMAIL_MCP_STATE_DIR` → `<root>/spool` |
+| `EMAIL_MCP_PLANS_DIR` | `EMAIL_MCP_STATE_DIR` → `<root>/plans` |
+| `EMAIL_MCP_GRAPH_DIR` | `EMAIL_MCP_STATE_DIR` → `<root>/graph` |
+| `EMAIL_MCP_FTS_DIR` | `EMAIL_MCP_STATE_DIR` → `<root>/fts` |
+| `EMAIL_MCP_AUDIT_DIR` | `EMAIL_MCP_STATE_DIR` → `<root>/audit` |
+
+**Policy: they are rejected, not ignored.** If any of them is still set,
+`config.state_root()` raises, `email-mcp doctor` goes red with the reason
+and the fix, and `email-mcp setup` blocks at the `state_dirs` step. Nothing
+is created and nothing is moved.
+
+That is deliberate. Ignoring a retired variable would silently relocate
+live state: someone running `EMAIL_MCP_SPOOL_DIR=/Volumes/big/spool` would
+restart into a tool that spools somewhere else entirely, and their queued
+mail would sit undelivered in the old directory with nothing looking at
+it. One legible startup error is cheaper than mail that looks lost.
+
+**To migrate**, pick a root, move the existing directories under it with
+their leaf names, and set one variable:
+
+```sh
+# was: EMAIL_MCP_SPOOL_DIR=/Volumes/big/spool
+#      EMAIL_MCP_AUDIT_DIR=/Volumes/big/ledger
+mkdir -p /Volumes/big/email-mcp
+mv /Volumes/big/spool  /Volumes/big/email-mcp/spool
+mv /Volumes/big/ledger /Volumes/big/email-mcp/audit
+export EMAIL_MCP_STATE_DIR=/Volumes/big/email-mcp
+unset EMAIL_MCP_SPOOL_DIR EMAIL_MCP_AUDIT_DIR
+email-mcp doctor          # confirms the root and the modes
+```
+
+The moved root is non-empty and has no marker, so the first run **will
+refuse it** — that is rule 3 doing its job on a directory it has never seen
+before. Adopt it deliberately:
+
+```sh
+printf '{"tool": "email-mcp", "root_version": 1}\n' \
+  > /Volumes/big/email-mcp/.email-mcp-root
+chmod 600 /Volumes/big/email-mcp/.email-mcp-root
+```
+
+`doctor` will now find the root but report the modes: directories you moved
+or made with `mkdir` are `0755` under a normal umask, and the tool will not
+silently retighten what it did not create (rule 1). Repair them explicitly:
+
+```sh
+email-mcp doctor --fix    # chmod 700 the root and its leaves, 600 the files
+email-mcp doctor          # green
+```
+
+If you were only using the defaults (`~/.email-mcp/*`), there is nothing to
+do: unset the variables if you set any, and the default root is adopted
+automatically on the next run.
 
 ## Tool reference
 

@@ -50,6 +50,10 @@ import pytest
 from email_mcp import audit, config, dispatcher, doctor, sender, server, triage
 from email_mcp.sources.apple_mail import AppleMailSource
 
+# Captured before conftest's autouse guard patches it: the snapshot must be
+# built by the REAL env-driven resolver, not by a session-pinned lambda.
+_REAL_STATE_ROOT = config.state_root
+
 SNAPSHOT = Path(__file__).parent / "snapshots" / "input_schemas.json"
 OUTPUT_SNAPSHOT = Path(__file__).parent / "snapshots" / "output_schemas.json"
 
@@ -208,11 +212,11 @@ def _all_tool_shapes(monkeypatch, tmp_path, mail_fixture) -> dict:
     for key in list(os.environ):
         if key.startswith("EMAIL_MCP_"):
             monkeypatch.delenv(key, raising=False)
+    state = base / "state"
     for key, value in {
         "EMAIL_MCP_MAIL_DIR": str(mail_fixture),
-        "EMAIL_MCP_SPOOL_DIR": str(base / "spool"),
-        "EMAIL_MCP_PLANS_DIR": str(base / "plans"),
-        "EMAIL_MCP_FTS_DIR": str(base / "fts"),
+        # ONE root: spool, plans, fts and the ledger all derive from it.
+        "EMAIL_MCP_STATE_DIR": str(state),
         "EMAIL_MCP_ATTACH_DIR": str(base / "attach"),
         "EMAIL_MCP_IDENTITIES": str(base / "none.toml"),
         "EMAIL_MCP_FROM_ADDR": "paris@example.org",
@@ -220,12 +224,12 @@ def _all_tool_shapes(monkeypatch, tmp_path, mail_fixture) -> dict:
         "EMAIL_MCP_SEND_ALLOW_ALL": "1",
     }.items():
         monkeypatch.setenv(key, value)
-    audit_dir = base / "audit"
-    audit_dir.mkdir()
-    audit_dir.chmod(0o700)
-    monkeypatch.setenv("EMAIL_MCP_AUDIT_DIR", str(audit_dir))
-    # Re-pin the conftest guard's resolver to THIS pass's empty ledger.
-    monkeypatch.setattr(config, "audit_dir", lambda create=True: audit_dir)
+    audit_dir = state / "audit"
+    # Undo the conftest guard's patched resolver: it pins ONE root for the
+    # whole session, and this builder needs a fresh empty tree per call
+    # (the byte-stability test runs it twice). Restoring the real function
+    # makes every leaf derive from EMAIL_MCP_STATE_DIR set just above.
+    monkeypatch.setattr(config, "state_root", _REAL_STATE_ROOT)
     monkeypatch.setattr(server, "_SOURCE",
                         AppleMailSource(mail_base=mail_fixture),
                         raising=False)

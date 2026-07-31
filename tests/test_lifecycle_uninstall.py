@@ -260,39 +260,45 @@ def test_purge_refuses_symlinked_root(home, tmp_path, capsys):
     assert root.read_text() == "file squatting on the state root"
 
 
-def test_purge_ignores_env_overridden_dirs_prints_them(
+def test_purge_ignores_env_overridden_root_prints_it(
     home, tmp_path, monkeypatch, capsys,
 ):
+    """A relocated state root is reported, never removed: purge deletes the
+    HARDCODED ~/.email-mcp and nothing else (design D7).
+
+    Since v0.11 there is one variable to relocate rather than five, so the
+    relocated spool AND the relocated token caches are the same directory
+    tree — and both must survive.
+    """
     estate = _install_estate(home)
-    outside_spool = tmp_path / "outside-spool"
-    outside_spool.mkdir()
-    (outside_spool / "pending.json").write_text("spooled")
-    outside_graph = tmp_path / "outside-graph"
-    outside_graph.mkdir()
-    (outside_graph / "work.token.json").write_text("{}")
-    monkeypatch.setenv("EMAIL_MCP_SPOOL_DIR", str(outside_spool))
-    monkeypatch.setenv("EMAIL_MCP_GRAPH_DIR", str(outside_graph))
+    outside = tmp_path / "outside-state"
+    (outside / "spool" / "pending").mkdir(parents=True)
+    (outside / "spool" / "pending" / "s1.json").write_text("spooled")
+    (outside / "graph").mkdir()
+    (outside / "graph" / "work.token.json").write_text("{}")
+    monkeypatch.setenv("EMAIL_MCP_STATE_DIR", str(outside))
 
     assert cli.main(["uninstall", "--purge", "--yes"]) == 0
     assert not estate["root"].exists()  # the hardcoded root went
-    # The env-overridden dirs were ONLY printed, never removed:
-    assert (outside_spool / "pending.json").read_text() == "spooled"
-    assert (outside_graph / "work.token.json").exists()
+    # The env-overridden tree was ONLY printed, never removed:
+    assert (outside / "spool" / "pending" / "s1.json").read_text() == "spooled"
+    assert (outside / "graph" / "work.token.json").exists()
     out = capsys.readouterr().out
-    assert "EMAIL_MCP_SPOOL_DIR" in out and "never removed" in out
-    assert any("EMAIL_MCP_GRAPH_DIR override" in line
+    assert "EMAIL_MCP_STATE_DIR" in out and "never removed" in out
+    assert any("EMAIL_MCP_STATE_DIR override" in line
                for line in out.splitlines())
 
 
 def test_purge_env_override_at_home_survives(home, monkeypatch):
-    """The L6 red-team headline case: EMAIL_MCP_SPOOL_DIR=$HOME. A naive
-    purge of "the spool dir" would delete the entire home directory; the
-    hardcoded-target fence means exactly ~/.email-mcp goes and every
-    sibling survives."""
+    """The L6 red-team headline case, now spelled EMAIL_MCP_STATE_DIR=$HOME.
+    A naive purge of "the state dir" would delete the entire home
+    directory; the hardcoded-target fence means exactly ~/.email-mcp goes
+    and every sibling survives — and uninstall must reach that fence
+    without first exploding on the resolver's own refusal of $HOME."""
     estate = _install_estate(home)
     (home / "Documents").mkdir()
     (home / "Documents" / "thesis.txt").write_text("irreplaceable")
-    monkeypatch.setenv("EMAIL_MCP_SPOOL_DIR", str(home))
+    monkeypatch.setenv("EMAIL_MCP_STATE_DIR", str(home))
 
     assert cli.main(["uninstall", "--purge", "--yes"]) == 0
     assert not estate["root"].exists()
