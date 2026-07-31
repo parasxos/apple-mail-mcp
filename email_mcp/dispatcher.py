@@ -571,6 +571,14 @@ def main() -> int:
     parser.add_argument("--install-launchd", action="store_true")
     parser.add_argument("--uninstall-launchd", action="store_true")
     args = parser.parse_args()
+    # Startup gate (mirrors server.main / cli.main): with a retired
+    # per-directory variable set, this agent would drain the DEFAULT spool
+    # while the operator's queued mail sat in the directory the variable
+    # named — delivering nothing and reporting success. Refuse instead.
+    retired = config.retired_state_var_error()
+    if retired is not None:
+        print(f"email-mcp dispatcher: {retired}", file=sys.stderr)
+        return 2
     if args.status:
         json.dump(status(), sys.stdout, indent=2)
         sys.stdout.write("\n")

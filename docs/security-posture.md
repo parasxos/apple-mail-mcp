@@ -755,6 +755,38 @@ a reader comparing releases should be able to see what changed its status.
 - **New:** the five retired `EMAIL_MCP_*_DIR` variables are **rejected**,
   not ignored — see `docs/reference.md`, "Migrating from the per-directory
   variables". Ignoring them would silently relocate live state.
+
+### v0.11 — findings from the independent Gate 4 audit
+
+The gate ran against the committed tree and the installed wheel and
+returned FAIL on the first pass. Three findings, all fixed and each with a
+regression test in `tests/test_config_state_dirs.py`:
+
+- **MAJOR — rejection was write-path only.** `retired_state_vars()` was
+  consulted only inside `state_root_refusal()`, which only
+  `state_root(create=True)` reached. Every `create=False` path skipped it,
+  so with `EMAIL_MCP_SPOOL_DIR` set, `list_scheduled` resolved the DEFAULT
+  root, found nothing, and answered `{"ok": true, "pending": []}` while the
+  operator's queued mail sat in the old directory with nothing delivering
+  it — verbatim the "mail that looks lost" outcome the rejection exists to
+  prevent. `server.py`, `cli.py` and `dispatcher.py` had no startup gate at
+  all. Now: a pure `retired_state_var_error()` consulted by the wire belt
+  and by all three entry points; `doctor` is the single, deliberate
+  exemption.
+- **MAJOR — `create=False` was not total.** `~nosuchuser/foo` raised
+  `RuntimeError` out of `expanduser()`, and a relative value with a deleted
+  cwd raised `FileNotFoundError` out of `absolute()` — both escaping
+  functions documented as "PURE" and "total by design", and both landing in
+  uninstall planning, `doctor` and `audit.query`. Resolution now returns an
+  unresolvable REASON instead of raising.
+- **MINOR — intermediates created world-readable.** `mkdir(parents=True)`
+  created every missing directory above the root at the process umask, so
+  `EMAIL_MCP_STATE_DIR=/a/b/c/root` left `a/`, `b/` and `c/` at 0755 —
+  directories a mail tool made that the user never named. They are not ours
+  to chmod, so they are no longer created: a missing parent is refused.
+
+Also uniform now: `graph_dir()` was the one leaf getter without a `create`
+parameter, so read-side callers rebuilt its path by hand.
 - **Known residual risks after this pass:** §2.1, §2.2, §2.4 (major, open),
   §2.6, §2.7, §2.9, §2.10, §2.11 are unchanged by v0.11 and remain as
   stated.

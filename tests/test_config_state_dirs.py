@@ -531,3 +531,107 @@ def test_an_unreadable_root_is_refused_not_assumed_empty(
 
     assert sorted(p.name for p in root.iterdir()) == ["their-secret.txt"]
     assert (root / "their-secret.txt").read_text() == "not ours"
+
+
+# --------------------------------------------------------------------- #
+# gate-4 round 2 — findings from the independent audit                   #
+# --------------------------------------------------------------------- #
+
+
+def test_retired_var_fails_read_paths_closed_not_silently_empty(
+        home, monkeypatch, tmp_path):
+    """MAJOR: rejection lived only on the WRITE path, so read tools
+    silently ignored a retired variable.
+
+    With EMAIL_MCP_SPOOL_DIR set, `list_scheduled` resolved the DEFAULT
+    root, found nothing there, and returned {"ok": true, "pending": []} —
+    while the operator's queued mail sat in the directory the variable
+    named, with nothing delivering it. An empty success is the worst
+    possible answer to "where is my mail": indistinguishable from "you
+    have none". Every tool must fail closed.
+    """
+    from email_mcp import server
+
+    old = tmp_path / "oldspool" / "pending"
+    old.mkdir(parents=True)
+    (old / "m1.json").write_text('{"id": "x", "subject": "queued"}')
+    monkeypatch.setenv("EMAIL_MCP_SPOOL_DIR", str(tmp_path / "oldspool"))
+
+    for tool in ("tool_list_scheduled", "tool_search_emails", "tool_audit",
+                 "tool_list_mailboxes"):
+        out = getattr(server, tool)()
+        assert out["ok"] is False, f"{tool} answered ok:true"
+        assert "retired" in out["error"], tool
+
+    # doctor is the ONE exemption: it exists to report the fault, and the
+    # error message sends the operator to it.
+    report = server.tool_doctor()
+    assert report["ok"] is False
+    assert "retired" in report["checks"]["state_root"]["detail"]
+
+
+def test_retired_var_is_refused_at_every_entry_point(home, monkeypatch,
+                                                     tmp_path):
+    """The startup gates, not just the lazy resolver: server, CLI and the
+    launchd dispatcher each refuse before doing any work. The dispatcher
+    matters most — it would otherwise drain the DEFAULT spool while the
+    operator's mail sat elsewhere."""
+    import subprocess
+    import sys
+
+    env = {k: v for k, v in os.environ.items()
+           if not k.startswith("EMAIL_MCP_")}
+    env["HOME"] = str(home)
+    env["EMAIL_MCP_AUDIT_DIR"] = str(tmp_path / "old-ledger")
+    for module, args in (("email_mcp.server", ["--selftest"]),
+                         ("email_mcp.cli", ["version"]),
+                         ("email_mcp.dispatcher", ["--status"])):
+        p = subprocess.run([sys.executable, "-m", module, *args],
+                           capture_output=True, text=True, env=env)
+        assert p.returncode == 2, f"{module} did not refuse: rc={p.returncode}"
+        assert "retired" in p.stderr, module
+
+
+def test_resolution_is_total_when_the_path_cannot_be_expanded(
+        home, monkeypatch):
+    """MAJOR: `~nosuchuser/foo` raised RuntimeError out of
+    state_root(create=False), state_root_refusal() and every create=False
+    getter — all documented as total. Uninstall planning and doctor call
+    exactly those, so a typo'd variable was a traceback, not a message."""
+    from email_mcp import audit, doctor, lifecycle
+
+    monkeypatch.setenv("EMAIL_MCP_STATE_DIR", "~nosuchuser12345/foo")
+
+    assert isinstance(config.state_root(create=False), Path)   # no raise
+    for getter in LEAF_GETTERS:
+        assert isinstance(getattr(config, getter)(create=False), Path)
+    assert isinstance(lifecycle.StatePaths.resolve(), lifecycle.StatePaths)
+    assert isinstance(lifecycle.uninstall_plan(purge=True), dict)
+    assert audit.query()["events"] == []
+    check = doctor.check_state_root()
+    assert check["ok"] is False and "cannot be resolved" in check["detail"]
+
+    # …and the WRITE path still refuses, as a typed refusal.
+    with pytest.raises(config.StateDirRefused):
+        config.state_root()
+
+
+def test_a_missing_parent_is_refused_not_created_world_readable(
+        home, monkeypatch, tmp_path):
+    """`mkdir(parents=True)` created every missing intermediate at the
+    process umask: EMAIL_MCP_STATE_DIR=/a/b/c/root left a/, b/ and c/ at
+    0755 — directories the user never named, made by a mail tool. We may
+    not chmod them (not ours to mode), so they are not created at all."""
+    deep = tmp_path / "deep" / "a" / "b" / "root"
+    monkeypatch.setenv("EMAIL_MCP_STATE_DIR", str(deep))
+
+    reason = config.state_root_refusal()
+    assert reason is not None and "does not exist" in reason
+    with pytest.raises(config.StateDirRefused):
+        config.state_root()
+    assert not (tmp_path / "deep").exists()   # not one intermediate
+
+    # With the parent present it is an ordinary relocation target again.
+    deep.parent.mkdir(parents=True)
+    root = config.state_root()
+    assert _mode(root) == 0o700

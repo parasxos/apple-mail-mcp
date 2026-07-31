@@ -53,10 +53,9 @@ WIRE_TIMEOUT = 90.0
 # On-disk state the child would otherwise write under the real ~/.email-mcp.
 # The child is a genuine second process, so the suite's autouse monkeypatch
 # guards do not reach it — every path has to be pinned through the env.
-_STATE_DIRS = (
-    "FTS_DIR", "AUDIT_DIR", "SPOOL_DIR", "PLANS_DIR", "GRAPH_DIR",
-    "ATTACH_DIR",
-)
+# ONE root since v0.11 (spool/plans/graph/fts/audit derive from it) plus
+# the attachment scratch, which is deliberately NOT under the root.
+_STATE_DIRS = ("STATE_DIR", "ATTACH_DIR")
 
 
 def _server_command() -> list[str]:
@@ -82,7 +81,7 @@ def _server_env(tmp_path: Path, mail_dir: Path, **extra: str) -> dict[str, str]:
     for var in _STATE_DIRS:
         d = tmp_path / "wire-state" / var.lower()
         d.mkdir(parents=True, exist_ok=True)
-        d.chmod(0o700)  # what config.audit_dir guarantees
+        d.chmod(0o700)  # what the created-only rule guarantees for ours
         env[f"EMAIL_MCP_{var}"] = str(d)
     env.update(extra)
     return env

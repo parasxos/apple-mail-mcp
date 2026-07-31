@@ -149,6 +149,34 @@ def retired_state_vars() -> list[str]:
                   if os.environ.get(v, "").strip())
 
 
+def retired_state_var_error() -> str | None:
+    """The migration message for any retired variable still set, or None.
+
+    Pure, total, and — unlike :func:`state_root_refusal` — free of any
+    filesystem question, which is why READ paths can and must consult it
+    too. Rejection used to live only on the write path, so a read tool
+    silently ignored the variable: with EMAIL_MCP_SPOOL_DIR set,
+    ``list_scheduled`` resolved the DEFAULT root, found nothing, and
+    returned ``{"ok": true, "pending": []}`` while the user's queued mail
+    sat in the old directory with nothing delivering it. That is precisely
+    the "mail that looks lost" outcome the rejection exists to prevent, so
+    it has to fail closed on every entry point, not just on writes.
+    """
+    retired = retired_state_vars()
+    if not retired:
+        return None
+    return (
+        f"{', '.join(retired)} {'is' if len(retired) == 1 else 'are'} "
+        "retired — v0.11 derives spool, plans, graph, fts and audit from "
+        "ONE root. Ignoring the variable would relocate live state without "
+        "telling you (scheduled mail would still be in the old directory, "
+        "and nothing would be delivering it). Unset "
+        f"{'it' if len(retired) == 1 else 'them'} and set "
+        "EMAIL_MCP_STATE_DIR to the parent directory instead, moving the "
+        "existing contents there first."
+    )
+
+
 def _is_same_dir(a: Path, b: Path) -> bool:
     """Directory identity by inode, not by spelling.
 
@@ -200,7 +228,15 @@ def _make_ours(d: Path) -> bool:
     gates in a row found a new way past the fences.
     """
     try:
-        d.mkdir(mode=0o700, parents=True, exist_ok=False)
+        # parents=False deliberately. `parents=True` creates every missing
+        # intermediate at the process umask, so EMAIL_MCP_STATE_DIR=
+        # /a/b/c/root produced a/, b/ and c/ world-readable — directories
+        # the user never named, made by a mail tool, at 0755. We do not
+        # chmod them (they are not ours), which left the only options
+        # "create them loose" or "do not create them at all". A missing
+        # parent is a configuration mistake with a one-line fix, so it is
+        # refused in state_root_refusal rather than papered over here.
+        d.mkdir(mode=0o700, exist_ok=False)
     except FileExistsError:
         return False
     # umask can only clear bits, so mkdir(0o700) may land tighter but never
@@ -209,17 +245,37 @@ def _make_ours(d: Path) -> bool:
     return True
 
 
-def _configured_root() -> tuple[Path, bool]:
-    """(root, explicit) — the configured state root and whether the user
-    named it. No filesystem effects; no validation."""
+def _configured_root() -> tuple[Path, bool, str | None]:
+    """(root, explicit, unresolvable) — the configured state root, whether
+    the user named it, and why it could not be resolved (None = fine).
+
+    TOTAL: this never raises. Two ways resolution itself fails, both found
+    at the v0.11 gate, both of which used to escape as a bare RuntimeError
+    or FileNotFoundError from a function documented as total:
+
+      * ``~nosuchuser/foo`` — ``expanduser()`` raises RuntimeError when the
+        named user has no home directory;
+      * a relative value while the process's cwd has been deleted —
+        ``absolute()`` raises FileNotFoundError.
+
+    Both are configuration faults, so they become a REASON (reported by
+    doctor, raised as StateDirRefused on the write path) rather than a
+    traceback out of uninstall planning or a read tool.
+    """
     raw = os.environ.get("EMAIL_MCP_STATE_DIR", "").strip()
-    root = Path(raw).expanduser() if raw else Path.home() / ".email-mcp"
+    try:
+        root = Path(raw).expanduser() if raw else Path.home() / ".email-mcp"
+    except (RuntimeError, OSError) as e:
+        return Path(raw or "~/.email-mcp"), bool(raw), str(e)
     # Collapse `..` TEXTUALLY before validating, so the path we check is the
     # path we then use. `$HOME/sub/..` names $HOME but cannot be stat'd while
     # `sub` is absent, so an identity check saw nothing to compare and the
     # mkdir afterwards created `sub` and marked $HOME. Textual collapse is
     # the conservative direction here: it can only make us refuse more.
-    return Path(os.path.normpath(root.absolute())), bool(raw)
+    try:
+        return Path(os.path.normpath(root.absolute())), bool(raw), None
+    except OSError as e:
+        return root, bool(raw), str(e)
 
 
 def state_root_refusal() -> str | None:
@@ -235,19 +291,14 @@ def state_root_refusal() -> str | None:
     ``$HOME/spool`` from it. Validation belongs to resolution; only the
     EFFECT is conditional on `create`.
     """
-    retired = retired_state_vars()
+    retired = retired_state_var_error()
     if retired:
-        return (
-            f"{', '.join(retired)} {'is' if len(retired) == 1 else 'are'} "
-            "retired — v0.11 derives spool, plans, graph, fts and audit from "
-            "ONE root. Ignoring the variable would relocate live state "
-            "without telling you (scheduled mail would still be in the old "
-            "directory, and nothing would be delivering it). Unset "
-            f"{'it' if len(retired) == 1 else 'them'} and set "
-            "EMAIL_MCP_STATE_DIR to the parent directory instead, moving the "
-            "existing contents there first."
-        )
-    root, explicit = _configured_root()
+        return retired
+    root, explicit, unresolvable = _configured_root()
+    if unresolvable:
+        return (f"EMAIL_MCP_STATE_DIR={root} cannot be resolved to a path "
+                f"({unresolvable}). Point it at an absolute path in a "
+                "directory that exists.")
     if _is_home_or_above(root):
         return (f"{root} is your home directory or above it — refusing to "
                 "manage state there. Point EMAIL_MCP_STATE_DIR at a "
@@ -260,6 +311,13 @@ def state_root_refusal() -> str | None:
     if root.exists() and not root.is_dir() and not root.is_symlink():
         return (f"{root} exists and is not a directory — refusing to manage "
                 "it. Point EMAIL_MCP_STATE_DIR at a directory.")
+    if not root.exists() and not root.parent.is_dir():
+        # We create the root, never a chain of directories above it: those
+        # would land at the process umask (0755) and belong to nobody.
+        return (f"{root.parent} does not exist, so {root} cannot be created "
+                "without also creating directories above it. Create the "
+                "parent yourself, or point EMAIL_MCP_STATE_DIR inside an "
+                "existing directory.")
     if root.exists() and not _marked(root):
         try:
             # The marker is OURS, so it is not "someone else's files" —
@@ -312,7 +370,7 @@ def state_root(create: bool = True) -> Path:
     :func:`state_root_refusal` for the verdict; anything that intends to
     WRITE must go through ``create=True``, which raises.
     """
-    root, _ = _configured_root()
+    root, _, _unresolvable = _configured_root()
     if not create:
         return root
 
@@ -392,10 +450,13 @@ def attach_dir() -> Path:
     return d
 
 
-def graph_dir() -> Path:
+def graph_dir(create: bool = True) -> Path:
     """Graph executor state (per-identity OAuth token caches), <root>/graph.
-    Token files grant delegated mailbox access."""
-    return _leaf("graph")
+    Token files grant delegated mailbox access. create=False resolves
+    without touching the disk, like every other managed getter — it was
+    the one leaf missing the parameter, so read-side callers had to
+    rebuild the path by hand instead of asking for it."""
+    return _leaf("graph", create=create)
 
 
 def plans_dir(create: bool = True) -> Path:

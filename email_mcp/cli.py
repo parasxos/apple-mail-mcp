@@ -267,6 +267,18 @@ def _unknown_command(cmd: str) -> int:
 def main(argv: list[str] | None = None) -> int:
     argv = list(sys.argv[1:] if argv is None else argv)
     try:
+        # A retired per-directory variable is refused HERE, before any
+        # command runs, so the operator learns on the first invocation
+        # rather than from a read command that quietly reports nothing.
+        # `doctor` is exempt: its whole job is to explain what is wrong,
+        # and it reports the same message in its state_root check.
+        from . import config
+        retired = config.retired_state_var_error()
+        if retired is not None and (not argv or argv[0] != "doctor"):
+            print(f"email-mcp: {retired}", file=sys.stderr)
+            print("email-mcp: run `email-mcp doctor` for the full report.",
+                  file=sys.stderr)
+            return 2
         if not argv:
             return _run_server([])
         if argv[0].startswith("-"):

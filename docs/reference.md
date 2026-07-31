@@ -313,6 +313,15 @@ and measured in `tests/test_config_state_dirs.py`.
    listed — an unreadable directory — the tool cannot tell whether it is
    someone else's, so it refuses rather than assuming it is empty. Every
    branch here errs toward refusing.
+9. **The root is created; the directories above it are not.** If the
+   root's parent does not exist, the configuration is refused rather than
+   `mkdir -p`'d: intermediates would land at your umask (0755) and be
+   directories a mail tool made that nobody named. Create the parent
+   yourself, then point the variable inside it.
+10. **Resolution never throws.** A value that cannot even be turned into a
+    path (`~nosuchuser/foo`, a relative path with a deleted working
+    directory) becomes a reported refusal, not a traceback out of
+    `doctor` or `uninstall`.
 
 ### Migrating from the per-directory variables
 
@@ -326,10 +335,23 @@ v0.11 retired five variables:
 | `EMAIL_MCP_FTS_DIR` | `EMAIL_MCP_STATE_DIR` → `<root>/fts` |
 | `EMAIL_MCP_AUDIT_DIR` | `EMAIL_MCP_STATE_DIR` → `<root>/audit` |
 
-**Policy: they are rejected, not ignored.** If any of them is still set,
-`config.state_root()` raises, `email-mcp doctor` goes red with the reason
-and the fix, and `email-mcp setup` blocks at the `state_dirs` step. Nothing
-is created and nothing is moved.
+**Policy: they are rejected, not ignored — on every entry point.** If any
+of them is still set:
+
+- `email-mcp <anything>` (except `doctor`) prints the migration message to
+  stderr and exits **2**;
+- `python -m email_mcp.server` refuses before the stdio server binds, and
+  the launchd dispatcher refuses before it drains a spool;
+- every MCP tool (except `doctor`) returns `{"ok": false, "code":
+  "invalid_input"}` carrying the same message;
+- `email-mcp doctor` is the one exemption — it *reports* the fault, red,
+  with the fix;
+- `email-mcp setup` blocks at the `state_dirs` step.
+
+Nothing is created and nothing is moved.
+
+`doctor` is exempt on purpose: the error message tells you to run it, so
+gating it would swallow the report it points at.
 
 That is deliberate. Ignoring a retired variable would silently relocate
 live state: someone running `EMAIL_MCP_SPOOL_DIR=/Volumes/big/spool` would

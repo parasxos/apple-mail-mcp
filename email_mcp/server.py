@@ -22,7 +22,7 @@ from dataclasses import asdict, is_dataclass
 from datetime import datetime, timezone
 from typing import Any
 
-from . import __version__, audit, codes, ids
+from . import __version__, audit, codes, config, ids
 from .config import source_name
 from .log import get_logger
 from .sender import SendError, reply_email, schedule_email, send_email
@@ -177,7 +177,7 @@ def _classify(e: BaseException) -> tuple[str, bool]:
     return codes.INTERNAL_ERROR, True
 
 
-def _belt(op_from: str | None = None):
+def _belt(op_from: str | None = None, *, config_gate: bool = True):
     """No exception escapes a dict-returning tool to the MCP wire: known
     caller-fixable classes map to coded envelopes, anything else is the
     belt of last resort, `internal_error`. Every catch logs the FULL
@@ -187,7 +187,12 @@ def _belt(op_from: str | None = None):
 
     `op_from` names the parameter whose value is the operation's durable
     artifact id (triage_apply's plan_id), threaded into the failure
-    envelope as operation_id per contract §2."""
+    envelope as operation_id per contract §2.
+
+    `config_gate=False` exempts a tool from the retired-variable
+    precheck below. Exactly one tool needs it: `doctor`, whose entire job
+    is to REPORT a broken configuration. Gating it would swallow the
+    report the error message tells the operator to go and read."""
     def deco(fn):
         sig = inspect.signature(fn)
 
@@ -233,6 +238,20 @@ def _belt(op_from: str | None = None):
         @functools.wraps(fn)
         def wrapper(*args, **kwargs):
             try:
+                # A retired per-directory variable is a CONFIGURATION
+                # fault, not a filesystem one, so it is checked here rather
+                # than left to the resolver — which only validates on the
+                # write path. Without this, a read tool resolved the
+                # DEFAULT root, found nothing, and answered
+                # {"ok": true, "pending": []} while the user's queued mail
+                # sat in the directory the retired variable named. An empty
+                # success is the worst possible answer to "where is my
+                # mail": it is indistinguishable from "you have none".
+                retired = (config.retired_state_var_error()
+                           if config_gate else None)
+                if retired is not None:
+                    return _fail(codes.INVALID_INPUT, _clip(retired),
+                                 args, kwargs)
                 return _bound(fn(*args, **kwargs))
             except UnicodeDecodeError as e:
                 # ValueError subclass, but NOT the caller's fault: MCP
@@ -1013,7 +1032,7 @@ def tool_cancel_scheduled(id: str) -> dict:
         "cancelled", subject=entry.subject)
 
 
-@_belt()
+@_belt(config_gate=False)   # doctor must REPORT a broken configuration
 def tool_doctor() -> dict:
     from . import doctor
 
@@ -1639,6 +1658,14 @@ def main() -> int:
              "only that section. Prefer --doctor for the full picture.",
     )
     args = parser.parse_args()
+    # Startup gate: a retired per-directory variable is refused before the
+    # stdio server binds, so a misconfigured install fails at launch with
+    # one legible line instead of serving tools that quietly answer "you
+    # have no mail". --doctor is exempt: it exists to report the fault.
+    retired = config.retired_state_var_error()
+    if retired is not None and not args.doctor:
+        print(f"email-mcp: {retired}", file=sys.stderr)
+        return 2
     if args.selftest:
         return _selftest()
     if args.refresh_test:
