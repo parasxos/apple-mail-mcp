@@ -496,3 +496,38 @@ def test_the_package_never_resolves_a_path_out_of_its_own_directory():
     assert not offenders, (
         "package walks above its own directory (works in an editable "
         "install, breaks in a wheel): " + ", ".join(offenders))
+
+
+def test_an_unreadable_root_is_refused_not_assumed_empty(
+        home, monkeypatch, tmp_path):
+    """Fail-open found at the v0.11 gate: a root whose contents cannot be
+    listed was treated as EMPTY, and therefore adoptable.
+
+    `chmod 0300` on a directory holding another tool's files made it
+    silently adoptable — the marker was written and spool/ and audit/ were
+    created inside it. The refusal exists precisely to stop email-mcp
+    managing a directory that already holds someone else's data, and an
+    undeterminable answer has to count as "refuse", not "proceed".
+    """
+    root = tmp_path / "someone-elses"
+    root.mkdir(mode=0o700)
+    (root / "their-secret.txt").write_text("not ours")
+    root.chmod(0o300)                    # writable + traversable, NOT readable
+    monkeypatch.setenv("EMAIL_MCP_STATE_DIR", str(root))
+    try:
+        reason = config.state_root_refusal()
+        assert reason is not None and "cannot be read" in reason
+        with pytest.raises(config.StateDirRefused):
+            config.state_root()
+        for getter in LEAF_GETTERS:
+            with pytest.raises(config.StateDirRefused):
+                getattr(config, getter)()
+        # …and a mutation's receipt is dropped rather than the mutation
+        # being blocked, or the foreign directory being written into.
+        from email_mcp import audit
+        assert audit.emit("send", outcome="sent") is None
+    finally:
+        root.chmod(0o700)
+
+    assert sorted(p.name for p in root.iterdir()) == ["their-secret.txt"]
+    assert (root / "their-secret.txt").read_text() == "not ours"

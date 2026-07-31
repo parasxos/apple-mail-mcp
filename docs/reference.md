@@ -301,12 +301,18 @@ and measured in `tests/test_config_state_dirs.py`.
 6. **Read paths never create.** `doctor`, `audit.query()`,
    `spool.entries()`, `fts.status()` and `uninstall` planning all resolve
    with `create=False`, which touches nothing. A `doctor` run against a
-   machine with no state tree creates no state tree.
+   machine with no state tree creates no state tree. (The one file any
+   import creates is the debug log, `~/Library/Logs/email-mcp.log` — not
+   state, outside the root, and suppressed by `EMAIL_MCP_LOG_FILE=off`.)
 7. **`doctor` reports, `doctor --fix` repairs.** Configuration never
    silently repairs a permission. A loose mode on a pre-existing directory
    is a *finding*: `email-mcp doctor` shows it, `email-mcp doctor --fix`
    chmods it — on request. That is also the only thing that will tighten a
    directory you created yourself.
+8. **A root that cannot be read is refused.** If the contents cannot be
+   listed — an unreadable directory — the tool cannot tell whether it is
+   someone else's, so it refuses rather than assuming it is empty. Every
+   branch here errs toward refusing.
 
 ### Migrating from the per-directory variables
 

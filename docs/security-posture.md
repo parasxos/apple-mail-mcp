@@ -330,6 +330,17 @@ then writes: ask `config.state_root_refusal()` (pure; stats, never
 creates) for the verdict, and anything intending to write goes through
 `create=True`, which raises. See §2.3.
 
+**One honest exception, stated rather than glossed:** the debug logger
+creates its own file (`~/Library/Logs/email-mcp.log`, and `~/Library/Logs`
+if absent) when the package is imported. That is not state — it is outside
+the root, `uninstall --purge` removes it, and `EMAIL_MCP_LOG_FILE=off`
+suppresses it entirely. Measured: with logging off, a run of `doctor.run()`,
+`audit.query()`, `uninstall_plan()` and `run_fixes(dry_run=True)` against a
+`HOME` containing a deliberately 0755 state tree creates **nothing** and
+changes **no** mode. The read-side guarantee is about state and modes; the
+log is neither, and this paragraph exists so nobody has to discover the
+difference by auditing.
+
 *Proven by* — `tests/test_config_state_dirs.py` (39 tests): created-only
 modes, marker semantics, refusal without any filesystem effect (mode *and*
 contents unchanged), root/leaf symlink behaviour, read-side purity,

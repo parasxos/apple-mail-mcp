@@ -265,8 +265,18 @@ def state_root_refusal() -> str | None:
             # The marker is OURS, so it is not "someone else's files" —
             # counting it made a freshly adopted root look foreign.
             others = any(p.name != STATE_MARKER for p in root.iterdir())
-        except OSError:
-            others = False     # unreadable: the effects below fail loudly
+        except OSError as e:
+            # We cannot tell whether this directory is someone else's, so
+            # we must not adopt it. Treating an unlistable root as EMPTY
+            # was a fail-open: `chmod 0300` on a directory full of another
+            # tool's files made it silently adoptable — marker written,
+            # spool and ledger created inside — which is exactly what this
+            # check exists to prevent. Every other branch here errs toward
+            # refusing; this one has to as well.
+            return (f"{root} cannot be read ({e.strerror}), so whether it "
+                    "already holds someone else's files cannot be "
+                    "determined. Refusing to manage it — fix its "
+                    "permissions, or point EMAIL_MCP_STATE_DIR elsewhere.")
         # Re-read the marker before refusing. Two writers exist (server and
         # the launchd dispatcher), and they race on the first mutation
         # after a root is configured: one can pass the _marked() check
