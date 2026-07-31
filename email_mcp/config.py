@@ -136,6 +136,33 @@ def send_delivery_cmd() -> str:
     return os.environ.get("EMAIL_MCP_DELIVERY_CMD", "/usr/sbin/sendmail").strip()
 
 
+class StateDirRefused(OSError):
+    """An EMAIL_MCP_*_DIR resolves to $HOME or an ancestor of it.
+
+    The fence lives HERE, in the getter that performs the mkdir and chmod,
+    rather than only in `lifecycle._degenerate_overrides` / `repairs._degenerate`
+    — those cover `setup` and `doctor --fix`, but the MCP server, the launchd
+    dispatcher, the FTS agent and the Graph token cache all reach the getters
+    directly. Refusing loudly beats silently tightening a directory the user
+    did not name: `EMAIL_MCP_SPOOL_DIR=/Users` would otherwise `chmod 0700
+    /Users`, breaking every other account's traversal.
+    """
+
+
+def _degenerate(d: Path) -> bool:
+    """True when `d` is $HOME or an ancestor of it, however it is spelled.
+
+    Resolved, not lexical: `$HOME/sub/..` and `//$HOME` name the same
+    directory while comparing unequal.
+    """
+    try:
+        target = d.resolve()
+        home = Path.home().resolve()
+    except OSError:
+        return False
+    return target == home or target in home.parents
+
+
 def _lock_down(d: Path, overridden: bool) -> None:
     """Tighten a state dir to 0700, and its parent only when we own it.
 
@@ -145,24 +172,42 @@ def _lock_down(d: Path, overridden: bool) -> None:
     behind their back, and a symlinked parent would land the chmod on its
     target. Same rule audit_dir already applies.
     """
+    if overridden and _degenerate(d):
+        raise StateDirRefused(
+            f"{d} is your home directory or above it — refusing to create "
+            "state there or change its mode. Point the EMAIL_MCP_*_DIR "
+            "override at a directory of its own."
+        )
     if not overridden and not d.parent.is_symlink():
         d.parent.chmod(0o700)
     if not d.is_symlink():
         d.chmod(0o700)
 
 
-def spool_dir() -> Path:
+def spool_dir(create: bool = True) -> Path:
     """Root of the scheduled-mail spool (frozen .eml + .json manifests).
 
     Default ~/.email-mcp/spool, override with EMAIL_MCP_SPOOL_DIR. The tree
     holds fully-composed outgoing mail (bodies + attachments), so it is
     created 0700 and kept that way.
+
+    Pass create=False to resolve the path without touching the filesystem:
+    read-side callers (doctor) must never create. Without that, a plain
+    `email-mcp doctor` materialised the five spool subdirectories wherever
+    EMAIL_MCP_SPOOL_DIR pointed — including inside ~/Library/Mail.
     """
     raw = os.environ.get("EMAIL_MCP_SPOOL_DIR", "").strip()
     d = Path(raw).expanduser() if raw else Path.home() / ".email-mcp" / "spool"
-    for sub in ("pending", "sending", "sent", "failed", "cancelled"):
-        (d / sub).mkdir(parents=True, exist_ok=True)
-    _lock_down(d, bool(raw))
+    if create:
+        for sub in ("pending", "sending", "sent", "failed", "cancelled"):
+            s = d / sub
+            s.mkdir(parents=True, exist_ok=True)
+            if not s.is_symlink():
+                # The subdirs hold composed outgoing mail too — the 0700
+                # parent already blocks traversal, but the invariant is
+                # stated per-directory, so make it true per-directory.
+                s.chmod(0o700)
+        _lock_down(d, bool(raw))
     return d
 
 
@@ -190,13 +235,19 @@ def graph_dir() -> Path:
 # ---------------------------------------------------------------------- #
 
 
-def plans_dir() -> Path:
+def plans_dir(create: bool = True) -> Path:
     """Root of the triage plan store (frozen plan JSONs). Created 0700 —
-    plans carry message metadata."""
+    plans carry message metadata.
+
+    Pass create=False to resolve the path without touching the filesystem:
+    read-side callers (doctor) must never create, which also stops a
+    diagnostic from materialising directories wherever EMAIL_MCP_PLANS_DIR
+    happens to point."""
     raw = os.environ.get("EMAIL_MCP_PLANS_DIR", "").strip()
     d = Path(raw).expanduser() if raw else Path.home() / ".email-mcp" / "plans"
-    d.mkdir(parents=True, exist_ok=True)
-    _lock_down(d, bool(raw))
+    if create:
+        d.mkdir(parents=True, exist_ok=True)
+        _lock_down(d, bool(raw))
     return d
 
 

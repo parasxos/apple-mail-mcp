@@ -604,13 +604,26 @@ def test_failure_envelopes_are_bounded_and_do_not_reflect_the_caller():
     """
     import json
 
-    out = server.tool_triage_apply("A" * 60000)
-
-    assert out["ok"] is False
-    assert len(json.dumps(out)) < 4000
-    assert "truncated" in out["error"]
-    # §2: never minted *for* a failure. Nothing was created, so nothing threads.
-    assert "operation_id" not in out
+    big = "A" * 60000
+    # Argument validation only — no Mail store, no fixture, no $HOME.
+    # An earlier version of this test drove triage_apply, which reaches the
+    # truncation path ONLY on a machine that already has ~/Library/Mail:
+    # everywhere else it short-circuits on the precondition with a short
+    # message, so the test passed on the author's laptop and would have gone
+    # red on the first CI run.
+    paths = {
+        "get_email": lambda: server.tool_get_email("someid", view=big),
+        "get_emails_batch": lambda: server.tool_get_emails_batch(["x"], view=big),
+        "list_scheduled": lambda: server.tool_list_scheduled(state=big),
+        "cancel_scheduled": lambda: server.tool_cancel_scheduled(big),
+        "search_emails": lambda: server.tool_search_emails(query="x", after=big),
+    }
+    for name, call in paths.items():
+        out = call()
+        assert out["ok"] is False, name
+        assert len(json.dumps(out)) < 4000, f"{name} envelope unbounded"
+        assert "truncated" in out["error"], name
+        assert big not in json.dumps(out), f"{name} reflected the payload"
 
 
 def test_operation_id_is_echoed_only_for_minted_shaped_ids():

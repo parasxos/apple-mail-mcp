@@ -281,12 +281,22 @@ def check_spool_plans() -> dict:
     from . import spool
     from .dispatcher import STALE_SENDING_MINUTES
 
-    spool_root = config.spool_dir()   # creates + chmods, like every caller
-    plans_root = config.plans_dir()
+    # Resolve only — doctor checks stat, it never creates (the purity rule
+    # _graph_token_dir and check_fts already follow). Creating here let a
+    # read-only diagnostic build a spool tree wherever EMAIL_MCP_SPOOL_DIR
+    # pointed, ~/Library/Mail included.
+    spool_root = config.spool_dir(create=False)
+    plans_root = config.plans_dir(create=False)
     problems: list[str] = []
     fixes: list[str] = []
     for label, d in (("spool", spool_root), ("plans", plans_root)):
-        mode = d.stat().st_mode & 0o777
+        try:
+            mode = d.stat().st_mode & 0o777
+        except FileNotFoundError:
+            # Absent is a fresh install, not a fault — the same rule
+            # check_fts applies to a missing index. The first write creates
+            # it 0700; a read-side check must not create it just to stat it.
+            continue
         if mode != 0o700:
             problems.append(f"{label} dir {d} is mode {mode:o} (want 700)")
             fixes.append(f"chmod 700 {d}")

@@ -458,7 +458,8 @@ def _plist_path() -> Path:
 
 
 def _log_path() -> Path:
-    d = config.spool_dir().parent
+    # Path only — resolving where the log lives must not create the spool.
+    d = config.spool_dir(create=False).parent
     return d / "dispatcher.log"
 
 

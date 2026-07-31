@@ -90,3 +90,43 @@ def test_symlinked_state_dir_is_not_chmodded_through(clean_env, tmp_path, monkey
 
     assert _mode(victim) == 0o755, f"{getter} chmodded through a symlink"
     assert (victim / "data.txt").read_text() == "theirs"
+
+
+@pytest.mark.parametrize("getter", GETTERS)
+def test_override_at_or_above_home_is_refused(clean_env, monkeypatch, getter):
+    """`EMAIL_MCP_*_DIR=/Users` must not become `chmod 0700 /Users`.
+
+    Skipping the PARENT chmod was not enough: the target itself was still
+    tightened, so pointing an override at the parent of $HOME still changed
+    a directory the user did not name, system-wide on a real Mac. The fence
+    refuses, and compares RESOLVED paths so `$HOME/sub/..` cannot slip past.
+    """
+    var = {
+        "spool_dir": "EMAIL_MCP_SPOOL_DIR", "graph_dir": "EMAIL_MCP_GRAPH_DIR",
+        "plans_dir": "EMAIL_MCP_PLANS_DIR", "fts_dir": "EMAIL_MCP_FTS_DIR",
+    }[getter]
+    home = clean_env
+    ancestor = home.parent
+
+    for spelling in (str(home), f"{home}/sub/..", str(ancestor)):
+        monkeypatch.setenv(var, spelling)
+        before = _mode(ancestor)
+        with pytest.raises(config.StateDirRefused):
+            getattr(config, getter)()
+        assert _mode(ancestor) == before, f"{spelling} changed the mode anyway"
+
+
+def test_read_side_resolution_never_creates(clean_env, tmp_path, monkeypatch):
+    """create=False resolves a path without materialising it.
+
+    A plain `doctor` used to build the spool tree wherever the override
+    pointed — including inside ~/Library/Mail, contradicting the one
+    guarantee the security posture states most absolutely.
+    """
+    target = tmp_path / "not-created-by-a-read"
+    monkeypatch.setenv("EMAIL_MCP_SPOOL_DIR", str(target))
+
+    resolved = config.spool_dir(create=False)
+
+    assert resolved == target
+    assert not target.exists()

@@ -202,8 +202,12 @@ Everything the tool owns holds mail-derived data: the spool holds
 fully-composed outgoing messages with bodies and attachments; plans hold
 message metadata; the ledger holds recipients and subjects; the graph dir
 holds OAuth token caches that grant delegated mailbox access. All state
-directories are created and kept at **0700**; `identities.toml`, ledger
-months and token caches at **0600**. `write_meta()` and the token-cache
+directories are created and kept at **0700** — including the five spool
+subdirectories, which were `0755` until this was measured; `identities.toml`,
+ledger months and token caches at **0600**. One qualification, stated rather
+than assumed: when a state directory is itself a **symlink**, its mode is
+left alone. Chmod follows links, so tightening it would change the mode of
+whatever the link points at — a directory this tool does not own. `write_meta()` and the token-cache
 writer use the same discipline: tmp file in the same directory, chmod,
 atomic rename.
 
@@ -269,41 +273,43 @@ is worse than the thing it guards. The **write** path is where the tool
 itself could create the leak, and that is where all four fences live
 (§1.4).
 
-### 2.3 OPEN (critical) — the degenerate-override fence is in the callers, not the config getters
+### 2.3 CLOSED — the degenerate-override fence now lives in the config getters
 
-`lifecycle._degenerate_overrides()` and `repairs._degenerate()` both refuse
-an `EMAIL_MCP_*_DIR` that resolves to `$HOME` or an ancestor of it. **The
-four config getters that actually perform the `mkdir` and `chmod` do
-not** — `config.spool_dir()`, `plans_dir()`, `graph_dir()`, `fts_dir()`
-each `mkdir` the target and then `chmod 0700` the target *and its parent*,
-unconditionally.
+`lifecycle._degenerate_overrides()` and `repairs._degenerate()` refuse an
+`EMAIL_MCP_*_DIR` that resolves to `$HOME` or an ancestor of it, but they
+only protect `email-mcp setup` and `doctor --fix`. Every other path reaches
+the getters directly: the MCP server via `spool.py` / `plans.py`, the
+launchd dispatcher, `doctor.py`, the FTS agent and the Graph token cache.
+The getters used to `mkdir` the target and then `chmod 0700` the target
+*and its parent*, unconditionally.
 
-So the fence protects `email-mcp setup` and `doctor --fix`, and nothing
-else. Every other path reaches the getters directly: the MCP server via
-`spool.py` / `plans.py`, the launchd dispatcher (`dispatcher.py:461`),
-`doctor.py:284-285`, the FTS agent (`fts.py:326`) and the Graph token
-cache (`graph.py:233`).
+**Originally reproduced 2026-07-31** (a throwaway `$HOME` under `/tmp`):
 
-**Reproduced 2026-07-31** (a throwaway `$HOME` under `/tmp`):
+- `EMAIL_MCP_SPOOL_DIR=$HOME` → `$HOME`'s **parent** went `0755 → 0700`,
+  and five directories (`pending sending sent failed cancelled`) appeared
+  in the home directory.
+- `EMAIL_MCP_SPOOL_DIR=<parent of $HOME>` → the **grandparent** went
+  `0755 → 0700`. On a real Mac that is `chmod 0700 /Users` — a
+  system-visible change breaking other users' traversal.
 
-- `EMAIL_MCP_SPOOL_DIR=$HOME` → `$HOME`'s **parent** goes `0755 → 0700`,
-  and five directories (`pending sending sent failed cancelled`) appear in
-  the home directory.
-- `EMAIL_MCP_SPOOL_DIR=<parent of $HOME>` → the **grandparent** goes
-  `0755 → 0700` and the five subdirectories land beside the home
-  directory. On a real Mac that is `chmod 0700 /Users`, which is a
-  system-visible change (it breaks other users' traversal of `/Users`).
+**Fixed in two steps, and the first was not enough.** `config._lock_down()`
+first stopped chmodding the *parent* of an operator-named directory. That
+closed the `EMAIL_MCP_SPOOL_DIR=$HOME` case but **not** the worse one: the
+target itself was still chmodded, so pointing the override at `/Users`
+still produced `chmod 0700 /Users`. A release gate checked only the first
+scenario and reported the finding closed; it was not. The fence now also
+refuses outright — `config.StateDirRefused` is raised when an overridden
+state dir resolves to `$HOME` or above, comparing **resolved** paths so
+`$HOME/sub/..` and `//$HOME` cannot walk past it.
 
-**Blast radius:** `chmod 0700` on one directory the user did not name, plus
-five empty directories. No data is deleted and no data is disclosed — the
-mode change is *tightening*, not loosening. But `/Users` at 0700 is a
-change to the machine, made by a mail tool, with no prompt.
+**Verified:** with `EMAIL_MCP_SPOOL_DIR` pointed at the parent of a
+throwaway `$HOME`, the getter raises and the directory stays `0755`.
+Regression tests: `tests/test_config_state_dirs.py`.
 
-**Status:** not fenced at the time of writing. The correct fix is to move
-the check into the getters (a shared helper in `config.py`), so it holds
-for every entry point rather than the two that happen to call setup's
-copy. Until then, the honest statement is: **if you set an `EMAIL_MCP_*_DIR`
-to your home directory or above, the server will act on it.**
+**Residual:** a refusal is an exception, so a server or dispatcher started
+with a degenerate override fails loudly instead of running degraded. That
+is the intended trade — the alternative is a mail tool silently changing
+the mode of a directory the user did not name.
 
 ### 2.4 OPEN (major) — `identities.toml` as a FIFO hangs every lifecycle command forever
 
@@ -446,7 +452,14 @@ These are design commitments, not incidental behavior:
 
 - **`~/Library/Mail` is never written.** All mail mutation goes through
   Mail.app's own scripting interface or through a transport; the store is
-  read-only to this tool.
+  read-only to this tool. The one way this was falsifiable has been closed:
+  pointing `EMAIL_MCP_SPOOL_DIR` at the mail store made a plain
+  `email-mcp doctor` — no `--fix` — create the five spool subdirectories
+  inside it and take it `0755 → 0700`, because the read-side check called a
+  getter that creates. The state-dir getters now take `create=False`, and
+  every read path (`doctor`, `spool.entries`, the dispatcher's log-path
+  resolution) uses it. Verified: `doctor` against a mail-store-pointed
+  spool dir now creates nothing and leaves the mode untouched.
 - **Keychain and 1Password items are never deleted.** `uninstall` prints
   the `security delete-generic-password` commands and stops.
 - **`triage_plan` cannot delete.** `delete` through `triage_plan` raises

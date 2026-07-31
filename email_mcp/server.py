@@ -83,6 +83,42 @@ def _to_jsonable(obj: Any) -> Any:
 _MAX_ERROR_CHARS = 2000
 
 
+def _clip(text: str) -> str:
+    """Bound one line of failure prose (contract §7).
+
+    Applies to EVERY `ok: false` site, not just the belt's. Most failure
+    messages quote the offending argument back — `unknown view {view!r}`,
+    `cannot cancel {id}` — so a 60 KB argument returns as a 60 KB envelope
+    on a stdio transport unless every construction site is bounded. Clipping
+    only inside the belt closed one door and left twenty open.
+    """
+    if not isinstance(text, str) or len(text) <= _MAX_ERROR_CHARS:
+        return text
+    return text[:_MAX_ERROR_CHARS] + f"… [truncated, {len(text)} chars; see log]"
+
+
+def _bound(result):
+    """Clip the `error` prose of a failure envelope on its way out.
+
+    Every one of the 20 tools is belted, so this is the single choke point
+    every envelope crosses — a new `ok: false` site cannot bypass it, which
+    is why the bound lives here rather than at the twenty construction
+    sites. Success envelopes and per-id `errors[]` entries are shaped data,
+    not prose, and pass through untouched except for their own `error`.
+    """
+    if not isinstance(result, dict):
+        return result
+    if result.get("ok") is False and isinstance(result.get("error"), str):
+        result["error"] = _clip(result["error"])
+    # get_emails_batch reports per-id failures as data inside ok: true.
+    entries = result.get("errors")
+    if isinstance(entries, list):
+        for entry in entries:
+            if isinstance(entry, dict) and isinstance(entry.get("error"), str):
+                entry["error"] = _clip(entry["error"])
+    return result
+
+
 def _classify(e: BaseException) -> tuple[str, bool]:
     """Map an exception to its §3 code, and whether the prose should name the
     exception type.
@@ -180,7 +216,7 @@ def _belt(op_from: str | None = None):
         @functools.wraps(fn)
         def wrapper(*args, **kwargs):
             try:
-                return fn(*args, **kwargs)
+                return _bound(fn(*args, **kwargs))
             except UnicodeDecodeError as e:
                 # ValueError subclass, but NOT the caller's fault: MCP
                 # arguments arrive as valid str — undecodable bytes come

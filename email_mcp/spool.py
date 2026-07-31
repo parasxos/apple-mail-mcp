@@ -89,7 +89,11 @@ def read_eml(state: str, id: str) -> bytes:
 
 
 def entries(state: str) -> list[Entry]:
-    d = config.spool_dir() / state
+    # create=False: a pure scan must not materialise the spool tree. doctor
+    # calls this, and creating here let a read-only diagnostic build
+    # directories wherever EMAIL_MCP_SPOOL_DIR pointed. A missing dir simply
+    # globs to nothing, which is the honest answer for "what is queued".
+    d = config.spool_dir(create=False) / state
     out = []
     for manifest in sorted(d.glob("*.json")):
         try:
