@@ -379,30 +379,35 @@ def state_root_refusal() -> str | None:
         return (f"{root.parent} is not writable, so {root} cannot be "
                 "created. Fix its permissions, or point "
                 "EMAIL_MCP_STATE_DIR somewhere writable.")
+    if root.is_dir():
+        try:
+            listing = [p.name for p in root.iterdir()]
+        except OSError as e:
+            # STRUCTURAL, so it runs for the DEFAULT root too. A root we
+            # cannot list is unusable whoever named it: `chmod 000
+            # ~/.email-mcp` made every scan return empty and every report
+            # say "no queued mail" while real, composed, undelivered
+            # messages sat on disk. It also fails open on the ownership
+            # question — an unlistable directory full of another tool's
+            # files was silently adoptable. Both directions say refuse.
+            return (f"{root} cannot be read ({e.strerror or e}) — refusing "
+                    "to manage it, and any report about it would be a "
+                    "guess. Fix its permissions, or point "
+                    "EMAIL_MCP_STATE_DIR at a directory you can read.")
+    else:
+        listing = []
     if not explicit:
         # Everything ABOVE this line is structural — a stray file, a broken
-        # link, an absent or unwritable parent — and applies to the default
-        # root too. Only the CONTENT check below is exempt for it:
-        # ~/.email-mcp predates the marker, and every v0.10 install has one
-        # full of our own files. Adopting it is the upgrade path.
+        # link, an absent/unwritable parent, an unreadable directory — and
+        # applies to the default root too. Only the CONTENT check below is
+        # exempt for it: ~/.email-mcp predates the marker, and every v0.10
+        # install has one full of our own files. Adopting it is the
+        # upgrade path.
         return None
     if root.exists() and not _marked(root):
-        try:
-            # The marker is OURS, so it is not "someone else's files" —
-            # counting it made a freshly adopted root look foreign.
-            others = any(p.name != STATE_MARKER for p in root.iterdir())
-        except OSError as e:
-            # We cannot tell whether this directory is someone else's, so
-            # we must not adopt it. Treating an unlistable root as EMPTY
-            # was a fail-open: `chmod 0300` on a directory full of another
-            # tool's files made it silently adoptable — marker written,
-            # spool and ledger created inside — which is exactly what this
-            # check exists to prevent. Every other branch here errs toward
-            # refusing; this one has to as well.
-            return (f"{root} cannot be read ({e.strerror}), so whether it "
-                    "already holds someone else's files cannot be "
-                    "determined. Refusing to manage it — fix its "
-                    "permissions, or point EMAIL_MCP_STATE_DIR elsewhere.")
+        # The marker is OURS, so it is not "someone else's files" —
+        # counting it made a freshly adopted root look foreign.
+        others = any(name != STATE_MARKER for name in listing)
         # Re-read the marker before refusing. Two writers exist (server and
         # the launchd dispatcher), and they race on the first mutation
         # after a root is configured: one can pass the _marked() check

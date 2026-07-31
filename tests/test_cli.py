@@ -15,6 +15,7 @@ from __future__ import annotations
 import importlib
 import json
 import os
+import re
 import subprocess
 import sys
 from pathlib import Path
@@ -134,15 +135,20 @@ def test_unknown_subcommand_exits_2_listing_commands(capsys):
         assert name in err
 
 
-@pytest.mark.parametrize("name,stage", [
-    ("setup", "L3"), ("update", "L4"), ("uninstall", "L4"),
+@pytest.mark.parametrize("name,remedy", [
+    ("setup", "--yes"), ("update", "--yes"), ("uninstall", "--yes"),
 ])
-def test_lifecycle_stubs_exit_2_with_pointer(capsys, name, stage):
+def test_lifecycle_stubs_exit_2_with_pointer(capsys, name, remedy):
+    """Exit 2, silent stdout, and an actionable stderr line. It used to
+    pin the internal stage label ("L3"/"L4") INTO the operator-facing
+    message; an audit called that out as meaningless to a user, so what is
+    pinned now is the remedy."""
     assert cli.main([name]) == 2
     captured = capsys.readouterr()
     assert captured.out == ""
     assert name in captured.err
-    assert stage in captured.err
+    assert remedy in captured.err
+    assert not re.search(r"\bL[0-9]\b", captured.err), "internal jargon"
 
 
 # --------------------------------------------------------------------- #

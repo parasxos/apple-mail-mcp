@@ -463,12 +463,14 @@ def test_no_terminal_without_yes_exits_2(home, capsys):
     impossible: refuse with a usage error, print nothing to stdout,
     remove nothing. Keeps the frozen stub contract that
     test_cli.py::test_lifecycle_stubs_exit_2_with_pointer pins for
-    `uninstall`: exit 2, silent stdout, "uninstall" + "L4" on stderr."""
+    `uninstall`: exit 2, silent stdout, "uninstall" + the remedy on stderr."""
     estate = _install_estate(home)
     assert lifecycle.run_uninstall_cli([]) == 2
     captured = capsys.readouterr()
     assert captured.out == ""
-    assert "uninstall" in captured.err and "L4" in captured.err
+    assert "uninstall" in captured.err and "--yes" in captured.err
+    import re as _re
+    assert not _re.search(r"\bL[0-9]\b", captured.err), "internal jargon"
     assert "--yes" in captured.err
     assert (estate["agents"]
             / f"{dispatcher.LAUNCHD_LABEL}.plist").exists()

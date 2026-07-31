@@ -178,11 +178,18 @@ def write_meta(meta: dict) -> Path:
     """Write meta.json atomically: tmp in the same directory, chmod 0600,
     then rename over the target (the graph token-cache discipline)."""
     path = meta_path()
-    # ~/.email-mcp is a directory we name and own, so creating it here is
+    # ~/.email-mcp is a directory we name and own, so CREATING it here is
     # ours to do (unlike an operator-named EMAIL_MCP_IDENTITIES path — see
-    # write_identities).
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.parent.chmod(0o700)
+    # write_identities). Re-moding a PRE-EXISTING one is not: this
+    # chmod fired unconditionally, so `update` on a v0.10 tree silently
+    # tightened the root to 0700 while spool/, plans/ and audit/ stayed
+    # 0755 — an inconsistent half-repair, and a silent one, which is
+    # exactly what the created-only rule exists to prevent. doctor reports
+    # every loose mode and `doctor --fix` repairs them together, on
+    # request.
+    if not path.parent.exists():
+        path.parent.mkdir(parents=True)
+        path.parent.chmod(0o700)
     tmp = path.with_name(f"{path.name}.{os.getpid()}.tmp")
     tmp.write_text(json.dumps(meta, indent=2, sort_keys=True) + "\n",
                    encoding="utf-8")
@@ -1257,10 +1264,9 @@ def run_setup_cli(argv: list[str] | None = None) -> int:
             # (tests/test_cli.py::test_lifecycle_stubs_exit_2_with_pointer):
             # exit 2, silent stdout, "setup" + the "L3" stage pointer on
             # stderr — the wizard landed in L3, the pointer stays honest.
-            print("email-mcp setup: the interactive wizard (L3 of the "
-                  "v0.11 lifecycle work) needs a terminal — rerun in "
-                  "one, or script it with --yes or --answers FILE.",
-                  file=sys.stderr)
+            print("email-mcp setup: the interactive wizard needs a "
+                  "terminal — rerun in one, or script it with --yes or "
+                  "--answers FILE.", file=sys.stderr)
             return 2
 
     results = run_setup(answers, interactive=interactive)
@@ -1479,8 +1485,8 @@ def run_update_cli(argv: list[str] | None = None) -> int:
         # stderr — update mutates launchd + meta, so a non-terminal run
         # must opt in explicitly.
         print("email-mcp update: refusing to run outside a terminal "
-              "without --yes (L4 of the v0.11 lifecycle work) — rerun "
-              "in one, or pass --yes.", file=sys.stderr)
+              "without --yes — rerun in one, or pass --yes.",
+              file=sys.stderr)
         return 2
     return run_update()
 
@@ -1645,6 +1651,14 @@ def uninstall_plan(purge: bool) -> dict:
         keep.append(f"{root} (spool, plans, audit ledger, "
                     "identities.toml, meta.json — remove with "
                     "`email-mcp uninstall --purge`)")
+        # Purge only ever touches the HARDCODED root, so naming it is
+        # correct — but saying nothing about a CONFIGURED root that was
+        # refused answered the question about the wrong directory.
+        refusal = config.state_root_refusal()
+        if refusal is not None and paths.root != root:
+            print_only.append(
+                f"{paths.root} (EMAIL_MCP_STATE_DIR — refused: {refusal} "
+                "— never removed; this plan is about the path above)")
         keep.append(f"{home / 'Library' / 'Logs'}/email-mcp*.log "
                     "(--purge removes them)")
         keep.append(f"{home / 'Library' / 'Mail'} — never touched")
@@ -1837,8 +1851,7 @@ def run_uninstall_cli(argv: list[str] | None = None) -> int:
         # (tests/test_cli.py::test_lifecycle_stubs_exit_2_with_pointer):
         # exit 2, silent stdout, "uninstall" + the "L4" stage pointer on
         # stderr.
-        print("email-mcp uninstall: the typed confirmation (L4 of the "
-              "v0.11 lifecycle work) needs a terminal — rerun in one, "
+        print("email-mcp uninstall: the typed confirmation needs a terminal — rerun in one, "
               "or pass --yes.", file=sys.stderr)
         return 2
     return run_uninstall(purge=args.purge, assume_yes=args.yes)

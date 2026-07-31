@@ -279,6 +279,7 @@ def query(
     events: list[dict] = []
     files_scanned = 0
     skipped = 0
+    unreadable_files: list[str] = []
     for path in sorted(root.iterdir()):
         if not _MONTH_FILE.fullmatch(path.name):
             continue
@@ -290,6 +291,10 @@ def query(
         try:
             text = path.read_text(encoding="utf-8", errors="replace")
         except OSError:
+            # An unreadable month file is not an empty one. Dropping it
+            # silently made "no events" and "a ledger we cannot read" the
+            # same response.
+            unreadable_files.append(path.name)
             continue
         files_scanned += 1
         for raw in text.splitlines():
@@ -323,11 +328,16 @@ def query(
     # in favor of the later-appended line.
     events.reverse()
     events.sort(key=lambda r: str(r.get("ts", "")), reverse=True)
-    return {
+    out = {
         "events": events[:limit],
         "files_scanned": files_scanned,
         "skipped_lines": skipped,
     }
+    if unreadable_files:
+        # Additive and CONDITIONAL: a healthy ledger returns exactly the
+        # v0.10 shape, so the frozen output surface does not move.
+        out["unreadable_files"] = unreadable_files
+    return out
 
 
 def tail(n: int = 20) -> list[dict]:

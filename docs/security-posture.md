@@ -956,6 +956,53 @@ lesson of this gate and is recorded as such:
 - **INFO — `--purge` destroyed queued mail without counting it.** It warned
   about the audit ledger; undelivered messages now get a count too.
 
+### v0.11 — eighth and ninth passes, and the structural fix
+
+Both auditors returned FAIL again. Five consecutive gates had now found the
+SAME SHAPE — a caveat wired into one reporting surface and forgotten on its
+sibling — so this round fixed the shape, not just the instances.
+
+- **MAJOR — an unreadable DEFAULT root was not refused at all.** The
+  "cannot be read" check sat inside the explicit-root content branch, so
+  `chmod 000 ~/.email-mcp` skipped it: with two real queued messages on
+  disk, every scan returned empty and every surface answered "no queued
+  mail". Unreadability is STRUCTURAL — it applies whoever named the root —
+  so it now runs above the default-root exemption, with the directory
+  listed exactly once and reused.
+- **MAJOR — `tool_list_scheduled` and `tool_audit` disclosed a refused root
+  but not an unreadable manifest or month file.** The previous round had
+  taught `dispatcher --status` and `doctor` both halves and the tools only
+  one.
+- **THE STRUCTURAL FIX: `email_mcp/health.py`.** There is now ONE
+  definition of "is a report about our own state trustworthy", and every
+  surface that reports counts, lists or an `ok` about state this tool owns
+  merges it. A surface can no longer pick up half of it, and the helper
+  performs its own scan rather than trusting the caller to have scanned
+  first — the implicit ordering that made a too-early call return a silent
+  `{}`. Caveat keys are **conditional**: a healthy install returns exactly
+  the frozen v0.10/v0.11 shape, so the output surface does not move.
+- **MINOR — `uninstall` named the DEFAULT root while the CONFIGURED one was
+  refused**, answering about the wrong directory.
+- **MINOR — configuration silently re-moded a pre-existing tree.**
+  `write_meta` chmodded the root 0700 unconditionally, so `update` on a
+  v0.10 tree tightened the ROOT while `spool/`, `plans/` and `audit/`
+  stayed 0755 — a silent, inconsistent half-repair, and a direct
+  contradiction of §1.6.1. Configuration now reports; `doctor --fix`
+  repairs them together, on request.
+- **MINOR — internal roadmap labels ("L3 of the…", "L4 of the v0.11
+  lifecycle work") reached operator-facing errors**, and two tests pinned
+  them there. Both the strings and the assertions are gone.
+
+What the ninth pass confirmed clean, having tried specifically to break it:
+no write or chmod through a symlink on any managed path (root, five leaves,
+five spool state subdirectories, marker, month files, token caches, plan
+files, spool `.eml`/`.json`, identities, meta, attach dir); no read-side
+creation anywhere; no decoy modified through `EMAIL_MCP_IDENTITIES`,
+`EMAIL_MCP_ATTACH_DIR` or a relocated root; no traceback from any of nine
+hostile root shapes; the documented migration works literally as written
+with real queued mail surviving and visible; and `uninstall --purge` now
+states how many undelivered messages it is about to destroy.
+
 **Still open, deliberately:** the root TOCTOU (§0 boundary — a local
 attacker with write access to the root's parent can swap a symlink between
 the refusal check and the mkdir; cost is one stray 0600 dotfile, no mode

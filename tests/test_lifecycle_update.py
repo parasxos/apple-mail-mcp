@@ -17,7 +17,7 @@ while absent agents are never installed, meta.json is stamped with
 state_version/package_version/updated_at, the doctor runs and the
 releases URL prints, ONE lifecycle event (outcome `update`) goes on
 record per run, and the non-TTY refusal keeps test_cli.py's frozen stub
-contract (exit 2, silent stdout, "update" + "L4" on stderr).
+contract (exit 2, silent stdout, "update" + the remedy on stderr).
 """
 from __future__ import annotations
 
@@ -308,11 +308,15 @@ def test_no_terminal_without_yes_exits_2(home, capsys):
     usage error, printing nothing to stdout and touching nothing. The
     refusal keeps the frozen stub contract that
     test_cli.py::test_lifecycle_stubs_exit_2_with_pointer pins for
-    `update`: exit 2, silent stdout, "update" + "L4" on stderr."""
+    `update`: exit 2, silent stdout, "update" + the remedy on stderr.
+    The internal stage label ("L4") used to be pinned here, which is how it
+    reached operator-facing text; an audit called that out."""
     assert lifecycle.run_update_cli([]) == 2
     captured = capsys.readouterr()
     assert captured.out == ""
-    assert "update" in captured.err and "L4" in captured.err
+    assert "update" in captured.err and "--yes" in captured.err
+    import re as _re
+    assert not _re.search(r"\bL[0-9]\b", captured.err), "internal jargon"
     assert "--yes" in captured.err
     assert not (home / ".email-mcp").exists()  # refused = nothing created
     # And through the real dispatch, as the frozen test hits it:

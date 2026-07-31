@@ -452,12 +452,12 @@ def test_no_terminal_without_answers_exits_2(home, capsys):
     (as here) the CLI refuses with a usage error, printing nothing to
     stdout. The refusal keeps the frozen stub contract that
     test_cli.py::test_lifecycle_stubs_exit_2_with_pointer still pins for
-    `setup`: exit 2, silent stdout, "setup" + "L3" on stderr."""
+    `setup`: exit 2, silent stdout, "setup" + the remedy on stderr."""
     assert lifecycle.run_setup_cli([]) == 2
     captured = capsys.readouterr()
     assert captured.out == ""
     assert "--yes" in captured.err and "--answers" in captured.err
-    assert "setup" in captured.err and "L3" in captured.err
+    assert "setup" in captured.err and "--yes" in captured.err
     # And through the real dispatch, as MCP clients would hit it:
     assert cli.main(["setup"]) == 2
 

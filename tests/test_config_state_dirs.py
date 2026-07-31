@@ -1026,7 +1026,7 @@ def test_state_reporting_tools_flag_a_refused_root(home, monkeypatch,
     assert "already contains files" in sched["state_root_refused"]
 
     aud = server.tool_audit()
-    assert aud["events_are_complete"] is False
+    assert aud["counts_are_meaningful"] is False
     assert "state_root_refused" in aud
 
 
@@ -1044,7 +1044,7 @@ def test_unreadable_manifests_make_dispatcher_counts_untrustworthy(home):
 
     assert report["counts_are_meaningful"] is False
     assert report["counts"] is None
-    assert report["unreadable_manifests"]["pending"] == ["truncated.json"]
+    assert report["unreadable"]["spool/pending"] == ["truncated.json"]
 
 
 def test_doctor_reports_a_symlinked_spool_state_subdir(home, tmp_path):
@@ -1132,3 +1132,74 @@ def test_purge_counts_the_queued_mail_it_is_about_to_destroy(home):
 
     assert any("still queued and undelivered" in line
                for line in plan["remove"])
+
+
+def test_unreadable_default_root_is_refused_and_no_surface_claims_empty(
+        home):
+    """MAJOR: the "cannot be read" check lived inside the EXPLICIT-root
+    content branch, so the DEFAULT root skipped it entirely. `chmod 000
+    ~/.email-mcp` with real queued mail on disk made every scan return
+    empty and every surface answer "no queued mail" — the operator (or the
+    model, via MCP) is told their mail was never scheduled.
+
+    Unreadability is STRUCTURAL: it applies whoever named the root.
+    """
+    from email_mcp import dispatcher, doctor, server, spool
+
+    entry = spool.Entry(
+        id="q1", send_at="2099-01-01T00:00:00+00:00",
+        created_at="2026-01-01T00:00:00+00:00", to=["a@b.c"], cc=[],
+        bcc=[], subject="REAL QUEUED", attachments=[], message_id="<m@x>")
+    spool.save(b"body", entry)
+    root = home / ".email-mcp"
+    root.chmod(0o000)
+    try:
+        assert "cannot be read" in (config.state_root_refusal() or "")
+        assert server.tool_list_scheduled()["counts_are_meaningful"] is False
+        assert server.tool_audit()["counts_are_meaningful"] is False
+        assert dispatcher.status()["counts_are_meaningful"] is False
+        assert doctor.run()["ok"] is False
+    finally:
+        root.chmod(0o700)
+
+    # …and the mail was never touched.
+    assert (root / "spool" / "pending" / "q1.json").exists()
+
+
+def test_every_state_report_shares_one_definition_of_trustworthy(home):
+    """The structural fix for the pattern that produced five gate FAILs in
+    a row: each caveat had been wired into one surface and forgotten on
+    its sibling. There is now ONE helper, and every reporting surface
+    merges it — so a surface cannot pick up half of it."""
+    from email_mcp import health, server, dispatcher
+
+    (config.spool_dir() / "pending" / "trunc.json").write_text('{"id":')
+
+    caveat = health.caveats(spool_states=("pending",))
+    assert caveat[health.MEANINGFUL_KEY] is False
+    assert caveat[health.UNREADABLE_KEY]["spool/pending"] == ["trunc.json"]
+
+    for report in (server.tool_list_scheduled(), dispatcher.status()):
+        assert report["counts_are_meaningful"] is False
+        assert report["unreadable"]["spool/pending"] == ["trunc.json"]
+
+
+def test_configuration_never_re_modes_a_pre_existing_tree(home):
+    """`write_meta` chmodded the root 0700 unconditionally, so `update` on
+    a v0.10 tree silently tightened the ROOT while spool/plans/audit stayed
+    0755 — a silent, inconsistent half-repair. Configuration reports;
+    `doctor --fix` repairs, together and on request."""
+    from email_mcp import lifecycle, repairs
+
+    root = home / ".email-mcp"
+    for sub in ("", "spool", "plans", "audit"):
+        (root / sub if sub else root).mkdir(parents=True, exist_ok=True)
+    for sub in ("", "spool", "plans", "audit"):
+        (root / sub if sub else root).chmod(0o755)
+
+    lifecycle.write_meta({"state_version": 1})
+
+    assert _mode(root) == 0o755, "configuration silently re-moded the root"
+    repairs.run_fixes()
+    for sub in ("", "spool", "plans", "audit"):
+        assert _mode(root / sub if sub else root) == 0o700

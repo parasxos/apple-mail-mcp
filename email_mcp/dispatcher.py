@@ -581,24 +581,19 @@ def status() -> dict:
             for e in spool.entries("pending")
         ],
     }
-    # Two independent ways the counts can lie, and BOTH must flag: a root
-    # we may not manage (above), and manifests we could not parse. A
-    # truncated manifest — what a crash or ENOSPC leaves mid-save — is real
-    # queued mail that entries() skips, so `pending 0` meant "nothing
-    # queued" and "a message we cannot read" alike. doctor named these
-    # already; the command an operator actually runs did not.
-    unreadable = {st: spool.unreadable(st) for st in spool.STATES}
-    unreadable = {st: names for st, names in unreadable.items() if names}
-    if refusal is not None or unreadable:
-        out["counts_are_meaningful"] = False
+    # ONE shared definition of "is this report trustworthy" (email_mcp.
+    # health), so a surface cannot pick up half of it — which is exactly
+    # how a refused root and an unreadable manifest came to be flagged
+    # here and nowhere else.
+    from . import health
+
+    caveat = health.caveats(spool_states=spool.STATES, audit_query=None)
+    if caveat:
+        out.update(caveat)
         # Drop the zeros rather than leave `jq .counts.pending` reading 0
         # next to a flag it will not look at.
         out["counts"] = None
         out["pending"] = []
-    if refusal is not None:
-        out["state_root_refused"] = refusal
-    if unreadable:
-        out["unreadable_manifests"] = unreadable
     return out
 
 
@@ -622,16 +617,10 @@ def main() -> int:
         json.dump(report, sys.stdout, indent=2)
         sys.stdout.write("\n")
         if report.get("counts_are_meaningful") is False:
-            if report.get("state_root_refused"):
-                print(f"email-mcp dispatcher: "
-                      f"{report['state_root_refused']}", file=sys.stderr)
-            if report.get("unreadable_manifests"):
-                for st, names in sorted(report["unreadable_manifests"].items()):
-                    print(f"email-mcp dispatcher: {st}/: cannot read "
-                          f"{', '.join(sorted(names))} — queued mail may be "
-                          "present but uncounted", file=sys.stderr)
-            print("email-mcp dispatcher: the counts are NOT meaningful — "
-                  "run `email-mcp doctor`.", file=sys.stderr)
+            from . import health
+
+            for line in health.summarize(report):
+                print(f"email-mcp dispatcher: {line}", file=sys.stderr)
             return 1
         return 0
     if args.install_launchd:

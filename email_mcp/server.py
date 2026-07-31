@@ -781,16 +781,19 @@ def tool_list_scheduled(state: str | None = None, limit: int = 50) -> dict:
         **out,
     }
     # This tool ANSWERS "is my mail queued?", and spool.entries honestly
-    # returns [] for a spool it may not manage — so against a refused root
-    # the answer was a confident empty queue, indistinguishable from
-    # "nothing scheduled". The mail is real and undelivered. Say so.
-    # (Same shape as dispatcher.status(); a blanket belt gate would be
-    # wrong — tools that read Apple Mail, not our state, are unaffected by
-    # a refused root and must keep working.)
-    refusal = config.state_root_refusal()
-    if refusal is not None:
-        result["state_root_refused"] = refusal
-        result["counts_are_meaningful"] = False
+    # returns [] for a spool it may not manage or a manifest it cannot
+    # parse — so the answer was a confident empty queue, indistinguishable
+    # from "nothing scheduled", for real undelivered mail. ONE helper
+    # decides that, shared with dispatcher.status and tool_audit, because
+    # wiring it per-surface is what produced five gate FAILs in a row.
+    # (Deliberately not a blanket belt gate: tools that read Apple Mail
+    # rather than our state are unaffected by a refused root.)
+    from . import health
+
+    caveat = health.caveats(spool_states=tuple(states))
+    if caveat:
+        result.update(caveat)
+        result["pending"] = []
     return result
 
 
@@ -1086,13 +1089,11 @@ def tool_audit(
                       plan_id=plan_id, operation_id=operation_id,
                       limit=limit)
     result = {"ok": True, **out}
-    # Same rule as list_scheduled: an empty ledger and an UNREADABLE ledger
-    # must not look alike. Costs receipts rather than mail, so the query
-    # still answers — it just stops implying the ledger is empty.
-    refusal = config.state_root_refusal()
-    if refusal is not None:
-        result["state_root_refused"] = refusal
-        result["events_are_complete"] = False
+    # Same rule and the same helper: an empty ledger and an UNREADABLE
+    # ledger must not look alike.
+    from . import health
+
+    result.update(health.caveats(audit_query=out))
     return result
 
 
