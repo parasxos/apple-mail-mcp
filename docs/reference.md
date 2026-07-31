@@ -339,7 +339,13 @@ and measured in `tests/test_config_state_dirs.py`.
 10. **Resolution never throws.** A value that cannot even be turned into a
     path (`~nosuchuser/foo`, a relative path with a deleted working
     directory) becomes a reported refusal, not a traceback out of
-    `doctor` or `uninstall`.
+    `doctor` or `uninstall`. The same goes for every structural fault the
+    tool can see before acting — a stray file on the root, a symlink to
+    nothing, an absent or unwritable parent. Each is one legible line with
+    a fix, not an `OSError` from deep in a later call.
+11. **The marker is held to 0600**, like every other state file: a
+    pre-existing one at a looser mode is reported and repaired by
+    `doctor --fix`.
 
 ### Migrating from the per-directory variables
 
@@ -406,9 +412,13 @@ or made with `mkdir` are `0755` under a normal umask, and the tool will not
 silently retighten what it did not create (rule 1). Repair them explicitly:
 
 ```sh
-email-mcp doctor --fix    # chmod 700 the root and its leaves, 600 the files
-email-mcp doctor          # green
+email-mcp doctor --fix --dry-run   # what it WOULD repair; touches nothing
+email-mcp doctor --fix             # chmod 700 the dirs, 600 the files
+email-mcp doctor                   # green for the state checks
 ```
+
+(`--dry-run` is the safe first move on someone else's machine: it prints
+every repair as `dry-run: would fix` and writes nothing.)
 
 If you were only using the defaults (`~/.email-mcp/*`), there is nothing to
 do: unset the variables if you set any, and the default root is adopted

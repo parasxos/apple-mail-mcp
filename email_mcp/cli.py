@@ -114,9 +114,16 @@ def cmd_doctor(rest: list[str]) -> int:
         help="run the whitelisted safe repairs first, then re-run the "
              "doctor (exit reflects the re-run)",
     )
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="with --fix: report what WOULD be repaired and touch nothing",
+    )
     parser.add_argument("--json", action="store_true",
                         help="machine-readable output")
     args = parser.parse_args(rest)
+    if args.dry_run and not args.fix:
+        parser.error("--dry-run only makes sense with --fix")
 
     from . import server  # late: the doctor pulls the whole tool layer
 
@@ -132,8 +139,10 @@ def cmd_doctor(rest: list[str]) -> int:
     from . import repairs
 
     before = server.tool_doctor()
-    fixes = repairs.run_fixes()
-    after = server.tool_doctor()
+    fixes = repairs.run_fixes(dry_run=args.dry_run)
+    # A dry run touches nothing, so there is nothing to re-check: report the
+    # same state twice rather than implying a second, changed reading.
+    after = before if args.dry_run else server.tool_doctor()
     if args.json:
         json.dump({"before": before, "fixes": fixes, "after": after},
                   sys.stdout, indent=2, default=str)

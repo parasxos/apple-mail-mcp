@@ -795,6 +795,64 @@ regression test in `tests/test_config_state_dirs.py`:
 
 Also uniform now: `graph_dir()` was the one leaf getter without a `create`
 parameter, so read-side callers rebuilt its path by hand.
+
+### v0.11 — second and third independent Gate 4 passes
+
+Three auditors ran against the committed tree and the installed wheel.
+Everything below was reproduced before it was fixed:
+
+- **MAJOR — a read-side command created and CLAIMED the state tree.**
+  `dispatcher --status`, documented as a read-only overview, resolved
+  `config.spool_dir()` with `create=True`: diagnosing an install wrote the
+  ownership marker and the whole spool. Three siblings had the same defect
+  — `spool.load`/`read_eml`, `plans.load`/`all_plans`/`gc`, and
+  `fts._log_path`, which built `<root>/fts` in order to format a string
+  into a plist. All now resolve `create=False`; only `save()` and `claim()`
+  create. A single regression test now exercises the ENTIRE read surface in
+  one place, and a tracing probe confirms **zero** `create=True` calls
+  reach it.
+- **MAJOR — `EMAIL_MCP_IDENTITIES` was unfenced.** `doctor --fix` chmodded
+  whatever it named: measured at 644 → 600 on a decoy `~/.zshrc`, and
+  `/etc/passwd` entered the repair list. Naming a path is not consent to
+  have its mode changed, and a stale value points somewhere else entirely.
+  The fixer now touches `identities.toml` only inside a directory it
+  manages; elsewhere `doctor` reports a loose mode and `--fix` leaves it
+  alone. This was the last live instance of the class §1.6.1 calls
+  unrepresentable — for FILES it was still representable.
+- **MAJOR — the "one root" claim was false** for `identities.toml` and
+  `meta.json`, which are anchored at `~/.email-mcp` regardless of the root,
+  while both documents drew them inside `<root>/`. The docs now say what
+  the code does and why (§1.6). The code placement is deliberate and was
+  kept: moving them under a relocatable root would break sending for anyone
+  who relocates and expects their existing identities file to be found.
+- **MAJOR — the migration message dead-ended.** It said "moving the
+  existing contents there first", which makes the target non-empty and
+  unmarked — refused in turn — and named no escape. The message now names
+  the marker and points at the full procedure. (The reference doc already
+  carried the adoption step; the runtime message did not.)
+- **MINOR — several read paths raised on an unreadable root.** A mode-000
+  root made even the stat probes throw out of `audit.query`,
+  `spool.entries`, `plans.all_plans`, `fts.status`, `dispatcher.status` and
+  uninstall planning. All total now (`config.is_dir_safe`).
+- **MINOR — structural faults tracebacked** instead of refusing: a stray
+  file on the DEFAULT root, a dangling-symlink root, an absent or
+  unwritable parent. All are refusals with a fix now, and they run before
+  the default-root content exemption because they apply to it too.
+- **MINOR — `StatePaths.meta` disagreed with `meta_path()`**, so a
+  relocated root reported a `meta.json` that did not exist.
+- **MINOR — the ownership marker kept a loose mode.** A marker at 0644
+  survived both configuration and `doctor --fix` while the docs promised
+  0600; it is now in the repairs file sweep.
+- **MINOR — `doctor --fix` had no CLI dry run**, though the registry has
+  implemented one since v0.10 and its docstring advertises it. `email-mcp
+  doctor --fix --dry-run` now reaches it.
+- **INFO — `_MAX_ERROR_CHARS` measured bytes.** Renamed `_MAX_ERROR_BYTES`;
+  behaviour was already correct.
+
+**Still open, deliberately:** the root TOCTOU (§0 boundary — a local
+attacker with write access to the root's parent can swap a symlink between
+the refusal check and the mkdir; cost is one stray 0600 dotfile, no mode
+change, no data), and `~/Library/LaunchAgents` following a symlink (§2.6).
 - **Known residual risks after this pass:** §2.1, §2.2, §2.4 (major, open),
   §2.6, §2.7, §2.9, §2.10, §2.11 are unchanged by v0.11 and remain as
   stated.

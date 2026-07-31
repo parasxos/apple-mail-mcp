@@ -80,7 +80,7 @@ def _to_jsonable(obj: Any) -> Any:
 
 # Generous for genuine one-line prose, small enough that no failure envelope
 # can carry a caller's payload back across the wire.
-_MAX_ERROR_CHARS = 2000
+_MAX_ERROR_BYTES = 2000
 
 # A message id is an Envelope Index ROWID or a minted spool id — tens of
 # bytes. Bounded in the same unit as _clip so the two cannot disagree.
@@ -104,9 +104,9 @@ def _clip(text: str) -> str:
     if not isinstance(text, str):
         return text
     raw = text.encode("utf-8")
-    if len(raw) <= _MAX_ERROR_CHARS:
+    if len(raw) <= _MAX_ERROR_BYTES:
         return text
-    cut = raw[:_MAX_ERROR_CHARS].decode("utf-8", errors="ignore")
+    cut = raw[:_MAX_ERROR_BYTES].decode("utf-8", errors="ignore")
     return cut + f"… [truncated, {len(text)} chars; see log]"
 
 

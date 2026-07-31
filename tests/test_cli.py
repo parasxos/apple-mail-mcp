@@ -23,6 +23,12 @@ import pytest
 
 from email_mcp import cli, server
 
+
+def _mode(p) -> int:
+    import stat
+
+    return stat.S_IMODE(p.stat().st_mode)
+
 COMMAND_NAMES = [
     "serve", "setup", "doctor", "update", "uninstall",
     "audit", "fts", "graph", "dispatcher", "version",
@@ -272,7 +278,7 @@ def test_doctor_fix_runs_repairs_between_two_doctor_passes(
         calls.append("doctor")
         return next(reports)
 
-    def fake_run_fixes() -> dict:
+    def fake_run_fixes(*, dry_run: bool = False) -> dict:
         calls.append("fixes")
         return FIXES
 
@@ -298,7 +304,8 @@ def test_doctor_fix_exit_reflects_the_rerun_not_the_fixes(
     from email_mcp import repairs
 
     monkeypatch.setattr(server, "tool_doctor", lambda: next(reports))
-    monkeypatch.setattr(repairs, "run_fixes", lambda: FIXES)
+    monkeypatch.setattr(repairs, "run_fixes",
+                        lambda *, dry_run=False: FIXES)
     assert cli.main(["doctor", "--fix"]) == 1  # still red after fixing
 
 
@@ -307,7 +314,8 @@ def test_doctor_fix_json_shape_is_before_fixes_after(monkeypatch, capsys):
     from email_mcp import repairs
 
     monkeypatch.setattr(server, "tool_doctor", lambda: next(reports))
-    monkeypatch.setattr(repairs, "run_fixes", lambda: FIXES)
+    monkeypatch.setattr(repairs, "run_fixes",
+                        lambda *, dry_run=False: FIXES)
     assert cli.main(["doctor", "--fix", "--json"]) == 0
     out = json.loads(capsys.readouterr().out)
     assert list(out) == ["before", "fixes", "after"]
@@ -384,3 +392,26 @@ def test_package_version_ignores_a_stale_installed_distribution(monkeypatch):
 
     monkeypatch.setattr(md, "version", lambda name: "0.0.1-stale")
     assert cli._package_version() == email_mcp.__version__
+
+
+def test_doctor_fix_dry_run_reports_without_touching_anything(
+    home, monkeypatch, capsys,
+):
+    """The registry has implemented dry_run since v0.10 and its docstring
+    advertises "a dry run truly touches nothing" — but no CLI flag reached
+    it, so the safest way to use the fixer was unreachable from the
+    command line."""
+    root = home / ".email-mcp"
+    root.mkdir(mode=0o755)
+    before = _mode(root)
+
+    rc = cli.main(["doctor", "--fix", "--dry-run"])
+
+    out = capsys.readouterr().out
+    assert "dry-run: would fix" in out
+    assert _mode(root) == before          # nothing repaired
+    assert sorted(p.name for p in root.iterdir()) == []   # nothing created
+    assert rc in (0, 1)
+
+    # --dry-run without --fix is a usage error, not a silent no-op.
+    assert cli.main(["doctor", "--dry-run"]) == 2

@@ -551,6 +551,8 @@ def test_run_fixes_with_uncreatable_state_root_never_raises(
     repair (and then the tree does get built), which would not exercise
     the un-creatable path at all.
     """
+    from email_mcp import config, doctor
+
     _install_estate(home)
     ro = tmp_path / "ro"
     ro.mkdir()
@@ -559,12 +561,20 @@ def test_run_fixes_with_uncreatable_state_root_never_raises(
     monkeypatch.setenv("EMAIL_MCP_STATE_DIR", str(root))
     ro.chmod(0o500)
     try:
+        # The fault is now caught at RESOLUTION — an unwritable parent is
+        # knowable before any effect, so it is a refusal with a fix rather
+        # than a repair that attempts a mkdir and reports the OSError. Both
+        # satisfy "reported, never raised"; this one is legible.
+        reason = config.state_root_refusal()
+        assert reason is not None and "not writable" in reason
+        check = doctor.check_state_root()
+        assert check["ok"] is False and "not writable" in check["detail"]
+
         result = repairs.run_fixes()
     finally:
         ro.chmod(0o700)
 
-    failed_ids = {f["repair"] for f in result["failed"]}
-    assert "state_dir_missing" in failed_ids
+    assert isinstance(result["failed"], list)   # returned, did not raise
     assert not root.exists() and not dead.exists()
     assert list(ro.iterdir()) == []   # nothing created under the frozen parent
 

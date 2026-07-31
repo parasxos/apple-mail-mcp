@@ -336,11 +336,14 @@ def state_root_refusal() -> str | None:
         return (f"{root} exists and is not a directory — refusing to manage "
                 "it. Move it aside, or point EMAIL_MCP_STATE_DIR at a "
                 "directory.")
-    if not explicit:
-        # The DEFAULT root is never refused for its CONTENTS: ~/.email-mcp
-        # predates the marker, and every v0.10 install has one full of our
-        # own files. Adopting it is the upgrade path (see docs/reference).
-        return None
+    if not root.exists() and root.is_symlink():
+        # A dangling link is neither refused nor usable: the guards here are
+        # gated on exists(), which is False for a broken link, so the tool
+        # sailed past and every write failed with a FileNotFoundError from
+        # deep in the stack instead of one legible line at config time.
+        return (f"{root} is a symlink to a path that does not exist. "
+                "Repoint or remove the link, or set EMAIL_MCP_STATE_DIR to "
+                "a real directory.")
     if not root.exists() and not root.parent.is_dir():
         # We create the root, never a chain of directories above it: those
         # would land at the process umask (0755) and belong to nobody.
@@ -348,6 +351,21 @@ def state_root_refusal() -> str | None:
                 "without also creating directories above it. Create the "
                 "parent yourself, or point EMAIL_MCP_STATE_DIR inside an "
                 "existing directory.")
+    if not root.exists() and not os.access(root.parent, os.W_OK | os.X_OK):
+        # Same class as the missing parent: knowable before any effect, so
+        # it is a refusal with a fix rather than a raw PermissionError out
+        # of the first mkdir (security-posture §1.7, degradation not
+        # tracebacks).
+        return (f"{root.parent} is not writable, so {root} cannot be "
+                "created. Fix its permissions, or point "
+                "EMAIL_MCP_STATE_DIR somewhere writable.")
+    if not explicit:
+        # Everything ABOVE this line is structural — a stray file, a broken
+        # link, an absent or unwritable parent — and applies to the default
+        # root too. Only the CONTENT check below is exempt for it:
+        # ~/.email-mcp predates the marker, and every v0.10 install has one
+        # full of our own files. Adopting it is the upgrade path.
+        return None
     if root.exists() and not _marked(root):
         try:
             # The marker is OURS, so it is not "someone else's files" —
@@ -414,6 +432,14 @@ def state_root(create: bool = True) -> Path:
     if not _marked(root):
         _mark(root)
     return root
+
+
+def marker_path(root: Path) -> Path:
+    """The ownership marker inside `root`. Public so the repairs registry
+    can hold it to the same 0600 rule as every other state file — a
+    pre-existing marker at 0644 stayed 0644 through both configuration and
+    `doctor --fix`, while the docs promised 0600."""
+    return root / STATE_MARKER
 
 
 def _leaf(name: str, create: bool = True) -> Path:

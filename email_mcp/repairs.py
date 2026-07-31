@@ -274,6 +274,9 @@ def _state_files() -> list[Path]:
     if config.state_root_refusal():
         # A refused root owns no files either — same gate as _state_dirs.
         return files
+    marker = config.marker_path(_state_root())
+    if marker.is_file() and not _off_limits(marker, links):
+        files.append(marker)   # docs promise 0600; hold it to that
     for root, pattern in ((config.audit_dir(create=False), "*.jsonl"),
                           (_graph_root(), "*.token.json")):
         if (root.is_dir() and not root.is_symlink()

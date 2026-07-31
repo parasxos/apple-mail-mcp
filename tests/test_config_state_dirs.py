@@ -793,3 +793,57 @@ def test_the_migration_message_names_the_adoption_step(home, monkeypatch):
     assert config.STATE_MARKER in msg
     assert "doctor --fix" in msg
     assert "docs/reference.md" in msg
+
+
+def test_structural_faults_refuse_legibly_instead_of_tracebacking(
+        home, monkeypatch, tmp_path):
+    """MINOR (both auditors): a dangling-symlink root and an unwritable
+    parent were neither refused nor usable — every guard was gated on
+    exists(), so the tool sailed past and each write failed with a raw
+    FileNotFoundError/PermissionError from deep in the stack. §1.7 of the
+    security posture promises degradation, not tracebacks.
+
+    Structural faults apply to the DEFAULT root too, which is why these
+    checks now run before the default-root content exemption.
+    """
+    # (a) dangling link on the default root
+    (home / ".email-mcp").symlink_to(tmp_path / "nowhere")
+    reason = config.state_root_refusal()
+    assert reason is not None and "does not exist" in reason
+    for getter in LEAF_GETTERS:
+        with pytest.raises(config.StateDirRefused):
+            getattr(config, getter)()
+    (home / ".email-mcp").unlink()
+
+    # (b) unwritable parent, again on the default root
+    home.chmod(0o500)
+    try:
+        reason = config.state_root_refusal()
+        assert reason is not None and "not writable" in reason
+        with pytest.raises(config.StateDirRefused):
+            config.state_root()
+    finally:
+        home.chmod(0o755)
+
+    # (c) …and a healthy default root is still adopted normally.
+    assert config.state_root_refusal() is None
+    assert _mode(config.state_root()) == 0o700
+
+
+def test_the_ownership_marker_is_held_to_0600(home):
+    """INFO->fixed: config only writes the marker when absent, and the
+    repairs file sweep did not list it, so a marker at 0644 stayed 0644
+    through both configuration and `doctor --fix` — while the docs
+    promised 0600."""
+    from email_mcp import repairs
+
+    root = home / ".email-mcp"
+    root.mkdir()
+    marker = config.marker_path(root)
+    marker.write_text("{}\n")
+    marker.chmod(0o644)
+
+    assert marker in repairs._state_files()
+    repairs.run_fixes()
+
+    assert _mode(marker) == 0o600
