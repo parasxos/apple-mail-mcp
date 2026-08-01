@@ -279,8 +279,8 @@ def test_uninstalled_agents_are_not_drift(home, writer):
 def test_plan_fix_only_restricts_to_the_named_checks(home, writer):
     os.chmod(writer.plans, 0o755)  # a tree_modes finding AND meta pending
     rows = checks.plan_fix(only=frozenset({checks.META_VERSION}))
-    assert [type(r) for r in rows] == [plan.WriteFile]
-    assert rows[0].path == writer.root / META
+    assert [type(r) for r in rows] == [plan.AdoptRoot, plan.WriteFile]
+    assert rows[1].path == writer.root / META
     os.chmod(writer.plans, 0o700)
 
 
@@ -293,7 +293,10 @@ def test_plan_fix_repairs_everything_in_one_plan(home, writer, launchctl):
     legacy = (home / "Library" / "LaunchAgents" /
               f"{dispatcher.LEGACY_LABELS[0]}.plist")
     legacy.write_text("<plist/>")
+    before = _snapshot(home) | _snapshot(writer.root)
     rows = checks.plan_fix()
+    assert _snapshot(home) | _snapshot(writer.root) == before  # build is pure
+    assert isinstance(rows[0], plan.AdoptRoot)  # adoption is a row, not an effect
     results = plan.execute(rows, verb="doctor_fix")
     assert all(r.ok for r in results)
     assert checks.findings() == []

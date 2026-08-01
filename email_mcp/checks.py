@@ -7,7 +7,9 @@ Probes are read-only by TYPE: they hold a StateReader, which has nothing
 effectful to call. Repairs map a finding to the plan.py action(s) that fix
 it, and receive a StateWriter as proof of an adoptable root — a writer
 cannot exist for a refused root, so a repair mutating under one is
-uncompilable, not merely untested. That is the whole gate.
+uncompilable, not merely untested. That is the whole gate. Adoption
+itself rides the plan as its first row (plan.AdoptRoot), so even that
+effect happens inside execute(), never while the plan is built.
 
 `doctor` renders `findings()`; `doctor --fix` hands `plan_fix()` to
 plan.execute — the same executor uninstall uses, so audit events, dry-run
@@ -284,9 +286,11 @@ def findings() -> list[Finding]:
 def plan_fix(only: frozenset[str] | None = None) -> list[plan.Row]:
     """Map findings to their repair actions — the plan doctor --fix hands
     to plan.execute. `only` restricts to a subset of check ids (update's
-    migration slice). Adoption happens exactly once, and only when there
-    is something to repair; for a refused root no StateWriter can exist,
-    so the answer is a PrintOnly report, never a mutation."""
+    migration slice). Adoption is the plan's FIRST row, never a build
+    effect: the writer the repairs are built against comes to exist
+    inside execute(), so a dry run or a declined confirmation adopts
+    nothing. For a refused root no StateWriter can exist — the answer is
+    a PrintOnly report, never a mutation."""
     survey = _survey()
     if isinstance(survey, state.Refused):
         return [plan.PrintOnly(f"cannot fix: {survey.reason}")]
@@ -295,11 +299,8 @@ def plan_fix(only: frozenset[str] | None = None) -> list[plan.Row]:
             if c.repair is not None and (only is None or c.id in only)]
     if not todo:
         return []
-    try:
-        writer = resolved.adopt()
-    except state.RefusedError as e:
-        return [plan.PrintOnly(f"cannot fix: {e}")]
-    rows: list[plan.Row] = []
+    adopt = plan.AdoptRoot(resolved)
+    rows: list[plan.Row] = [adopt]
     for c, f in todo:
-        rows += c.repair(writer, f)
+        rows += c.repair(adopt.writer, f)
     return rows

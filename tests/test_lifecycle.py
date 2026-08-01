@@ -319,13 +319,29 @@ def test_doctor_fix_repairs_the_squat(home, monkeypatch, capsys):
 
 
 def test_doctor_fix_dry_run_is_pure(home, monkeypatch, capsys):
-    _no_input(monkeypatch)
-    writer = state.State.resolve().adopt()
-    (writer.root / "audit").write_text("squatter")
+    """THE --fix dry-run acceptance, against the worst input: an
+    unadopted 0755 root plus a legacy plist pending. Not one path, mode,
+    kind or size changes — adoption included, because adoption is the
+    plan's first row, never a plan-build effect. A declined typed
+    confirmation is equally pure."""
+    root = home / ".email-mcp"
+    root.mkdir()
+    os.chmod(root, 0o755)
+    legacy = (home / "Library" / "LaunchAgents" /
+              f"{dispatcher.LEGACY_LABELS[0]}.plist")
+    legacy.write_text("<plist/>")
     before = _snapshot(home)
+    _no_input(monkeypatch)
     assert lifecycle.doctor_fix(dry_run=True) == 0
     assert _snapshot(home) == before
-    assert "move" in capsys.readouterr().out
+    out = capsys.readouterr().out
+    assert f"adopt state root {root}" in out
+    assert f"remove file {legacy}" in out
+
+    _script(monkeypatch, ["nope"])
+    assert lifecycle.doctor_fix() == 1
+    assert _snapshot(home) == before
+    assert "aborted" in capsys.readouterr().out
 
 
 def test_doctor_fix_nothing_to_fix(home, monkeypatch, capsys):

@@ -33,7 +33,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import ClassVar
 
-from . import audit
+from . import audit, state
 from .log import get_logger
 
 _log = get_logger()
@@ -245,6 +245,32 @@ class WriteFile(Action):
             raise
         os.replace(tmp, self.path)
         os.chmod(self.path, self.mode)  # O_CREAT modes are umask-clipped
+
+
+@dataclass(frozen=True)
+class AdoptRoot(Action):
+    """State-root adoption (mkdir 0700 + marker) as a plan row: the one
+    effectful door opens inside execute(), never while a plan is built —
+    a dry run renders the adoption it would perform. `writer` is the
+    capability the repair rows after this one are built against; handing
+    it out is pure (path questions only), and its tree exists because
+    this row runs first."""
+
+    resolved: state.Resolved
+    wants: ClassVar[str] = "present"
+
+    @property
+    def writer(self) -> state.StateWriter:
+        return state.StateWriter(self.resolved.root)
+
+    def target(self) -> Path:
+        return self.resolved.root
+
+    def describe(self) -> str:
+        return f"adopt state root {self.resolved.root} (mkdir 0700 + marker)"
+
+    def _run(self) -> None:
+        self.resolved.adopt()
 
 
 @dataclass(frozen=True)
