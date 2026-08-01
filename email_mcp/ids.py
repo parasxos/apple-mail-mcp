@@ -15,7 +15,7 @@ import re
 import secrets
 from datetime import datetime, timezone
 
-_ID_RE = re.compile(r"\d{8}T\d{6}Z-[0-9a-f]{12}")
+_ID_RE = re.compile(r"[0-9]{8}T[0-9]{6}Z-[0-9a-f]{12}")  # ASCII: strftime mints nothing else
 
 
 def utcnow() -> datetime:

@@ -47,6 +47,8 @@ def _doctor(rest: list[str]) -> int:
     parser.add_argument("--dry-run", action="store_true",
                         help="with --fix: preview the repairs, touch nothing")
     args = parser.parse_args(rest)
+    if args.dry_run and not args.fix:
+        parser.error("--dry-run previews --fix; add --fix")
     from . import checks, doctor, lifecycle
 
     if args.fix:
@@ -54,13 +56,11 @@ def _doctor(rest: list[str]) -> int:
     hits = checks.findings()
     for f in hits:
         print(f"FAIL {f.check}: {f.detail}")
-    if any(f.check != checks.STATE_ROOT for f in hits):
+    if any(checks.repairable(f) for f in hits):
         print("run `email-mcp doctor --fix` to repair.")
     report = doctor.run()
-    for name, c in {**report["checks"], "audit": report["audit"]}.items():
-        print(f"{'ok  ' if c['ok'] else 'FAIL'} {name}: {c['detail']}")
-        if not c["ok"] and c.get("fix"):
-            print(f"     fix: {c['fix']}")
+    for line in doctor.render(report):
+        print(line)
     return 0 if report["ok"] and not hits else 1
 
 

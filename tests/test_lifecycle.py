@@ -475,3 +475,20 @@ def test_setup_refused_root_exits_nonzero(home, monkeypatch, tmp_path,
     assert lifecycle.setup(yes=True) == 1
     assert "cannot set up" in capsys.readouterr().out
     assert not (home / ".email-mcp").exists()
+
+
+def test_purge_plan_names_an_unlistable_logs_dir(home, installed):
+    """A plan that cannot enumerate must say so: Path.glob swallows
+    PermissionError, so an unreadable ~/Library/Logs used to yield a
+    preview with no log rows and no note — silent under-description."""
+    logs = home / "Library" / "Logs"
+    logs.chmod(0o000)
+    try:
+        rows = lifecycle.plan_uninstall(purge=True)
+    finally:
+        logs.chmod(0o755)
+    notes = [r for r in rows if isinstance(r, plan.PrintOnly)
+             and "cannot list" in r.text]
+    assert notes and str(logs) in notes[0].text
+    assert not any(isinstance(r, plan.UnlinkFile)
+                   and str(logs) in str(r.target()) for r in rows)

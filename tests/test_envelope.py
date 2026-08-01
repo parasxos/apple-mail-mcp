@@ -267,3 +267,15 @@ def test_partial_failure_channels_are_bounded_inside_ok_true():
     assert entry["code"] == "invalid_input"
     assert len(entry["id"].encode("utf-8")) <= _CAP
     assert len(entry["error"].encode("utf-8")) <= _CAP
+
+
+def test_minted_id_vocabulary_is_ascii():
+    """\\d matches Unicode digits, but strftime mints only ASCII — an id
+    claim written in another script is not ours and never threads onto
+    the wire as operation_id."""
+    from email_mcp import ids
+
+    assert ids.is_minted_id("20260801T123456Z-abcdefabcdef")
+    assert not ids.is_minted_id("\u0662\u0660\u0662\u0666\u0660\u0668"
+                                "\u0660\u0661T\u0661\u0662\u0663\u0664"
+                                "\u0665\u0666Z-abcdefabcdef")

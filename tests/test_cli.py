@@ -194,6 +194,14 @@ def test_verb_flag_sets_are_closed(home):
     assert e.value.code == 2
 
 
+def test_doctor_dry_run_requires_fix(home):
+    """--dry-run alone was a silent no-op flag. The closed-flag-set rule
+    covers pairings too: it previews --fix, so it demands --fix."""
+    with pytest.raises(SystemExit) as e:
+        cli.main(["doctor", "--dry-run"])
+    assert e.value.code == 2
+
+
 def test_version_prints_the_single_source(home, capsys):
     assert cli.main(["version"]) == 0
     assert capsys.readouterr().out.strip() == email_mcp.__version__

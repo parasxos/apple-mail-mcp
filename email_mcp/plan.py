@@ -125,7 +125,7 @@ class RemoveTree(Action):
     wants: ClassVar[str] = "absent"
 
     def __post_init__(self) -> None:
-        if self.root != Path.home() / ".email-mcp":
+        if self.root != state.default_root():
             raise ValueError(
                 "RemoveTree exists only for ~/.email-mcp — build it via "
                 "RemoveTree.state_root()."
@@ -133,7 +133,7 @@ class RemoveTree(Action):
 
     @staticmethod
     def state_root() -> "RemoveTree | Kept | PrintOnly":
-        root = Path.home() / ".email-mcp"
+        root = state.default_root()
         try:
             lst = os.lstat(root)
         except FileNotFoundError:

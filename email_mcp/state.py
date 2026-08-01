@@ -170,6 +170,13 @@ class Resolved:
         return StateWriter(root)
 
 
+def default_root() -> Path:
+    """THE spelling of the default state root. Every module that must name
+    it — resolve itself, the purge fence, identities' default home — asks
+    here, so the root's location has exactly one owner."""
+    return Path.home() / ".email-mcp"
+
+
 class State:
     """Namespace for the single resolution entry point (concept §1)."""
 
@@ -217,7 +224,7 @@ class State:
                         f"directory is gone — use an absolute path."
                     )
         else:
-            root = home / ".email-mcp"
+            root = default_root()
 
         try:
             lst = os.lstat(root)

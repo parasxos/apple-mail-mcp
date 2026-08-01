@@ -52,6 +52,19 @@ def confirm_and_run(rows: list[plan.Row], *, verb: str, yes: bool = False,
 # ---------------------------------------------------------------------- #
 
 
+def _listed(d: Path, consequence: str) -> tuple[list[str], plan.Row | None]:
+    """Names in `d`, or the PrintOnly row saying the plan cannot see them.
+    Path.glob swallows PermissionError, so a plan built over it silently
+    under-describes; a plan that cannot enumerate must say so instead —
+    one rule for every directory a plan builder walks."""
+    try:
+        return sorted(os.listdir(d)), None
+    except FileNotFoundError:
+        return [], None
+    except OSError as e:
+        return [], plan.PrintOnly(f"{d}: cannot list ({e}) — {consequence}")
+
+
 def plan_uninstall(purge: bool = False) -> list[plan.Row]:
     """Agents out + graph token caches removed, state kept; --purge adds
     the state tree itself and the default logs. Env-overridden or refused
@@ -70,7 +83,7 @@ def plan_uninstall(purge: bool = False) -> list[plan.Row]:
     if isinstance(r, state.Refused):
         rows.append(plan.PrintOnly(f"state root refused: {r.reason} — "
                                    f"nothing under it was touched"))
-    elif r.root != Path.home() / ".email-mcp":
+    elif r.root != state.default_root():
         rows.append(plan.PrintOnly(
             f"state root is overridden to {r.root} ({state.ENV_VAR}) — "
             f"not touched; remove it yourself"))
@@ -78,14 +91,9 @@ def plan_uninstall(purge: bool = False) -> list[plan.Row]:
         rows.append(plan.RemoveTree.state_root())
     else:
         reader = r.reader()
-        try:
-            names = sorted(os.listdir(reader.graph))
-        except FileNotFoundError:
-            names = []
-        except OSError as e:
-            rows.append(plan.PrintOnly(f"{reader.graph}: cannot list ({e}) "
-                                       f"— token caches not removed"))
-            names = []
+        names, cannot = _listed(reader.graph, "token caches not removed")
+        if cannot:
+            rows.append(cannot)
         rows += [plan.UnlinkFile(reader.graph / n) for n in names
                  if n.endswith(".token.json")]
         rows.append(plan.Kept(r.root, "state kept — pass --purge to remove")
@@ -99,8 +107,11 @@ def plan_uninstall(purge: bool = False) -> list[plan.Row]:
                                        f"(EMAIL_MCP_LOG_FILE={raw}) — "
                                        f"not removed"))
         logs = Path.home() / "Library" / "Logs"
-        rows += [plan.UnlinkFile(p)
-                 for p in sorted(logs.glob("email-mcp*.log*"))]
+        names, cannot = _listed(logs, "log files not removed")
+        if cannot:
+            rows.append(cannot)
+        rows += [plan.UnlinkFile(logs / n) for n in names
+                 if n.startswith("email-mcp") and ".log" in n]
     return rows
 
 
@@ -235,10 +246,8 @@ def _smoke() -> None:
 
     print("\nsmoke test (doctor):")
     report = doctor.run()
-    for name, c in {**report["checks"], "audit": report["audit"]}.items():
-        print(f"  {'ok  ' if c['ok'] else 'FAIL'} {name}: {c['detail']}")
-        if not c["ok"] and c.get("fix"):
-            print(f"       fix: {c['fix']}")
+    for line in doctor.render(report, indent="  "):
+        print(line)
     print("  => ready" if report["ok"]
           else "  => NOT ready — fix the FAIL lines and re-run doctor")
 
@@ -253,6 +262,12 @@ def setup(*, yes: bool = False) -> int:
     if isinstance(r, state.Refused):
         print(f"cannot set up: {r.reason}")
         return 1
+    # Adoption is a BUILD effect here, deliberately — unlike --fix/update,
+    # where it rides the plan. Setup is the create verb: the registry
+    # reads an absent root as healthy (doctor stays quiet on machines
+    # that never installed), so its findings — the meta stamp above all —
+    # exist only against the adopted tree. There is no dry-run or typed
+    # confirmation on this path for the ordering to betray.
     writer = r.adopt()  # the one effectful door: root + marker exist now
     # Materialize every managed leaf (0700, accessor-verified):
     _ = (writer.spool, writer.plans, writer.graph, writer.fts, writer.audit)

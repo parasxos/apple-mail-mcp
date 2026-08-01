@@ -1,5 +1,5 @@
 [build-system]
-requires = ["setuptools>=68"]
+requires = ["setuptools>=77"]  # license = "MIT" is PEP 639; older setuptools rejects it
 build-backend = "setuptools.build_meta"
 
 [project]

@@ -149,6 +149,12 @@ def send_delivery_cmd() -> str:
     return os.environ.get("EMAIL_MCP_DELIVERY_CMD", "/usr/sbin/sendmail").strip()
 
 
+def state_dir() -> Path:
+    """Path of the managed state root itself. A path question only —
+    never creates."""
+    return _state().root
+
+
 def spool_dir() -> Path:
     """Path of the scheduled-mail spool (frozen .eml + .json manifests):
     <state root>/spool. A path question only — never creates."""
@@ -311,4 +317,4 @@ def identities_file() -> Path:
     raw = os.environ.get("EMAIL_MCP_IDENTITIES", "").strip()
     if raw:
         return Path(raw).expanduser()
-    return Path.home() / ".email-mcp" / "identities.toml"
+    return state.default_root() / "identities.toml"

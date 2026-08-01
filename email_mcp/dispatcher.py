@@ -453,8 +453,7 @@ def _plist_path() -> Path:
 
 
 def _log_path() -> Path:
-    d = config.spool_dir().parent
-    return d / "dispatcher.log"
+    return config.state_dir() / "dispatcher.log"
 
 
 def _plist_content() -> str:

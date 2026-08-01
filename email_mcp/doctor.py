@@ -513,6 +513,20 @@ def _guarded(name: str, fn) -> dict:
         return {"ok": False, "detail": f"check crashed: {e!r}"}
 
 
+def render(report: dict, *, indent: str = "") -> list[str]:
+    """The one text form of a doctor report. Every surface that prints one
+    (the CLI verb, setup's smoke test) asks here — two hand-written
+    renderings kept equal by care is the drift this module exists to
+    prevent in others."""
+    lines = []
+    for name, c in {**report["checks"], "audit": report["audit"]}.items():
+        lines.append(f"{indent}{'ok  ' if c['ok'] else 'FAIL'} "
+                     f"{name}: {c['detail']}")
+        if not c["ok"] and c.get("fix"):
+            lines.append(f"{indent}     fix: {c['fix']}")
+    return lines
+
+
 def run() -> dict:
     """Run every check. Returns {ok, read_only, checks, audit} — the
     ledger check rides beside `checks` (see the module docstring for why

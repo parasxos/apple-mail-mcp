@@ -283,6 +283,14 @@ def findings() -> list[Finding]:
     return [f for _, f in survey[1]]
 
 
+def repairable(finding: Finding) -> bool:
+    """Whether the registry holds a repair for this finding. The CLI asks,
+    the registry answers — which checks are probe-only is not dispatcher
+    knowledge."""
+    return any(c.id == finding.check and c.repair is not None
+               for c in REGISTRY)
+
+
 def plan_fix(only: frozenset[str] | None = None) -> list[plan.Row]:
     """Map findings to their repair actions — the plan doctor --fix hands
     to plan.execute. `only` restricts to a subset of check ids (update's

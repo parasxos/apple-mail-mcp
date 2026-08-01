@@ -3,9 +3,8 @@
 **Your Apple Mail, fully agent-operable.**
 An MCP server that gives Claude direct access to Mail.app on your Mac — read at SQL speed, send Outlook-safe mail as any of your identities, schedule delivery, and triage whole mailboxes — without ever letting AppleScript near a message body.
 
-![version](https://img.shields.io/badge/version-v0.9.0-blue)
-![tools](https://img.shields.io/badge/MCP%20tools-19-brightgreen)
-![tests](https://img.shields.io/badge/tests-172%20passing-success)
+![ci](https://github.com/parasxos/email-mcp/actions/workflows/ci.yml/badge.svg)
+![tools](https://img.shields.io/badge/MCP%20tools-20-brightgreen)
 ![platform](https://img.shields.io/badge/platform-macOS%20%2B%20Mail.app-orange)
 
 ## Install

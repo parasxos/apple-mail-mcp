@@ -602,7 +602,7 @@ def _plist_path() -> Path:
 
 
 def _log_path() -> Path:
-    return config.fts_dir().parent / "fts.log"
+    return config.state_dir() / "fts.log"
 
 
 def _plist_content() -> str:
