@@ -2,16 +2,18 @@
 
 Pipeline (see docs/triage-design.md — every number below was measured on
 the live store): SELECT via the existing SQLite read layer → PLAN frozen
-to disk → ACT in ONE batched AppleScript addressing messages as
-`«class mssg» id <ROWID>` (0.16 s keyed lookup vs 85.6 s for a whose-scan
-in a 72k mailbox — Mail's AppleScript object id IS the Envelope Index
-ROWID) → VERIFY by re-reading the index (write-through ≤2 s).
+to disk → ACT in batched AppleScript sub-scripts of _CHUNK_SIZE messages,
+each addressed as `«class mssg» id <ROWID>` (0.16 s keyed lookup vs
+85.6 s for a whose-scan in a 72k mailbox — Mail's AppleScript object id
+IS the Envelope Index ROWID) → VERIFY by re-reading the index
+(write-through ≤2 s).
 
 The Envelope Index is never opened writable; all mutations go through
 Mail.app itself, which owns server sync (EWS/IMAP alike).
 """
 from __future__ import annotations
 
+import math
 import subprocess
 import time
 from dataclasses import replace
@@ -340,9 +342,9 @@ def _render_preflight() -> str:
     )
 
 
-def _render_script(plan: Plan) -> str:
+def _render_script(plan: Plan, messages: list[PlanMessage]) -> str:
     blocks: list[str] = []
-    for m in plan.messages:
+    for m in messages:
         spec = (f"«class mssg» id {m.rowid} of "
                 f"{_mailbox_specifier(m.scheme, m.account, m.mailbox)}")
         acts = []
@@ -413,11 +415,23 @@ def _osa_error_code(stderr: str) -> int | None:
     return None
 
 
+# Apply runs the plan in sub-scripts of this many messages: small enough
+# that a killed chunk forfeits at most ten messages' stdout (and the
+# post-kill drain window in _verify stays ~2.5 min), large enough that
+# per-script startup does not dominate. A timeout banks the chunks done.
+_CHUNK_SIZE = 10
+
+
 def _auto_timeout(n: int) -> float:
+    """Time budget for one n-message chunk script."""
     override = config.triage_timeout_seconds()
     if override > 0:
         return override
-    return max(60.0, min(300.0, 30.0 + 0.6 * n))
+    # 12 s/message is the worst per-message apply cost measured live
+    # (2026-08-01: a 71k-message Exchange inbox; a 61k Gmail store ran
+    # 3.7 s/message) — the old 0.6 s/message budget was 20× short. 30 s
+    # covers script startup; the floor absorbs Mail hiccups on tiny chunks.
+    return max(60.0, 30.0 + 12.0 * n)
 
 
 def _parse_batch_output(stdout: str, planned: list[int]) -> dict[int, tuple[str, str]]:
@@ -507,7 +521,8 @@ def _observed(s: dict | None) -> dict:
                               "mailbox_rowid", "deleted")}
 
 
-def _verify(source, plan: Plan, acted: set[int]) -> dict:
+def _verify(source, plan: Plan, acted: set[int],
+            window_s: float = 0.0) -> dict:
     locate_fn = getattr(source, "locate_by_gmid", lambda *_: None)
     snap_fn = source.triage_snapshot
     by_id = {m.rowid: m for m in plan.messages}
@@ -515,7 +530,15 @@ def _verify(source, plan: Plan, acted: set[int]) -> dict:
     verified: list[int] = []
     polls = 0
     interval = config.triage_verify_interval()
-    for polls in range(1, config.triage_verify_polls() + 1):
+    max_polls = config.triage_verify_polls()
+    if window_s and interval:
+        # A killed chunk's queued work keeps draining inside Mail after the
+        # kill. The backlog is at most the chunk itself and drains no slower
+        # than the run that earned the kill, so one extra chunk-budget of
+        # polling is the smallest window that cannot under-report (the fixed
+        # 3×2 s window missed four post-kill deletes, observed 2026-08-01).
+        max_polls = max(max_polls, math.ceil(window_s / interval))
+    for polls in range(1, max_polls + 1):
         # Check first, sleep only between rounds: write-through is often
         # instant, and the pre-poll sleep dominated small plans (measured
         # 2.2 s fixed overhead on a 0.16 s mutation).
@@ -609,46 +632,75 @@ def apply_plan(source, plan_id: str) -> dict:
             f"account id(s) {sorted(missing)} not present in Mail.app.",
         )
 
-    # ACT — one batched script.
+    # ACT — the plan runs as sub-scripts of _CHUNK_SIZE messages, each with
+    # its own time budget: a timeout kills one chunk, the chunks already
+    # done stay banked, and everything the batch never reached is reported
+    # honestly instead of riding a wholesale kill.
     planned_ids = [m.rowid for m in plan.messages]
-    script = _render_script(plan)
-    timeout = _auto_timeout(len(planned_ids))
-    osa_started = time.monotonic()
-    timed_out = False
-    try:
-        proc = _run_osascript(script, timeout=timeout)
+    results: dict[int, tuple[str, str]] = {}
+    killed: list[PlanMessage] = []  # the one chunk a timeout hit
+    killed_budget = 0.0
+    osa_ms = 0
+    for start in range(0, len(plan.messages), _CHUNK_SIZE):
+        chunk = plan.messages[start:start + _CHUNK_SIZE]
+        budget = _auto_timeout(len(chunk))
+        osa_started = time.monotonic()
+        try:
+            proc = _run_osascript(_render_script(plan, chunk), timeout=budget)
+        except subprocess.TimeoutExpired:
+            osa_ms += int((time.monotonic() - osa_started) * 1000)
+            killed, killed_budget = chunk, budget
+            detail = (
+                f"osascript killed at {budget:.0f}s; verification may still "
+                "confirm this message. If this recurs, raise "
+                "EMAIL_MCP_TRIAGE_TIMEOUT (per-chunk budget) or lower "
+                "EMAIL_MCP_TRIAGE_DELETE_MAX to work in smaller plans."
+            )
+            for m in chunk:
+                results[m.rowid] = ("batch_timeout", detail)
+            break
+        osa_ms += int((time.monotonic() - osa_started) * 1000)
         stdout = proc.stdout or ""
         if proc.returncode != 0 and not stdout.strip():
-            plans.finish(plan, "failed",
-                         {"error": (proc.stderr or "").strip()[:300]})
-            raise TriageError(
-                "script_error",
-                f"batch script failed wholesale: {(proc.stderr or '').strip()[:200]}",
-            )
-    except subprocess.TimeoutExpired:
-        timed_out = True
-        stdout = ""  # lost — VERIFY below independently reconciles
-    osa_ms = int((time.monotonic() - osa_started) * 1000)
+            if not results:  # first chunk: nothing banked — the plan failed
+                plans.finish(plan, "failed",
+                             {"error": (proc.stderr or "").strip()[:300]})
+                raise TriageError(
+                    "script_error",
+                    "batch script failed wholesale: "
+                    f"{(proc.stderr or '').strip()[:200]}",
+                )
+            # Later chunks: mutations are already banked — a wholesale
+            # script failure is item data now, never a plan-level error.
+            err = (proc.stderr or "").strip()[:200]
+            for m in chunk:
+                results[m.rowid] = (
+                    "applescript", f"chunk script failed wholesale: {err}")
+            break
+        results.update(_parse_batch_output(stdout, [m.rowid for m in chunk]))
+    for m in plan.messages:  # chunks after a break were never attempted
+        results.setdefault(m.rowid, (
+            "not_attempted",
+            "an earlier chunk stopped the batch before this message was "
+            "attempted; the plan is spent — re-plan to retry",
+        ))
 
-    results = _parse_batch_output(stdout, planned_ids)
-    if timed_out:
-        results = {rid: ("batch_timeout",
-                         f"osascript killed at {timeout:.0f}s; "
-                         "verification may still confirm this message")
-                   for rid in planned_ids}
     acted = {rid for rid, (code, _) in results.items() if code == "ok"}
     failures = [
         {"id": str(rid), "code": code, "detail": detail}
         for rid, (code, detail) in sorted(results.items()) if code != "ok"
     ]
 
-    # VERIFY — on timeout, check everything; mutations that landed get
-    # upgraded to verified even though the script's stdout was lost.
-    to_verify = set(planned_ids) if timed_out else acted
-    ver = _verify(source, plan, to_verify)
-    if timed_out:
-        acted = set(ver["verified"])
-        failures = [f for f in failures if int(f["id"]) not in acted]
+    # VERIFY — acted messages, plus the killed chunk: the kill does not
+    # cancel work Mail already queued (observed live 2026-08-01: four
+    # deletes landed AFTER the kill), so its ids get a drain-sized window
+    # and confirmed ones are upgraded from batch_timeout to acted.
+    killed_ids = {m.rowid for m in killed}
+    ver = _verify(source, plan, acted | killed_ids, window_s=killed_budget)
+    rescued = set(ver["verified"]) & killed_ids
+    if rescued:
+        acted |= rescued
+        failures = [f for f in failures if int(f["id"]) not in rescued]
 
     status = "applied" if acted or ver["verified"] else "failed"
     note = None

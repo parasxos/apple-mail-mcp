@@ -152,7 +152,8 @@ tool-level code:
 | `mid_mismatch` | the Message-ID guard tripped — the ROWID points at a different message than planned; nothing was done to it |
 | `applescript` | Mail returned an AppleScript error for this one message (detail carries the number + text) |
 | `no_result` | the script produced no line for this id |
-| `batch_timeout` | osascript was killed at the deadline; verification may still confirm the message independently |
+| `batch_timeout` | osascript was killed at its chunk's deadline; verification (over a drain-sized window) may still confirm the message — the detail names the escape hatches (`EMAIL_MCP_TRIAGE_TIMEOUT`, `EMAIL_MCP_TRIAGE_DELETE_MAX`) |
+| `not_attempted` | an earlier chunk stopped the batch (timeout or wholesale script failure) before this message's chunk ran; nothing was done to it — re-plan to retry |
 
 `get_emails_batch`'s `errors[]` entries are `{id, error}` prose today; they
 gain an `errors[].code` (from `not_found`/`invalid_input`) at v0.11.
@@ -241,7 +242,7 @@ message_id before retrying — never blind-resend.
 | `cancel_scheduled` | **Effectively** — the pending→cancelled transition happens at most once (atomic rename fence); repeats and races return `{ok: false}` explaining the current state, mutating nothing | safe to retry until a terminal answer; graph revoke failures leave the entry pending with instructions (Exchange keeps the job until the revoke is CONFIRMED) |
 | `triage_plan` | Each call freezes a NEW plan file (durable artifact, zero mail mutation) | retry freely; superseded plans expire on their own (TTL 600 s) and are GC'd (7 d) |
 | `triage_plan_delete` | same as triage_plan | same |
-| `triage_apply` | **Exactly-once per plan** — the atomic claim rename means one apply owns the plan; a re-invocation returns `plan_claimed` (mid-flight) or `plan_already_applied` (done), never re-mutates | do not re-invoke mid-flight (large plans run minutes); after `batch_timeout` the verify pass has already reconciled what landed — read `failures[]`/`pending[]`, don't re-apply |
+| `triage_apply` | **Exactly-once per plan** — the atomic claim rename means one apply owns the plan; a re-invocation returns `plan_claimed` (mid-flight) or `plan_already_applied` (done), never re-mutates | do not re-invoke mid-flight (large plans run minutes); after `batch_timeout` the verify pass has already reconciled what landed — read `failures[]`/`pending[]`, don't re-apply; `not_attempted` leftovers need a fresh plan |
 | `mailbox_create` | **Yes** — already-exists short-circuits to `{ok: true, existed: true}` without touching Mail | retry freely |
 | `mailbox_delete` | **Yes** — already-absent returns `{ok: true, existed: false}`; outcome decided by live re-probe, not by AppleScript's (often false) error | retry freely |
 
@@ -262,8 +263,9 @@ Caps REJECT, never truncate. Values below are the defaults of
 | plan TTL (draft → applicable) | 600 s | `EMAIL_MCP_TRIAGE_TTL` |
 | plan GC horizon | 7 days | fixed |
 | stale apply-claim finalised as failed | 2 × TTL | fixed |
-| apply script timeout | auto: max(60, min(300, 30 + 0.6·n)) s | `EMAIL_MCP_TRIAGE_TIMEOUT` (>0 overrides) |
-| apply/mailbox verify | 3 polls × 2.0 s | `EMAIL_MCP_TRIAGE_VERIFY_POLLS` / `…_VERIFY_INTERVAL` |
+| apply chunk size | 10 messages per sub-script; a timeout kills one chunk and banks the rest | fixed (`_CHUNK_SIZE`) |
+| apply script timeout (per chunk) | auto: max(60, 30 + 12·chunk) s — 12 s/msg is the worst per-message cost measured live (2026-08-01, 71k-message Exchange store) | `EMAIL_MCP_TRIAGE_TIMEOUT` (>0 overrides, per chunk) |
+| apply/mailbox verify | 3 polls × 2.0 s; after a killed chunk, polls stretch to cover one chunk-budget of async drain | `EMAIL_MCP_TRIAGE_VERIFY_POLLS` / `…_VERIFY_INTERVAL` |
 | batch read | 50 ids | fixed (`_BATCH_MAX_IDS`) |
 | search / list / scheduled page | default 50, **max 500** | `limit` parameter (1..500; over-cap rejects `invalid_input` — added 2026-08-01 after an uncapped 20k-row page took the server down) |
 | attachment budget per message | 20 MB pre-base64 | `EMAIL_MCP_MAX_ATTACH_MB` |

@@ -73,9 +73,10 @@ MID_MISMATCH = "mid_mismatch"
 APPLESCRIPT = "applescript"
 NO_RESULT = "no_result"
 BATCH_TIMEOUT = "batch_timeout"
+NOT_ATTEMPTED = "not_attempted"
 
 ITEM_CODES = frozenset({OK, MID_MISMATCH, APPLESCRIPT, NO_RESULT,
-                        BATCH_TIMEOUT})
+                        BATCH_TIMEOUT, NOT_ATTEMPTED})
 
 # --------------------------------------------------------------------- #
 # Belt codes (contract §3.5) — new at v0.10                             #

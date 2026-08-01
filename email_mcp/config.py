@@ -217,7 +217,8 @@ def triage_ttl_seconds() -> int:
 
 
 def triage_timeout_seconds() -> float:
-    """Batch osascript timeout; 0 (default) = auto from message count."""
+    """Apply's per-chunk osascript timeout; 0 (default) = auto from the
+    chunk's message count."""
     return float(os.environ.get("EMAIL_MCP_TRIAGE_TIMEOUT", "0"))
 
 

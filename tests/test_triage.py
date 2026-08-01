@@ -7,6 +7,7 @@ Mail.app."""
 from __future__ import annotations
 
 import json
+import re
 import sqlite3
 import subprocess
 from datetime import datetime, timedelta, timezone
@@ -448,6 +449,220 @@ def test_apply_expired_double_apply_and_claim(src, db, fake_osa, monkeypatch):
 
 
 # --------------------------------------------------------------------- #
+# chunked apply                                                         #
+# --------------------------------------------------------------------- #
+
+
+def _seed_bulk(db, n, start=1000):
+    """N unread ops-bot messages in the LOCAL Inbox (rowids start…), each
+    with a Message-ID header so rendered blocks carry the mid guard."""
+    for i in range(n):
+        rid, gmid = start + i, 9500 + i
+        db.execute(
+            "INSERT INTO messages(ROWID, subject, sender, summary, date_sent,"
+            " date_received, mailbox, read, flagged, deleted, conversation_id,"
+            " global_message_id, flag_color)"
+            " VALUES (?, 3, 3, 3, ?, ?, 1, 0, 0, 0, ?, ?, NULL)",
+            (rid, 1714810000 + i, 1714810100 + i, 8000 + i, gmid))
+        db.execute(
+            "INSERT INTO message_global_data(ROWID, message_id_header)"
+            " VALUES (?, ?)", (gmid, f"<bulk-{i}@cern.ch>"))
+    db.commit()
+    return set(range(start, start + n))
+
+
+def _script_ids(script):
+    return [int(x) for x in re.findall(r"«class mssg» id (\d+)", script)]
+
+
+def _bulk_plan(src, db, n):
+    seeded = _seed_bulk(db, n)
+    plan = _plan(src, [{"action": "mark_read"}], from_addr="ops-bot",
+                 unread_only=True, limit=50)
+    assert {m.rowid for m in plan.messages} == seeded
+    return plan
+
+
+def _ok_and_mutate(db):
+    """A chunk handler that acts on exactly the ids in the script."""
+    def batch(script):
+        ids = _script_ids(script)
+        db.executemany("UPDATE messages SET read=1 WHERE ROWID=?",
+                       [(i,) for i in ids])
+        db.commit()
+        return subprocess.CompletedProcess(
+            [], 0, "".join(f"OK {i}\n" for i in ids), "")
+    return batch
+
+
+def test_apply_chunks_the_batch(src, db, fake_osa):
+    """12 messages → two sub-scripts of 10 + 2; every planned id appears
+    in exactly one chunk and the envelope reads as one batch."""
+    plan = _bulk_plan(src, db, 12)
+    fake_osa.batch = _ok_and_mutate(db)
+
+    res = triage.apply_plan(src, plan.id)
+    sizes = [len(_script_ids(s)) for s in fake_osa.batch_scripts]
+    assert sizes == [10, 2]
+    seen = [i for s in fake_osa.batch_scripts for i in _script_ids(s)]
+    assert sorted(seen) == sorted(m.rowid for m in plan.messages)
+    assert res["status"] == "applied" and res["planned"] == 12
+    assert res["acted"] == 12 and res["verified"] == 12
+    assert res["failures"] == [] and res["pending"] == []
+
+
+def test_chunk_timeout_banks_earlier_chunks_acted(src, db, fake_osa):
+    """The banking pin: chunk 1's OKs survive a chunk-2 kill even before
+    write-through confirms them — a monolithic batch would have relabelled
+    every planned id batch_timeout and reported acted from verify alone."""
+    plan = _bulk_plan(src, db, 12)
+    calls = {"n": 0}
+
+    def batch(script):
+        calls["n"] += 1
+        if calls["n"] == 1:  # chunk 1 acts; the index has not caught up
+            ids = _script_ids(script)
+            return subprocess.CompletedProcess(
+                [], 0, "".join(f"OK {i}\n" for i in ids), "")
+        raise subprocess.TimeoutExpired(["osascript"], 60)
+    fake_osa.batch = batch
+
+    res = triage.apply_plan(src, plan.id)
+    assert res["status"] == "applied"
+    assert res["acted"] == 10 and res["verified"] == 0
+    assert {int(f["id"]) for f in res["failures"]} \
+        == {m.rowid for m in plan.messages[10:]}
+    assert {f["code"] for f in res["failures"]} == {"batch_timeout"}
+    assert len(res["pending"]) == 12  # acted + killed, none index-confirmed
+    stored = plans.load(plan.id)
+    assert stored.status == "applied" and stored.result["acted"] == 10
+
+
+def test_accounting_accumulates_across_chunks(src, db, fake_osa):
+    """Per-chunk partial failures sum into one cumulative envelope."""
+    plan = _bulk_plan(src, db, 12)
+
+    def batch(script):
+        ids = _script_ids(script)
+        bad, good = ids[0], ids[1:]
+        db.executemany("UPDATE messages SET read=1 WHERE ROWID=?",
+                       [(i,) for i in good])
+        db.commit()
+        out = "".join(f"OK {i}\n" for i in good)
+        out += f"ERR {bad} applescript -1728 nope\n"
+        return subprocess.CompletedProcess([], 0, out, "")
+    fake_osa.batch = batch
+
+    res = triage.apply_plan(src, plan.id)
+    assert res["acted"] == 10 and res["verified"] == 10
+    assert sorted(int(f["id"]) for f in res["failures"]) \
+        == sorted([plan.messages[0].rowid, plan.messages[10].rowid])
+    assert {f["code"] for f in res["failures"]} == {"applescript"}
+
+
+def test_timeout_detail_names_the_escape_hatches(src, fake_osa):
+    def batch(script):
+        raise subprocess.TimeoutExpired(["osascript"], 60)
+    plan = _plan(src, [{"action": "mark_read"}], unread_only=True)
+    fake_osa.batch = batch
+
+    res = triage.apply_plan(src, plan.id)
+    (f,) = res["failures"]
+    assert f["code"] == "batch_timeout"
+    assert "EMAIL_MCP_TRIAGE_TIMEOUT" in f["detail"]
+    assert "EMAIL_MCP_TRIAGE_DELETE_MAX" in f["detail"]
+    assert res["status"] == "failed"  # nothing acted, nothing verified
+
+
+def test_kill_stops_the_batch_and_reports_the_rest(src, db, fake_osa):
+    """23 messages, kill on chunk 2: chunk 3 is never attempted and says
+    so — a distinct code from the killed chunk's batch_timeout."""
+    plan = _bulk_plan(src, db, 23)
+    calls = {"n": 0}
+
+    def batch(script):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            return _ok_and_mutate(db)(script)
+        raise subprocess.TimeoutExpired(["osascript"], 60)
+    fake_osa.batch = batch
+
+    res = triage.apply_plan(src, plan.id)
+    assert len(fake_osa.batch_scripts) == 2  # chunk 3 never rendered
+    rows = [m.rowid for m in plan.messages]
+    by_code: dict[str, set[int]] = {}
+    for f in res["failures"]:
+        by_code.setdefault(f["code"], set()).add(int(f["id"]))
+    assert by_code["batch_timeout"] == set(rows[10:20])
+    assert by_code["not_attempted"] == set(rows[20:])
+    assert all("re-plan" in f["detail"] for f in res["failures"]
+               if f["code"] == "not_attempted")
+    assert res["planned"] == 23
+    assert res["acted"] == 10 and res["verified"] == 10
+
+
+def test_late_wholesale_chunk_failure_keeps_banked_progress(src, db, fake_osa):
+    """A wholesale script failure AFTER mutations landed must not raise
+    the banked work away: it becomes item data, not a plan-level error."""
+    plan = _bulk_plan(src, db, 12)
+    calls = {"n": 0}
+
+    def batch(script):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            return _ok_and_mutate(db)(script)
+        return subprocess.CompletedProcess(
+            [], 1, "", "execution error: Mail got an error. (-609)")
+    fake_osa.batch = batch
+
+    res = triage.apply_plan(src, plan.id)
+    assert res["status"] == "applied" and res["acted"] == 10
+    assert {int(f["id"]) for f in res["failures"]} \
+        == {m.rowid for m in plan.messages[10:]}
+    assert all(f["code"] == "applescript" and "wholesale" in f["detail"]
+               for f in res["failures"])
+
+
+def test_first_chunk_wholesale_failure_still_raises(src, fake_osa):
+    plan = _plan(src, [{"action": "mark_read"}], unread_only=True)
+    fake_osa.batch = lambda s: subprocess.CompletedProcess(
+        [], 1, "", "execution error: boom (-609)")
+    with pytest.raises(triage.TriageError) as ei:
+        triage.apply_plan(src, plan.id)
+    assert ei.value.code == "script_error"
+    assert plans.load(plan.id).status == "failed"
+
+
+class _LazySnapshotSource:
+    """Snapshot resolves only from the ready_at-th call on — models Mail
+    draining a killed chunk's queued work after the process died."""
+
+    def __init__(self, ready_at):
+        self.calls = 0
+        self.ready_at = ready_at
+
+    def triage_snapshot(self, rowids):
+        self.calls += 1
+        read = 1 if self.calls >= self.ready_at else 0
+        return {rid: {"read": read, "flagged": 0, "flag_color": -1,
+                      "mailbox_rowid": 1, "deleted": 0} for rid in rowids}
+
+
+def test_postkill_verify_window_scales_with_chunk_budget(monkeypatch):
+    monkeypatch.setenv("EMAIL_MCP_TRIAGE_VERIFY_INTERVAL", "0.001")
+    plan = _synthetic_plan([_msg(11, "local", "Inbox")],
+                           [PlanAction("mark_read")])
+    # Default window (3 polls) gives up before the drain completes…
+    slow = _LazySnapshotSource(ready_at=10)
+    ver = triage._verify(slow, plan, {11})
+    assert ver["verified"] == [] and len(ver["pending"]) == 1
+    # …the drain-sized window keeps polling and catches the late landing.
+    slow = _LazySnapshotSource(ready_at=10)
+    ver = triage._verify(slow, plan, {11}, window_s=0.05)
+    assert ver["verified"] == [11] and ver["pending"] == []
+
+
+# --------------------------------------------------------------------- #
 # script rendering                                                      #
 # --------------------------------------------------------------------- #
 
@@ -479,7 +694,7 @@ def test_script_render_escaping_and_structure():
         [PlanAction("flag", color=2), PlanAction("move_to", mailbox="Filed/Sub")],
         target,
     )
-    script = triage._render_script(plan)
+    script = triage._render_script(plan, plan.messages)
     # escaping: backslash then quote
     assert 'mailbox "We\\"ird\\\\Box" of account id' in script
     # keyed specifier, per-message try blocks
