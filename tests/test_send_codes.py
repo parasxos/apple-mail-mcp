@@ -103,6 +103,43 @@ def test_transport_unavailable_on_failed_preflight(send_env, monkeypatch):
     assert "transport unavailable" in out["error"]
 
 
+def test_smtp_default_reports_dns_truth_not_ssh_session(monkeypatch, tmp_path):
+    """A DEFAULT smtp identity whose host does not resolve must fail in
+    smtp's own vocabulary. The seam flow used to be gated on being the
+    default rather than on being session-shaped, so this exact case
+    reported "session dead ... (2FA)" — ssh prose for a DNS failure —
+    and sent the first user's debugging down the wrong path (2026-08-01:
+    smtp.cern.ch is split-horizon DNS, unresolvable off-site)."""
+    import socket as socket_mod
+
+    from email_mcp.transports import smtp as smtp_mod
+
+    ident = tmp_path / "identities.toml"
+    ident.write_text(
+        'default = "main"\n\n[main]\n'
+        'from_addr = "camilla@example.org"\n'
+        'driver = "smtp"\nhost = "smtp.cern.example"\nport = 587\n'
+        'username = "cv"\nkeychain = "item"\n'
+    )
+    monkeypatch.setenv("EMAIL_MCP_IDENTITIES", str(ident))
+    monkeypatch.setattr(smtp_mod, "_read_keychain",
+                        lambda item, account: "pw")
+
+    def _no_dns(addr, timeout=None):
+        raise socket_mod.gaierror(
+            8, "nodename nor servname provided, or not known")
+
+    monkeypatch.setattr(smtp_mod.socket, "create_connection", _no_dns)
+    out = server.tool_send_email(
+        to="camilla@example.org", subject="s", body="b")
+    assert out["ok"] is False
+    assert out["code"] == "transport_unavailable"
+    assert "smtp.cern.example:587" in out["error"]
+    assert "nodename" in out["error"]          # the DNS truth, verbatim
+    assert "2FA" not in out["error"]           # ssh vocabulary stays home
+    assert "session" not in out["error"]
+
+
 def test_delivery_failure_default_code(send_env, monkeypatch):
     monkeypatch.setattr(sender, "_socket_alive", lambda: True)
 

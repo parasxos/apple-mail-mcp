@@ -438,7 +438,15 @@ def preflight(ident: identities.Identity) -> tuple[bool, bool]:
     own ensure(). Failure reasons feed _transport_unavailable()."""
     global _last_preflight_error
     _last_preflight_error = None
-    if _is_default(ident):
+    if _is_default(ident) and hasattr(
+            transports.get_transport(ident), "socket_alive"):
+        # The seam flow is gated on the transport actually being
+        # SESSION-shaped, not on being the default: an smtp default used
+        # to be pushed through check/boot/check here, dialling three
+        # times and then reporting a DNS failure as "session dead —
+        # establish it (2FA)" (first-user machine, 2026-08-01). The
+        # failure reason belongs to the transport that failed, in its
+        # own vocabulary.
         if _socket_alive():
             return True, False
         bootstrapped = _bootstrap_master()
