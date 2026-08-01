@@ -451,9 +451,13 @@ class AppleMailSource:
             where.append(clause + ")")
 
         if q.from_addr:
-            where.append("(a.address LIKE ? ESCAPE '\\' OR a.comment LIKE ? ESCAPE '\\')")
-            esc = _like_escape(q.from_addr)
-            params.extend([f"%{esc}%", f"%{esc}%"])
+            if q.from_exact:
+                where.append("a.address = ? COLLATE NOCASE")
+                params.append(q.from_addr)
+            else:
+                where.append("(a.address LIKE ? ESCAPE '\\' OR a.comment LIKE ? ESCAPE '\\')")
+                esc = _like_escape(q.from_addr)
+                params.extend([f"%{esc}%", f"%{esc}%"])
 
         if q.to_addr:
             where.append(

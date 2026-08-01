@@ -82,6 +82,12 @@ class SearchQuery:
     # under a fresh id, so a delete selection that saw the Trash would
     # re-select its own prior work forever. Plain searches leave this False.
     exclude_trash: bool = False
+    # Narrow from_addr from its substring semantics (over address AND
+    # display name) to case-insensitive equality against the bare sender
+    # address. Set ONLY by the delete-plan path — a substring there turns
+    # "google.com" into a domain-wide delete (field-observed 2026-08-01).
+    # Plain searches leave this False.
+    from_exact: bool = False
 
 
 class EmailSource(Protocol):

@@ -45,6 +45,30 @@ def test_search_from_filter(mail_fixture):
     src = AppleMailSource(mail_base=mail_fixture)
     hits = src.search(SearchQuery(from_addr="stefan"))
     assert [r.id for r in hits] == ["100"]
+    # The documented truth (field-observed 2026-08-01): from_addr is a
+    # SUBSTRING match over both the address and the display name — a bare
+    # domain matches every sender at it.
+    hits = src.search(SearchQuery(from_addr="cern.ch"))
+    assert [r.id for r in hits] == ["101", "100", "200"]
+    hits = src.search(SearchQuery(from_addr="DCS Ops"))
+    assert [r.id for r in hits] == ["101", "200"]
+
+
+def test_search_from_exact_matches_bare_address_only(mail_fixture):
+    """from_exact (set only by the delete planner) narrows from_addr to
+    case-insensitive equality against the bare sender address — fragments
+    and display names select nothing."""
+    src = AppleMailSource(mail_base=mail_fixture)
+
+    def exact(addr):
+        return [r.id for r in
+                src.search(SearchQuery(from_addr=addr, from_exact=True))]
+
+    assert exact("stefan.schlenker@cern.ch") == ["100"]
+    assert exact("STEFAN.SCHLENKER@CERN.CH") == ["100"]  # case-insensitive
+    assert exact("cern.ch") == []            # domain fragment: nothing
+    assert exact("stefan") == []             # local-part fragment: nothing
+    assert exact("Stefan Schlenker") == []   # display name: nothing
 
 
 def test_search_has_attachment_true(mail_fixture):

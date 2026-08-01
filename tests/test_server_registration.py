@@ -69,3 +69,21 @@ def test_read_only_env_is_read_at_build_time(monkeypatch):
     mcp = server._build_mcp_server()
     monkeypatch.setenv("EMAIL_MCP_READ_ONLY", "1")
     assert _tool_names(mcp) == ALL_TOOLS
+
+
+def test_from_addr_matching_semantics_are_documented(monkeypatch):
+    """search/triage_plan advertise the substring truth; the destructive
+    planner advertises its exact matcher (descriptions are outside the
+    inputSchema freeze by design — see test_schema_snapshot)."""
+    monkeypatch.delenv("EMAIL_MCP_READ_ONLY", raising=False)
+    mcp = server._build_mcp_server()
+    try:
+        desc = {t.name: t.description or ""
+                for t in asyncio.run(mcp.list_tools())}
+    except Exception:
+        desc = {t.name: t.description or ""
+                for t in mcp._tool_manager.list_tools()}
+    assert "substring" in desc["search_emails"].lower()
+    assert "substring" in desc["triage_plan"].lower()
+    assert "exact" in desc["triage_plan_delete"].lower()
+    assert "substring" in desc["triage_plan_delete"].lower()  # the contrast

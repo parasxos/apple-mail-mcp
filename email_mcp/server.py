@@ -900,7 +900,9 @@ def _build_mcp_server():
     ) -> dict:
         """Search emails. `query` matches subject, sender name/address, the
         stored snippet, AND full message bodies (local FTS index). All other
-        filters are AND-combined.
+        filters are AND-combined. `from_addr`/`to_addr` are case-insensitive
+        SUBSTRING matches over both address and display name — e.g.
+        from_addr="google.com" matches every sender at that domain.
 
         Returns {ok, fts, results}. `fts` reports body-index health —
         state (ready/absent/disabled), indexed/missing/backlog counts, hits
@@ -1224,7 +1226,9 @@ def _build_mcp_server():
             """Stage a mailbox-management operation: SELECT messages with the
             same filters as search_emails, and freeze them + `actions` into a
             reviewable plan. NOTHING is modified — mutation happens only when
-            triage_apply is called with the returned plan_id.
+            triage_apply is called with the returned plan_id. As in
+            search_emails, `from_addr` is a case-insensitive substring match
+            over both address and display name.
 
             The two-call plan/apply split is BY DESIGN: show the returned plan
             (count, summary, messages) to the user before applying. Plans
@@ -1263,7 +1267,10 @@ def _build_mcp_server():
         ) -> dict:
             """Stage DELETION of the selected messages — the destructive verb's
             own door (triage_plan refuses `delete`). SELECT with the same
-            filters as search_emails; NOTHING is deleted by this call — review
+            filters as search_emails, EXCEPT `from_addr`: here it is an EXACT
+            full-address match (case-insensitive, never a substring), so a
+            fragment like "google.com" selects nothing instead of staging a
+            domain-wide delete. NOTHING is deleted by this call — review
             the returned plan (count, summary, messages) with the user, then
             execute it via triage_apply, exactly like any other plan.
 

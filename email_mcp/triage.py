@@ -246,8 +246,13 @@ def build_delete_plan(source, q: SearchQuery) -> Plan:
     lives on in the account's Trash mailbox under a fresh id, so a delete
     plan that selected it would re-delete prior work on every round and
     never converge (observed live 2026-08-01). This is the one place the
-    exclusion is decided; plain searches stay Trash-inclusive."""
-    q = replace(q, exclude_trash=True)
+    exclusion is decided; plain searches stay Trash-inclusive.
+
+    from_addr is an EXACT bare-address match here (case-insensitive),
+    never search's substring — a fragment like "google.com" must select
+    nothing rather than stage a domain-wide delete (observed live
+    2026-08-01). Decided here, alongside the Trash exclusion."""
+    q = replace(q, exclude_trash=True, from_exact=True)
     refs = source.search(q)
     accounts = {r.account for r in refs}
     if len(accounts) > 1:

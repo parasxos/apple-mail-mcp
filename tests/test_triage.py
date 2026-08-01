@@ -314,7 +314,7 @@ def test_delete_plan_never_selects_the_trash(src, db):
     deleted=0 (the field failure of 2026-08-01 — count=43 every round)."""
     _seed_trash(db, (8300, 2, 3, 7002, 9101))  # trashed ops-bot copy
     plan = triage.build_delete_plan(
-        src, SearchQuery(from_addr="ops-bot", limit=10))
+        src, SearchQuery(from_addr="ops-bot@cern.ch", limit=10))
     assert {m.rowid for m in plan.messages} == {101, 200}  # 8300 excluded
 
 
@@ -336,7 +336,7 @@ def test_delete_plan_converges_after_apply(src, db, fake_osa):
         return subprocess.CompletedProcess([], 0, f"OK {old_rowid}\n", "")
 
     plan = triage.build_delete_plan(
-        src, SearchQuery(from_addr="ops-bot", limit=1))
+        src, SearchQuery(from_addr="ops-bot@cern.ch", limit=1))
     assert [m.rowid for m in plan.messages] == [101]  # newest of the two
     fake_osa.batch = lambda s: trash(101, 8101, 2, 7002, 9101)
     res = triage.apply_plan(src, plan.id)
@@ -344,14 +344,15 @@ def test_delete_plan_converges_after_apply(src, db, fake_osa):
 
     # Round 2: count dropped by acted; the fresh Trash rowid is invisible.
     plan2 = triage.build_delete_plan(
-        src, SearchQuery(from_addr="ops-bot", limit=10))
+        src, SearchQuery(from_addr="ops-bot@cern.ch", limit=10))
     assert [m.rowid for m in plan2.messages] == [200]
     fake_osa.batch = lambda s: trash(200, 8200, 3, 7001, 9200)
     assert triage.apply_plan(src, plan2.id)["verified"] == 1
 
     # Round 3: converged — nothing left to delete, ever.
     with pytest.raises(triage.TriageError) as ei:
-        triage.build_delete_plan(src, SearchQuery(from_addr="ops-bot", limit=10))
+        triage.build_delete_plan(
+            src, SearchQuery(from_addr="ops-bot@cern.ch", limit=10))
     assert ei.value.code == "empty_selection"
 
 
@@ -362,6 +363,38 @@ def test_plain_search_still_finds_trashed_mail(src, db):
     by_id = {r.id: r for r in hits}
     assert "8300" in by_id
     assert by_id["8300"].mailbox == "Trash"
+
+
+def test_delete_plan_from_addr_is_exact_never_substring(src):
+    """The mutation pin for the domain-wide-delete footgun (field-observed
+    2026-08-01: from_addr="google.com" would have staged Calendar, Drive
+    AND security mail in one selection). Dies against a delete planner
+    that reuses search's substring matcher."""
+    # Every LOCAL-account sender ends in cern.ch: substring semantics would
+    # stage all 3 messages; exact semantics stage nothing.
+    with pytest.raises(triage.TriageError) as ei:
+        triage.build_delete_plan(
+            src, SearchQuery(from_addr="cern.ch", account=LOCAL_ACCT, limit=10))
+    assert ei.value.code == "empty_selection"
+    assert list(config.plans_dir().glob("*.json")) == []  # nothing staged
+
+    # Display names never match either (substring matches via comment).
+    with pytest.raises(triage.TriageError) as ei:
+        triage.build_delete_plan(
+            src, SearchQuery(from_addr="DCS Ops", account=LOCAL_ACCT, limit=10))
+    assert ei.value.code == "empty_selection"
+
+    # The full bare address selects exactly its own messages, any case.
+    plan = triage.build_delete_plan(
+        src, SearchQuery(from_addr="OPS-BOT@cern.ch", limit=10))
+    assert {m.rowid for m in plan.messages} == {101, 200}
+
+
+def test_triage_plan_from_addr_stays_substring(src):
+    """Only the destructive planner narrows from_addr — triage_plan keeps
+    the useful (now documented) substring selection."""
+    plan = _plan(src, [{"action": "mark_read"}], from_addr="ops-bot", limit=10)
+    assert {m.rowid for m in plan.messages} == {101, 200}
 
 
 def test_apply_partial_failure_reported(src, db, fake_osa):
