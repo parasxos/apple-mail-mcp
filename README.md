@@ -8,24 +8,26 @@ An MCP server that gives Claude direct access to Mail.app on your Mac — read a
 ![tests](https://img.shields.io/badge/tests-172%20passing-success)
 ![platform](https://img.shields.io/badge/platform-macOS%20%2B%20Mail.app-orange)
 
-## Quick Start
+## Install
 
 ```bash
-git clone https://github.com/parasxos/email-mcp && cd email-mcp
-python3 -m venv .venv && .venv/bin/pip install -e ".[dev]"
+pipx install git+https://github.com/parasxos/email-mcp
+email-mcp setup
 ```
 
-Register in `~/.claude.json` (Claude Code) or your MCP client's config:
+`setup` adopts `~/.email-mcp`, offers a sending identity and the launchd
+agents, prints the MCP client config to register, and ends with a doctor
+smoke test:
 
 ```json
 {
   "mcpServers": {
-    "apple-mail": { "command": "/path/to/email-mcp/.venv/bin/email-mcp" }
+    "apple-mail": { "command": "email-mcp" }
   }
 }
 ```
 
-Grant the host app **Full Disk Access** (reading) and **Automation → Mail** (triage). Verify with `python -m email_mcp.server --selftest`.
+Grant the host app **Full Disk Access** (reading) and **Automation → Mail** (triage). Check anytime with `email-mcp doctor`.
 
 ## What it does
 

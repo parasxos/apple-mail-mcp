@@ -1334,7 +1334,7 @@ def _doctor() -> int:
     return 0 if report["ok"] else 1
 
 
-def main() -> int:
+def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="email_mcp.server")
     parser.add_argument(
         "--selftest",
@@ -1390,7 +1390,7 @@ def main() -> int:
         help="DEPRECATED — alias for the doctor's transports check; prints "
              "only that section. Prefer --doctor for the full picture.",
     )
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
     if args.selftest:
         return _selftest()
     if args.refresh_test:

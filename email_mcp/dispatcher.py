@@ -549,13 +549,13 @@ def status() -> dict:
     }
 
 
-def main() -> int:
+def main(argv: list[str] | None = None) -> int:
     audit.set_process("dispatcher")  # tag this process's ledger events
     parser = argparse.ArgumentParser(prog="email_mcp.dispatcher")
     parser.add_argument("--status", action="store_true")
     parser.add_argument("--install-launchd", action="store_true")
     parser.add_argument("--uninstall-launchd", action="store_true")
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
     if args.status:
         json.dump(status(), sys.stdout, indent=2)
         sys.stdout.write("\n")
