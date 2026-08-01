@@ -408,6 +408,9 @@ def main(argv: list[str] | None = None) -> int:
                         help="ledger directory, file count, last event")
     args = parser.parse_args(argv)
 
+    rc = config.startup_guard("email-mcp audit")
+    if rc is not None:
+        return rc
     set_process("cli")
     if args.status:
         _print_status()

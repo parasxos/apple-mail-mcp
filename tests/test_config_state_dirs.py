@@ -1451,3 +1451,107 @@ def test_purge_does_not_count_mail_through_a_symlinked_spool(home,
     assert "message(s) still queued" not in line
     assert any("is a symlink" in x and "not counted above" in x
                for x in plan["print_only"])
+
+
+# --------------------------------------------------------------------- #
+# v0.11.1 — findings that reached the v0.11.0 tag                        #
+# --------------------------------------------------------------------- #
+
+
+@pytest.mark.parametrize("module,args", [
+    ("email_mcp.audit", ["--tail", "5"]),
+    ("email_mcp.fts", ["--status"]),
+    ("email_mcp.fts", ["--build"]),
+    ("email_mcp.dispatcher", ["--status"]),
+    ("email_mcp.cli", ["version"]),
+])
+def test_every_module_main_rejects_a_retired_variable(home, module, args):
+    """MAJOR, shipped in v0.11.0: the retired-variable gate was added to
+    cli/server/dispatcher one at a time, and `python -m email_mcp.audit`
+    — the invocation docs/v1-contract.md documents as THE audit-reading
+    interface — was never gated. It exited 0 with an empty ledger while the
+    operator's real events sat in the directory the still-set variable
+    named: the exact symptom the rejection exists to prevent.
+
+    `python -m email_mcp.fts --build` additionally tracebacked.
+
+    The gate now lives once, in config.startup_guard, and every main()
+    calls it — so a new entry point cannot quietly omit it.
+    """
+    import subprocess
+    import sys
+
+    env = {k: v for k, v in os.environ.items()
+           if not k.startswith("EMAIL_MCP_")}
+    env["HOME"] = str(home)
+    env["EMAIL_MCP_AUDIT_DIR"] = str(home / "old-ledger")
+
+    p = subprocess.run([sys.executable, "-m", module, *args],
+                       capture_output=True, text=True, env=env)
+
+    assert p.returncode == 2, f"{module} {args}: rc={p.returncode}"
+    assert "retired" in p.stderr, p.stderr[-300:]
+    assert "Traceback" not in p.stderr
+
+
+def test_doctor_remains_the_only_entry_point_exemption(home):
+    """It reports the fault rather than refusing to run — that is what the
+    error message tells the operator to do."""
+    import subprocess
+    import sys
+
+    env = {k: v for k, v in os.environ.items()
+           if not k.startswith("EMAIL_MCP_")}
+    env["HOME"] = str(home)
+    env["EMAIL_MCP_AUDIT_DIR"] = str(home / "old-ledger")
+
+    p = subprocess.run([sys.executable, "-m", "email_mcp.cli", "doctor"],
+                       capture_output=True, text=True, env=env)
+
+    assert p.returncode == 1          # red report, not a refusal to run
+    assert "retired" in p.stdout
+
+
+def test_a_hard_link_cannot_pull_a_chmod_out_of_the_tree(home):
+    """MINOR, shipped in v0.11.0: the fence checked is_symlink() but never
+    st_nlink. chmod acts on the INODE, so a hard link at a managed path
+    took its other name's mode with it — measured 644 -> 600 on a decoy
+    outside the tree. POSIX gives no way to say which name is "ours", so a
+    file with a second name is not ours to mode."""
+    from email_mcp import repairs
+
+    decoy = home / ".zshrc"
+    decoy.write_text("export X=1\n")
+    decoy.chmod(0o644)
+    root = home / ".email-mcp"
+    root.mkdir()
+    os.link(decoy, root / "identities.toml")
+
+    result = repairs.run_fixes()
+
+    assert _mode(decoy) == 0o644, "chmod followed the hard link"
+    failed = [f for f in result["failed"] if f["repair"] == "state_file_perms"]
+    assert failed, "skipped silently instead of reporting the refusal"
+    assert "more than one name" in failed[0]["error"]
+
+
+def test_doctor_reports_a_loose_mode_on_an_unmanaged_identities_file(
+        home, monkeypatch, tmp_path):
+    """MINOR, shipped in v0.11.0: both the security document and repairs'
+    own docstring promised doctor would REPORT a loose mode on a file named
+    by EMAIL_MCP_IDENTITIES outside the tree. Nothing did — a user pointing
+    it at a world-readable file holding SMTP credentials got no signal."""
+    from email_mcp import doctor
+
+    ext = tmp_path / "ext.toml"
+    ext.write_text('default = "w"\n[w]\nfrom_addr="a@b.c"\n'
+                   'driver="pipe"\ncommand="/bin/true"\n')
+    ext.chmod(0o644)
+    monkeypatch.setenv("EMAIL_MCP_IDENTITIES", str(ext))
+
+    check = doctor.check_identities()
+
+    assert check["ok"] is False
+    assert "mode 644" in check["detail"]
+    assert "chmod 600" in check["fix"]
+    assert _mode(ext) == 0o644, "reported AND modified; it must only report"

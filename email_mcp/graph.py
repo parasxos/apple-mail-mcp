@@ -588,6 +588,9 @@ def main(argv: list[str] | None = None) -> int:
                        help="report identity NAME's token cache — purely "
                             "local, no network")
     args = parser.parse_args(argv)
+    rc = config.startup_guard("email-mcp graph")
+    if rc is not None:
+        return rc
     name = args.login or args.status
 
     from . import identities  # late: CLI-only dependency

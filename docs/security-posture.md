@@ -1120,6 +1120,45 @@ the surface that ACTS on the number (`uninstall --purge`) counts the tree it
 is about to delete. Recorded because it is the one remaining path where an
 operator can read "no queued mail" while composed mail sits on disk.
 
+### v0.11.1 — a defect that reached the v0.11.0 tag
+
+Three late audits of earlier commits landed after v0.11.0 was tagged. Two
+of them, independently, had found the same thing, and it was still present
+in the released code:
+
+- **MAJOR — `python -m email_mcp.audit` and `python -m email_mcp.fts`
+  ignored a retired variable.** The gate had been added to `cli`, `server`
+  and `dispatcher` ONE AT A TIME, and the module forms were never covered —
+  so `python -m email_mcp.audit --tail 5` exited **0 with an empty ledger**
+  while the operator's real events sat in the directory the still-set
+  variable named. That is the precise symptom the rejection exists to
+  prevent, reached through the invocation `docs/v1-contract.md` documents
+  as the audit-reading interface, while `docs/reference.md` claimed in bold
+  that rejection applied "on every entry point". `python -m email_mcp.fts
+  --build` additionally exited with a raw traceback.
+  The gate now lives ONCE, in `config.startup_guard`, called by every
+  `main()` — the same structural answer as `health.py`, applied to the
+  other rule that had been spreading surface by surface. `doctor` remains
+  the single deliberate exemption.
+- **MINOR — a hard link pulled a chmod out of the tree.** The fence checked
+  `is_symlink()` but never `st_nlink`, and `chmod` acts on the inode: a
+  hard link at `<root>/identities.toml` took a decoy outside the tree from
+  644 to 600. POSIX offers no way to say which name is "ours", so a file
+  with a second name is not ours to mode — it is now reported and refused,
+  not silently skipped.
+- **MINOR — a promised warning did not exist.** Both this document and
+  `repairs._managed_identities_file`'s docstring said `doctor` would still
+  REPORT a loose mode on a file named by `EMAIL_MCP_IDENTITIES` outside the
+  managed tree. Nothing did, so a user pointing that variable at a
+  world-readable file holding SMTP credentials got no signal at all. The
+  check now exists, report-only: it never changes a mode on a file the user
+  merely named.
+
+The lesson is the one this whole gate series kept teaching, and it survived
+the release: **a rule that is applied per-surface will be forgotten on a
+surface.** Both structural fixes — `health.py` and now
+`config.startup_guard` — exist because fixing the instances was not enough.
+
 **Still open, deliberately:** the root TOCTOU (§0 boundary — a local
 attacker with write access to the root's parent can swap a symlink between
 the refusal check and the mkdir; cost is one stray 0600 dotfile, no mode

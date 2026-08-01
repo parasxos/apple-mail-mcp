@@ -143,6 +143,29 @@ RETIRED_STATE_VARS = (
 )
 
 
+def startup_guard(prog: str) -> int | None:
+    """Refuse a retired per-directory variable at a process entry point.
+
+    Returns an exit code to use, or None to proceed. EVERY ``main()`` calls
+    this — `cli`, `server`, `dispatcher`, `audit`, `fts`, `graph` — because
+    gating them one at a time is exactly how `python -m email_mcp.audit`
+    came to answer "no events, exit 0" while the operator's real ledger sat
+    in the directory the still-set variable named. That is the symptom the
+    rejection exists to prevent, reached through a form
+    docs/v1-contract.md documents.
+
+    `doctor` is the one deliberate exemption and does not call this: its
+    job is to REPORT the fault.
+    """
+    import sys
+
+    reason = retired_state_var_error()
+    if reason is None:
+        return None
+    print(f"{prog}: {reason}", file=sys.stderr)
+    return 2
+
+
 def retired_state_vars() -> list[str]:
     """Retired per-directory variables that are still set, sorted."""
     return sorted(v for v in RETIRED_STATE_VARS

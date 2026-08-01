@@ -745,6 +745,9 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--install-launchd", action="store_true")
     parser.add_argument("--uninstall-launchd", action="store_true")
     args = parser.parse_args(argv)
+    rc = config.startup_guard("email-mcp fts")
+    if rc is not None:
+        return rc
 
     if args.install_launchd:
         print(install_launchd())

@@ -181,17 +181,51 @@ def check_accessibility() -> dict:
             "fix": _ACCESSIBILITY_FIX}
 
 
+def _identities_mode_note() -> str | None:
+    """A loose mode on the identities file, wherever it lives.
+
+    `doctor --fix` only re-modes it inside a directory we manage — but both
+    the security document and repairs.py's own docstring promised that
+    doctor would still REPORT a loose mode on a file named by
+    EMAIL_MCP_IDENTITIES anywhere else, and nothing did. A user pointing
+    that variable at a world-readable file holding SMTP credentials got no
+    signal at all.
+    """
+    path = config.identities_file()
+    try:
+        if not path.is_file():
+            return None
+        mode = path.stat().st_mode & 0o777
+    except OSError:
+        return None
+    if mode == 0o600:
+        return None
+    return (f"{path} is mode {mode:o} — it holds sending credentials and "
+            "wants 600")
+
+
 def check_identities() -> dict:
     """Does the identities file parse? The load error is surfaced verbatim
     — it already names the file and the offending key."""
+    mode_note = _identities_mode_note()
     try:
         idents, default = identities.load()
     except SendError as e:  # IdentityError subclasses SendError
+        # Verbatim, deliberately: the loader's message already names the
+        # file and the offending key, and a test pins that it reaches the
+        # user unaltered. A malformed file is the headline; its mode is
+        # reported on the parse-success path below.
         return {"ok": False, "detail": str(e),
                 "fix": f"edit {config.identities_file()}"}
-    return {"ok": True,
-            "detail": f"{len(idents)} identity(ies): "
-                      f"{', '.join(sorted(idents))}; default {default!r}"}
+    detail = (f"{len(idents)} identity(ies): "
+              f"{', '.join(sorted(idents))}; default {default!r}")
+    if mode_note:
+        # Report, do not repair: a file the user merely NAMED is not ours
+        # to re-mode (repairs._managed_identities_file), but staying silent
+        # about credentials at 644 is the gap that pairing left open.
+        return {"ok": False, "detail": f"{detail}; {mode_note}",
+                "fix": f"chmod 600 {config.identities_file()}"}
+    return {"ok": True, "detail": detail}
 
 
 def check_transports() -> dict:

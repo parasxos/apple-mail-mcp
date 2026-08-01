@@ -285,12 +285,28 @@ def _state_files() -> list[Path]:
     return files
 
 
+def _multiply_linked(f: Path) -> bool:
+    """True when this path is not the file's only name.
+
+    chmod acts on the INODE, so a hard link at a managed path takes its
+    other name's mode with it — measured at 644 -> 600 on a decoy outside
+    the tree. `is_symlink()` is False for a hard link, so the symlink fence
+    never applied, and POSIX gives us no way to tell which name is "ours".
+    A file with a second name is therefore not only ours to mode.
+    """
+    try:
+        return f.stat().st_nlink > 1
+    except OSError:
+        return True    # cannot tell → do not touch
+
+
 def _files_not_0600() -> list[Path]:
-    """Real (non-symlink) files only — chmod follows symlinks, and a
-    link squatting on identities.toml (or planted in the ledger) must
-    never redirect the fix onto a victim file."""
+    """Real (non-symlink, singly-linked) files only — chmod follows a
+    symlink and acts through a hard link, and neither may redirect the fix
+    onto a file outside the tree."""
     return [f for f in _state_files()
-            if not f.is_symlink() and _mode(f) != 0o600]
+            if not f.is_symlink() and not _multiply_linked(f)
+            and _mode(f) != 0o600]
 
 
 def _symlinked_bad_files() -> list[Path]:
@@ -301,12 +317,23 @@ def _symlinked_bad_files() -> list[Path]:
 def _detect_state_file_perms() -> str | None:
     bad = _files_not_0600()
     links = _symlinked_bad_files()
-    if not bad and not links:
+    if not bad and not links and not [
+            f for f in _state_files()
+            if not f.is_symlink() and _multiply_linked(f)
+            and _mode(f) != 0o600]:
         return None
+    linked = [f for f in _state_files()
+              if not f.is_symlink() and _multiply_linked(f)
+              and _mode(f) != 0o600]
     parts = []
     if bad:
         parts.append("state file(s) not 0600: " + ", ".join(
             f"{f} ({_mode(f):o})" for f in bad))
+    if linked:
+        parts.append(
+            "state file(s) with more than one name, not ours to mode "
+            "(chmod would follow the hard link): " + ", ".join(
+                f"{f} ({_mode(f):o})" for f in linked))
     if links:
         parts.append(
             "symlinked state file(s) with target not 0600 (never chmod "
@@ -319,6 +346,18 @@ def _apply_state_file_perms() -> str:
     for f in _files_not_0600():
         f.chmod(0o600)
         fixed.append(str(f))
+    hard = [f for f in _state_files()
+            if not f.is_symlink() and _multiply_linked(f)
+            and _mode(f) != 0o600]
+    if hard and not fixed:
+        # Report the refusal rather than claiming a fix: chmod through a
+        # hard link would change the mode of the file's OTHER name.
+        raise RuntimeError(
+            "refusing to chmod state file(s) that have more than one name: "
+            + ", ".join(str(f) for f in hard)
+            + " — chmod acts on the inode, so it would re-mode whatever "
+              "else links to it. Remove the extra link, or fix the mode "
+              "yourself")
     links = _symlinked_bad_files()
     if links:
         done = f" (did chmod 0600: {', '.join(fixed)})" if fixed else ""
