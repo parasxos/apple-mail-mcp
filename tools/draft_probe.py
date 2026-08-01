@@ -171,7 +171,11 @@ def _probe(args, verdict):
     verdict["rowid"] = rowid
     verdict["mailbox"] = mailbox_name(url)
     verdict["account"] = account_label(url)
-    if verdict["mailbox"].split("/")[-1] != "Drafts":
+    # Case-insensitive: the local account stores its drafts mailbox as
+    # "DRAFTS" (all caps), IMAP accounts as "Drafts" — first live run
+    # (2026-08-01) landed in local DRAFTS and the exact-case check
+    # refused a verdict over spelling.
+    if verdict["mailbox"].split("/")[-1].lower() != "drafts":
         raise ProbeError(f"draft landed in {verdict['mailbox']!r}, "
                          "not a Drafts mailbox")
     verdict["in_drafts"] = True

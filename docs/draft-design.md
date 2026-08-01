@@ -73,7 +73,21 @@ refuses, the movement shrinks to a documented "not possible here"** and
 the honest answer to a draft request stays "compose the text; paste it
 yourself" — stated, not silently substituted.
 
-*Probe built 2026-08-01, awaiting run.*
+**PROBE VERDICT — Lane A FAILED on stored fidelity (run 2026-08-01,
+rowids 1322571/1322585 against the live store).** The scripted-save
+draft stores a `multipart/alternative` whose **`text/plain` part is
+EMPTY** and whose `text/html` part is wrapped in the founding-bug
+signature (`Apple-Mail-URLShareWrapperClass` → `<blockquote type="cite">`
+with style-reset attributes). Mail re-composes from its editor model, so
+Lane A structurally cannot store our composer's bytes — the send-by-hand
+half is moot; the fidelity bar is already missed in storage. Two Lane A
+warts confirmed in passing: compose defaults to an arbitrary account
+(the run landed under a forgotten mail.com identity), and the local
+account spells its drafts mailbox `DRAFTS` (probe matcher now
+case-insensitive). **Per this note's own rule, the movement shrinks: the
+remaining choice is Lane B (IMAP APPEND — our bytes exactly, at the cost
+of a new protocol + credential surface) or a documented "not possible
+here". Decision: Paris's.**
 
 ## What is deliberately NOT here
 
