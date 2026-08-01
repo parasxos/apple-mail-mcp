@@ -73,6 +73,8 @@ refuses, the movement shrinks to a documented "not possible here"** and
 the honest answer to a draft request stays "compose the text; paste it
 yourself" — stated, not silently substituted.
 
+*Probe built 2026-08-01, awaiting run.*
+
 ## What is deliberately NOT here
 
 - **No `send_draft`.** The invariant is the feature.
