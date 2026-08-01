@@ -157,7 +157,17 @@ def test_quote_html_strips_script_and_style_blocks():
 # --------------------------------------------------------------------- #
 
 
-def test_allowlist_blocks_foreign_recipient(capture_delivery):
+def test_default_is_open_without_a_declaration(capture_delivery):
+    """The 2026-08-01 flip: sending is unrestricted unless the identity
+    DECLARES a restriction — the client's per-send prompt is the everyday
+    checkpoint; the guard is the opt-in trial harness."""
+    res = sender.send_email(to="stranger@example.org", subject="s", body="b")
+    assert res.ok is True
+    assert len(capture_delivery) == 1
+
+
+def test_allowlist_blocks_foreign_recipient(monkeypatch, capture_delivery):
+    monkeypatch.setenv("EMAIL_MCP_SEND_ALLOW_ALL", "0")  # guard DECLARED
     with pytest.raises(sender.SendError) as ei:
         sender.send_email(
             to="colleague@cern.ch", subject="s", body="b",
@@ -181,7 +191,8 @@ def test_allow_all_env_disables_guard(monkeypatch, capture_delivery):
     assert len(capture_delivery) == 1
 
 
-def test_foreign_cc_also_blocked(capture_delivery):
+def test_foreign_cc_also_blocked(monkeypatch, capture_delivery):
+    monkeypatch.setenv("EMAIL_MCP_SEND_ALLOW_ALL", "0")  # guard DECLARED
     with pytest.raises(sender.SendError):
         sender.send_email(
             to="paris.moschovakos@cern.ch",
@@ -189,6 +200,21 @@ def test_foreign_cc_also_blocked(capture_delivery):
             subject="s", body="b",
         )
     assert capture_delivery == []
+
+
+def test_declared_allowlist_binds_and_admits_self(monkeypatch,
+                                                  capture_delivery):
+    """A declared allowlist engages the guard by itself — and the guard
+    always admits the identity's own address (bcc_self rides on every
+    send; a guard blocking even self-mail once blocked EVERYTHING for a
+    listless allow_all = false identity)."""
+    monkeypatch.setenv("EMAIL_MCP_SEND_ALLOWLIST", "camilla@example.com")
+    assert sender.send_email(to="camilla@example.com",
+                             subject="s", body="b").ok is True
+    assert sender.send_email(to="paris.moschovakos@cern.ch",
+                             subject="s", body="b").ok is True
+    with pytest.raises(sender.SendError):
+        sender.send_email(to="stranger@example.org", subject="s", body="b")
 
 
 def test_custom_allowlist(monkeypatch, capture_delivery):
@@ -455,6 +481,10 @@ def _write_identities(tmp_path, monkeypatch) -> None:
         host = "smtp.gmail.com"
         port = 587
         keychain = "email-mcp-gmail"
+        # DECLARED guard: since the 2026-08-01 flip, an undeclared
+        # identity is open — the cross-identity scoping test needs one
+        # identity that actually restricts.
+        allowlist = ["parasxos@gmail.com"]
     """))
     monkeypatch.setenv("EMAIL_MCP_IDENTITIES", str(p))
 

@@ -202,6 +202,8 @@ def _identity_rows() -> list[plan.Row]:
         lines.append(f"keychain = {json.dumps(item)}")
         print("store the app password yourself — no file ever holds it:")
         print(f"  security add-generic-password -a {username} -s {item} -w")
+        print("sending is unrestricted by default — declare an allowlist "
+              "(or allow_all = false) in the file to restrict it")
     elif driver == "ssh_sendmail":
         lines.append(f"host = {json.dumps(_ask('SSH host'))}")
         lines.append(f"user = {json.dumps(_ask('SSH user'))}")

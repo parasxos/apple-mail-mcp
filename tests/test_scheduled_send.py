@@ -88,7 +88,8 @@ def test_schedule_rejects_past():
     assert "past" in str(ei.value)
 
 
-def test_schedule_enforces_allowlist_at_schedule_time():
+def test_schedule_enforces_allowlist_at_schedule_time(monkeypatch):
+    monkeypatch.setenv("EMAIL_MCP_SEND_ALLOW_ALL", "0")  # guard DECLARED
     with pytest.raises(sender.SendError):
         sender.schedule_email(
             to="stranger@example.org", subject="s", body="b",

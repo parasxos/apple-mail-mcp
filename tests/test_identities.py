@@ -70,8 +70,43 @@ def test_absent_file_synthesizes_default_mirroring_env(monkeypatch):
         "delivery_cmd": "/usr/bin/sendmail",
     }
     assert ident.allowlist == ["someone@example.org"]
-    assert ident.allow_all is False
+    # Open since the 2026-08-01 flip: the fallback allowlist is not a
+    # DECLARED restriction, so the synthesized identity is unrestricted.
+    assert ident.allow_all is True
     assert ident.bcc_self is False
+
+
+def test_env_declared_allowlist_engages_the_guard(monkeypatch):
+    monkeypatch.setenv("EMAIL_MCP_FROM_ADDR", "someone@example.org")
+    monkeypatch.setenv("EMAIL_MCP_SEND_ALLOWLIST", "a@b.org")
+    ident = identities.get()
+    assert ident.allow_all is False
+    assert ident.allowlist == ["a@b.org"]
+
+
+def test_toml_declared_allowlist_engages_the_guard(tmp_path, monkeypatch):
+    _write_toml(tmp_path, monkeypatch, """\
+        default = "main"
+
+        [main]
+        from_addr = "x@example.org"
+        driver = "pipe"
+        command = "/usr/sbin/sendmail -t -i"
+        allowlist = ["a@b.org"]
+    """)
+    assert identities.get().allow_all is False
+
+
+def test_toml_undeclared_identity_is_open(tmp_path, monkeypatch):
+    _write_toml(tmp_path, monkeypatch, """\
+        default = "main"
+
+        [main]
+        from_addr = "x@example.org"
+        driver = "pipe"
+        command = "/usr/sbin/sendmail -t -i"
+    """)
+    assert identities.get().allow_all is True
 
 
 def test_identities_env_var_overrides_file_path(tmp_path, monkeypatch):

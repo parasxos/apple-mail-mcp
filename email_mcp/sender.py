@@ -12,10 +12,12 @@ CERN path), `smtp`, or `pipe` (see `email_mcp.transports`). With no
 identities file a single default identity is synthesized from the env
 getters, so the original env-only setup keeps working unchanged.
 
-Safety: unless `EMAIL_MCP_SEND_ALLOW_ALL` (or the identity's `allow_all`)
-is set, every recipient must be on the identity's allowlist — which
-defaults to *just its own From: address*. A mistake during the trial can
-therefore only reach the sender himself.
+Safety: sending is unrestricted unless the identity DECLARES a restriction
+— an `allowlist`, or `allow_all = false` (env: `EMAIL_MCP_SEND_ALLOWLIST`
+/ `EMAIL_MCP_SEND_ALLOW_ALL=0`). An engaged guard restricts recipients to
+the allowlist plus the identity's own address, so a trial mistake can only
+reach the sender himself; day to day, the client's per-send permission
+prompt is the checkpoint.
 """
 from __future__ import annotations
 
@@ -137,17 +139,25 @@ def _bare(addr: str) -> str:
 
 
 def _enforce_allowlist(recipients: list[str], ident: identities.Identity) -> None:
-    if config.send_allow_all() or ident.allow_all:
+    # The identity OWNS the whole decision: env synthesis bakes
+    # config.send_allow_all() into the synthesized identity, a TOML block
+    # bakes its own declaration in at load. Consulting config here too was
+    # a second spelling of the same rule.
+    if ident.allow_all:
         return
-    allowed = {a.strip().lower() for a in ident.allowlist}
+    # An engaged guard always admits the identity's own address: bcc_self
+    # rides on every send, and a guard that blocks even self-mail blocked
+    # EVERYTHING for a TOML identity with allow_all = false and no list.
+    allowed = ({a.strip().lower() for a in ident.allowlist}
+               | {_bare(ident.from_addr)})
     blocked = sorted({_bare(r) for r in recipients if _bare(r) not in allowed})
     if blocked:
         raise SendError(
             f"Refusing to send as identity [{ident.name}]: recipient(s) not "
             f"on its allowlist — {', '.join(blocked)}. Sending is restricted "
-            f"to {', '.join(sorted(allowed))} until EMAIL_MCP_SEND_ALLOW_ALL=1 "
-            f"(or allow_all on [{ident.name}]) is set. (Trial-safety guard: "
-            "mistakes can only reach the identity's own address.)",
+            f"to {', '.join(sorted(allowed))} by this identity's declared "
+            f"guard (allowlist / allow_all = false) — extend the allowlist, "
+            f"or remove the declaration to lift it.",
             code=codes.RECIPIENT_NOT_ALLOWED,
         )
 

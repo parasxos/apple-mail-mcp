@@ -71,12 +71,13 @@ a CERN host (see [Identities & transports](#identities--transports) for SMTP
 and pipe lanes). A `Bcc`-to-self is added automatically so there's a
 searchable record (delivery leaves no Exchange *Sent* copy).
 
-**Self-only safety guard.** While `EMAIL_MCP_SEND_ALLOW_ALL` is off (the
-default), every recipient must be on the allowlist — which defaults to *just
-the From: address*. A mistake during the trial can therefore only reach you. A
-blocked send returns `{ok: false, error}` naming the address; it never leaves
-the machine. Flip `EMAIL_MCP_SEND_ALLOW_ALL=1` (or set an explicit
-`EMAIL_MCP_SEND_ALLOWLIST`) once you trust it.
+**Opt-in safety guard.** Sending is unrestricted by default (since
+2026-08-01); the client's per-send permission prompt is the everyday
+checkpoint. An identity that *declares* a restriction — an `allowlist`, or
+`allow_all = false` (env identity: `EMAIL_MCP_SEND_ALLOWLIST`, or
+`EMAIL_MCP_SEND_ALLOW_ALL=0`) — is restricted to that allowlist plus its
+own address, so a trial mistake can only reach you. A blocked send returns
+`{ok: false, error}` naming the address; it never leaves the machine.
 
 **Attachments.** Pass `attachments` as a list of local file paths. Each file
 is attached with a MIME type guessed from its name (fallback
@@ -234,7 +235,7 @@ The tests build a fake `~/Library/Mail/V10` tree in `tmp_path` — they don't re
 | `EMAIL_MCP_ATTACH_DIR` | `$TMPDIR/email-mcp` | Where `get_attachment` writes blobs. |
 | `EMAIL_MCP_FROM_ADDR` | *(empty)* | From: address for outgoing mail. Required for env-only sending (with `identities.toml` absent). |
 | `EMAIL_MCP_FROM_NAME` | *(empty)* | From: display name. |
-| `EMAIL_MCP_SEND_ALLOW_ALL` | `0` | `1` disables the allowlist (send to anyone). |
+| `EMAIL_MCP_SEND_ALLOW_ALL` | `1` | `0` engages the env identity's guard (allowlist + own address only). Setting `EMAIL_MCP_SEND_ALLOWLIST` engages it too. |
 | `EMAIL_MCP_SEND_ALLOWLIST` | (From: addr) | Comma-separated addresses sending may reach while the guard is on. |
 | `EMAIL_MCP_BCC_SELF` | `1` | Bcc the From: address on every send for a record. |
 | `EMAIL_MCP_MAX_ATTACH_MB` | `20` | Total attachment budget per outgoing message (file bytes, pre-base64). |
@@ -358,4 +359,4 @@ index verifies the mutations landed (write-through ≤2 s).
 - Triage mutations go through Mail.app's AppleScript interface; the Envelope Index is never opened writable.
 - `get_attachment` writes only to the configurable `EMAIL_MCP_ATTACH_DIR`.
 - Body and attachment size are capped by `EMAIL_MCP_MAX_BODY_BYTES`.
-- Sending is the only outward action: guarded by the self-only allowlist (default), a mandatory non-empty `to`/`subject`/`body`, and Bcc-to-self for an audit trail.
+- Sending is the only outward action: gated by the client's per-send permission prompt (plus the opt-in allowlist guard for trials), a mandatory non-empty `to`/`subject`/`body`, and Bcc-to-self for an audit trail.

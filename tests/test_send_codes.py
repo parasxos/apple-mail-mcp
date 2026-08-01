@@ -50,7 +50,8 @@ def test_required_fields_are_invalid_input(send_env):
     assert _send(body=" ")["code"] == "invalid_input"
 
 
-def test_recipient_not_allowed(send_env):
+def test_recipient_not_allowed(send_env, monkeypatch):
+    monkeypatch.setenv("EMAIL_MCP_SEND_ALLOW_ALL", "0")  # guard DECLARED
     out = _send(to="stranger@example.org")
     assert out["code"] == "recipient_not_allowed"
     assert "allowlist" in out["error"]

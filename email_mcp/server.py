@@ -1051,12 +1051,13 @@ def _build_mcp_server():
             pipe) and allowlist, so which lane the mail leaves on follows from
             the name alone.
 
-            Safety: while the allowlist guard is active (default), recipients are
-            restricted to the sending identity's own address — a returned
-            {ok: false, error} naming a blocked address means the guard fired,
-            not a delivery failure. A Bcc-to-self is added automatically for a
-            Sent record. Returns {ok, message_id, to, cc, bcc, subject,
-            attachments} on success.
+            Safety: recipients are unrestricted by default; an identity that
+            DECLARES a guard (an allowlist, or allow_all = false) is
+            restricted to that allowlist plus its own address — a returned
+            {ok: false, error} naming a blocked address means the declared
+            guard fired, not a delivery failure. A Bcc-to-self is added
+            automatically for a Sent record. Returns {ok, message_id, to,
+            cc, bcc, subject, attachments} on success.
             """
             return tool_send_email(
                 to=to, subject=subject, body=body, cc=cc, bcc=bcc,

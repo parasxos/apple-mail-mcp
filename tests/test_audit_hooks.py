@@ -66,8 +66,9 @@ def delivered(monkeypatch):
 
 
 def test_send_email_emits_send_on_both_terminals(
-    send_env, delivered, audit_dir_guard
+    send_env, delivered, audit_dir_guard, monkeypatch
 ):
+    monkeypatch.setenv("EMAIL_MCP_SEND_ALLOW_ALL", "0")  # guard DECLARED
     ok = server.tool_send_email(to="paris@example.org", subject="hi",
                                 body="b")
     assert ok["ok"] is True
@@ -95,6 +96,7 @@ def test_reply_email_emits_reply_with_orig_id_and_reply_all(
 
     monkeypatch.setattr(server, "_SOURCE",
                         AppleMailSource(mail_base=mail_fixture))
+    monkeypatch.setenv("EMAIL_MCP_SEND_ALLOW_ALL", "0")  # guard DECLARED
     blocked = server.tool_reply_email(id="100", body="x")  # allowlist fires
     assert blocked["ok"] is False
     monkeypatch.setenv("EMAIL_MCP_SEND_ALLOW_ALL", "1")

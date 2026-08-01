@@ -49,7 +49,9 @@ class Identity:
     driver: str = "ssh_sendmail"
     params: dict = field(default_factory=dict)
     allowlist: list[str] = field(default_factory=list)
-    allow_all: bool = False
+    # Open by default (2026-08-01): the guard is engaged by DECLARING a
+    # restriction — an allowlist, or allow_all = false — never implied.
+    allow_all: bool = True
     bcc_self: bool = True
     # Who fires this identity's schedules: the launchd spool (default,
     # universal) or Exchange-side deferred send. Immediate sends always
@@ -198,7 +200,10 @@ def load() -> tuple[dict[str, Identity], str]:
             driver=driver,
             params={k: v for k, v in t.items() if k not in _KNOWN_FIELDS},
             allowlist=allowlist,
-            allow_all=bool(t.get("allow_all", False)),
+            # The one rule: unrestricted unless the block DECLARES a
+            # restriction — an explicit allow_all wins; otherwise a
+            # declared allowlist binds, and no declaration means open.
+            allow_all=bool(t.get("allow_all", not allowlist)),
             bcc_self=bool(t.get("bcc_self", True)),
             executor=executor,
             graph=dict(graph),

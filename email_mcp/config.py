@@ -114,14 +114,17 @@ def send_from_name() -> str:
 
 
 def send_allow_all() -> bool:
-    """When false (default), recipients are restricted to the allowlist —
-    the trial-safety guard so a mistake can only reach your own address.
-
-    Flip EMAIL_MCP_SEND_ALLOW_ALL=1 to send to anyone.
+    """Sending is unrestricted unless a restriction is DECLARED (the one
+    rule, mirrored by the TOML loader): EMAIL_MCP_SEND_ALLOW_ALL=0 engages
+    the guard, and so does setting EMAIL_MCP_SEND_ALLOWLIST — a declared
+    allowlist is meant to bind. Default flipped open 2026-08-01: the
+    client's per-send permission prompt is the everyday checkpoint; the
+    guard is the opt-in trial harness, not the product posture.
     """
-    return os.environ.get("EMAIL_MCP_SEND_ALLOW_ALL", "0").strip() in {
-        "1", "true", "True", "yes",
-    }
+    raw = os.environ.get("EMAIL_MCP_SEND_ALLOW_ALL", "").strip()
+    if raw:
+        return raw in {"1", "true", "True", "yes"}
+    return not os.environ.get("EMAIL_MCP_SEND_ALLOWLIST", "").strip()
 
 
 def send_allowlist() -> set[str]:
