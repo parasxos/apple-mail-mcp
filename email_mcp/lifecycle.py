@@ -1559,29 +1559,43 @@ def _logs_dir() -> Path:
     return Path.home() / "Library" / "Logs"
 
 
-def _purge_logs() -> list[Path]:
+def _purge_logs() -> tuple[list[Path], list[str]]:
     """Unlink ``~/Library/Logs/email-mcp*.log`` (config.log_file's
-    default home). unlink never recurses, so a symlinked log file costs
-    only the link itself — but a symlinked Logs DIRECTORY is a
-    redirection, and the D7 rule the graph token sweep applies holds
-    here too: refuse, never glob through it."""
+    default home) → ``(removed, failed)``. unlink never recurses, so a
+    symlinked log file costs only the link itself — but a symlinked Logs
+    DIRECTORY is a redirection, and the D7 rule the graph token sweep
+    applies holds here too: refuse, never glob through it (the plan lists
+    that under ``left alone``, so it is no broken promise here).
+
+    ``failed`` names every log the plan promised under ``remove:`` that
+    is still on disk — the caller feeds it into ``left_behind``. Failures
+    used to be swallowed (``except OSError: continue``), so a 555
+    ~/Library/Logs made ``uninstall --purge`` print "uninstall complete."
+    and exit 0 over the surviving file — the same lie the token sweep
+    was cured of, one remover later."""
     removed: list[Path] = []
+    failed: list[str] = []
     logs = _logs_dir()
     if logs.is_symlink():
-        return removed
+        return removed, failed
     try:
         log_files = config.list_matching(logs, ".log")
+    except FileNotFoundError:
+        return removed, failed   # no Logs dir, no logs — vacuously done
     except OSError as e:
         print(f"  could not read {logs} ({e.strerror or e}) — logs may "
               "remain; remove them yourself", file=sys.stderr)
+        failed.append(f"{logs} ({e.strerror or e})")
         log_files = []
     for path in [p for p in log_files if p.name.startswith("email-mcp")]:
         try:
             path.unlink()
-        except OSError:
+        except OSError as e:
+            print(f"  could not remove {path}: {e}", file=sys.stderr)
+            failed.append(f"{path} ({e})")
             continue
         removed.append(path)
-    return removed
+    return removed, failed
 
 
 def uninstall_plan(purge: bool) -> dict:
@@ -1913,8 +1927,10 @@ def run_uninstall(purge: bool, assume_yes: bool) -> int:
                 print(f"  {root_path} already absent")
             else:
                 print(f"  removed {root}")
-        for log_path in _purge_logs():
+        removed_logs, failed_logs = _purge_logs()
+        for log_path in removed_logs:
             print(f"  removed {log_path}")
+        left_behind.extend(failed_logs)
     if left_behind:
         print("uninstall INCOMPLETE — still present: "
               + "; ".join(left_behind), file=sys.stderr)

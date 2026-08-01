@@ -533,6 +533,34 @@ def test_purge_refuses_a_symlinked_logs_dir(home, tool_shims, capsys):
     assert not estate["root"].exists()  # the real purge still happened
 
 
+def test_purge_with_unwritable_logs_dir_exits_incomplete(
+    home, tool_shims, capsys,
+):
+    """~/Library/Logs readable but unwritable (0555): the plan promises
+    the log under "remove:", the unlink then fails — the run must count
+    the survivor and exit 1, never print "uninstall complete." over it
+    (the exit contract the token sweep already honours). The failure
+    used to be swallowed with `continue` and the run exited 0."""
+    estate = _install_estate(home)
+    logs = estate["logs"]
+    log_file = logs / "email-mcp.log"
+
+    plan = lifecycle.uninstall_plan(purge=True)
+    assert any(str(log_file) == line for line in plan["remove"])
+
+    logs.chmod(0o555)
+    try:
+        assert cli.main(["uninstall", "--purge", "--yes"]) == 1
+        captured = capsys.readouterr()
+        assert "INCOMPLETE" in captured.err
+        assert str(log_file) in captured.err
+        assert "uninstall complete." not in captured.out
+        assert log_file.exists()  # the survivor the exit code is about
+        assert not estate["root"].exists()  # the purge itself still ran
+    finally:
+        logs.chmod(0o755)
+
+
 def test_uninstall_without_launchctl_exits_nonzero(
     home, tmp_path, monkeypatch, capsys,
 ):
