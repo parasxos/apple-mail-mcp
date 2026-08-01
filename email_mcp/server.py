@@ -1229,8 +1229,10 @@ def _build_mcp_server():
 
             Deletion uses Mail.app's own delete verb → messages go to their
             account's Trash mailbox; nothing is erased permanently. The
-            selection must live in ONE account (cross-account selections are
-            rejected — add the account= filter) and caps at 50 messages
+            selection never includes Trash mailboxes, so already-trashed
+            copies are not re-selected and plan → apply → re-plan converges.
+            The selection must live in ONE account (cross-account selections
+            are rejected — add the account= filter) and caps at 50 messages
             (EMAIL_MCP_TRIAGE_DELETE_MAX), tighter than triage_plan's cap.
             Returns {ok, plan_id, count, expires_at, summary, messages} or
             {ok: false, code, error}.

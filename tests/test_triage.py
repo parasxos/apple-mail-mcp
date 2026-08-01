@@ -84,6 +84,25 @@ def _add_mailbox(db, rowid, url):
     db.commit()
 
 
+TRASH_MB = 50
+
+
+def _seed_trash(db, *rows):
+    """Add the LOCAL account's Trash mailbox, plus optional trashed copies.
+    A trashed copy is exactly what Mail.app produces (field-observed
+    2026-08-01): a FRESH rowid in the Trash mailbox with deleted still 0 —
+    that column is Apple's purge flag, not mailbox membership."""
+    _add_mailbox(db, TRASH_MB, f"local://{LOCAL_ACCT}/Trash")
+    for rowid, subject, sender, conv, gmid in rows:
+        db.execute(
+            "INSERT INTO messages(ROWID, subject, sender, summary, date_sent,"
+            " date_received, mailbox, read, flagged, deleted, conversation_id,"
+            " global_message_id, flag_color)"
+            " VALUES (?,?,?,?, 1714800000, 1714800100, ?, 1, 0, 0, ?, ?, NULL)",
+            (rowid, subject, sender, subject, TRASH_MB, conv, gmid))
+    db.commit()
+
+
 # --------------------------------------------------------------------- #
 # planning                                                              #
 # --------------------------------------------------------------------- #
@@ -287,6 +306,61 @@ def test_delete_plan_cap_names_its_env_knob(src, monkeypatch):
     assert ei.value.code == "selection_too_large"
     assert "EMAIL_MCP_TRIAGE_DELETE_MAX" in str(ei.value)
     assert list(config.plans_dir().glob("*.json")) == []  # nothing staged
+
+
+def test_delete_plan_never_selects_the_trash(src, db):
+    """The mutation pin: this dies against a selection that filters only on
+    deleted=0 (the field failure of 2026-08-01 — count=43 every round)."""
+    _seed_trash(db, (8300, 2, 3, 7002, 9101))  # trashed ops-bot copy
+    plan = triage.build_delete_plan(
+        src, SearchQuery(from_addr="ops-bot", limit=10))
+    assert {m.rowid for m in plan.messages} == {101, 200}  # 8300 excluded
+
+
+def test_delete_plan_converges_after_apply(src, db, fake_osa):
+    """plan → apply (Mail.app trashes: fresh rowid in Trash, deleted=0) →
+    re-plan the same sender: count drops by acted, trashed copies are never
+    re-selected, and the last round converges to empty_selection."""
+    _seed_trash(db)
+
+    def trash(old_rowid, new_rowid, subject, conv, gmid):
+        db.execute("DELETE FROM messages WHERE ROWID=?", (old_rowid,))
+        db.execute(
+            "INSERT INTO messages(ROWID, subject, sender, summary, date_sent,"
+            " date_received, mailbox, read, flagged, deleted, conversation_id,"
+            " global_message_id, flag_color)"
+            " VALUES (?,?, 3, ?, 1714800000, 1714800100, ?, 1, 0, 0, ?, ?, NULL)",
+            (new_rowid, subject, subject, TRASH_MB, conv, gmid))
+        db.commit()
+        return subprocess.CompletedProcess([], 0, f"OK {old_rowid}\n", "")
+
+    plan = triage.build_delete_plan(
+        src, SearchQuery(from_addr="ops-bot", limit=1))
+    assert [m.rowid for m in plan.messages] == [101]  # newest of the two
+    fake_osa.batch = lambda s: trash(101, 8101, 2, 7002, 9101)
+    res = triage.apply_plan(src, plan.id)
+    assert res["status"] == "applied" and res["verified"] == 1
+
+    # Round 2: count dropped by acted; the fresh Trash rowid is invisible.
+    plan2 = triage.build_delete_plan(
+        src, SearchQuery(from_addr="ops-bot", limit=10))
+    assert [m.rowid for m in plan2.messages] == [200]
+    fake_osa.batch = lambda s: trash(200, 8200, 3, 7001, 9200)
+    assert triage.apply_plan(src, plan2.id)["verified"] == 1
+
+    # Round 3: converged — nothing left to delete, ever.
+    with pytest.raises(triage.TriageError) as ei:
+        triage.build_delete_plan(src, SearchQuery(from_addr="ops-bot", limit=10))
+    assert ei.value.code == "empty_selection"
+
+
+def test_plain_search_still_finds_trashed_mail(src, db):
+    """Only DELETE plans exclude the Trash — users legitimately search it."""
+    _seed_trash(db, (8300, 2, 3, 7002, 9101))
+    hits = src.search(SearchQuery(from_addr="ops-bot", limit=10))
+    by_id = {r.id: r for r in hits}
+    assert "8300" in by_id
+    assert by_id["8300"].mailbox == "Trash"
 
 
 def test_apply_partial_failure_reported(src, db, fake_osa):

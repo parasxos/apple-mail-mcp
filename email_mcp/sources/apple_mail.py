@@ -248,6 +248,26 @@ class AppleMailSource:
                 out.append(r["ROWID"])
         return out
 
+    # URL-path tails of per-account Trash mailboxes: "Trash" (local accounts,
+    # Gmail's [Gmail]/Trash), "Deleted%20Messages" (IMAP), "Deleted%20Items"
+    # (Exchange), "Bin" (Gmail in non-US locales).
+    _TRASH_TAILS = frozenset(
+        {"Trash", "Deleted%20Messages", "Deleted%20Items", "Bin"}
+    )
+
+    def _trash_mailbox_ids(self) -> list[int]:
+        """Mailbox ROWIDs of every account's Trash. Trashed mail keeps
+        deleted=0 (that column is Apple's purge flag, not membership) and
+        reappears here under a fresh ROWID — Trash membership is what marks
+        a message as trashed."""
+        rows = self._conn.execute(
+            "SELECT ROWID, url FROM mailboxes WHERE url IS NOT NULL"
+        ).fetchall()
+        return [
+            r["ROWID"] for r in rows
+            if r["url"].rsplit("/", 1)[-1] in self._TRASH_TAILS
+        ]
+
     def _local_archive_ids(self) -> list[int]:
         """Mailbox ROWIDs for local-only folders that Mail.app rules file
         messages into (SaneBox-style, mailing-list folders, etc.).
@@ -453,6 +473,14 @@ class AppleMailSource:
 
         if q.unread_only:
             where.append("m.read = 0")
+
+        if q.exclude_trash:
+            trash_ids = self._trash_mailbox_ids()
+            if trash_ids:
+                where.append(
+                    f"m.mailbox NOT IN ({','.join('?' * len(trash_ids))})"
+                )
+                params.extend(trash_ids)
 
         if where:
             sql += " WHERE " + " AND ".join(where)

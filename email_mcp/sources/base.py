@@ -76,6 +76,11 @@ class SearchQuery:
     unread_only: bool = False
     limit: int = 50
     offset: int = 0
+    # Skip every account's Trash mailbox. Set ONLY by the delete-plan path
+    # (triage.build_delete_plan) — trashed mail keeps deleted=0 and lives on
+    # under a fresh id, so a delete selection that saw the Trash would
+    # re-select its own prior work forever. Plain searches leave this False.
+    exclude_trash: bool = False
 
 
 class EmailSource(Protocol):

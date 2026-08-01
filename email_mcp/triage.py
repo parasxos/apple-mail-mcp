@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import subprocess
 import time
+from dataclasses import replace
 from datetime import datetime, timedelta
 
 from . import audit, config, plans
@@ -237,7 +238,14 @@ def build_delete_plan(source, q: SearchQuery) -> Plan:
     live in ONE account (symmetric with move_to's guard) and must fit the
     tighter delete cap. The result is a normal frozen Plan carrying the one
     `delete` action — it expires, is reviewed and applies through the
-    unchanged apply_plan exactly like any other plan."""
+    unchanged apply_plan exactly like any other plan.
+
+    The selection never sees the Trash: trashed mail keeps deleted=0 and
+    lives on in the account's Trash mailbox under a fresh id, so a delete
+    plan that selected it would re-delete prior work on every round and
+    never converge (observed live 2026-08-01). This is the one place the
+    exclusion is decided; plain searches stay Trash-inclusive."""
+    q = replace(q, exclude_trash=True)
     refs = source.search(q)
     accounts = {r.account for r in refs}
     if len(accounts) > 1:
