@@ -14,7 +14,7 @@ from __future__ import annotations
 import tomllib
 from dataclasses import dataclass, field
 
-from . import config
+from . import codes, config
 from .transports import DRIVERS, SendError
 
 # TOML keys that map to Identity fields; everything else in a block is a
@@ -32,7 +32,13 @@ _EXECUTORS = {"launchd", "graph"}
 class IdentityError(SendError):
     """A caller-fixable problem with the identities file (or an unknown
     identity name). Subclasses SendError so every existing
-    `except SendError` handler catches it for free."""
+    `except SendError` handler catches it for free.
+
+    Every identities-file problem is `identity_misconfigured` (contract
+    §3.4); the one bad-argument site — an unknown `from_identity` name —
+    overrides with `unknown_identity`."""
+
+    code = codes.IDENTITY_MISCONFIGURED
 
 
 @dataclass(frozen=True)
@@ -213,6 +219,7 @@ def get(name: str | None = None) -> Identity:
     if name not in identities:
         raise IdentityError(
             f"unknown identity {name!r}. Available: {sorted(identities)} "
-            f"(default: {default!r}) — defined in {config.identities_file()}."
+            f"(default: {default!r}) — defined in {config.identities_file()}.",
+            code=codes.UNKNOWN_IDENTITY,
         )
     return identities[name]

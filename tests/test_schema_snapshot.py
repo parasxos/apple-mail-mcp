@@ -1,7 +1,7 @@
 """inputSchema snapshot: the 20-tool input surface is FROZEN at v0.10
 (docs/v1-contract.md §8 — inputs do not change in v0.11). Descriptions are
 EXCLUDED from the snapshot: docstring churn is allowed, schemas are not.
-outputSchema snapshots come at v0.11, when typed returns land."""
+The outputSchema freeze lives in test_output_schemas.py."""
 from __future__ import annotations
 
 import asyncio

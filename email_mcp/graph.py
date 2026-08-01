@@ -42,7 +42,7 @@ from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
 from pathlib import Path
 
-from . import config, state
+from . import codes, config, state
 from .log import get_logger
 from .transports import SendError
 
@@ -67,7 +67,13 @@ class GraphError(SendError):
     catches it for free; schedule-time callers treat it as the signal to
     fall back to the launchd executor, reconcile-time callers as "leave
     the entry alone and retry next pass".
+
+    One code for the whole class: the Exchange lane was unavailable or
+    refused. Graph errors never reach the send/reply/schedule wire (the
+    fallback swallows them); they surface only through cancel_scheduled.
     """
+
+    code = codes.TRANSPORT_UNAVAILABLE
 
 
 class GraphTransportError(GraphError):

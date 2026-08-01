@@ -1,6 +1,6 @@
-"""v0.10 wire-safety belts (docs/v1-contract.md §3.5/§7): previously-
-crashing paths return coded envelopes; success shapes stay byte-untouched;
-the FULL traceback goes to the file log, never the wire."""
+"""Wire-safety belts on the server tools (docs/v1-contract.md §3.5/§7),
+now one boundary in envelope.py: previously-crashing paths return coded
+envelopes; the FULL traceback goes to the file log, never the wire."""
 from __future__ import annotations
 
 import logging
@@ -51,11 +51,11 @@ def test_unknown_or_bad_ids_return_not_found_and_invalid_input(
     assert server.tool_get_attachment("424242", "1.2")["code"] == "not_found"
     assert server.tool_get_email("not-a-rowid")["code"] == "invalid_input"
 
-    # Success shapes byte-untouched: the bare v0.7-compat dict gains no
-    # envelope keys from the belt.
+    # Success is the v0.11 envelope and never gains failure keys.
     ok = server.tool_get_email("100")
+    assert ok["ok"] is True
     assert "code" not in ok and "fix" not in ok
-    assert ok["ref"]["id"] == "100"
+    assert ok["email"]["ref"]["id"] == "100"
 
 
 def test_missing_mail_store_returns_mail_unavailable(monkeypatch):

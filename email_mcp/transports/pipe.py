@@ -11,6 +11,7 @@ import shutil
 import subprocess
 import time
 
+from .. import codes
 from ..log import get_logger
 from . import SendError
 
@@ -36,7 +37,8 @@ class PipeTransport:
         self.last_ensure_error: str | None = None
         self._prefix = f"[{identity}/{self.name}]"
         if not self.argv:
-            raise SendError(f"{self._prefix} `command` is empty.")
+            raise SendError(f"{self._prefix} `command` is empty.",
+                            code=codes.IDENTITY_MISCONFIGURED)
 
     # ----------------------------------------------------------------- #
     # MailTransport protocol                                            #
@@ -55,12 +57,14 @@ class PipeTransport:
             )
         except FileNotFoundError as e:
             raise SendError(
-                f"{self._prefix} command not found: {self.argv[0]}"
+                f"{self._prefix} command not found: {self.argv[0]}",
+                code=codes.TRANSPORT_UNAVAILABLE,
             ) from e
         except subprocess.TimeoutExpired as e:
             raise SendError(
                 f"{self._prefix} {self.argv[0]} hung for 60s — is the local "
-                "MTA configured?"
+                "MTA configured?",
+                code=codes.DELIVERY_FAILED,
             ) from e
         if proc.returncode != 0:
             err = (proc.stderr or b"").decode("utf-8", "replace").strip()
@@ -70,7 +74,8 @@ class PipeTransport:
             )
             raise SendError(
                 f"{self._prefix} delivery failed (exit {proc.returncode}): "
-                f"{err or 'no stderr'}"
+                f"{err or 'no stderr'}",
+                code=codes.DELIVERY_FAILED,
             )
         _log.info("pipe deliver ok (%.1fs)", time.monotonic() - t0)
 

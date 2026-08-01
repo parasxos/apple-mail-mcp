@@ -13,6 +13,7 @@ import socket
 import subprocess
 import time
 
+from .. import codes
 from ..log import get_logger
 from . import SendError
 
@@ -35,7 +36,8 @@ def _read_keychain(item: str, account: str) -> str:
         )
     except FileNotFoundError as e:
         raise SendError(
-            "`security` CLI not found — the smtp driver needs macOS."
+            "`security` CLI not found — the smtp driver needs macOS.",
+            code=codes.CREDENTIALS_UNAVAILABLE,
         ) from e
     except subprocess.TimeoutExpired as e:
         raise SendError(
@@ -43,13 +45,15 @@ def _read_keychain(item: str, account: str) -> str:
             f"{_KEYCHAIN_TIMEOUT}s — macOS is probably showing a permission "
             "prompt this process cannot see. Open Keychain Access, find "
             f"{item!r}, and set Access Control to \"Always Allow\" (or run "
-            "the read once in a terminal and click Always Allow)."
+            "the read once in a terminal and click Always Allow).",
+            code=codes.CREDENTIALS_UNAVAILABLE,
         ) from e
     if proc.returncode != 0:
         raise SendError(
             f"Keychain item {item!r} not readable (security exit "
             f"{proc.returncode}). Store the app password once with: "
-            f"security add-generic-password -s {item} -a {account} -w"
+            f"security add-generic-password -s {item} -a {account} -w",
+            code=codes.CREDENTIALS_UNAVAILABLE,
         )
     return proc.stdout.rstrip("\n")
 
@@ -73,7 +77,8 @@ def _read_op(ref: str) -> str:
     except FileNotFoundError as e:
         raise SendError(
             "`op` CLI not found — install the 1Password CLI "
-            "(brew install 1password-cli) or use a `keychain` param instead."
+            "(brew install 1password-cli) or use a `keychain` param instead.",
+            code=codes.CREDENTIALS_UNAVAILABLE,
         ) from e
     except subprocess.TimeoutExpired as e:
         raise SendError(
@@ -81,14 +86,16 @@ def _read_op(ref: str) -> str:
             "the app is probably locked and waiting for Touch ID. Unlock "
             "1Password and retry. (Headless contexts like the launchd "
             "dispatcher cannot answer that prompt; keep 1Password unlocked "
-            "or use a `keychain` param for scheduled mail.)"
+            "or use a `keychain` param for scheduled mail.)",
+            code=codes.CREDENTIALS_UNAVAILABLE,
         ) from e
     if proc.returncode != 0:
         err = (proc.stderr or "").strip()
         raise SendError(
             f"1Password read for {ref!r} failed (op exit {proc.returncode}): "
             f"{err[:200]} — check the secret reference (op read {ref!r}) and "
-            "that the CLI is signed in (Settings → Developer → CLI integration)."
+            "that the CLI is signed in (Settings → Developer → CLI integration).",
+            code=codes.CREDENTIALS_UNAVAILABLE,
         )
     return proc.stdout.rstrip("\n")
 
@@ -119,7 +126,8 @@ class SmtpTransport:
             raise SendError(
                 f"[{identity}/{self.name}] needs a secret source: set "
                 "`op` (1Password secret reference) or `keychain` (macOS "
-                "Keychain item) in identities.toml."
+                "Keychain item) in identities.toml.",
+                code=codes.IDENTITY_MISCONFIGURED,
             )
         # SMTP AUTH login defaults to the identity's own address, which is
         # what Gmail/iCloud app passwords expect.
@@ -130,9 +138,15 @@ class SmtpTransport:
         self._prefix = f"[{identity}/{self.name}]"
 
     def _secret(self) -> str:
-        if self.op:
-            return _read_op(self.op)
-        return _read_keychain(self.keychain, self.username)
+        # The readers are identity-agnostic seams; the driver owns the
+        # lane, so the secret errors gain their [identity/smtp] prefix
+        # here (contract §3.4 — the formerly UNPREFIXED prose).
+        try:
+            if self.op:
+                return _read_op(self.op)
+            return _read_keychain(self.keychain, self.username)
+        except SendError as e:
+            raise SendError(f"{self._prefix} {e}", code=e.code) from e
 
     @property
     def _secret_ref(self) -> str:
@@ -175,14 +189,16 @@ class SmtpTransport:
             raise SendError(
                 f"{self._prefix} SMTP auth failed for {self.username} at "
                 f"{self.host}:{self.port} — secret {self._secret_ref!r} "
-                f"holds a wrong or expired app password: {e}"
+                f"holds a wrong or expired app password: {e}",
+                code=codes.AUTH_FAILED,
             ) from e
         except (smtplib.SMTPException, OSError) as e:
             _log.error("smtp deliver failed (%.1fs): %s",
                        time.monotonic() - t0, e)
             raise SendError(
                 f"{self._prefix} SMTP delivery via {self.host}:{self.port} "
-                f"failed: {e}"
+                f"failed: {e}",
+                code=codes.DELIVERY_FAILED,
             ) from e
         finally:
             if server is not None:

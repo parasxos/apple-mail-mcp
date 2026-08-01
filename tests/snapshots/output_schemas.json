@@ -1,0 +1,403 @@
+{
+  "audit": {
+    "events": [
+      "dict"
+    ],
+    "files_scanned": "int",
+    "ok": "bool",
+    "skipped_lines": "int"
+  },
+  "cancel_scheduled": {
+    "id": "str",
+    "ok": "bool",
+    "status": "str",
+    "subject": "str",
+    "was_due": "str"
+  },
+  "doctor": "dict",
+  "get_attachment": {
+    "attachment": {
+      "mime": "str",
+      "name": "str",
+      "path": "str",
+      "size": "int"
+    },
+    "ok": "bool"
+  },
+  "get_email": {
+    "email": {
+      "one_of": [
+        {
+          "attachments": [
+            {
+              "attachment_id": "str",
+              "mime": "str|null",
+              "name": "str",
+              "size": "int|null"
+            }
+          ],
+          "body_html": "str",
+          "body_text": "str",
+          "flags": "dict",
+          "headers": "dict",
+          "ref": {
+            "account": "str",
+            "cc": [
+              "str"
+            ],
+            "date": "str",
+            "from_addr": "str",
+            "has_attachment": "bool",
+            "id": "str",
+            "mailbox": "str",
+            "snippet": "str",
+            "subject": "str",
+            "thread_id": "str",
+            "to": [
+              "str"
+            ],
+            "unread": "bool"
+          }
+        },
+        {
+          "attachments": [
+            {
+              "attachment_id": "str",
+              "mime": "str|null",
+              "name": "str",
+              "size": "int|null"
+            }
+          ],
+          "flags": "dict",
+          "headers": "dict",
+          "ref": {
+            "account": "str",
+            "cc": [
+              "str"
+            ],
+            "date": "str",
+            "from_addr": "str",
+            "has_attachment": "bool",
+            "id": "str",
+            "mailbox": "str",
+            "snippet": "str",
+            "subject": "str",
+            "thread_id": "str",
+            "to": [
+              "str"
+            ],
+            "unread": "bool"
+          }
+        },
+        {
+          "date": "str",
+          "from_addr": "str",
+          "id": "str",
+          "mailbox": "str",
+          "subject": "str",
+          "unread": "bool"
+        }
+      ]
+    },
+    "ok": "bool"
+  },
+  "get_emails_batch": {
+    "emails": [
+      {
+        "one_of": [
+          {
+            "attachments": [
+              {
+                "attachment_id": "str",
+                "mime": "str|null",
+                "name": "str",
+                "size": "int|null"
+              }
+            ],
+            "body_html": "str",
+            "body_text": "str",
+            "flags": "dict",
+            "headers": "dict",
+            "ref": {
+              "account": "str",
+              "cc": [
+                "str"
+              ],
+              "date": "str",
+              "from_addr": "str",
+              "has_attachment": "bool",
+              "id": "str",
+              "mailbox": "str",
+              "snippet": "str",
+              "subject": "str",
+              "thread_id": "str",
+              "to": [
+                "str"
+              ],
+              "unread": "bool"
+            }
+          },
+          {
+            "attachments": [
+              {
+                "attachment_id": "str",
+                "mime": "str|null",
+                "name": "str",
+                "size": "int|null"
+              }
+            ],
+            "flags": "dict",
+            "headers": "dict",
+            "ref": {
+              "account": "str",
+              "cc": [
+                "str"
+              ],
+              "date": "str",
+              "from_addr": "str",
+              "has_attachment": "bool",
+              "id": "str",
+              "mailbox": "str",
+              "snippet": "str",
+              "subject": "str",
+              "thread_id": "str",
+              "to": [
+                "str"
+              ],
+              "unread": "bool"
+            }
+          },
+          {
+            "date": "str",
+            "from_addr": "str",
+            "id": "str",
+            "mailbox": "str",
+            "subject": "str",
+            "unread": "bool"
+          }
+        ]
+      }
+    ],
+    "errors": [
+      {
+        "code": "str",
+        "error": "str",
+        "id": "str"
+      }
+    ],
+    "ok": "bool",
+    "view": "str"
+  },
+  "get_thread": {
+    "ok": "bool",
+    "thread": [
+      {
+        "account": "str",
+        "cc": [
+          "str"
+        ],
+        "date": "str",
+        "from_addr": "str",
+        "has_attachment": "bool",
+        "id": "str",
+        "mailbox": "str",
+        "snippet": "str",
+        "subject": "str",
+        "thread_id": "str",
+        "to": [
+          "str"
+        ],
+        "unread": "bool"
+      }
+    ]
+  },
+  "list_mailboxes": {
+    "mailboxes": [
+      {
+        "account": "str",
+        "name": "str",
+        "path": "str",
+        "total": "int",
+        "unread": "int"
+      }
+    ],
+    "ok": "bool"
+  },
+  "list_recent": {
+    "messages": [
+      {
+        "account": "str",
+        "cc": [
+          "str"
+        ],
+        "date": "str",
+        "from_addr": "str",
+        "has_attachment": "bool",
+        "id": "str",
+        "mailbox": "str",
+        "snippet": "str",
+        "subject": "str",
+        "thread_id": "str",
+        "to": [
+          "str"
+        ],
+        "unread": "bool"
+      }
+    ],
+    "ok": "bool"
+  },
+  "list_scheduled": "dict",
+  "mailbox_create": "dict",
+  "mailbox_delete": "dict",
+  "refresh_mail": {
+    "after": "dict|null",
+    "applescript_duration_ms": "int|null",
+    "before": "dict|null",
+    "code": "str|null",
+    "error": "str|null",
+    "error_code": "int|null",
+    "new_messages": "int|null",
+    "ok": "bool",
+    "waited_seconds": "float"
+  },
+  "reply_email": {
+    "attachments": [
+      "str"
+    ],
+    "bcc": [
+      "str"
+    ],
+    "bootstrapped": "bool",
+    "cc": [
+      "str"
+    ],
+    "error": "str|null",
+    "message_id": "str",
+    "ok": "bool",
+    "subject": "str",
+    "to": [
+      "str"
+    ]
+  },
+  "schedule_email": {
+    "attachments": [
+      "str"
+    ],
+    "attempts": "int",
+    "bcc": [
+      "str"
+    ],
+    "cc": [
+      "str"
+    ],
+    "created_at": "str",
+    "delivered_at": "str|null",
+    "executor": "str",
+    "graph_draft_id": "str|null",
+    "id": "str",
+    "identity": "str",
+    "last_error": "str|null",
+    "message_id": "str",
+    "next_attempt_at": "str|null",
+    "ok": "bool",
+    "send_at": "str",
+    "status": "str",
+    "subject": "str",
+    "to": [
+      "str"
+    ]
+  },
+  "search_emails": {
+    "fts": "dict",
+    "ok": "bool",
+    "results": [
+      {
+        "account": "str",
+        "body_match": "bool",
+        "cc": [
+          "str"
+        ],
+        "date": "str",
+        "from_addr": "str",
+        "has_attachment": "bool",
+        "id": "str",
+        "mailbox": "str",
+        "snippet": "str",
+        "subject": "str",
+        "thread_id": "str",
+        "to": [
+          "str"
+        ],
+        "unread": "bool"
+      }
+    ]
+  },
+  "send_email": {
+    "attachments": [
+      "str"
+    ],
+    "bcc": [
+      "str"
+    ],
+    "bootstrapped": "bool",
+    "cc": [
+      "str"
+    ],
+    "error": "str|null",
+    "message_id": "str",
+    "ok": "bool",
+    "subject": "str",
+    "to": [
+      "str"
+    ]
+  },
+  "triage_apply": "dict",
+  "triage_plan": {
+    "actions": [
+      {
+        "action": "str",
+        "color": "int|null",
+        "mailbox": "str|null"
+      }
+    ],
+    "count": "int",
+    "expires_at": "str",
+    "messages": [
+      {
+        "date": "str",
+        "from_addr": "str",
+        "id": "str",
+        "mailbox": "str",
+        "subject": "str",
+        "unread": "bool"
+      }
+    ],
+    "ok": "bool",
+    "plan_id": "str",
+    "summary": "str"
+  },
+  "triage_plan_delete": {
+    "actions": [
+      {
+        "action": "str",
+        "color": "int|null",
+        "mailbox": "str|null"
+      }
+    ],
+    "count": "int",
+    "expires_at": "str",
+    "messages": [
+      {
+        "date": "str",
+        "from_addr": "str",
+        "id": "str",
+        "mailbox": "str",
+        "subject": "str",
+        "unread": "bool"
+      }
+    ],
+    "ok": "bool",
+    "plan_id": "str",
+    "summary": "str"
+  }
+}

@@ -6,31 +6,37 @@ launches per the README's ``~/.claude.json`` snippet.
 Add ``--selftest`` to do a non-MCP smoke check that prints mailbox + latest
 subject counts. Useful for verifying Full-Disk-Access on a new machine.
 ``--doctor`` runs the full environment diagnosis (email_mcp.doctor).
+
+Every tool is a pure function returning a typed value or raising a typed
+error; ``envelope.tool`` is the one boundary that turns either into the
+wire dict (docs/v1-contract.md §2). The result dataclasses below ARE the
+outputSchema — the freeze derives from them (envelope.schema_of).
 """
 from __future__ import annotations
 
 import argparse
-import functools
-import inspect
 import json
 import re
 import subprocess
 import sys
 import time
-from dataclasses import asdict, is_dataclass
+from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
-from typing import Any
 
-from . import audit, codes
+from . import audit, codes, envelope, spool
 from .config import source_name
+from .envelope import InvalidInput, NotFound
 from .log import get_logger
-from .sender import SendError, reply_email, schedule_email, send_email
+from .plans import PlanAction
+from .sender import SendError, SendResult, reply_email, schedule_email, send_email
 from .triage import (
-    TriageError, apply_plan, build_delete_plan, build_plan, create_mailbox,
-    delete_mailbox,
+    apply_plan, build_delete_plan, build_plan, create_mailbox, delete_mailbox,
 )
 from .sources import get_source
-from .sources.base import EmailSource, SearchQuery
+from .sources.base import (
+    AttachmentBlob, AttachmentRef, Email, EmailRef, EmailSource, Mailbox,
+    SearchQuery,
+)
 
 _log = get_logger()
 
@@ -59,67 +65,136 @@ def _parse_dt(s: str | None) -> datetime | None:
     return dt
 
 
-def _to_jsonable(obj: Any) -> Any:
-    """Recursively convert dataclasses + datetimes to JSON-friendly types."""
-    if is_dataclass(obj) and not isinstance(obj, type):
-        return {k: _to_jsonable(v) for k, v in asdict(obj).items()}
-    if isinstance(obj, datetime):
-        return obj.isoformat()
-    if isinstance(obj, list):
-        return [_to_jsonable(x) for x in obj]
-    if isinstance(obj, dict):
-        return {k: _to_jsonable(v) for k, v in obj.items()}
-    return obj
-
-
 # ---------------------------------------------------------------------- #
-# Wire-safety belt (docs/v1-contract.md §3.5 / §7)                        #
+# Wire result types — the success shapes of the 20 tools (contract §1).  #
+# Fields typed `dict` are dynamic passthroughs the types cannot see      #
+# into (fts health, doctor checks, audit events, freshness snapshots).   #
 # ---------------------------------------------------------------------- #
 
 
-def _belt(op_from: str | None = None):
-    """No exception escapes a dict-returning tool to the MCP wire: known
-    caller-fixable classes map to coded envelopes, anything else is the
-    belt of last resort, `internal_error`. Every catch logs the FULL
-    traceback to the file log (never the wire) and the envelope carries
-    fix: "run doctor". Success shapes pass through byte-untouched — the
-    belt only exists where the tool used to crash.
+@dataclass(frozen=True)
+class SearchHit(EmailRef):
+    """An EmailRef plus body_match: true when the hit came in via the body
+    index and the query is not visible in subject/from/snippet."""
+    body_match: bool = False
 
-    `op_from` names the parameter whose value is the operation's durable
-    artifact id (triage_apply's plan_id), threaded into the failure
-    envelope as operation_id per contract §2."""
-    def deco(fn):
-        sig = inspect.signature(fn)
 
-        def _fail(code: str, error: str, args: tuple, kwargs: dict) -> dict:
-            _log.exception("belt[%s]: %s", fn.__name__, code)
-            out: dict = {"ok": False, "code": code, "error": error,
-                         "fix": "run doctor"}
-            if op_from is not None:
-                try:
-                    value = sig.bind_partial(*args, **kwargs) \
-                               .arguments.get(op_from)
-                except TypeError:
-                    value = None
-                if value:
-                    out["operation_id"] = str(value)
-            return out
+@dataclass(frozen=True)
+class SearchPage:
+    fts: dict
+    results: list[SearchHit]
 
-        @functools.wraps(fn)
-        def wrapper(*args, **kwargs):
-            try:
-                return fn(*args, **kwargs)
-            except ValueError as e:
-                return _fail(codes.INVALID_INPUT, str(e), args, kwargs)
-            except LookupError as e:
-                return _fail(codes.NOT_FOUND, str(e), args, kwargs)
-            except FileNotFoundError as e:
-                return _fail(codes.MAIL_UNAVAILABLE, str(e), args, kwargs)
-            except Exception as e:
-                return _fail(codes.INTERNAL_ERROR,
-                             f"{type(e).__name__}: {e}", args, kwargs)
-        return wrapper
-    return deco
+
+@dataclass(frozen=True)
+class EmailMetadata:
+    """view="metadata": everything except the bodies."""
+    ref: EmailRef
+    headers: dict
+    attachments: list[AttachmentRef]
+    flags: dict
+
+
+@dataclass(frozen=True)
+class EmailMinimal:
+    """view="minimal": the id/subject/from/date skeleton (triage_plan's
+    message shape). view="full" is sources.base.Email itself."""
+    id: str
+    subject: str
+    from_addr: str
+    date: datetime
+    mailbox: str
+    unread: bool
+
+
+@dataclass(frozen=True)
+class OneEmail:
+    email: Email | EmailMetadata | EmailMinimal
+
+
+@dataclass(frozen=True)
+class BatchItemError:
+    """Per-id failure inside get_emails_batch — data, never tool failure."""
+    id: str
+    error: str
+    code: str
+
+
+@dataclass(frozen=True)
+class EmailBatch:
+    view: str
+    emails: list[Email | EmailMetadata | EmailMinimal]
+    errors: list[BatchItemError]
+
+
+@dataclass(frozen=True)
+class Thread:
+    thread: list[EmailRef]
+
+
+@dataclass(frozen=True)
+class MailboxList:
+    mailboxes: list[Mailbox]
+
+
+@dataclass(frozen=True)
+class RecentPage:
+    messages: list[EmailRef]
+
+
+@dataclass(frozen=True)
+class AttachmentOut:
+    attachment: AttachmentBlob
+
+
+@dataclass(frozen=True)
+class RefreshOutcome:
+    """refresh_mail's report. `ok` is the nudge outcome, not tool failure
+    (§2 documented exception); `code` is the §3.3 mapping of error_code."""
+    ok: bool
+    applescript_duration_ms: int | None
+    waited_seconds: float
+    before: dict | None
+    after: dict | None
+    new_messages: int | None
+    error: str | None
+    error_code: int | None
+    code: str | None
+
+
+@dataclass(frozen=True)
+class PlanMessageOut:
+    id: str
+    subject: str
+    from_addr: str
+    date: str
+    mailbox: str
+    unread: bool
+
+
+@dataclass(frozen=True)
+class PlanReceipt:
+    """The staged-plan shape shared by triage_plan and triage_plan_delete."""
+    plan_id: str
+    count: int
+    expires_at: str
+    summary: str
+    actions: list[PlanAction]
+    messages: list[PlanMessageOut]
+
+
+@dataclass(frozen=True)
+class CancelReceipt:
+    id: str
+    status: str
+    subject: str
+    was_due: str
+
+
+@dataclass(frozen=True)
+class AuditPage:
+    events: list[dict]
+    files_scanned: int
+    skipped_lines: int
 
 
 # ---------------------------------------------------------------------- #
@@ -127,7 +202,7 @@ def _belt(op_from: str | None = None):
 # ---------------------------------------------------------------------- #
 
 
-@_belt()
+@envelope.tool
 def tool_search_emails(
     query: str = "",
     from_addr: str | None = None,
@@ -140,7 +215,7 @@ def tool_search_emails(
     unread_only: bool = False,
     limit: int = 50,
     offset: int = 0,
-) -> dict:
+) -> SearchPage:
     q = SearchQuery(
         query=query,
         from_addr=from_addr,
@@ -155,7 +230,7 @@ def tool_search_emails(
         offset=offset,
     )
     src = _source()
-    results = [_to_jsonable(r) for r in src.search(q)]
+    hits = src.search(q)
 
     # Index health rides along with every search (honest degradation) —
     # sources without a body index simply lack the fts_status attribute.
@@ -164,18 +239,17 @@ def tool_search_emails(
     })
     hit_ids = {str(r) for r in fts.pop("rowids", [])}
 
-    # body_match: the hit came in via the body index and the query is not
-    # visible in what the caller already sees (subject/from/snippet).
     ql = query.lower()
-    for r in results:
+    results = []
+    for r in hits:
         visible = bool(ql) and (
-            ql in r["subject"].lower()
-            or ql in r["from_addr"].lower()
-            or ql in r["snippet"].lower()
+            ql in r.subject.lower()
+            or ql in r.from_addr.lower()
+            or ql in r.snippet.lower()
         )
-        r["body_match"] = r["id"] in hit_ids and not visible
-
-    return {"ok": True, "fts": fts, "results": results}
+        results.append(SearchHit(
+            **asdict(r), body_match=r.id in hit_ids and not visible))
+    return SearchPage(fts=fts, results=results)
 
 
 # Payload views for get_email / get_emails_batch, smallest first.
@@ -183,77 +257,70 @@ _VIEWS = ("minimal", "metadata", "full")
 _BATCH_MAX_IDS = 50
 
 
-def _shape_email(msg: Any, view: str) -> dict:
-    """Size a full Email to the requested view.
-
-    full     — the complete shape (ref, headers, bodies, attachments, flags)
-    metadata — everything except the bodies
-    minimal  — id/subject/from/date skeleton (triage_plan's message shape)
-    """
-    full = _to_jsonable(msg)
+def _shape_email(msg: Email, view: str) -> Email | EmailMetadata | EmailMinimal:
+    """Size a full Email to the requested view."""
     if view == "full":
-        return full
+        return msg
     if view == "metadata":
-        return {k: v for k, v in full.items()
-                if k not in ("body_text", "body_html")}
-    ref = full["ref"]
-    return {
-        "id": ref["id"], "subject": ref["subject"],
-        "from_addr": ref["from_addr"], "date": ref["date"],
-        "mailbox": ref["mailbox"], "unread": ref["unread"],
-    }
+        return EmailMetadata(ref=msg.ref, headers=msg.headers,
+                             attachments=msg.attachments, flags=msg.flags)
+    ref = msg.ref
+    return EmailMinimal(id=ref.id, subject=ref.subject,
+                        from_addr=ref.from_addr, date=ref.date,
+                        mailbox=ref.mailbox, unread=ref.unread)
 
 
-def _bad_view(view: str) -> dict:
-    return {"ok": False,
-            "error": f"unknown view {view!r} (want one of {_VIEWS})"}
-
-
-@_belt()
-def tool_get_email(id: str, view: str = "full") -> dict:
+def _check_view(view: str) -> None:
     if view not in _VIEWS:
-        return _bad_view(view)
-    return _shape_email(_source().get(id), view)
+        raise InvalidInput(f"unknown view {view!r} (want one of {_VIEWS})")
 
 
-@_belt()
-def tool_get_emails_batch(ids: list[str], view: str = "full") -> dict:
-    if view not in _VIEWS:
-        return _bad_view(view)
+@envelope.tool
+def tool_get_email(id: str, view: str = "full") -> OneEmail:
+    _check_view(view)
+    return OneEmail(email=_shape_email(_source().get(id), view))
+
+
+@envelope.tool
+def tool_get_emails_batch(ids: list[str], view: str = "full") -> EmailBatch:
+    _check_view(view)
     if len(ids) > _BATCH_MAX_IDS:
-        return {"ok": False,
-                "error": f"{len(ids)} ids exceeds the batch cap of "
-                         f"{_BATCH_MAX_IDS} — split the request"}
+        raise InvalidInput(f"{len(ids)} ids exceeds the batch cap of "
+                           f"{_BATCH_MAX_IDS} — split the request")
     src = _source()
-    emails: list[dict] = []
-    errors: list[dict] = []
+    emails: list[Email | EmailMetadata | EmailMinimal] = []
+    errors: list[BatchItemError] = []
     for id in ids:
         try:
             emails.append(_shape_email(src.get(str(id)), view))
         except (ValueError, LookupError) as e:
-            errors.append({"id": str(id), "error": str(e)})
-    return {"ok": True, "view": view, "emails": emails, "errors": errors}
+            errors.append(BatchItemError(id=str(id), error=str(e),
+                                         code=envelope.classify(e)))
+    return EmailBatch(view=view, emails=emails, errors=errors)
 
 
-def tool_get_thread(thread_id: str) -> list[dict]:
-    return [_to_jsonable(r) for r in _source().thread(thread_id)]
+@envelope.tool
+def tool_get_thread(thread_id: str) -> Thread:
+    return Thread(thread=list(_source().thread(thread_id)))
 
 
-def tool_list_mailboxes() -> list[dict]:
-    return [_to_jsonable(m) for m in _source().mailboxes()]
+@envelope.tool
+def tool_list_mailboxes() -> MailboxList:
+    return MailboxList(mailboxes=list(_source().mailboxes()))
 
 
+@envelope.tool
 def tool_list_recent(
     mailbox: str | None = None,
     account: str | None = None,
     limit: int = 50,
-) -> list[dict]:
-    return [_to_jsonable(r) for r in _source().recent(mailbox, account, limit)]
+) -> RecentPage:
+    return RecentPage(messages=list(_source().recent(mailbox, account, limit)))
 
 
-@_belt()
-def tool_get_attachment(id: str, attachment_id: str) -> dict:
-    return _to_jsonable(_source().attachment(id, attachment_id))
+@envelope.tool
+def tool_get_attachment(id: str, attachment_id: str) -> AttachmentOut:
+    return AttachmentOut(attachment=_source().attachment(id, attachment_id))
 
 
 # ---------------------------------------------------------------------- #
@@ -328,8 +395,8 @@ def _run_mail_check_for_new(timeout_seconds: float) -> dict:
     return out
 
 
-@_belt()
-def tool_refresh_mail(wait_seconds: float = 5.0, timeout_seconds: float = 30.0) -> dict:
+@envelope.tool
+def tool_refresh_mail(wait_seconds: float = 5.0, timeout_seconds: float = 30.0) -> RefreshOutcome:
     """Ask Mail.app to fetch new mail, then report what changed.
 
     Mail.app does the IMAP/OAuth work; we just nudge it. Returns a snapshot
@@ -357,16 +424,21 @@ def tool_refresh_mail(wait_seconds: float = 5.0, timeout_seconds: float = 30.0) 
         if isinstance(a, int) and isinstance(b, int):
             new_messages = max(0, a - b)
 
-    return {
-        "ok": result["ok"],
-        "applescript_duration_ms": result.get("duration_ms"),
-        "waited_seconds": wait_seconds if result["ok"] else 0,
-        "before": snap_before or None,
-        "after": snap_after or None,
-        "new_messages": new_messages,
-        "error": result.get("error"),
-        "error_code": result.get("error_code"),
-    }
+    error_code = result.get("error_code")
+    return RefreshOutcome(
+        ok=result["ok"],
+        applescript_duration_ms=result.get("duration_ms"),
+        waited_seconds=wait_seconds if result["ok"] else 0.0,
+        before=snap_before or None,
+        after=snap_after or None,
+        new_messages=new_messages,
+        error=result.get("error"),
+        error_code=error_code,
+        # §3.3: the numeric osascript code additionally carries its mapped
+        # string code from the one namespace.
+        code=codes.OSA_CODE_MAP.get(error_code) if error_code is not None
+        else None,
+    )
 
 
 # ---------------------------------------------------------------------- #
@@ -374,7 +446,7 @@ def tool_refresh_mail(wait_seconds: float = 5.0, timeout_seconds: float = 30.0) 
 # ---------------------------------------------------------------------- #
 
 
-@_belt()
+@envelope.tool
 def tool_send_email(
     to: str,
     subject: str,
@@ -383,11 +455,10 @@ def tool_send_email(
     bcc: str | None = None,
     attachments: list[str] | None = None,
     from_identity: str | None = None,
-) -> dict:
-    """Compose + send. Returns {ok, message_id, to, cc, bcc, ...} or a
-    structured {ok: false, error} for caller-fixable failures. Every
-    terminal outcome records ONE `send` ledger event (transmission
-    family: failures are ledger-worthy too — an attempt to transmit)."""
+) -> SendResult:
+    """Compose + send. Every terminal outcome records ONE `send` ledger
+    event (transmission family: failures are ledger-worthy too — an
+    attempt to transmit); the SendError's §3.4 code rides the wire."""
     try:
         res = send_email(
             to=to, subject=subject, body=body, cc=cc, bcc=bcc,
@@ -396,17 +467,17 @@ def tool_send_email(
     except SendError as e:
         audit.emit("send", outcome="failed", tool="send_email",
                    subject=subject, detail={"error": str(e)[:300]})
-        return {"ok": False, "error": str(e)}
+        raise
     audit.emit("send", outcome="sent", tool="send_email",
                message_id=res.message_id, identity=from_identity,
                to=res.to, cc=res.cc or None, bcc=res.bcc or None,
                subject=res.subject,
                detail={"attachments": res.attachments}
                if res.attachments else None)
-    return _to_jsonable(res)
+    return res
 
 
-@_belt()
+@envelope.tool
 def tool_reply_email(
     id: str,
     body: str,
@@ -416,7 +487,7 @@ def tool_reply_email(
     include_history: bool = True,
     attachments: list[str] | None = None,
     from_identity: str | None = None,
-) -> dict:
+) -> SendResult:
     try:
         res = reply_email(
             _source(), id=id, body=body, reply_all=reply_all, cc=cc, bcc=bcc,
@@ -429,16 +500,16 @@ def tool_reply_email(
         audit.emit("reply", outcome="failed", tool="reply_email",
                    detail={"orig_id": id, "reply_all": reply_all,
                            "error": str(e)[:300]})
-        return {"ok": False, "error": str(e)}
+        raise
     audit.emit("reply", outcome="sent", tool="reply_email",
                message_id=res.message_id, identity=from_identity,
                to=res.to, cc=res.cc or None, bcc=res.bcc or None,
                subject=res.subject,
                detail={"orig_id": id, "reply_all": reply_all})
-    return _to_jsonable(res)
+    return res
 
 
-@_belt()
+@envelope.tool
 def tool_schedule_email(
     to: str,
     subject: str,
@@ -448,7 +519,7 @@ def tool_schedule_email(
     bcc: str | None = None,
     attachments: list[str] | None = None,
     from_identity: str | None = None,
-) -> dict:
+) -> spool.Entry:
     try:
         entry = schedule_email(
             to=to, subject=subject, body=body, send_at=send_at,
@@ -458,7 +529,7 @@ def tool_schedule_email(
     except SendError as e:
         audit.emit("schedule", outcome="failed", tool="schedule_email",
                    subject=subject, detail={"error": str(e)[:300]})
-        return {"ok": False, "error": str(e)}
+        raise
     # graph_fallback: the identity asked for Exchange-side deferred send
     # but the entry landed on launchd — the silent-fallback decision is
     # only recoverable here, at the tool layer.
@@ -479,50 +550,41 @@ def tool_schedule_email(
                 "draft_id": entry.graph_draft_id,
                 "graph_fallback": graph_fallback},
     )
-    return {"ok": True, **_to_jsonable(entry)}
+    return entry
 
 
-@_belt()
+@envelope.tool
 def tool_list_scheduled(state: str | None = None, limit: int = 50) -> dict:
-    from . import spool
     from .dispatcher import LAUNCHD_LABEL, _plist_path
 
-    states = [state] if state else list(spool.STATES)
     if state and state not in spool.STATES:
-        return {"ok": False,
-                "error": f"unknown state {state!r} (want one of {spool.STATES})"}
-    out = {s: [_to_jsonable(e) for e in spool.entries(s)][-limit:] for s in states}
+        raise InvalidInput(f"unknown state {state!r} "
+                           f"(want one of {spool.STATES})")
+    states = [state] if state else list(spool.STATES)
     return {
-        "ok": True,
         "dispatcher_installed": _plist_path().exists(),
         "dispatcher_label": LAUNCHD_LABEL,
-        **out,
+        **{s: spool.entries(s)[-limit:] for s in states},
     }
 
 
-def _triage_err(e: TriageError) -> dict:
-    return {"ok": False, "code": e.code, "error": str(e)}
-
-
-def _plan_payload(plan) -> dict:
-    """The staged-plan response shape shared by triage_plan and
-    triage_plan_delete."""
-    return {
-        "ok": True,
-        "plan_id": plan.id,
-        "count": len(plan.messages),
-        "expires_at": plan.expires_at,
-        "summary": plan.summary,
-        "actions": [_to_jsonable(a) for a in plan.actions],
-        "messages": [
-            {"id": str(m.rowid), "subject": m.subject, "from_addr": m.from_addr,
-             "date": m.date, "mailbox": m.mailbox, "unread": m.unread}
+def _plan_receipt(plan) -> PlanReceipt:
+    return PlanReceipt(
+        plan_id=plan.id,
+        count=len(plan.messages),
+        expires_at=plan.expires_at,
+        summary=plan.summary,
+        actions=list(plan.actions),
+        messages=[
+            PlanMessageOut(id=str(m.rowid), subject=m.subject,
+                           from_addr=m.from_addr, date=m.date,
+                           mailbox=m.mailbox, unread=m.unread)
             for m in plan.messages
         ],
-    }
+    )
 
 
-@_belt()
+@envelope.tool
 def tool_triage_plan(
     query: str = "",
     from_addr: str | None = None,
@@ -535,7 +597,7 @@ def tool_triage_plan(
     unread_only: bool = False,
     limit: int = 0,
     actions: list[dict] | None = None,
-) -> dict:
+) -> PlanReceipt:
     from .config import triage_max_messages
 
     cap = triage_max_messages()
@@ -547,14 +609,10 @@ def tool_triage_plan(
         limit=limit if 0 < limit <= cap else cap + 1,  # +1 exposes over-cap
         offset=0,  # plans must be stable selections — no paging
     )
-    try:
-        plan = build_plan(_source(), q, actions)
-    except TriageError as e:
-        return _triage_err(e)
-    return _plan_payload(plan)
+    return _plan_receipt(build_plan(_source(), q, actions))
 
 
-@_belt()
+@envelope.tool
 def tool_triage_plan_delete(
     query: str = "",
     from_addr: str | None = None,
@@ -566,7 +624,7 @@ def tool_triage_plan_delete(
     has_attachment: bool | None = None,
     unread_only: bool = False,
     limit: int = 0,
-) -> dict:
+) -> PlanReceipt:
     from .triage import delete_max
 
     cap = delete_max()
@@ -578,27 +636,17 @@ def tool_triage_plan_delete(
         limit=limit if 0 < limit <= cap else cap + 1,  # +1 exposes over-cap
         offset=0,  # plans must be stable selections — no paging
     )
-    try:
-        plan = build_delete_plan(_source(), q)
-    except TriageError as e:
-        return _triage_err(e)
-    return _plan_payload(plan)
+    return _plan_receipt(build_delete_plan(_source(), q))
 
 
-@_belt(op_from="plan_id")
+@envelope.tool(op_from="plan_id")
 def tool_triage_apply(plan_id: str) -> dict:
-    try:
-        return apply_plan(_source(), plan_id)
-    except TriageError as e:
-        return _triage_err(e)
+    return apply_plan(_source(), plan_id)
 
 
-@_belt()
+@envelope.tool
 def tool_mailbox_create(account: str, path: str) -> dict:
-    try:
-        out = create_mailbox(_source(), account, path)
-    except TriageError as e:
-        return _triage_err(e)
+    out = create_mailbox(_source(), account, path)
     # Store family: emit only on actual change — the idempotent
     # already-there path (existed=true) leaves no ledger event.
     if out.get("existed") is False:
@@ -607,12 +655,9 @@ def tool_mailbox_create(account: str, path: str) -> dict:
     return out
 
 
-@_belt()
+@envelope.tool
 def tool_mailbox_delete(account: str, path: str) -> dict:
-    try:
-        out = delete_mailbox(_source(), account, path)
-    except TriageError as e:
-        return _triage_err(e)
+    out = delete_mailbox(_source(), account, path)
     # Emit only when a deletion was actually issued at Mail (existed) —
     # the idempotent already-absent path leaves no ledger event.
     if out.get("existed"):
@@ -625,12 +670,10 @@ def tool_mailbox_delete(account: str, path: str) -> dict:
     return out
 
 
-@_belt()
-def tool_cancel_scheduled(id: str) -> dict:
-    from . import spool
-
-    def _done(out: dict, outcome: str, *, reason: str | None = None,
-              subject: str | None = None, **extra) -> dict:
+@envelope.tool
+def tool_cancel_scheduled(id: str) -> CancelReceipt:
+    def _finish(outcome: str, *, reason: str | None = None,
+                subject: str | None = None, **extra) -> None:
         """The ONE cancel emit: every terminal exit records exactly one
         `cancel` event; op = the spool id (the artifact-id rule threads
         it to the entry's schedule/deliver events)."""
@@ -638,21 +681,19 @@ def tool_cancel_scheduled(id: str) -> dict:
         audit.emit("cancel", outcome=outcome, operation_id=id,
                    tool="cancel_scheduled", spool_id=id, subject=subject,
                    detail=detail)
-        return out
 
     found = spool.find(id)
     if found is None:
-        return _done(
-            {"ok": False, "error": f"no scheduled message with id {id!r}"},
-            "failed", reason="not_found")
+        _finish("failed", reason="not_found")
+        raise NotFound(f"no scheduled message with id {id!r}")
     state, entry = found
     if state != "pending":
-        return _done(
-            {"ok": False,
-             "error": f"cannot cancel {id}: status is {state!r} "
-                      "(only pending messages can be cancelled)"},
-            "failed", reason="not_pending", subject=entry.subject,
-            state=state)
+        _finish("failed", reason="not_pending", subject=entry.subject,
+                state=state)
+        raise InvalidInput(
+            f"cannot cancel {id}: status is {state!r} "
+            "(only pending messages can be cancelled)",
+            operation_id=id)
 
     if entry.executor == "graph":
         # Exchange holds an armed deferred draft — revoke it FIRST; the
@@ -663,10 +704,10 @@ def tool_cancel_scheduled(id: str) -> dict:
         try:
             ident = identities.get(entry.identity)
         except SendError as e:
-            return _done(
-                {"ok": False, "error": f"cannot cancel {id}: {e}"},
-                "failed", reason="identity_unavailable",
-                subject=entry.subject)
+            _finish("failed", reason="identity_unavailable",
+                    subject=entry.subject)
+            raise SendError(f"cannot cancel {id}: {e}", code=e.code,
+                            operation_id=id) from e
         try:
             draft_id = entry.graph_draft_id
             if draft_id is None:
@@ -677,69 +718,65 @@ def tool_cancel_scheduled(id: str) -> dict:
             outcome = (graph.delete_draft(ident, draft_id)
                        if draft_id else "gone")
         except SendError as e:
-            return _done(
-                {"ok": False,
-                 "error": f"cannot cancel {id}: Exchange still holds the "
-                          f"deferred draft and the revoke failed ({e}). "
-                          "Retry, or discard the draft in Outlook/OWA "
-                          "yourself, then cancel again."},
-                "failed", reason="revoke_failed", subject=entry.subject)
+            _finish("failed", reason="revoke_failed", subject=entry.subject)
+            raise SendError(
+                f"cannot cancel {id}: Exchange still holds the deferred "
+                f"draft and the revoke failed ({e}). Retry, or discard the "
+                "draft in Outlook/OWA yourself, then cancel again.",
+                code=e.code, operation_id=id) from e
         if outcome == "gone":
             # F10 race: the draft vanished on its own — did Exchange
             # already send it? Only Sent Items can say.
             try:
                 sent = graph.sent_by_message_id(ident, entry.message_id)
             except SendError as e:
-                return _done(
-                    {"ok": False,
-                     "error": f"cannot cancel {id}: the deferred draft is "
-                              f"gone but Sent Items could not be checked "
-                              f"({e}) — outcome ambiguous, retry."},
-                    "failed", reason="sent_check_failed",
-                    subject=entry.subject)
+                _finish("failed", reason="sent_check_failed",
+                        subject=entry.subject)
+                raise SendError(
+                    f"cannot cancel {id}: the deferred draft is gone but "
+                    f"Sent Items could not be checked ({e}) — outcome "
+                    "ambiguous, retry.",
+                    code=e.code, operation_id=id) from e
             if sent:
                 # Atomic ownership hand-off (same rename fence as the
                 # cancel below) — a concurrently reconciling dispatcher
                 # must not race this terminal move.
                 if not spool.claim(id, "pending", "sent"):
-                    return _done(
-                        {"ok": False,
-                         "error": f"cannot cancel {id}: a dispatcher "
-                                  "just moved it — re-check "
-                                  "list_scheduled"},
-                        "failed", reason="claim_lost",
-                        subject=entry.subject)
+                    _finish("failed", reason="claim_lost",
+                            subject=entry.subject)
+                    raise InvalidInput(
+                        f"cannot cancel {id}: a dispatcher just moved it — "
+                        "re-check list_scheduled",
+                        operation_id=id)
                 entry.delivered_at = spool.iso(spool.utcnow())
                 entry.next_attempt_at = None
                 entry.last_error = None
                 entry.status = "sent"
                 spool.update("sent", entry)
                 # Terminal state change, ok:false on the wire — still a
-                # ledger-worthy outcome of its own.
-                return _done(
-                    {"ok": False, "id": id, "status": "sent",
-                     "error": f"cannot cancel {id}: Exchange already sent "
-                              "it (found in Sent Items) — the entry has "
-                              "been moved to sent/."},
-                    "too_late_sent", subject=entry.subject)
+                # ledger-worthy outcome of its own. The failure keeps the
+                # entry's terminal state as data (v0.10 wire keys).
+                _finish("too_late_sent", subject=entry.subject)
+                raise InvalidInput(
+                    f"cannot cancel {id}: Exchange already sent it (found "
+                    "in Sent Items) — the entry has been moved to sent/.",
+                    operation_id=id, data={"id": id, "status": "sent"})
             # Confirmed absent from Drafts AND Sent Items: nothing is
             # armed (someone may have discarded it in OWA) — proceed as
             # revoked and cancel the local entry below.
 
     if not spool.claim(id, "pending", "cancelled"):
-        return _done(
-            {"ok": False,
-             "error": f"cannot cancel {id}: a dispatcher just claimed it"},
-            "failed", reason="claim_lost", subject=entry.subject)
+        _finish("failed", reason="claim_lost", subject=entry.subject)
+        raise InvalidInput(f"cannot cancel {id}: a dispatcher just claimed it",
+                           operation_id=id)
     entry.status = "cancelled"
     spool.update("cancelled", entry)
-    return _done(
-        {"ok": True, "id": id, "status": "cancelled",
-         "subject": entry.subject, "was_due": entry.send_at},
-        "cancelled", subject=entry.subject)
+    _finish("cancelled", subject=entry.subject)
+    return CancelReceipt(id=id, status="cancelled", subject=entry.subject,
+                         was_due=entry.send_at)
 
 
-@_belt()
+@envelope.tool
 def tool_doctor() -> dict:
     from . import doctor
 
@@ -761,7 +798,7 @@ def _valid_iso_bound(value: str) -> bool:
     return True
 
 
-@_belt()
+@envelope.tool
 def tool_audit(
     since: str | None = None,
     until: str | None = None,
@@ -770,17 +807,16 @@ def tool_audit(
     plan_id: str | None = None,
     operation_id: str | None = None,
     limit: int = 50,
-) -> dict:
+) -> AuditPage:
     for name, value in (("since", since), ("until", until)):
         if value is not None and not _valid_iso_bound(str(value)):
-            return {"ok": False, "code": codes.INVALID_INPUT,
-                    "error": f"invalid ISO datetime for `{name}`: {value!r} "
-                             "(want ISO-8601; prefixes allowed, e.g. "
-                             "2026-07 or 2026-07-29)"}
-    out = audit.query(since=since, until=until, tool=tool, event=event,
-                      plan_id=plan_id, operation_id=operation_id,
-                      limit=limit)
-    return {"ok": True, **out}
+            raise InvalidInput(
+                f"invalid ISO datetime for `{name}`: {value!r} "
+                "(want ISO-8601; prefixes allowed, e.g. "
+                "2026-07 or 2026-07-29)")
+    return AuditPage(**audit.query(
+        since=since, until=until, tool=tool, event=event,
+        plan_id=plan_id, operation_id=operation_id, limit=limit))
 
 
 # ---------------------------------------------------------------------- #
@@ -837,7 +873,8 @@ def _build_mcp_server():
         the question: "full" (headers + text/HTML bodies + attachment list —
         the default), "metadata" (everything except the bodies), "minimal"
         (id/subject/from/date/mailbox/unread skeleton). Bodies are always
-        read live from the mail store, never from the search index."""
+        read live from the mail store, never from the search index.
+        Returns {ok, email}."""
         return tool_get_email(id, view=view)
 
     @mcp.tool()
@@ -851,13 +888,15 @@ def _build_mcp_server():
         return tool_get_emails_batch(ids, view=view)
 
     @mcp.tool()
-    def get_thread(thread_id: str) -> list[dict]:
-        """Get every message in a conversation, oldest first."""
+    def get_thread(thread_id: str) -> dict:
+        """Get every message in a conversation, oldest first.
+        Returns {ok, thread}."""
         return tool_get_thread(thread_id)
 
     @mcp.tool()
-    def list_mailboxes() -> list[dict]:
-        """List all known mailboxes across all accounts, with message counts."""
+    def list_mailboxes() -> dict:
+        """List all known mailboxes across all accounts, with message
+        counts. Returns {ok, mailboxes}."""
         return tool_list_mailboxes()
 
     @mcp.tool()
@@ -865,14 +904,16 @@ def _build_mcp_server():
         mailbox: str | None = None,
         account: str | None = None,
         limit: int = 50,
-    ) -> list[dict]:
-        """List the newest messages, optionally scoped to a mailbox/account."""
+    ) -> dict:
+        """List the newest messages, optionally scoped to a mailbox/account.
+        Returns {ok, messages}."""
         return tool_list_recent(mailbox=mailbox, account=account, limit=limit)
 
     @mcp.tool()
     def get_attachment(id: str, attachment_id: str) -> dict:
         """Materialise an attachment to a tmp file and return its path. The
-        caller (Claude) can then `Read` the file. Bytes are never inlined."""
+        caller (Claude) can then `Read` the file. Bytes are never inlined.
+        Returns {ok, attachment}."""
         return tool_get_attachment(id, attachment_id)
 
     @mcp.tool()
