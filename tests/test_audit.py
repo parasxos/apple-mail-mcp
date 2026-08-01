@@ -1,8 +1,8 @@
 """Audit ledger core (email_mcp.audit + email_mcp.ids) — v0.10 S1.
 
-The suite-wide EMAIL_MCP_AUDIT_DIR guard moves to conftest.py at S2 (when
-server/dispatcher hooks start emitting from other test files); until then
-the autouse fixture below isolates every test in THIS file.
+The autouse fixture below shadows conftest's adopted-tree guard: it pins
+only EMAIL_MCP_STATE_DIR, so emit's own adoption path (dir creation,
+permissions, refusal-drops) is exercised for real in this file.
 """
 from __future__ import annotations
 
@@ -16,16 +16,16 @@ from pathlib import Path
 
 import pytest
 
-from email_mcp import audit
+from email_mcp import audit, state
 
 
 @pytest.fixture(autouse=True)
 def audit_dir_guard(tmp_path, monkeypatch):
-    """Point the ledger at a per-test tmp dir — nothing here may ever
-    touch ~/.email-mcp/audit — and reset the process tag afterwards."""
-    d = tmp_path / "audit"
-    monkeypatch.setenv("EMAIL_MCP_AUDIT_DIR", str(d))
-    yield d
+    """Pin the state root inside tmp — nothing here may ever touch
+    ~/.email-mcp — and reset the process tag afterwards. The audit leaf
+    is handed out un-created: emit's own adoption is under test."""
+    monkeypatch.setenv("EMAIL_MCP_STATE_DIR", str(tmp_path / "state"))
+    yield tmp_path / "state" / "audit"
     audit.set_process("server")
 
 
@@ -37,8 +37,9 @@ def _lines(d: Path) -> list[str]:
 
 
 def _seed(d: Path, month: str, records: list) -> Path:
-    """Write a monthly file from dicts (serialized) and/or raw lines."""
-    d.mkdir(parents=True, exist_ok=True)
+    """Write a monthly file from dicts (serialized) and/or raw lines —
+    through the adoption door, so the tree stays marker-resolvable."""
+    assert state.State.resolve().adopt().audit == d
     path = d / f"{month}.jsonl"
     lines = [r if isinstance(r, str) else json.dumps(r) for r in records]
     path.write_text("\n".join(lines) + "\n", encoding="utf-8")
@@ -128,24 +129,26 @@ def test_emit_never_raises_and_returns_none_when_unwritable(
 ):
     parent = tmp_path / "ro"
     parent.mkdir()
-    monkeypatch.setenv("EMAIL_MCP_AUDIT_DIR", str(parent / "audit"))
-    parent.chmod(0o500)  # audit dir cannot be created underneath
+    monkeypatch.setenv("EMAIL_MCP_STATE_DIR", str(parent / "state"))
+    parent.chmod(0o500)  # the state root cannot be created underneath
     try:
         assert audit.emit("send", outcome="sent") is None  # no raise
     finally:
         parent.chmod(0o700)
-    assert not (parent / "audit").exists()
+    assert not (parent / "state").exists()
 
 
-def test_env_overridden_dir_never_chmods_parent(audit_dir_guard):
-    """Gate regression: with EMAIL_MCP_AUDIT_DIR set, the parent is not
-    ours — chmod'ing it can raise (root-owned temp roots) and would cost
-    the event. Only the default ~/.email-mcp parent gets locked down."""
-    parent = audit_dir_guard.parent
-    parent.chmod(0o755)
+def test_state_root_parent_never_chmodded(tmp_path, monkeypatch):
+    """The root's parent is not ours — chmod'ing it can raise (root-owned
+    temp roots) and would cost the event. Adoption locks down the root
+    itself and stops there."""
+    root = tmp_path / "state"
+    monkeypatch.setenv("EMAIL_MCP_STATE_DIR", str(root))
+    tmp_path.chmod(0o755)
     assert audit.emit("send", outcome="sent") is not None
-    assert len(_lines(audit_dir_guard)) == 1  # the event landed
-    assert stat.S_IMODE(parent.stat().st_mode) == 0o755  # parent untouched
+    assert len(_lines(root / "audit")) == 1        # the event landed
+    assert stat.S_IMODE(root.stat().st_mode) == 0o700
+    assert stat.S_IMODE(tmp_path.stat().st_mode) == 0o755  # parent untouched
 
 
 def test_emit_file_and_dir_permissions(audit_dir_guard):
@@ -164,8 +167,9 @@ def test_set_process_tags_src(audit_dir_guard):
 
 
 def _hammer(dir_str: str, src: str, count: int) -> None:
-    """Spawned-process worker: emit `count` events into the given ledger."""
-    os.environ["EMAIL_MCP_AUDIT_DIR"] = dir_str
+    """Spawned-process worker: emit `count` events into the given ledger
+    (dir_str is the audit leaf; its parent is the state root)."""
+    os.environ["EMAIL_MCP_STATE_DIR"] = str(Path(dir_str).parent)
     from email_mcp import audit as aud
     aud.set_process(src)
     for i in range(count):
@@ -264,11 +268,11 @@ def test_query_prunes_months_and_filters_fields(audit_dir_guard):
 
 def test_query_absent_dir_returns_empty(tmp_path, monkeypatch):
     missing = tmp_path / "never-created"
-    monkeypatch.setenv("EMAIL_MCP_AUDIT_DIR", str(missing))
+    monkeypatch.setenv("EMAIL_MCP_STATE_DIR", str(missing))
     assert audit.query() == {
         "events": [], "files_scanned": 0, "skipped_lines": 0,
     }
-    assert not missing.exists()  # create=False never mkdirs
+    assert not missing.exists()  # read paths never create
 
 
 def test_cli_tail_and_status(audit_dir_guard, capsys):
@@ -299,7 +303,7 @@ def test_detail_fence_strips_bodies_and_secrets_recursively(tmp_path, monkeypatc
     """Audit finding F2: the no-bodies guarantee must be a structural fence,
     not call-site discipline — denylisted keys never reach the ledger, at
     any nesting depth, and the redaction itself is on record."""
-    monkeypatch.setenv("EMAIL_MCP_AUDIT_DIR", str(tmp_path))
+    monkeypatch.setenv("EMAIL_MCP_STATE_DIR", str(tmp_path / "state"))
     from email_mcp import audit
     audit.emit(
         "send", outcome="sent", operation_id="op-fence-1",
@@ -310,7 +314,7 @@ def test_detail_fence_strips_bodies_and_secrets_recursively(tmp_path, monkeypatc
             "reason": "ok-to-keep",
         },
     )
-    line = next(tmp_path.glob("*.jsonl")).read_text()
+    line = next((tmp_path / "state" / "audit").glob("*.jsonl")).read_text()
     assert "SECRET BODY TEXT" not in line
     assert "tok-123" not in line and "hunter2" not in line
     assert '"keep": "yes"' in line.replace("  ", " ") or '"keep":"yes"' in line
@@ -323,8 +327,7 @@ def test_detail_fence_strips_bodies_and_secrets_recursively(tmp_path, monkeypatc
 def test_plan_finish_survives_malformed_result(tmp_path, monkeypatch):
     """Audit finding F5: a shaped-data surprise in the finish result must
     neither raise out of plans.finish nor lose the plan_finish event."""
-    monkeypatch.setenv("EMAIL_MCP_AUDIT_DIR", str(tmp_path / "audit"))
-    monkeypatch.setenv("EMAIL_MCP_PLANS_DIR", str(tmp_path / "plans"))
+    monkeypatch.setenv("EMAIL_MCP_STATE_DIR", str(tmp_path / "state"))
     from email_mcp import audit, plans
     plan = plans.Plan(
         id=plans.new_id(), created_at=plans.iso(plans.utcnow()),

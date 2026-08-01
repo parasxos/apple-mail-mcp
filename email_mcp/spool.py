@@ -18,9 +18,9 @@ import json
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
-from . import config, ids
+from . import config, ids, state
 
-STATES = ("pending", "sending", "sent", "failed", "cancelled")
+STATES = state.SPOOL_STATES
 
 
 @dataclass
@@ -63,8 +63,11 @@ def _paths(state: str, id: str) -> tuple[Path, Path]:
 
 def save(raw: bytes, entry: Entry) -> None:
     """Write .eml + .json into pending/ (tmp-then-rename, so a crashed
-    writer never leaves a half-visible message)."""
-    eml, manifest = _paths("pending", entry.id)
+    writer never leaves a half-visible message). The one spool write seam
+    that goes through state adoption — every other operation renames or
+    rewrites inside the tree it guarantees."""
+    d = state.State.resolve().adopt().spool / "pending"
+    eml, manifest = d / f"{entry.id}.eml", d / f"{entry.id}.json"
     for path, data in ((eml, raw), (manifest, _dumps(entry))):
         tmp = path.with_suffix(path.suffix + ".tmp")
         tmp.write_bytes(data)

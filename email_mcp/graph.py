@@ -17,7 +17,7 @@ busy-loop.
 
 Auth: delegated device-code flow (Mail.ReadWrite + Mail.Send +
 offline_access), stdlib only — no msal. Token caches live at
-`config.graph_dir()/<identity>.token.json`, 0600 inside a 0700 dir,
+`<state root>/graph/<identity>.token.json`, 0600 inside a 0700 dir,
 rewritten atomically (tmp + rename). Access tokens refresh silently via
 the cached refresh_token; when refresh fails the GraphError names the fix:
 
@@ -42,7 +42,7 @@ from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
 from pathlib import Path
 
-from . import config
+from . import config, state
 from .log import get_logger
 from .transports import SendError
 
@@ -224,17 +224,17 @@ def _graph_reason(body: dict) -> str:
 
 
 # --------------------------------------------------------------------- #
-# token cache (config.graph_dir()/<name>.token.json, 0600 in 0700)       #
+# token cache (<state root>/graph/<name>.token.json, 0600 in 0700)       #
 # --------------------------------------------------------------------- #
 
 
 def _token_path(ident) -> Path:
     try:
-        d = config.graph_dir()
-    except OSError as e:
-        # An unwritable/uncreatable state dir must surface as a GraphError:
-        # schedule-time callers then fall back to launchd instead of
-        # leaking a raw OSError traceback through the tool.
+        d = state.State.resolve().adopt().graph
+    except OSError as e:  # RefusedError included
+        # An unadoptable state tree or broken graph leaf must surface as a
+        # GraphError: schedule-time callers then fall back to launchd
+        # instead of leaking a raw OSError traceback through the tool.
         raise GraphError(
             f"[{_name(ident)}/graph] cannot create/open the graph state "
             f"dir: {e}"

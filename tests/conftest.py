@@ -255,31 +255,22 @@ def mail_fixture(tmp_path: Path) -> Path:
 
 
 @pytest.fixture(autouse=True)
-def fts_dir_guard(tmp_path_factory, monkeypatch) -> Path:
-    """Point the FTS index at a per-test tmp dir for EVERY test — nothing in
-    the suite may ever touch (or create) ~/.email-mcp/fts."""
-    d = tmp_path_factory.mktemp("fts-index")
-    monkeypatch.setenv("EMAIL_MCP_FTS_DIR", str(d))
-    return d
+def state_dir_guard(tmp_path_factory, monkeypatch) -> Path:
+    """Pin the managed state tree (spool/plans/graph/fts/audit) to a fresh
+    per-test root for EVERY test — nothing in the suite may ever resolve,
+    adopt, or write ~/.email-mcp. Module fixtures that wipe every
+    EMAIL_MCP_* variable re-pin this same root themselves."""
+    root = tmp_path_factory.mktemp("state-root")
+    monkeypatch.setenv("EMAIL_MCP_STATE_DIR", str(root))
+    return root
 
 
-@pytest.fixture(autouse=True)
-def audit_dir_guard(tmp_path_factory, monkeypatch) -> Path:
-    """Point the audit ledger at a per-test tmp dir for EVERY test — nothing
-    in the suite may ever touch (or create) ~/.email-mcp/audit (mirrors the
-    fts guard above).
+@pytest.fixture
+def audit_dir_guard(state_dir_guard) -> Path:
+    """The audit leaf under the pinned state root, created through the one
+    effectful door (name kept: the ledger suites address the directory).
+    test_audit.py / test_audit_redteam.py shadow this fixture on purpose:
+    their tests exercise emit's own adoption path on a virgin root."""
+    from email_mcp import state
 
-    Belt on top of the env pin: several test modules wipe every EMAIL_MCP_*
-    variable in their own autouse fixtures, which run AFTER this one — the
-    env pin alone would not survive them, and any mutation-path emit (the
-    v0.10 hooks fire in dispatcher/triage/server tests) would land in the
-    REAL ledger. So the resolver itself is pinned too. test_audit.py
-    shadows this fixture by name on purpose: its tests exercise the real
-    env-driven config.audit_dir (permissions, absent-dir, parent-chmod)."""
-    from email_mcp import config
-
-    d = tmp_path_factory.mktemp("audit-ledger")
-    d.chmod(0o700)  # what config.audit_dir guarantees; doctor checks it
-    monkeypatch.setenv("EMAIL_MCP_AUDIT_DIR", str(d))
-    monkeypatch.setattr(config, "audit_dir", lambda create=True: d)
-    return d
+    return state.State.resolve().adopt().audit

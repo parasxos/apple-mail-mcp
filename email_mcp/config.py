@@ -1,9 +1,22 @@
-"""Runtime configuration via environment variables. All optional."""
+"""Runtime configuration via environment variables. All optional.
+
+The five state-tree getters (spool_dir/plans_dir/graph_dir/fts_dir/
+audit_dir) are pure path questions delegating to email_mcp.state — the
+tree itself is created only through state adoption (the one effectful
+door). They raise state.RefusedError with the single policy reason when
+resolution refuses (retired vars, home-directory roots, ...).
+"""
 from __future__ import annotations
 
 import os
 import re
 from pathlib import Path
+
+from . import state
+
+
+def _state() -> state.StateReader:
+    return state.State.resolve().reader()
 
 
 def mail_dir() -> Path:
@@ -137,19 +150,9 @@ def send_delivery_cmd() -> str:
 
 
 def spool_dir() -> Path:
-    """Root of the scheduled-mail spool (frozen .eml + .json manifests).
-
-    Default ~/.email-mcp/spool, override with EMAIL_MCP_SPOOL_DIR. The tree
-    holds fully-composed outgoing mail (bodies + attachments), so it is
-    created 0700 and kept that way.
-    """
-    raw = os.environ.get("EMAIL_MCP_SPOOL_DIR", "").strip()
-    d = Path(raw).expanduser() if raw else Path.home() / ".email-mcp" / "spool"
-    for sub in ("pending", "sending", "sent", "failed", "cancelled"):
-        (d / sub).mkdir(parents=True, exist_ok=True)
-    d.parent.chmod(0o700)
-    d.chmod(0o700)
-    return d
+    """Path of the scheduled-mail spool (frozen .eml + .json manifests):
+    <state root>/spool. A path question only — never creates."""
+    return _state().spool
 
 
 def send_max_retries() -> int:
@@ -158,18 +161,9 @@ def send_max_retries() -> int:
 
 
 def graph_dir() -> Path:
-    """Root of the Graph executor state (per-identity OAuth token caches).
-
-    Default ~/.email-mcp/graph, override with EMAIL_MCP_GRAPH_DIR. Token
-    files grant delegated mailbox access, so the dir is created 0700 and
-    kept that way (same pattern as spool_dir).
-    """
-    raw = os.environ.get("EMAIL_MCP_GRAPH_DIR", "").strip()
-    d = Path(raw).expanduser() if raw else Path.home() / ".email-mcp" / "graph"
-    d.mkdir(parents=True, exist_ok=True)
-    d.parent.chmod(0o700)
-    d.chmod(0o700)
-    return d
+    """Path of the Graph executor state (per-identity OAuth token caches):
+    <state root>/graph. A path question only — never creates."""
+    return _state().graph
 
 
 # ---------------------------------------------------------------------- #
@@ -178,14 +172,9 @@ def graph_dir() -> Path:
 
 
 def plans_dir() -> Path:
-    """Root of the triage plan store (frozen plan JSONs). Created 0700 —
-    plans carry message metadata."""
-    raw = os.environ.get("EMAIL_MCP_PLANS_DIR", "").strip()
-    d = Path(raw).expanduser() if raw else Path.home() / ".email-mcp" / "plans"
-    d.mkdir(parents=True, exist_ok=True)
-    d.parent.chmod(0o700)
-    d.chmod(0o700)
-    return d
+    """Path of the triage plan store (frozen plan JSONs):
+    <state root>/plans. A path question only — never creates."""
+    return _state().plans
 
 
 def triage_max_messages() -> int:
@@ -223,21 +212,10 @@ def triage_verify_interval() -> float:
 # ---------------------------------------------------------------------- #
 
 
-def fts_dir(create: bool = True) -> Path:
-    """Root of the local FTS5 body index. Created 0700 like plans_dir —
-    the index stores extracted message bodies.
-
-    Default ~/.email-mcp/fts, override with EMAIL_MCP_FTS_DIR. Pass
-    create=False to resolve the path without touching the filesystem —
-    read paths (search, --status) must never create the index directory.
-    """
-    raw = os.environ.get("EMAIL_MCP_FTS_DIR", "").strip()
-    d = Path(raw).expanduser() if raw else Path.home() / ".email-mcp" / "fts"
-    if create:
-        d.mkdir(parents=True, exist_ok=True)
-        d.parent.chmod(0o700)
-        d.chmod(0o700)
-    return d
+def fts_dir() -> Path:
+    """Path of the local FTS5 body index: <state root>/fts. A path
+    question only — never creates."""
+    return _state().fts
 
 
 def fts_enabled() -> bool:
@@ -278,25 +256,10 @@ def fts_reconcile_days() -> int:
 # ---------------------------------------------------------------------- #
 
 
-def audit_dir(create: bool = True) -> Path:
-    """Root of the append-only audit ledger (monthly JSONL event files).
-    Created 0700 like plans_dir — events carry recipients and subjects.
-
-    Default ~/.email-mcp/audit, override with EMAIL_MCP_AUDIT_DIR. Pass
-    create=False to resolve the path without touching the filesystem —
-    read paths (query, --status) must never create the ledger directory.
-    """
-    raw = os.environ.get("EMAIL_MCP_AUDIT_DIR", "").strip()
-    d = Path(raw).expanduser() if raw else Path.home() / ".email-mcp" / "audit"
-    if create:
-        d.mkdir(parents=True, exist_ok=True)
-        if not raw:
-            # Lock down ~/.email-mcp itself. An env-overridden dir's
-            # parent is not ours to chmod (and may refuse — e.g. a
-            # root-owned temp root), which must never cost an event.
-            d.parent.chmod(0o700)
-        d.chmod(0o700)
-    return d
+def audit_dir() -> Path:
+    """Path of the append-only audit ledger (monthly JSONL event files):
+    <state root>/audit. A path question only — never creates."""
+    return _state().audit
 
 
 def send_max_attach_mb() -> float:

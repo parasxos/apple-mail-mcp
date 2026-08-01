@@ -17,7 +17,7 @@ from dataclasses import asdict, dataclass, field
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-from . import audit, config, ids
+from . import audit, config, ids, state
 
 STATUSES = ("draft", "applied", "failed", "expired")
 
@@ -83,7 +83,8 @@ def _revive(data: dict) -> Plan:
 
 
 def save(plan: Plan) -> None:
-    path = _path(plan.id)
+    # The one plan write seam: the store comes to exist via state adoption.
+    path = state.State.resolve().adopt().plans / f"{plan.id}.json"
     tmp = path.with_suffix(path.suffix + ".tmp")
     tmp.write_bytes(json.dumps(asdict(plan), indent=2).encode())
     tmp.rename(path)

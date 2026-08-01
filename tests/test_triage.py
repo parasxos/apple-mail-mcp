@@ -27,7 +27,7 @@ def _clean_env(monkeypatch, tmp_path):
     for k in list(__import__("os").environ):
         if k.startswith("EMAIL_MCP_"):
             monkeypatch.delenv(k, raising=False)
-    monkeypatch.setenv("EMAIL_MCP_PLANS_DIR", str(tmp_path / "plans"))
+    monkeypatch.setenv("EMAIL_MCP_STATE_DIR", str(tmp_path / "state"))
     monkeypatch.setenv("EMAIL_MCP_TRIAGE_VERIFY_INTERVAL", "0")
 
 

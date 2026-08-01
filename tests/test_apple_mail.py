@@ -176,8 +176,8 @@ def test_absent_index_degrades_to_like_and_creates_nothing(
         mail_fixture, monkeypatch, tmp_path):
     from email_mcp import server
 
-    target = tmp_path / "fts-never-created"
-    monkeypatch.setenv("EMAIL_MCP_FTS_DIR", str(target))
+    target = tmp_path / "state-never-created"
+    monkeypatch.setenv("EMAIL_MCP_STATE_DIR", str(target))
     monkeypatch.setattr(server, "_SOURCE", AppleMailSource(mail_base=mail_fixture))
 
     out = server.tool_search_emails(query="I2C")

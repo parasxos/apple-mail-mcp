@@ -36,16 +36,16 @@ def _iso_in(minutes: float) -> str:
 
 
 @pytest.fixture
-def send_env(monkeypatch, tmp_path):
-    """Documented defaults + isolated spool/plans (mirrors the sender
-    suites; the audit dir is already pinned by the conftest guard)."""
+def send_env(monkeypatch, tmp_path, state_dir_guard):
+    """Documented defaults (mirrors the sender suites); the state root is
+    re-pinned after the EMAIL_MCP_* wipe — spool/plans/audit all live
+    under the conftest guard's root."""
     for k in list(os.environ):
         if k.startswith("EMAIL_MCP_"):
             monkeypatch.delenv(k, raising=False)
+    monkeypatch.setenv("EMAIL_MCP_STATE_DIR", str(state_dir_guard))
     monkeypatch.setenv("EMAIL_MCP_FROM_ADDR", "paris@example.org")
     monkeypatch.setenv("EMAIL_MCP_FROM_NAME", "Paris")
-    monkeypatch.setenv("EMAIL_MCP_SPOOL_DIR", str(tmp_path / "spool"))
-    monkeypatch.setenv("EMAIL_MCP_PLANS_DIR", str(tmp_path / "plans"))
     monkeypatch.setenv("EMAIL_MCP_IDENTITIES",
                        str(tmp_path / "no-identities.toml"))
 

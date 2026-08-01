@@ -26,9 +26,7 @@ def _env(monkeypatch, tmp_path, mail_fixture):
         if k.startswith("EMAIL_MCP_"):
             monkeypatch.delenv(k, raising=False)
     monkeypatch.setenv("EMAIL_MCP_MAIL_DIR", str(mail_fixture))
-    monkeypatch.setenv("EMAIL_MCP_SPOOL_DIR", str(tmp_path / "spool"))
-    monkeypatch.setenv("EMAIL_MCP_PLANS_DIR", str(tmp_path / "plans"))
-    monkeypatch.setenv("EMAIL_MCP_FTS_DIR", str(tmp_path / "fts"))
+    monkeypatch.setenv("EMAIL_MCP_STATE_DIR", str(tmp_path / "state"))
     monkeypatch.setenv("EMAIL_MCP_IDENTITIES",
                        str(tmp_path / "identities.toml"))
     # Post person-clean flip there is no default from_addr; the all-green
@@ -84,13 +82,13 @@ def test_run_shape_and_all_green(tmp_path):
         assert isinstance(check["detail"], str) and check["detail"], name
     assert "4 messages" in report["checks"]["mail_store"]["detail"]
     assert report["checks"]["graph"]["ok"] is True
-    # Absent index is a fresh install, not a fault — and statting it must
-    # not create the directory (read-path purity).
+    # Absent index is a fresh install, not a fault — and doctor is a pure
+    # reader: running it must not create ANY of the state tree.
     fts_check = report["checks"]["fts"]
     assert fts_check["ok"] is True
     assert "not built" in fts_check["detail"]
     assert "--build" in fts_check["fix"]
-    assert not (tmp_path / "fts").exists()
+    assert not (tmp_path / "state").exists()
 
 
 def test_read_only_flag_is_reflected(monkeypatch):
@@ -248,10 +246,8 @@ def test_check_audit_flags_file_where_dir_belongs(monkeypatch, tmp_path):
     the audit path must read as a fault, not a fresh install."""
     bogus = tmp_path / "audit"
     bogus.write_text("not a directory")
-    # conftest's audit_dir_guard monkeypatches config.audit_dir itself
-    # (env alone is inert here) — override the getter, per its docstring.
     from email_mcp import config, doctor
-    monkeypatch.setattr(config, "audit_dir", lambda create=True: bogus)
+    monkeypatch.setattr(config, "audit_dir", lambda: bogus)
     res = doctor.check_audit()
     assert res["ok"] is False
     assert "not a directory" in res["detail"]

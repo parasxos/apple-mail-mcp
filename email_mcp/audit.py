@@ -2,8 +2,8 @@
 
 The ledger indexes the truths already frozen elsewhere (spool manifests,
 plan files, Message-IDs) — it does not create truth. Schema v1 is specified
-in docs/v1-contract.md §6. Storage: monthly JSONL files under
-config.audit_dir() — ~/.email-mcp/audit/YYYY-MM.jsonl, dir 0700, files 0600.
+in docs/v1-contract.md §6. Storage: monthly JSONL files under the state
+tree's audit leaf — ~/.email-mcp/audit/YYYY-MM.jsonl, dir 0700, files 0600.
 
 Two writer processes exist (server + launchd dispatcher), so an append is
 one os.write on an O_APPEND fd opened per event — lines never interleave —
@@ -29,7 +29,7 @@ import os
 import re
 from datetime import datetime
 
-from . import config, ids
+from . import config, ids, state
 from .log import get_logger
 
 _log = get_logger()
@@ -130,8 +130,11 @@ def emit(
                 value = value[:SUBJECT_MAX_CHARS]
             record[key] = value
         line = _fit(record)
-        # Month resolved from this event's own ts: no rollover race.
-        path = config.audit_dir() / f"{ts[:7]}.jsonl"
+        # Month resolved from this event's own ts: no rollover race. The
+        # ledger dir comes from state adoption — a refused root or broken
+        # leaf raises here and is dropped by the fence below (§6:
+        # log-and-continue, absolute).
+        path = state.State.resolve().adopt().audit / f"{ts[:7]}.jsonl"
         # O_RDWR (not O_WRONLY) so the torn-tail probe below can pread.
         fd = os.open(path, os.O_RDWR | os.O_CREAT | os.O_APPEND, 0o600)
         try:
@@ -244,7 +247,7 @@ def query(
         limit = 50
     limit = max(1, min(limit, 500))
 
-    root = config.audit_dir(create=False)
+    root = config.audit_dir()  # a path question: read paths never create
     if not root.is_dir():
         return {"events": [], "files_scanned": 0, "skipped_lines": 0}
 
@@ -313,7 +316,7 @@ def tail(n: int = 20) -> list[dict]:
 
 
 def _print_status() -> None:
-    root = config.audit_dir(create=False)
+    root = config.audit_dir()
     if not root.is_dir():
         print(f"dir: {root} (absent — no events recorded yet)")
         return

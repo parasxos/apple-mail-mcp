@@ -21,7 +21,7 @@ from datetime import datetime, timedelta, timezone
 
 import pytest
 
-from email_mcp import config, dispatcher, graph, sender, server, spool
+from email_mcp import config, dispatcher, graph, sender, server, spool, state
 from email_mcp.graph import GraphError
 from email_mcp.identities import Identity
 from email_mcp.transports import SendError
@@ -29,13 +29,13 @@ from email_mcp.transports import SendError
 
 @pytest.fixture(autouse=True)
 def _graph_env(monkeypatch, tmp_path):
-    """Token caches + spool in tmp, identities pointed at a nonexistent
-    file, and no env leakage — nothing outside tmp_path is touched."""
+    """State tree (token caches + spool) in tmp, identities pointed at a
+    nonexistent file, and no env leakage — nothing outside tmp_path is
+    touched."""
     for k in list(os.environ):
         if k.startswith("EMAIL_MCP_"):
             monkeypatch.delenv(k, raising=False)
-    monkeypatch.setenv("EMAIL_MCP_GRAPH_DIR", str(tmp_path / "graph"))
-    monkeypatch.setenv("EMAIL_MCP_SPOOL_DIR", str(tmp_path / "spool"))
+    monkeypatch.setenv("EMAIL_MCP_STATE_DIR", str(tmp_path / "state"))
     monkeypatch.setenv(
         "EMAIL_MCP_IDENTITIES", str(tmp_path / "no-identities.toml")
     )
@@ -90,7 +90,7 @@ def _ident(name="cern", executor="graph"):
 
 def _seed_token(name="cern", access="acc-token", refresh="ref-token",
                 expires_in=3600.0):
-    path = config.graph_dir() / f"{name}.token.json"
+    path = state.State.resolve().adopt().graph / f"{name}.token.json"
     path.write_text(json.dumps({
         "access_token": access,
         "refresh_token": refresh,
@@ -1170,18 +1170,16 @@ def test_token_cache_truncated_json_is_clear_error_not_traceback(
     assert fake.calls == []
 
 
-def test_schedule_graph_dir_unwritable_falls_back_to_launchd(
+def test_schedule_graph_leaf_broken_falls_back_to_launchd(
     monkeypatch, tmp_path,
 ):
-    """config.graph_dir() raising OSError (unwritable disk/permissions) at
-    schedule time must behave like any GraphError: silent launchd
-    fallback, frozen .eml intact — not a traceback through the tool."""
+    """A broken graph leaf (a file squatting on it — leaves are
+    independent, so the spool still works) at schedule time must behave
+    like any GraphError: silent launchd fallback, frozen .eml intact —
+    not a traceback through the tool."""
     _write_graph_toml(tmp_path, monkeypatch)
-
-    def boom():
-        raise PermissionError("read-only file system")
-
-    monkeypatch.setattr(config, "graph_dir", boom)
+    root = state.State.resolve().adopt().root
+    (root / "graph").write_text("squatter")  # the leaf can never be a dir
     fake = _fake(monkeypatch)
     entry = sender.schedule_email(
         to="someone@example.org", subject="s", body="b",
@@ -1190,6 +1188,20 @@ def test_schedule_graph_dir_unwritable_falls_back_to_launchd(
     assert entry.executor == "launchd" and entry.graph_draft_id is None
     assert fake.calls == []
     assert spool.read_eml("pending", entry.id)
+
+
+def test_token_path_refused_state_is_graph_error(monkeypatch):
+    """A refused state resolution at token-cache access surfaces as a
+    GraphError naming the cause — the seam schedule callers fall back
+    on — never a raw OSError traceback."""
+    monkeypatch.setattr(
+        state.State, "resolve",
+        staticmethod(lambda: state.Refused("state root refused (test)")),
+    )
+    with pytest.raises(GraphError) as ei:
+        graph._token_path(_ident())
+    assert "cannot create/open the graph state dir" in str(ei.value)
+    assert "state root refused (test)" in str(ei.value)
 
 
 def test_create_send_wire_death_delete_gone_treated_as_armed(monkeypatch):

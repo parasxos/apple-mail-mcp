@@ -32,7 +32,7 @@ import sys
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-from . import audit, codes, config, identities, sender, spool
+from . import audit, codes, config, identities, sender, spool, state
 from .log import get_logger
 
 _log = get_logger()
@@ -506,6 +506,7 @@ def _remove_legacy_plists() -> list[str]:
 
 
 def install_launchd() -> str:
+    state.State.resolve().adopt()  # the agent's log lands in the state root
     migrated = _remove_legacy_plists()
     plist = _plist_path()
     plist.parent.mkdir(parents=True, exist_ok=True)

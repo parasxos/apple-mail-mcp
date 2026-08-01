@@ -276,16 +276,19 @@ def check_dispatcher() -> dict:
 
 
 def check_spool_plans() -> dict:
-    """Spool + plan stores: directories exist with 0700, per-state counts,
-    and no delivery claims stranded in sending/."""
+    """Spool + plan stores: 0700 modes where present (absent = fresh
+    install — the tree is created by state adoption on first use, never
+    by doctor), per-state counts, and no delivery claims stranded in
+    sending/."""
     from . import spool
     from .dispatcher import STALE_SENDING_MINUTES
 
-    spool_root = config.spool_dir()   # creates + chmods, like every caller
-    plans_root = config.plans_dir()
     problems: list[str] = []
     fixes: list[str] = []
-    for label, d in (("spool", spool_root), ("plans", plans_root)):
+    for label, d in (("spool", config.spool_dir()),
+                     ("plans", config.plans_dir())):
+        if not d.is_dir():
+            continue  # fresh install, not a fault
         mode = d.stat().st_mode & 0o777
         if mode != 0o700:
             problems.append(f"{label} dir {d} is mode {mode:o} (want 700)")
@@ -357,7 +360,7 @@ def check_audit() -> dict:
     on the first mutation. Reports the last recorded event via tail(1)."""
     from . import audit, ids
 
-    root = config.audit_dir(create=False)  # purity: never create here
+    root = config.audit_dir()  # a path question: doctor never creates
     if root.exists() and not root.is_dir():
         # Pathological: a regular file where the ledger dir belongs. emit()
         # would silently drop every event (mkdir over a file raises) — the
@@ -418,13 +421,6 @@ def check_audit() -> dict:
     return out
 
 
-def _graph_token_dir() -> Path:
-    """config.graph_dir()'s path WITHOUT its mkdir side effect — doctor
-    checks stat, they never create (same purity rule as check_fts)."""
-    raw = os.environ.get("EMAIL_MCP_GRAPH_DIR", "").strip()
-    return Path(raw).expanduser() if raw else Path.home() / ".email-mcp" / "graph"
-
-
 def _graph_token_report(name: str, path: Path) -> dict:
     """One identity's token cache: exists, refreshable shape, age."""
     fix = f"python -m email_mcp.graph --login {name}"
@@ -472,7 +468,7 @@ def check_graph() -> dict:
     )
     if not graph_idents:
         return {"ok": True, "detail": "no identities use the graph executor"}
-    d = _graph_token_dir()
+    d = config.graph_dir()  # a path question: doctor never creates
     report = {name: _graph_token_report(name, d / f"{name}.token.json")
               for name in graph_idents}
     bad = sorted(n for n, r in report.items() if not r["ok"])
