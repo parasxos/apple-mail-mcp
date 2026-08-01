@@ -14,6 +14,17 @@ pipx install git+https://github.com/parasxos/email-mcp
 email-mcp setup
 ```
 
+First time in a terminal? Three things that look wrong and aren't:
+`brew install pipx` asks `[y/n]` and wants a bare `y` (it rejects Enter
+alone); `pipx ensurepath` may print a ⚠️ about `--force` — the line after
+it ("pipx is ready to go!") is the verdict, ignore `--force`; and after
+`ensurepath`, close and reopen the terminal once so `email-mcp` is found.
+
+Grant the host app **Full Disk Access** *before* running `setup`
+(System Settings → Privacy & Security → Full Disk Access → your terminal
+app) — reading happens through Mail's local store, and the optional index
+build and closing smoke test need to see it.
+
 `setup` adopts `~/.email-mcp`, offers a sending identity and the launchd
 agents, prints the MCP client config to register, and ends with a doctor
 smoke test:
@@ -26,7 +37,14 @@ smoke test:
 }
 ```
 
-Grant the host app **Full Disk Access** (reading) and **Automation → Mail** (triage). Check anytime with `email-mcp doctor`.
+Also grant **Automation → Mail** when triage asks for it. Check anytime
+with `email-mcp doctor`.
+
+One transport note: corporate SMTP submission hosts (`smtp.<org>.ch` and
+friends) are often published only on the intranet — off-site they fail
+DNS resolution, and the failure envelope says exactly that. Either
+connect the VPN, or use the `ssh_sendmail` driver through a host you can
+reach (see `docs/reference.md`, "Identities & transports").
 
 ## What it does
 

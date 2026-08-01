@@ -133,6 +133,13 @@ Three drivers ship, all stdlib:
 | `smtp` | `smtplib`, STARTTLS (or implicit TLS on port 465); password read from the macOS Keychain |
 | `pipe` | pipe the raw message to a local command (`/usr/sbin/sendmail -t -i`, msmtp, …) |
 
+Picking between the first two: corporate submission hosts are often
+published only in the intranet's DNS (`smtp.cern.ch` is — it does not
+resolve from home, VPN off). If your org's SMTP host is intranet-only and
+you work off-site, `ssh_sendmail` through a login host you can always
+reach is the sturdier lane; the smtp driver reports an unresolvable host
+as a DNS failure, verbatim, so the two cases are easy to tell apart.
+
 A complete `~/.email-mcp/identities.toml` (chmod 600). The known keys
 (`from_addr`, `from_name`, `driver`, `allowlist`, `allow_all`, `bcc_self`)
 configure the identity; every other key in a block is a parameter for its
