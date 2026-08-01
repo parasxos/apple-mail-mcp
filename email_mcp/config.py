@@ -204,6 +204,20 @@ def _is_home_or_above(d: Path) -> bool:
     return any(_is_same_dir(d, a) for a in home.resolve().parents)
 
 
+def list_matching(d: Path, suffix: str) -> list[Path]:
+    """Entries of `d` ending in `suffix`, RAISING if `d` cannot be read.
+
+    `Path.glob` swallows a PermissionError and yields nothing, so an
+    unreadable directory is indistinguishable from an empty one. That trap
+    let `uninstall` report "no token caches" and exit 0 while OAuth refresh
+    tokens sat in a mode-000 `graph/` — deleting those caches is the entire
+    security job of a non-purge uninstall. Anything that enumerates in
+    order to DELETE, or to tell an operator that there is nothing to
+    delete, must use this instead of glob.
+    """
+    return sorted(d / n for n in os.listdir(d) if n.endswith(suffix))
+
+
 def is_dir_safe(p: Path) -> bool:
     """`p.is_dir()` that cannot raise.
 

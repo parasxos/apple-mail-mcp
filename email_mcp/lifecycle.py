@@ -1569,7 +1569,13 @@ def _purge_logs() -> list[Path]:
     logs = _logs_dir()
     if logs.is_symlink():
         return removed
-    for path in sorted(logs.glob("email-mcp*.log")):
+    try:
+        log_files = config.list_matching(logs, ".log")
+    except OSError as e:
+        print(f"  could not read {logs} ({e.strerror or e}) — logs may "
+              "remain; remove them yourself", file=sys.stderr)
+        log_files = []
+    for path in [p for p in log_files if p.name.startswith("email-mcp")]:
         try:
             path.unlink()
         except OSError:
@@ -1614,10 +1620,22 @@ def uninstall_plan(purge: bool) -> dict:
             f"{graph_default} (symlink — token caches behind it are "
             "never followed; delete them yourself)")
     elif config.is_dir_safe(graph_default):
-        for token in sorted(graph_default.glob("*.token.json")):
-            remove.append(str(token))
+        try:
+            for token in config.list_matching(graph_default, ".token.json"):
+                remove.append(str(token))
+        except OSError as e:
+            print_only.append(
+                f"{graph_default} could not be read ({e.strerror or e}) — "
+                "token caches inside it may survive this uninstall; check "
+                "it yourself")
     if paths.graph != graph_default and config.is_dir_safe(paths.graph):
-        for token in sorted(paths.graph.glob("*.token.json")):
+        try:
+            override_tokens = config.list_matching(paths.graph, ".token.json")
+        except OSError as e:
+            override_tokens = []
+            print_only.append(f"{paths.graph} could not be read "
+                              f"({e.strerror or e}) — token caches may remain")
+        for token in override_tokens:
             print_only.append(
                 f"{token} (EMAIL_MCP_STATE_DIR override — never removed; "
                 "delete it yourself)")
@@ -1635,8 +1653,24 @@ def uninstall_plan(purge: bool) -> dict:
         # directly: no resolver, no override, the same path as the rm.
         queued = 0
         counted_here = True
+        spool_root = root / "spool"
+
+        def _link(p: Path) -> bool:
+            try:
+                return p.is_symlink()
+            except OSError:
+                return False       # unreadable: handled by the scan below
+
+        if _link(spool_root):
+            # rmtree unlinks the LINK, so whatever is behind it survives —
+            # counting through it described mail that will not be deleted.
+            counted_here = False
+            print_only.append(
+                f"{spool_root} is a symlink — the spool behind it is not "
+                "removed by --purge, and is not counted above")
+            undelivered = ()
         for state in undelivered:
-            d = root / "spool" / state
+            d = spool_root / state
             try:
                 queued += sum(1 for n in os.listdir(d)
                               if n.endswith(".json"))
@@ -1666,8 +1700,14 @@ def uninstall_plan(purge: bool) -> dict:
                 f"{logs_dir} (symlink — logs behind it are never "
                 "followed; delete them yourself)")
         else:
-            for log in sorted(logs_dir.glob("email-mcp*.log")):
-                remove.append(str(log))
+            try:
+                for log in config.list_matching(logs_dir, ".log"):
+                    if log.name.startswith("email-mcp"):
+                        remove.append(str(log))
+            except OSError as e:
+                print_only.append(
+                    f"{logs_dir} could not be read ({e.strerror or e}) — "
+                    "log files inside it may survive")
         for var, raw in sorted(paths.env_overrides.items()):
             print_only.append(
                 f"{var}={raw} (env-overridden path — never removed; "
@@ -1828,7 +1868,7 @@ def run_uninstall(purge: bool, assume_yes: bool) -> int:
               "caches behind it are never followed; delete them yourself")
     elif config.is_dir_safe(graph_default):
         try:
-            tokens = sorted(graph_default.glob("*.token.json"))
+            tokens = config.list_matching(graph_default, ".token.json")
         except OSError as e:
             # Unreadable graph dir: report it and carry on. The whole
             # point of this path is to leave the machine in a KNOWN state,
@@ -1858,9 +1898,15 @@ def run_uninstall(purge: bool, assume_yes: bool) -> int:
             # leaves a HALF-removed state tree — the one outcome the
             # user must be told about, and never as a traceback.
             _log.warning("uninstall: purge failed partway: %s", e)
+            # "partly removed" was asserted even when rmtree failed on its
+            # FIRST scandir and the tree was completely intact — telling an
+            # operator their state is damaged when it is not.
+            intact = root_path.exists()
+            state = ("could not be removed and is intact" if intact
+                     else "is partly removed")
             print(f"email-mcp uninstall: purge incomplete ({e}) — "
-                  f"{root_path} is partly removed; delete the rest "
-                  "yourself", file=sys.stderr)
+                  f"{root_path} {state}; check it yourself",
+                  file=sys.stderr)
             left_behind.append(f"{root_path} (partly removed: {e})")
         else:
             if root is None:

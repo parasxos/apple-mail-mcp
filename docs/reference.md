@@ -413,7 +413,10 @@ silently retighten what it did not create (rule 1). Repair them explicitly:
 
 ```sh
 email-mcp doctor --fix --dry-run   # what it WOULD repair; touches nothing
-email-mcp doctor --fix             # chmod 700 the dirs, 600 the files
+email-mcp doctor --fix             # chmod 700 the dirs; 600 the marker,
+                                   # meta.json, identities.toml and the
+                                   # ledger months (spool manifests keep
+                                   # their own mode inside a 0700 parent)
 email-mcp doctor                   # green for the state checks
 ```
 

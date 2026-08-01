@@ -1380,3 +1380,74 @@ def test_the_launchd_check_does_not_go_green_over_an_uncountable_spool(
         pending.chmod(0o700)
 
     assert check["ok"] is False
+
+
+def test_uninstall_never_claims_it_removed_unreadable_token_caches(
+        home, monkeypatch):
+    """MAJOR: deleting the Graph token caches is the ENTIRE security job of
+    a non-purge uninstall, and it reported "nothing found (no agents, no
+    token caches)" + "uninstall complete" + exit 0 while OAuth refresh
+    tokens sat in a mode-000 graph/.
+
+    Mechanism: `Path.glob` SWALLOWS a PermissionError and yields nothing,
+    so an unreadable directory was indistinguishable from an empty one —
+    the same trap spool.py documents, unapplied here. The `except OSError`
+    written for this case was dead code, because glob never raised.
+    """
+    import subprocess
+    import sys
+
+    graph = home / ".email-mcp" / "graph"
+    graph.mkdir(parents=True)
+    token = graph / "acct.token.json"
+    token.write_text('{"refresh_token": "SECRET"}')
+    graph.chmod(0o000)
+    env = {k: v for k, v in os.environ.items()
+           if not k.startswith("EMAIL_MCP_")}
+    env["HOME"] = str(home)
+    try:
+        p = subprocess.run([sys.executable, "-m", "email_mcp.cli",
+                            "uninstall", "--yes"],
+                           capture_output=True, text=True, env=env)
+    finally:
+        graph.chmod(0o700)
+
+    combined = p.stdout + p.stderr
+    assert "could not be read" in combined, combined[-400:]
+    assert p.returncode != 0, "reported success over surviving credentials"
+    assert token.read_text() == '{"refresh_token": "SECRET"}'
+
+
+def test_uninstall_still_removes_readable_token_caches(home):
+    """The fence must be targeted: a readable graph/ is still swept."""
+    from email_mcp import lifecycle
+
+    graph = home / ".email-mcp" / "graph"
+    graph.mkdir(parents=True)
+    token = graph / "acct.token.json"
+    token.write_text("{}")
+
+    lifecycle.run_uninstall(False, True)
+
+    assert not token.exists()
+
+
+def test_purge_does_not_count_mail_through_a_symlinked_spool(home,
+                                                             tmp_path):
+    """LOW: rmtree unlinks the LINK, so mail behind it survives — counting
+    through it described mail that would not be deleted."""
+    from email_mcp import lifecycle, spool
+
+    elsewhere = tmp_path / "elsewhere"
+    (elsewhere / "pending").mkdir(parents=True)
+    (elsewhere / "pending" / "q1.json").write_text("{}")
+    root = home / ".email-mcp"
+    root.mkdir()
+    (root / "spool").symlink_to(elsewhere)
+
+    plan = lifecycle.uninstall_plan(purge=True)
+    line = next(x for x in plan["remove"] if "state tree" in x)
+
+    assert "message(s) still queued" not in line
+    assert any("is a symlink" in x and "not counted above" in x
+               for x in plan["print_only"])

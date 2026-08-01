@@ -1084,6 +1084,42 @@ in seven directory shapes; the healthy response shape byte-unchanged; no
 decoy touched; and the documented migration working literally with the
 mail visible at the end.
 
+### v0.11 — fourteenth and fifteenth passes
+
+One PASS, one FAIL. The FAIL found the most security-relevant defect of
+the whole gate series:
+
+- **MAJOR — `uninstall` reported "no token caches" and "complete", exit 0,
+  while OAuth refresh tokens survived in an unreadable `graph/`.** Deleting
+  those caches is the ENTIRE security job of a non-purge uninstall, and the
+  operator was told there was nothing to delete. The mechanism is the trap
+  `spool.py` already documents in its own comment and that was not applied
+  here: **`Path.glob` swallows a `PermissionError` and yields nothing**, so
+  an unreadable directory is indistinguishable from an empty one — and the
+  `except OSError` written for exactly this case was dead code, because
+  glob never raised. Every enumeration that exists in order to DELETE (or
+  to say there is nothing to delete) now goes through
+  `config.list_matching`, which uses `os.listdir` and raises: the default
+  and overridden token sweeps, both log sweeps, in plan and executor alike.
+  The command now reports what it could not read and exits non-zero.
+- **MINOR — "partly removed" was asserted when nothing had been removed.**
+  `rmtree` failing on its first `scandir` leaves the tree intact, and the
+  operator was told their state was damaged when it was not.
+- **LOW — the queued count read THROUGH a symlinked spool**, counting mail
+  that `--purge` will not delete (rmtree unlinks the link, not the target).
+- **LOW — `docs/reference.md` promised `--fix` would "600 the files"**;
+  it normalises the marker, `meta.json`, `identities.toml` and the ledger
+  months, and leaves spool manifests to their own mode inside a 0700
+  parent. The sentence now says that.
+
+**A residual, recorded rather than fixed:** with `EMAIL_MCP_STATE_DIR`
+pointed elsewhere, `doctor` describes the CONFIGURED tree, so mail orphaned
+in a previously-used root reads as "0 pending". That is the correct subject
+for a diagnostic — it reports the tree the dispatcher would send from — and
+the surface that ACTS on the number (`uninstall --purge`) counts the tree it
+is about to delete. Recorded because it is the one remaining path where an
+operator can read "no queued mail" while composed mail sits on disk.
+
 **Still open, deliberately:** the root TOCTOU (§0 boundary — a local
 attacker with write access to the root's parent can swap a symlink between
 the refusal check and the mkdir; cost is one stray 0600 dotfile, no mode
