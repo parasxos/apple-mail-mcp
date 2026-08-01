@@ -214,3 +214,32 @@ def test_immutable_open_works_with_concurrent_writer(tmp_path):
     finally:
         conn.execute("ROLLBACK")
         conn.close()
+
+
+# --------------------------------------------------------------------- #
+# mail_dir — the Full Disk Access boundary (config-owned)                #
+# --------------------------------------------------------------------- #
+
+
+def test_mail_dir_tcc_denial_names_full_disk_access(monkeypatch, tmp_path):
+    """Under TCC denial ~/Library/Mail EXISTS, so the not-exists remedy
+    never fires — the first user got a raw PermissionError traceback out
+    of setup instead of the words "Full Disk Access" (2026-08-01). The
+    denial must surface config's own remedy, not [Errno 1] alone."""
+    import pytest
+
+    from email_mcp import config
+
+    home = tmp_path / "h"
+    mail = home / "Library" / "Mail"
+    mail.mkdir(parents=True)
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.delenv("EMAIL_MCP_MAIL_DIR", raising=False)
+    mail.chmod(0o000)
+    try:
+        with pytest.raises(PermissionError) as e:
+            config.mail_dir()
+    finally:
+        mail.chmod(0o755)
+    assert "Full Disk Access" in str(e.value)
+    assert str(mail) in str(e.value)

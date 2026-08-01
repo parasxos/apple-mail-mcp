@@ -34,8 +34,21 @@ def mail_dir() -> Path:
             f"{base} does not exist. Apple Mail is not configured on this Mac, "
             f"or grant Full Disk Access to the app running Claude Code."
         )
+    try:
+        entries = list(base.iterdir())
+    except PermissionError as e:
+        # The TCC case: macOS denies access with the directory very much
+        # existing, so the not-exists branch above never fires — its remedy
+        # was written for exactly this failure and was unreachable for it.
+        # The first user read a 10-frame traceback out of `setup` instead
+        # of the words "Full Disk Access" (2026-08-01).
+        raise PermissionError(
+            f"{base} exists but cannot be read ({e.strerror or e}) — grant "
+            f"Full Disk Access to the app running Claude Code (System "
+            f"Settings → Privacy & Security → Full Disk Access)."
+        ) from e
     versioned = [
-        p for p in base.iterdir()
+        p for p in entries
         if p.is_dir() and re.fullmatch(r"V\d+", p.name)
     ]
     if not versioned:

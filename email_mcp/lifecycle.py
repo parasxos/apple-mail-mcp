@@ -280,7 +280,18 @@ def setup(*, yes: bool = False) -> int:
                        "take a while)?"):
         from . import fts
 
-        print(f"fts build: {fts.FtsIndex().build()}")
+        try:
+            print(f"fts build: {fts.FtsIndex().build()}")
+        except Exception as e:
+            # The build is OPTIONAL; its failure is a finding, not the end
+            # of setup. Unguarded, it took the client config and the smoke
+            # test down with it — the two things that would have named the
+            # actual problem in plain words (first user, 2026-08-01: no
+            # Full Disk Access → raw PermissionError traceback, half-
+            # configured machine, zero diagnosis).
+            print(f"fts build FAILED: {e}")
+            print("  setup continues — build later with: "
+                  "python -m email_mcp.fts --build")
     _print_client_config()
     _smoke()
     return code

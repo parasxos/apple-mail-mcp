@@ -511,3 +511,27 @@ def test_uninstall_plan_names_an_unlistable_graph_dir(home, installed):
     assert not any(isinstance(r, plan.UnlinkFile)
                    and str(r.target()).endswith(".token.json")
                    for r in rows)
+
+
+def test_setup_survives_a_failing_fts_build(home, smoke, monkeypatch, capsys):
+    """The first-user crash (2026-08-01): 'y' to the optional FTS build
+    with no Full Disk Access killed setup mid-run — no client config, no
+    smoke test, no diagnosis, launchd agents left half-configured. The
+    build's failure is a finding; the tail that names the real problem
+    must always run."""
+    _script(monkeypatch, [
+        "",     # From: address -> skip identity
+        "n",    # dispatcher agent
+        "n",    # fts agent
+        "y",    # fts build -> boom
+    ])
+    def _boom(self):
+        raise PermissionError(1, "Operation not permitted",
+                              str(home / "Library" / "Mail"))
+    monkeypatch.setattr("email_mcp.fts.FtsIndex.build", _boom)
+    assert lifecycle.setup() == 0
+    out = capsys.readouterr().out
+    assert "fts build FAILED" in out
+    assert "python -m email_mcp.fts --build" in out
+    assert '"apple-mail"' in out          # client config still printed
+    assert "42 messages" in out           # the smoke test still ran
