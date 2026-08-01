@@ -11,10 +11,11 @@ from dataclasses import dataclass
 
 import pytest
 
-from email_mcp import codes, envelope
+from email_mcp import codes, envelope, ids
 from email_mcp.envelope import (
     InvalidInput, MailUnavailable, NotFound, ToolError,
 )
+from email_mcp.state import RefusedError
 
 
 class _Recorder(logging.Handler):
@@ -45,6 +46,7 @@ class _Receipt:
     (IndexError("i"), "internal_error"),
     (LookupError("missing"), "not_found"),
     (sqlite3.ProgrammingError("closed db"), "internal_error"),
+    (RefusedError("EMAIL_MCP_SPOOL_DIR is retired"), "invalid_input"),
     (FileNotFoundError("gone"), "mail_unavailable"),
     (PermissionError("denied"), "mail_unavailable"),
     (sqlite3.DatabaseError("corrupt"), "mail_unavailable"),
@@ -124,14 +126,26 @@ def test_op_from_threads_belt_failures_only():
     def crash(plan_id: str) -> dict:
         raise RuntimeError("mid-apply")
 
-    assert crash("P-1")["operation_id"] == "P-1"       # positional
-    assert crash(plan_id="P-2")["operation_id"] == "P-2"
+    p1, p2 = ids.new_id(), ids.new_id()
+    assert crash(p1)["operation_id"] == p1             # positional
+    assert crash(plan_id=p2)["operation_id"] == p2
 
     @envelope.tool(op_from="plan_id")
     def reject(plan_id: str) -> dict:
         raise NotFound("no plan")
 
-    assert "operation_id" not in reject("P-9")
+    assert "operation_id" not in reject(ids.new_id())
+
+
+def test_op_from_gates_on_the_minted_vocabulary():
+    """The caller's argument is a claim, not proof of a mint (§2): only a
+    string in the minted vocabulary threads as operation_id."""
+    @envelope.tool(op_from="plan_id")
+    def crash(plan_id: str) -> dict:
+        raise RuntimeError("mid-apply")
+
+    for claim in ("P-1", "Z" * 60000, "", None, 42):
+        assert "operation_id" not in crash(claim)
 
 
 def test_belt_classifies_logs_traceback_and_says_run_doctor():
@@ -165,6 +179,45 @@ def test_belt_keeps_plain_prose_for_caller_fixable_codes():
     assert out["error"] == "invalid ISO datetime: 'x'"  # no type-name prefix
 
 
+def test_policy_refusal_is_invalid_input_with_the_bare_reason():
+    """A refused state root (§3.5 is the belt, this is not): the one
+    policy string, verbatim — no 'RefusedError: ' prefix."""
+    @envelope.tool
+    def t() -> dict:
+        raise RefusedError("EMAIL_MCP_SPOOL_DIR is retired — "
+                           "use EMAIL_MCP_STATE_DIR.")
+
+    out = t()
+    assert out["ok"] is False and out["code"] == "invalid_input"
+    assert out["error"].startswith("EMAIL_MCP_SPOOL_DIR is retired")
+
+
+class _EvilStr(Exception):
+    def __str__(self):
+        raise RuntimeError("unrenderable")
+
+
+class _EvilTyped(ToolError):
+    def __str__(self):
+        raise RuntimeError("unrenderable")
+
+
+@pytest.mark.parametrize("exc,code", [
+    (_EvilStr(), "internal_error"),   # belt arm
+    (_EvilTyped("x"), "internal_error"),  # typed arm
+])
+def test_exception_whose_str_raises_never_escapes(exc, code):
+    """§7 'no exception escapes to the wire' includes the exception
+    thrown while RENDERING the first one."""
+    @envelope.tool
+    def t() -> dict:
+        raise exc
+
+    out = t()
+    assert out["ok"] is False and out["code"] == code
+    assert type(exc).__name__ in out["error"]
+
+
 @pytest.mark.parametrize("exc", [
     NotFound("é" * 3000),       # typed path (multibyte at the cut)
     RuntimeError("x" * 5000),   # belt path
@@ -178,3 +231,39 @@ def test_failure_prose_is_byte_bounded_at_utf8_boundaries(exc):
     raw = err.encode("utf-8")           # decodes back: valid UTF-8
     assert len(raw) <= envelope.MAX_ERROR_BYTES + len("…".encode("utf-8"))
     assert err.endswith("…")
+
+
+_CAP = envelope.MAX_ERROR_BYTES + len("…".encode("utf-8"))
+
+
+def test_value_carried_failure_is_bounded_wholesale():
+    """refresh_mail / mailbox_delete report failure as a VALUE (§2
+    documented exceptions) — every string of that ok:false envelope is
+    bounded, including echoed caller arguments."""
+    @envelope.tool
+    def t() -> dict:
+        return {"ok": False, "error": "x" * 60000, "path": "y" * 60000,
+                "duration_ms": 7}
+
+    out = t()
+    assert out["ok"] is False and out["duration_ms"] == 7
+    assert len(out["error"].encode("utf-8")) <= _CAP
+    assert len(out["path"].encode("utf-8")) <= _CAP
+
+
+def test_partial_failure_channels_are_bounded_inside_ok_true():
+    """errors[]/failures[] are failure records riding in ok:true (§2) —
+    bounded like any failure prose, while success payloads are untouched."""
+    @envelope.tool
+    def t() -> dict:
+        return {"emails": [{"body_text": "b" * 5000}],
+                "errors": [{"id": "Z" * 60000,
+                            "error": "no message " + "Z" * 60000,
+                            "code": "invalid_input"}]}
+
+    out = t()
+    assert len(out["emails"][0]["body_text"]) == 5000   # payload untouched
+    entry = out["errors"][0]
+    assert entry["code"] == "invalid_input"
+    assert len(entry["id"].encode("utf-8")) <= _CAP
+    assert len(entry["error"].encode("utf-8")) <= _CAP

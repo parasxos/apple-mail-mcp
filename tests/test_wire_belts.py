@@ -97,15 +97,24 @@ def test_unexpected_exception_returns_internal_error_and_logs_traceback(
 
 
 def test_triage_apply_belt_carries_plan_id_operation_id(monkeypatch):
+    from email_mcp import ids
+
     monkeypatch.setattr(server, "_SOURCE", object())
 
     def _boom(src, plan_id):
         raise RuntimeError("exploded mid-apply")
 
     monkeypatch.setattr(server, "apply_plan", _boom)
-    out = server.tool_triage_apply(plan_id="P-123")
+    p1, p2 = ids.new_id(), ids.new_id()
+    out = server.tool_triage_apply(plan_id=p1)
     assert out["ok"] is False and out["code"] == "internal_error"
-    assert out["operation_id"] == "P-123"  # threads to the ledger's op
+    assert out["operation_id"] == p1  # threads to the ledger's op
 
-    out2 = server.tool_triage_apply("P-9")  # positional binding too
-    assert out2["operation_id"] == "P-9"
+    out2 = server.tool_triage_apply(p2)  # positional binding too
+    assert out2["operation_id"] == p2
+
+    # The minted-id gate (§2): a raw caller argument is a claim, not a
+    # mint — never echoed back as operation_id.
+    out3 = server.tool_triage_apply("Z" * 60000)
+    assert out3["ok"] is False
+    assert "operation_id" not in out3

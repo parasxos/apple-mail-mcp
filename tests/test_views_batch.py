@@ -107,6 +107,14 @@ def test_batch_over_cap_rejected_outright(src):
     assert "emails" not in out  # rejected, not partially served
 
 
+def test_batch_of_huge_bad_ids_cannot_flood_the_wire(src):
+    """50 ids of 60 KB each, AT the cap: every echo in errors[] is a
+    failure record the boundary byte-bounds — the envelope stays small."""
+    out = tool_get_emails_batch(["Z" * 60000] * 50)
+    assert out["ok"] is True and len(out["errors"]) == 50
+    assert len(json.dumps(out).encode("utf-8")) < 250_000
+
+
 # --------------------------------------------------------------------- #
 # search_emails envelope + body_match                                   #
 # --------------------------------------------------------------------- #

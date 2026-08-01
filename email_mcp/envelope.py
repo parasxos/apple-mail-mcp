@@ -12,13 +12,19 @@ this module is the ONLY place those become MCP wire dicts
 Three promises live here and nowhere else:
 
 - **Byte-bounding of failure prose** (`MAX_ERROR_BYTES`): no failure can
-  flood the wire, because there is no other `ok: false` construction site
-  to bound.
+  flood the wire. Failure prose crosses the boundary two ways — raised
+  (typed errors, belt catches) and carried as a VALUE (refresh_mail's
+  nudge report, mailbox_delete's verdict dicts, the §2 partial-failure
+  channels `errors[]`/`failures[]` inside ok:true) — so the one exit
+  bounds both: every string of an ok:false envelope, every string of a
+  partial-failure record.
 - **The minted-id gate on `operation_id`** (contract §2): a failure carries
   `operation_id` iff a durable artifact id had already been minted for the
   operation — typed errors declare theirs at raise time; belt failures
-  thread the id named by `op_from` (triage_apply's plan_id, per §1 row 18).
-  It is never minted *for* a failure.
+  thread the id named by `op_from` (triage_apply's plan_id, per §1 row 18)
+  only when it is in the minted vocabulary (`ids.is_minted_id`) — the
+  argument alone is the caller's claim, not proof of a mint. An id is
+  never minted *for* a failure.
 - **The exception→code classification** (`classify`): one table, ordered
   most-specific-first because the interesting rows are subclasses of the
   broad ones (UnicodeDecodeError IS-A ValueError, KeyError/IndexError ARE
@@ -38,7 +44,7 @@ import types
 import typing
 from datetime import datetime
 
-from . import codes
+from . import codes, ids, state
 from .log import get_logger
 
 _log = get_logger()
@@ -113,6 +119,9 @@ _CLASSIFY: tuple[tuple[type[BaseException], str], ...] = (
     (IndexError, codes.INTERNAL_ERROR),           # IS-A LookupError
     (LookupError, codes.NOT_FOUND),
     (sqlite3.ProgrammingError, codes.INTERNAL_ERROR),  # IS-A DatabaseError
+    (state.RefusedError, codes.INVALID_INPUT),  # IS-A OSError: a deliberate
+    # policy refusal (retired var, symlink, foreign dir) — the reason is
+    # caller-fixable environment, not the belt of last resort
     (FileNotFoundError, codes.MAIL_UNAVAILABLE),
     (PermissionError, codes.MAIL_UNAVAILABLE),
     (sqlite3.DatabaseError, codes.MAIL_UNAVAILABLE),
@@ -153,6 +162,42 @@ def _bound(prose: str) -> str:
     return raw[:MAX_ERROR_BYTES].decode("utf-8", "ignore") + "…"
 
 
+def _prose(e: BaseException) -> str:
+    """str(e), total: a __str__ that raises must not become the very
+    escape the boundary exists to prevent (contract §7)."""
+    try:
+        return str(e)
+    except Exception:
+        return f"<unprintable {type(e).__name__}>"
+
+
+def _clip(record: typing.Any) -> typing.Any:
+    """Byte-bound every string inside one failure record."""
+    if isinstance(record, str):
+        return _bound(record)
+    if isinstance(record, list):
+        return [_clip(x) for x in record]
+    if isinstance(record, dict):
+        return {k: _clip(v) for k, v in record.items()}
+    return record
+
+
+# The §2 partial-failure channels: failure records riding inside ok:true.
+_FAILURE_CHANNELS = ("errors", "failures")
+
+
+def _bounded(out: dict) -> dict:
+    """Bound failure prose wherever it crosses the boundary: the whole
+    envelope when ok is false (typed, belt, or carried as a value —
+    refresh_mail's nudge report, mailbox_delete's verdict dicts), and
+    each partial-failure record when ok is true. Success payloads
+    (bodies, attachments) are never touched."""
+    if out.get("ok") is False:
+        return _clip(out)
+    return {k: _clip(v) if k in _FAILURE_CHANNELS else v
+            for k, v in out.items()}
+
+
 # --------------------------------------------------------------------- #
 # The boundary decorator                                                #
 # --------------------------------------------------------------------- #
@@ -164,8 +209,10 @@ def tool(fn=None, *, op_from: str | None = None):
     Success values pass through `to_jsonable` and gain `ok: true`; a value
     carrying its own `ok` keeps it (doctor and refresh_mail report health,
     not tool failure — the §2 documented exceptions). `op_from` names the
-    parameter whose value is a durable artifact id minted by an EARLIER
-    operation; belt failures thread it as `operation_id`.
+    parameter that RECEIVES a durable artifact id minted by an EARLIER
+    operation; belt failures thread it as `operation_id` iff the value is
+    in the minted vocabulary — a caller's argument proves nothing by
+    itself. Every path exits through `_bounded`.
     """
 
     def deco(fn):
@@ -178,33 +225,34 @@ def tool(fn=None, *, op_from: str | None = None):
                 value = sig.bind_partial(*args, **kwargs).arguments.get(op_from)
             except TypeError:
                 value = None
-            return str(value) if value else None
+            return value if ids.is_minted_id(value) else None
 
         @functools.wraps(fn)
         def wrapper(*args, **kwargs):
             try:
                 value = fn(*args, **kwargs)
             except ToolError as e:
-                out = {"ok": False, "code": e.code, "error": _bound(str(e))}
+                out = {"ok": False, "code": e.code, "error": _prose(e)}
                 if e.fix:
                     out["fix"] = e.fix
                 if e.operation_id:
                     out["operation_id"] = e.operation_id
                 if e.data:
                     out.update(to_jsonable(e.data))
-                return out
             except Exception as e:
                 code = classify(e)
                 _log.exception("belt[%s]: %s", fn.__name__, code)
-                prose = (f"{type(e).__name__}: {e}"
-                         if code == codes.INTERNAL_ERROR else str(e))
-                out = {"ok": False, "code": code, "error": _bound(prose),
+                msg = _prose(e)
+                out = {"ok": False, "code": code,
+                       "error": (f"{type(e).__name__}: {msg}"
+                                 if code == codes.INTERNAL_ERROR else msg),
                        "fix": "run doctor"}
                 minted = _minted_id(args, kwargs)
                 if minted:
                     out["operation_id"] = minted
-                return out
-            return {"ok": True, **to_jsonable(value)}
+            else:
+                out = {"ok": True, **to_jsonable(value)}
+            return _bounded(out)
 
         return wrapper
 

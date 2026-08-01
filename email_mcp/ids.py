@@ -11,8 +11,11 @@ certainly for thousands (birthday bound) — 48 bits keep the red team's
 """
 from __future__ import annotations
 
+import re
 import secrets
 from datetime import datetime, timezone
+
+_ID_RE = re.compile(r"\d{8}T\d{6}Z-[0-9a-f]{12}")
 
 
 def utcnow() -> datetime:
@@ -26,3 +29,10 @@ def iso(dt: datetime) -> str:
 def new_id(now: datetime | None = None) -> str:
     stamp = (now or utcnow()).strftime("%Y%m%dT%H%M%SZ")
     return f"{stamp}-{secrets.token_hex(6)}"
+
+
+def is_minted_id(value: object) -> bool:
+    """True iff ``value`` is a string in the minted vocabulary above —
+    the proof the envelope boundary's operation_id gate demands
+    (contract §2: an id is minted here or it was never minted)."""
+    return isinstance(value, str) and _ID_RE.fullmatch(value) is not None
