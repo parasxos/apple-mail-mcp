@@ -249,11 +249,19 @@ def test_setup_refuses_state_override_at_home(home, monkeypatch, capsys, var):
 
 def test_doctor_fix_refuses_state_override_at_home(home, monkeypatch):
     """Same fence on the repair side: `doctor --fix` must not mkdir the
-    spool states into $HOME nor chmod $HOME (or its parent) because
+    spool states into $HOME, chmod $HOME (or its parent), or rename a
+    user file that happens to be named like a leaf, because
     EMAIL_MCP_STATE_DIR points there."""
     monkeypatch.setenv("EMAIL_MCP_STATE_DIR", str(home))
     home.chmod(0o755)  # deliberately "wrong" for a state dir
     parent_mode = home.parent.stat().st_mode & 0o777
+    # A user file squatting on the would-be audit leaf. PLANTED, because
+    # asserting on a file that was never created made this test pass
+    # vacuously while the squat repair — the one repair not routed
+    # through _state_dirs — renamed real ~/audit files aside under the
+    # very root the resolver refused.
+    user_audit = home / "audit"
+    user_audit.write_text("the user's own file, named audit\n")
 
     result = repairs.run_fixes()
 
@@ -261,7 +269,9 @@ def test_doctor_fix_refuses_state_override_at_home(home, monkeypatch):
     assert (home.parent.stat().st_mode & 0o777) == parent_mode
     for junk in SPOOL_STATES:
         assert not (home / junk).exists()
-    assert not (home / "spool").exists() and not (home / "audit").exists()
+    assert not (home / "spool").exists()
+    assert user_audit.is_file()                     # never renamed aside
+    assert list(home.glob("audit.bak-*")) == []
     # run_fixes must survive the refusal rather than crash on it.
     assert isinstance(result["failed"], list)
 

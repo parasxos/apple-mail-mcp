@@ -418,6 +418,13 @@ def _apply_meta_missing() -> str:
 
 
 def _detect_audit_path_is_file() -> str | None:
+    if config.state_root_refusal():
+        # A refused root owns no ledger directory either — same gate as
+        # _state_dirs. Without it this was the one repair that mutated a
+        # path under a root the resolver refused: EMAIL_MCP_STATE_DIR=$HOME
+        # with a user file ~/audit got that file renamed aside by the very
+        # run that printed the refusal.
+        return None
     root = config.audit_dir(create=False)
     if root.exists() and not root.is_dir():
         return (f"{root} is a regular file, not the ledger directory — "
