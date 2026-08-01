@@ -192,28 +192,48 @@ def test_absent_index_degrades_to_like_and_creates_nothing(
     assert not target.exists()
 
 
-def test_immutable_open_works_with_concurrent_writer(tmp_path):
-    """`?mode=ro&immutable=1` must let us read even if another connection holds
-    a write lock on the same DB file — that's the live Mail.app scenario."""
+def test_readonly_open_reads_wal_snapshot_beside_a_live_writer(tmp_path):
+    """The shipped contract (apple_mail._connect_readonly): plain `mode=ro`
+    honoring WAL — a reader sees the latest committed snapshot while a
+    separate WAL writer holds an uncommitted transaction. This replaces the
+    old `immutable=1` test: immutable was deliberately abandoned because it
+    bypasses WAL and yields "database disk image is malformed" whenever
+    Mail.app has pending WAL frames (see _connect_readonly's docstring)."""
     import sqlite3
     from email_mcp.sources.apple_mail import _connect_readonly
 
     db = tmp_path / "Envelope Index"
     db.parent.mkdir(parents=True, exist_ok=True)
-    conn = sqlite3.connect(db)
-    conn.execute("CREATE TABLE t (x INTEGER)")
-    conn.execute("INSERT INTO t VALUES (1)")
-    conn.commit()
-    # Start an exclusive transaction in the writer
-    conn.execute("BEGIN EXCLUSIVE")
+    writer = sqlite3.connect(db)
+    writer.execute("PRAGMA journal_mode=WAL")  # the live Mail.app mode
+    writer.execute("CREATE TABLE t (x INTEGER)")
+    writer.execute("INSERT INTO t VALUES (1)")
+    writer.commit()
+    # Writer opens a new transaction and stages an as-yet-uncommitted row.
+    writer.execute("BEGIN")
+    writer.execute("INSERT INTO t VALUES (2)")
     try:
         ro = _connect_readonly(db)
-        rows = ro.execute("SELECT x FROM t").fetchall()
-        assert [r[0] for r in rows] == [1]
+        # Reads the last COMMITTED snapshot (1), not the writer's pending 2.
+        assert [r[0] for r in ro.execute("SELECT x FROM t")] == [1]
+        # And it is genuinely read-only: writes are refused. match= matters —
+        # the writer holds a transaction, so a bare OperationalError would also
+        # be satisfied by "database is locked", which is a different property.
+        import pytest
+        with pytest.raises(sqlite3.OperationalError, match="readonly"):
+            ro.execute("INSERT INTO t VALUES (3)")
         ro.close()
+        # After the writer commits, a fresh ro connection sees both rows —
+        # the property freshness_snapshot() relies on.
+        writer.commit()
+        # The rows live in the uncheckpointed -wal sidecar: this is precisely
+        # what `immutable=1` could not see, so it is the regression guard.
+        assert (tmp_path / "Envelope Index-wal").exists()
+        ro2 = _connect_readonly(db)
+        assert [r[0] for r in ro2.execute("SELECT x FROM t ORDER BY x")] == [1, 2]
+        ro2.close()
     finally:
-        conn.execute("ROLLBACK")
-        conn.close()
+        writer.close()
 
 
 # --------------------------------------------------------------------- #
