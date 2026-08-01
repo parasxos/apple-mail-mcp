@@ -9,6 +9,7 @@ forward their argv to the module mains.
 from __future__ import annotations
 
 import os
+import re
 import subprocess
 import sys
 import tomllib
@@ -229,3 +230,21 @@ def test_packaging_single_sources_the_version():
     assert py["project"]["scripts"]["email-mcp"] == "email_mcp.cli:main"
     assert py["project"]["requires-python"] == ">=3.11"
     assert py["project"]["dependencies"] == ["mcp>=1.2,<2"]
+
+
+def test_declared_build_floor_supports_the_license_form():
+    """license = "MIT" is PEP 639, first supported by setuptools 77; a
+    lower declared floor names a build environment that cannot build the
+    package (setuptools 68 rejects the key outright). This row pins the
+    RULE, not the instance: whichever form the license takes, the floor
+    must be able to build it."""
+    py = tomllib.loads((REPO / "pyproject.toml").read_text())
+    if not isinstance(py["project"].get("license"), str):
+        return  # classifier form — any modern floor builds it
+    floors = [r for r in py["build-system"]["requires"]
+              if r.startswith("setuptools")]
+    assert floors, "build-system must pin its setuptools floor"
+    for req in floors:
+        m = re.search(r">=\s*(\d+)", req)
+        assert m and int(m.group(1)) >= 77, (
+            f"{req!r} cannot build a PEP 639 license string")

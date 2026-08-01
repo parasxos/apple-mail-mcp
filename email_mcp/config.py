@@ -310,11 +310,22 @@ def send_bootstrap_cmd() -> str:
 def identities_file() -> Path:
     """The identities TOML routing From: addresses to transports.
 
-    EMAIL_MCP_IDENTITIES overrides the path; default is
-    ~/.email-mcp/identities.toml. Absent file → a single identity is
-    synthesized from the send_* getters above (see email_mcp.identities).
+    EMAIL_MCP_IDENTITIES overrides the path; the default lives in the
+    RESOLVED state root — identities.toml is part of the managed tree
+    (setup writes it, checks hold it to 0600, --purge removes it), so the
+    one root override moves the whole tree, this file included. Pinning
+    it to the default spelling made setup write one file and sending read
+    another whenever EMAIL_MCP_STATE_DIR was set. A refused root falls
+    back to the default spelling: identity ROUTING must keep answering
+    (immediate sends need no managed state), and every write that needs
+    the tree still refuses on its own.
+
+    Absent file → a single identity is synthesized from the send_*
+    getters above (see email_mcp.identities).
     """
     raw = os.environ.get("EMAIL_MCP_IDENTITIES", "").strip()
     if raw:
         return Path(raw).expanduser()
-    return state.default_root() / "identities.toml"
+    r = state.State.resolve()
+    root = r.root if isinstance(r, state.Resolved) else state.default_root()
+    return root / "identities.toml"

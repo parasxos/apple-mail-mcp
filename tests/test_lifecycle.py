@@ -492,3 +492,22 @@ def test_purge_plan_names_an_unlistable_logs_dir(home, installed):
     assert notes and str(logs) in notes[0].text
     assert not any(isinstance(r, plan.UnlinkFile)
                    and str(logs) in str(r.target()) for r in rows)
+
+
+def test_uninstall_plan_names_an_unlistable_graph_dir(home, installed):
+    """The logs row's rule, applied to the token sweep: a graph/ the plan
+    cannot enumerate must say so — an unreadable directory used to read
+    as 'no token caches' while the caches sat inside it."""
+    graph = state.State.resolve().reader().graph
+    graph.chmod(0o000)
+    try:
+        rows = lifecycle.plan_uninstall(purge=False)
+    finally:
+        graph.chmod(0o700)
+    notes = [r for r in rows if isinstance(r, plan.PrintOnly)
+             and "cannot list" in r.text]
+    assert notes and str(graph) in notes[0].text
+    assert "token caches not removed" in notes[0].text
+    assert not any(isinstance(r, plan.UnlinkFile)
+                   and str(r.target()).endswith(".token.json")
+                   for r in rows)

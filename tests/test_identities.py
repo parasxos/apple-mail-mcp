@@ -371,3 +371,55 @@ def test_graph_keys_never_reach_params_and_ssh_transport_constructs(
     assert "executor" not in ident.params and "graph" not in ident.params
     transport = get_transport(ident)  # would raise SendError on a leak
     assert transport.host == "mailhost.example.org"
+
+
+# --------------------------------------------------------------------- #
+# path policy — the identities file is part of the managed tree          #
+# --------------------------------------------------------------------- #
+# One spelling owner: the default is <resolved root>/identities.toml, so
+# the one root override moves the whole tree, this file included. Before
+# this table, setup wrote under the override while sending read the
+# default spelling — two files, one name.
+
+
+def test_identities_default_lives_in_the_default_root(monkeypatch, tmp_path):
+    h = tmp_path / "h"
+    h.mkdir()
+    monkeypatch.setenv("HOME", str(h))
+    monkeypatch.delenv("EMAIL_MCP_IDENTITIES", raising=False)
+    monkeypatch.delenv("EMAIL_MCP_STATE_DIR", raising=False)
+    from email_mcp import config, state
+    assert config.identities_file() == state.default_root() / "identities.toml"
+
+
+def test_identities_follows_the_root_override_and_agrees_with_checks(
+    monkeypatch, tmp_path,
+):
+    """Under EMAIL_MCP_STATE_DIR the identities default moves WITH the
+    tree, and it is the same path the secret-file mode checks probe —
+    agreement by construction, not by care."""
+    monkeypatch.delenv("EMAIL_MCP_IDENTITIES", raising=False)
+    from email_mcp import checks, config, state
+    r = state.State.resolve()
+    assert isinstance(r, state.Resolved)  # _clean_env pinned the override
+    assert config.identities_file() == r.root / "identities.toml"
+    assert config.identities_file() in checks._secret_files(r.reader())
+
+
+def test_identities_env_override_wins_over_the_root(tmp_path):
+    from email_mcp import config
+    # _clean_env sets both EMAIL_MCP_IDENTITIES and EMAIL_MCP_STATE_DIR.
+    assert config.identities_file() == tmp_path / "no-identities.toml"
+
+
+def test_identities_answers_under_a_refused_root(monkeypatch, tmp_path):
+    """A refused root must not break identity routing: the path question
+    stays total and falls back to the default spelling."""
+    h = tmp_path / "h"
+    h.mkdir()
+    monkeypatch.setenv("HOME", str(h))
+    monkeypatch.delenv("EMAIL_MCP_IDENTITIES", raising=False)
+    monkeypatch.setenv("EMAIL_MCP_SPOOL_DIR", str(tmp_path))  # retired var
+    from email_mcp import config, state
+    assert isinstance(state.State.resolve(), state.Refused)
+    assert config.identities_file() == state.default_root() / "identities.toml"
