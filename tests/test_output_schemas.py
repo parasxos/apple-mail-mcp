@@ -124,10 +124,24 @@ EXPECTED_SKIPS = frozenset({
     # added post-boundary by the MCP wrapper only when the dispatcher is
     # missing — conditional presence, so not part of the typed return
     "schedule_email.warning",
+    # ADDITIVE keys since the oracle was taken (contract §8, 2026-08-01):
+    # ghost-mailbox honesty — local vs server-side counts, and the note
+    # explaining an empty page scoped to a server-side-only mailbox
+    "list_mailboxes.mailboxes[].local_count",
+    "list_recent.note",
+    "search_emails.note",
 })
 
 # oracle keys whose ABSENCE from the derived shape is expected (see above)
 _WAIVED_MISSING = frozenset({"schedule_email.warning"})
+
+# derived keys the oracle never saw: deliberate additive growth after the
+# shipped snapshot (contract §8) — any OTHER addition still fails the proof
+_WAIVED_ADDED = frozenset({
+    "list_mailboxes.mailboxes[].local_count",
+    "list_recent.note",
+    "search_emails.note",
+})
 
 
 def _compare(oracle, derived, path: str, skips: set, bad: list) -> None:
@@ -166,8 +180,12 @@ def _compare(oracle, derived, path: str, skips: set, bad: list) -> None:
             _compare(oracle[key], derived[key], child, skips, bad)
         for key in derived:
             if key not in oracle:
-                bad.append(f"{path}.{key}: derived adds a key the oracle "
-                           "never froze")
+                child = f"{path}.{key}"
+                if child in _WAIVED_ADDED:
+                    skips.add(child)
+                else:
+                    bad.append(f"{child}: derived adds a key the oracle "
+                               "never froze")
         return
     if isinstance(oracle, list):
         if not isinstance(derived, list):

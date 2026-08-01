@@ -383,9 +383,23 @@ class AppleMailSource:
     # ------------------------------------------------------------------ #
 
     def mailboxes(self) -> list[Mailbox]:
-        cur = self._conn.cursor()
-        rows = cur.execute(
-            "SELECT url, total_count, unread_count FROM mailboxes ORDER BY total_count DESC"
+        # total_count is the account's server-side number; local_count is
+        # the rows a read can actually serve. Gmail-style stores advertise
+        # thousands for label mailboxes (INBOX, [Gmail]/Sent Mail, …)
+        # whose local copies live only under [Gmail]/All Mail — both
+        # numbers are true, so both are reported (field evidence,
+        # 2026-08-01: the gap read as tool failure until named).
+        deleted = "AND m.deleted = 0" if self._have("messages", "deleted") else ""
+        rows = self._conn.execute(
+            f"""
+            SELECT mb.url AS url, mb.total_count AS total_count,
+                   mb.unread_count AS unread_count,
+                   COUNT(m.ROWID) AS local_count
+              FROM mailboxes mb
+              LEFT JOIN messages m ON m.mailbox = mb.ROWID {deleted}
+             GROUP BY mb.ROWID
+             ORDER BY mb.total_count DESC
+            """
         ).fetchall()
         return [
             Mailbox(
@@ -394,6 +408,7 @@ class AppleMailSource:
                 path=r["url"] or "",
                 total=int(r["total_count"] or 0),
                 unread=int(r["unread_count"] or 0),
+                local_count=int(r["local_count"] or 0),
             )
             for r in rows
             if r["url"]

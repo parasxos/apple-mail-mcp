@@ -20,6 +20,7 @@ import re
 import subprocess
 import sys
 import time
+import urllib.parse
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 
@@ -83,6 +84,7 @@ class SearchHit(EmailRef):
 class SearchPage:
     fts: dict
     results: list[SearchHit]
+    note: str | None       # why an empty mailbox-scoped page is empty
 
 
 @dataclass(frozen=True)
@@ -139,6 +141,7 @@ class MailboxList:
 @dataclass(frozen=True)
 class RecentPage:
     messages: list[EmailRef]
+    note: str | None       # why an empty mailbox-scoped page is empty
 
 
 @dataclass(frozen=True)
@@ -250,7 +253,11 @@ def tool_search_emails(
         )
         results.append(SearchHit(
             **asdict(r), body_match=r.id in hit_ids and not visible))
-    return SearchPage(fts=fts, results=results)
+    # An empty page scoped to a server-side-only mailbox must say why —
+    # the emptiness is real; only the silence was the bug.
+    note = _empty_scope_note(src, mailbox, account) \
+        if mailbox and not results else None
+    return SearchPage(fts=fts, results=results, note=note)
 
 
 # Payload views for get_email / get_emails_batch, smallest first.
@@ -268,6 +275,27 @@ def _check_page(limit: int) -> None:
     if not 0 < limit <= _PAGE_MAX:
         raise InvalidInput(f"limit {limit} is outside 1..{_PAGE_MAX} — "
                            "lower it and paginate")
+
+
+def _empty_scope_note(src: EmailSource, mailbox: str,
+                      account: str | None) -> str | None:
+    """Why an empty mailbox-scoped page is empty, when the store can say:
+    Gmail-style accounts advertise server-side counts for mailboxes that
+    hold ZERO local rows (their messages live only under [Gmail]/All
+    Mail), and an unexplained [] from such a scope read as tool failure
+    in the field (2026-08-01). Scope matching mirrors the source's
+    mailbox/account filters: URL substring over the quoted name."""
+    tail = "/" + urllib.parse.quote(mailbox)
+    scoped = [b for b in src.mailboxes()
+              if tail in b.path
+              and (not account or f"//{account}/" in b.path)]
+    server_side = sum(b.total for b in scoped)
+    if not scoped or not server_side or any(b.local_count for b in scoped):
+        return None
+    return (f"mailbox {mailbox!r} holds {server_side} message(s) "
+            "server-side but none in the local store — Gmail accounts "
+            "keep local copies only under [Gmail]/All Mail; search "
+            "there, or drop the mailbox filter.")
 
 
 def _shape_email(msg: Email, view: str) -> Email | EmailMetadata | EmailMinimal:
@@ -329,7 +357,11 @@ def tool_list_recent(
     limit: int = 50,
 ) -> RecentPage:
     _check_page(limit)
-    return RecentPage(messages=list(_source().recent(mailbox, account, limit)))
+    src = _source()
+    messages = list(src.recent(mailbox, account, limit))
+    note = _empty_scope_note(src, mailbox, account) \
+        if mailbox and not messages else None
+    return RecentPage(messages=messages, note=note)
 
 
 @envelope.tool
@@ -876,7 +908,9 @@ def _build_mcp_server():
         the index is absent or behind. `state: "absent"` means bodies were
         NOT searched (subject/sender/snippet only) until the index is
         built. Each result carries `body_match`: true when it matched only
-        in the body (the query is not visible in subject/from/snippet)."""
+        in the body (the query is not visible in subject/from/snippet).
+        An empty page scoped to a mailbox that exists only server-side
+        (see list_mailboxes' local_count) carries a `note` saying why."""
         return tool_search_emails(
             query=query, from_addr=from_addr, to_addr=to_addr,
             mailbox=mailbox, account=account, before=before, after=after,
@@ -912,8 +946,12 @@ def _build_mcp_server():
 
     @mcp.tool()
     def list_mailboxes() -> dict:
-        """List all known mailboxes across all accounts, with message
-        counts. Returns {ok, mailboxes}."""
+        """List all known mailboxes across all accounts. Each entry
+        carries two counts: `total` (what the account reports server-side)
+        and `local_count` (messages actually in the local store — what
+        search/list can serve). Gmail label mailboxes typically show
+        total > 0 with local_count 0: their local copies live only under
+        [Gmail]/All Mail. Returns {ok, mailboxes}."""
         return tool_list_mailboxes()
 
     @mcp.tool()
@@ -923,6 +961,8 @@ def _build_mcp_server():
         limit: int = 50,
     ) -> dict:
         """List the newest messages, optionally scoped to a mailbox/account.
+        An empty page scoped to a mailbox that exists only server-side
+        (see list_mailboxes' local_count) carries a `note` saying why.
         Returns {ok, messages}."""
         return tool_list_recent(mailbox=mailbox, account=account, limit=limit)
 

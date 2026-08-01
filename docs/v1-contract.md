@@ -405,6 +405,14 @@ gains an `audit` check (dir exists, perms, writability).
 - **outputSchema: frozen at v0.11**, after the bare shapes (§1, tools
   2, 4–7) take their one allowed break into envelopes. That break is the
   known normalization debt named in the roadmap and happens exactly once.
+  - *Additive growth 2026-08-01* (snapshot regenerated deliberately):
+    `list_mailboxes` entries gain `local_count` — messages actually in
+    the local store, alongside the server-side `total` (Gmail label
+    mailboxes advertise thousands with zero local rows; everything lives
+    under `[Gmail]/All Mail`). `search_emails` and `list_recent` gain
+    `note` — set when an empty page was scoped to such a server-side-only
+    mailbox, so the emptiness explains itself instead of reading as tool
+    failure.
 - **Audit schema**: `v` is bumped only for breaking changes to the event
   envelope; adding optional fields does not bump it. Readers must ignore
   unknown fields and tolerate mixed `v` within one file month.

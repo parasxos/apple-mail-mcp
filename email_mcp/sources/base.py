@@ -15,8 +15,9 @@ class Mailbox:
     account: str           # account UUID or alias
     name: str              # folder path within the account, e.g. "INBOX" or "[Gmail]/All Mail"
     path: str              # implementation-defined identifier (URL for Apple Mail)
-    total: int
+    total: int             # server-side count the account advertises
     unread: int
+    local_count: int       # messages actually in the local store — what reads can serve
 
 
 @dataclass(frozen=True)

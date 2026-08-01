@@ -90,6 +90,10 @@ def _build_envelope_index(db_path: Path) -> None:
         [
             (1, f"local://{LOCAL_ACCT}/Inbox", 3, 1),
             (2, f"imap://{IMAP_ACCT}/%5BGmail%5D/All%20Mail", 1, 0),
+            # Ghost label mailbox (field-observed 2026-08-01): Gmail
+            # advertises a server-side count but keeps every local copy
+            # under [Gmail]/All Mail — no message row ever points here.
+            (30, f"imap://{IMAP_ACCT}/Promo", 133, 5),
         ],
     )
 

@@ -215,6 +215,7 @@
     "mailboxes": [
       {
         "account": "str",
+        "local_count": "int",
         "name": "str",
         "path": "str",
         "total": "int",
@@ -244,6 +245,7 @@
         "unread": "bool"
       }
     ],
+    "note": "str|null",
     "ok": "bool"
   },
   "list_scheduled": "dict",
@@ -309,6 +311,7 @@
   },
   "search_emails": {
     "fts": "dict",
+    "note": "str|null",
     "ok": "bool",
     "results": [
       {

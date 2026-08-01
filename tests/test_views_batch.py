@@ -196,11 +196,11 @@ def test_bare_array_tools_gained_envelopes(src):
 
     out = server.tool_list_mailboxes()
     assert out["ok"] is True and set(out) == {"ok", "mailboxes"}
-    assert {m["name"] for m in out["mailboxes"]} == {"Inbox",
+    assert {m["name"] for m in out["mailboxes"]} == {"Inbox", "Promo",
                                                      "[Gmail]/All Mail"}
 
     out = server.tool_list_recent(limit=2)
-    assert out["ok"] is True and set(out) == {"ok", "messages"}
+    assert out["ok"] is True and set(out) == {"ok", "messages", "note"}
     assert [r["id"] for r in out["messages"]] == ["101", "100"]
 
 
@@ -210,3 +210,63 @@ def test_get_attachment_gained_the_envelope(src):
     blob = out["attachment"]
     assert blob["name"] == "production.csv"
     assert set(blob) == {"name", "mime", "size", "path"}
+
+
+# --------------------------------------------------------------------- #
+# ghost mailboxes (field evidence 2026-08-01): Gmail label mailboxes    #
+# advertise server-side counts with ZERO local rows — list_mailboxes    #
+# reports both counts, and an empty page scoped to one says why.        #
+# --------------------------------------------------------------------- #
+
+IMAP_ACCT = "BBBBBBBB-0000-0000-0000-000000000002"
+LOCAL_ACCT = "AAAAAAAA-0000-0000-0000-000000000001"
+
+
+def test_list_mailboxes_carries_local_count_alongside_total(src):
+    boxes = {m["name"]: m for m in server.tool_list_mailboxes()["mailboxes"]}
+    assert boxes["Inbox"]["total"] == 3
+    assert boxes["Inbox"]["local_count"] == 3
+    # The ghost stays advertised — it IS real server-side (hiding it
+    # would lie in the other direction) — but both numbers are on show.
+    assert boxes["Promo"]["total"] == 133
+    assert boxes["Promo"]["local_count"] == 0
+
+
+def test_scoped_search_on_a_ghost_mailbox_says_why_it_is_empty(src):
+    out = tool_search_emails(mailbox="Promo")
+    assert out["ok"] is True and out["results"] == []
+    assert "133" in out["note"]
+    assert "[Gmail]/All Mail" in out["note"]
+
+
+def test_scoped_list_recent_on_a_ghost_mailbox_says_why_it_is_empty(src):
+    out = tool_list_recent(mailbox="Promo")
+    assert out["ok"] is True and out["messages"] == []
+    assert "[Gmail]/All Mail" in out["note"]
+
+
+def test_note_respects_the_account_scope(src):
+    # Scoped to an account that has no such mailbox: nothing matched the
+    # scope at all — not the ghost situation, no note.
+    out = tool_search_emails(mailbox="Promo", account=LOCAL_ACCT)
+    assert out["results"] == [] and out["note"] is None
+    out = tool_search_emails(mailbox="Promo", account=IMAP_ACCT)
+    assert out["note"] is not None
+
+
+def test_normal_and_unknown_mailboxes_carry_no_note(src):
+    # Populated scope with hits: no note.
+    out = tool_search_emails(mailbox="Inbox")
+    assert out["results"] and out["note"] is None
+    # Populated scope emptied by filters: real emptiness, no note.
+    out = tool_search_emails(mailbox="Inbox", query="zzz-no-such-thing")
+    assert out["results"] == [] and out["note"] is None
+    # Unknown mailbox: the scope matched nothing — no note.
+    out = tool_search_emails(mailbox="NoSuchBox")
+    assert out["results"] == [] and out["note"] is None
+    # Unscoped empty search: no note.
+    out = tool_search_emails(query="zzz-no-such-thing")
+    assert out["results"] == [] and out["note"] is None
+    # Populated scoped list_recent: no note.
+    out = tool_list_recent(mailbox="Inbox")
+    assert out["messages"] and out["note"] is None

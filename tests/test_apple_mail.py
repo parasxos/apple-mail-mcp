@@ -11,10 +11,15 @@ def test_mailboxes(mail_fixture):
     src = AppleMailSource(mail_base=mail_fixture)
     boxes = src.mailboxes()
     names = sorted((b.account[:8], b.name) for b in boxes)
-    assert names == [("AAAAAAAA", "Inbox"), ("BBBBBBBB", "[Gmail]/All Mail")]
+    assert names == [("AAAAAAAA", "Inbox"), ("BBBBBBBB", "Promo"),
+                     ("BBBBBBBB", "[Gmail]/All Mail")]
     inbox = next(b for b in boxes if b.name == "Inbox")
     assert inbox.total == 3
     assert inbox.unread == 1
+    assert inbox.local_count == 3  # synced mailbox: both counts agree
+    ghost = next(b for b in boxes if b.name == "Promo")
+    assert ghost.total == 133 and ghost.unread == 5
+    assert ghost.local_count == 0  # server-side only: zero local rows
 
 
 def test_recent_orders_by_date_desc(mail_fixture):
