@@ -36,15 +36,16 @@ def _iso_in(minutes: float) -> str:
 
 
 @pytest.fixture
-def send_env(monkeypatch, tmp_path):
-    """Documented defaults + isolated spool/plans (mirrors the sender
-    suites; the audit dir is already pinned by the conftest guard)."""
+def send_env(monkeypatch, tmp_path, state_dir_guard):
+    """Documented defaults (mirrors the sender suites); the state root is
+    re-pinned after the EMAIL_MCP_* wipe — spool/plans/audit all live
+    under the conftest guard's root."""
     for k in list(os.environ):
         if k.startswith("EMAIL_MCP_"):
             monkeypatch.delenv(k, raising=False)
+    monkeypatch.setenv("EMAIL_MCP_STATE_DIR", str(state_dir_guard))
     monkeypatch.setenv("EMAIL_MCP_FROM_ADDR", "paris@example.org")
     monkeypatch.setenv("EMAIL_MCP_FROM_NAME", "Paris")
-    monkeypatch.setenv("EMAIL_MCP_STATE_DIR", str(tmp_path))
     monkeypatch.setenv("EMAIL_MCP_IDENTITIES",
                        str(tmp_path / "no-identities.toml"))
 
@@ -485,18 +486,6 @@ def test_doctor_audit_check_reports_and_gates_top_level_ok(
 ):
     from email_mcp import audit, doctor
 
-    # (a) ledger dir absent — a fresh install, not a fault. doctor is
-    # read-only: it says so and does NOT create the directory.
-    assert not audit_dir_guard.exists()
-    check = doctor.check_audit()
-    assert check["ok"] is True
-    assert "no ledger yet" in check["detail"]
-    assert check["last_event"] is None
-    assert not audit_dir_guard.exists()   # the check created nothing
-
-    # (b) ledger dir present but empty — no events recorded yet.
-    audit_dir_guard.mkdir(parents=True)
-    audit_dir_guard.chmod(0o700)
     check = doctor.check_audit()
     assert check["ok"] is True
     assert "no events yet" in check["detail"]

@@ -9,7 +9,7 @@ only after v1.0 — breaking = v2 (§8).*
 
 Sections: 1 scope + conformance table · 2 envelope semantics · 3 the one
 error-code namespace · 4 idempotency + retry · 5 caps + TTLs · 6 audit event
-schema v1 · 7 wire safety · 8 versioning · 9 known limitations.
+schema v1 · 7 wire safety · 8 versioning.
 
 ---
 
@@ -33,37 +33,34 @@ Conformance is staged deliberately:
   assignments of §3.4, made on paper here, get wired), and outputSchema is
   frozen by snapshot. inputSchema is already frozen at v0.10 (§8).
 
-| # | Tool | Side | Success shape (v0.11) | Failure shape (v0.11) | v0.10 change | Fully conformant at |
+| # | Tool | Side | Success shape today | Failure shape today | v0.10 change | Fully conformant at |
 |---|------|------|--------------------|--------------------|--------------|---------------------|
 | 1 | `search_emails` | R | `{ok: true, fts, results}` | crashed on bad `before`/`after` (ValueError leak) | belt: coded failures (`invalid_input`, `mail_unavailable`, `internal_error`) | **v0.10** |
-| 2 | `get_email` | R | `{ok: true, email}` — envelope since v0.11 (was bare dict) | `{ok: false, code, error}` — `not_found`, `mail_unavailable`, `invalid_input` (bad view), … | belt: coded failures on the crash paths (`not_found`, `mail_unavailable`, …) | **v0.11** — shipped |
-| 3 | `get_emails_batch` | R | `{ok: true, view, emails, errors}` — per-id failures are data in `errors[]`, each `{id, code, error}` | `{ok: false, code, error}` on bad view / >50 ids | belt on crash paths | **v0.11** — shipped |
-| 4 | `get_thread` | R | `{ok: true, thread: [...]}` — envelope since v0.11 (was bare array) | belted: `{ok: false, code, error}` | none — deferred: the declared array outputSchema blocked a coded dict | **v0.11** — shipped |
-| 5 | `list_mailboxes` | R | `{ok: true, mailboxes: [...]}` — envelope since v0.11 | belted: `{ok: false, code, error}` | none — deferred (same reason as get_thread) | **v0.11** — shipped |
-| 6 | `list_recent` | R | `{ok: true, messages: [...]}` — envelope since v0.11 | belted: `{ok: false, code, error}` | none — deferred (same reason as get_thread) | **v0.11** — shipped |
-| 7 | `get_attachment` | R | `{ok: true, attachment}` — envelope since v0.11 (was bare dict) | `{ok: false, code, error}` | belt: coded failures | **v0.11** — shipped |
-| 8 | `refresh_mail` | R | `{ok, before, after, new_messages, …}` (hardened since v0.4) | `{ok: false, error, error_code?, code?}` — the raw osascript number now carries its mapped string `code` (§3.3) | none needed (already total) | **v0.11** — shipped |
-| 9 | `list_scheduled` | R | `{ok: true, dispatcher_installed, …states}` | `{ok: false, code: invalid_input, error}` on unknown state | belt on crash paths | **v0.11** — shipped |
-| 10 | `doctor` | R | `{ok, read_only, checks, audit}` — **`ok` reports environment health**, not tool failure (documented exception to §2); `audit` is the ledger check as a top-level sibling of `checks` | already total | gained the `audit` check | **v0.10** |
+| 2 | `get_email` | R | **bare** shaped dict (v0.7-compat choice) | crashed on unknown id / unreadable store; `{ok: false, error}` (no code) on bad view | belt: coded failures on the crash paths (`not_found`, `mail_unavailable`, …) | v0.11 (success envelope + coded bad-view) |
+| 3 | `get_emails_batch` | R | `{ok: true, view, emails, errors}` — per-id failures are data in `errors[]` | `{ok: false, error}` (no code) on bad view / >50 ids | belt on crash paths | v0.11 (codes on the two rejects; `errors[].code`) |
+| 4 | `get_thread` | R | **bare array** of refs | crashes leak | none — **deferred**: its declared outputSchema is an array, so a coded dict cannot be returned without breaking the declared schema | v0.11 (gains envelope) |
+| 5 | `list_mailboxes` | R | **bare array** | crashes leak | none — **deferred** (same reason as get_thread) | v0.11 |
+| 6 | `list_recent` | R | **bare array** | crashes leak | none — **deferred** (same reason as get_thread) | v0.11 |
+| 7 | `get_attachment` | R | **bare** dict (path, meta) | crashed on unknown id / vanished file | belt: coded failures | v0.11 (success envelope) |
+| 8 | `refresh_mail` | R | `{ok, before, after, new_messages, …}` (hardened since v0.4) | `{ok: false, error, error_code?}` — numeric osascript code, no string code | none needed (already total) | v0.11 (string `code` via §3.3 map) |
+| 9 | `list_scheduled` | R | `{ok: true, dispatcher_installed, …states}` | `{ok: false, error}` (no code) on unknown state | belt on crash paths | v0.11 (code on the reject) |
+| 10 | `doctor` | R | `{ok, read_only, checks}` — **`ok` reports environment health**, not tool failure (documented exception to §2) | already total | gains the `audit` check | **v0.10** |
 | 11 | `audit` | R | `{ok: true, events, files_scanned, skipped_lines}` | `{ok: false, code, error, fix?}` | **new tool** — born conformant | **v0.10** |
-| 12 | `send_email` | W | `{ok: true, message_id, to, cc, bcc, subject, attachments, bootstrapped}` | `{ok: false, code, error}` — every SendError site coded per §3.4 | audit `send` event on every terminal outcome | **v0.11** — shipped |
-| 13 | `reply_email` | W | same as send_email | same | audit `reply` event | **v0.11** — shipped |
-| 14 | `schedule_email` | W | `{ok: true, id, send_at, message_id, executor, …, warning?}` | `{ok: false, code, error}` — §3.4 codes | audit `schedule` event | **v0.11** — shipped |
-| 15 | `cancel_scheduled` | W | `{ok: true, id, status, subject, was_due}` | `{ok: false, code, error, operation_id?}` — all 7 sites coded: unknown id → `not_found`, state conflicts → `invalid_input`, identity/Exchange trouble via §3.4 | audit `cancel` event | **v0.11** — shipped |
+| 12 | `send_email` | W | `{ok: true, message_id, to, cc, bcc, subject, attachments, bootstrapped}` | `{ok: false, error}` — SendError prose, no code | audit `send` event on every terminal outcome | v0.11 (codes per §3.4) |
+| 13 | `reply_email` | W | same as send_email | same | audit `reply` event | v0.11 (codes per §3.4) |
+| 14 | `schedule_email` | W | `{ok: true, id, send_at, message_id, executor, …, warning?}` | `{ok: false, error}` — prose | audit `schedule` event | v0.11 (codes per §3.4) |
+| 15 | `cancel_scheduled` | W | `{ok: true, id, status, subject, was_due}` | `{ok: false, error}` — **7 prose-only failure sites**, no codes | audit `cancel` event | v0.11 (sites gain codes from §3; unknown id → `not_found`, the rest pinned in the v0.11 plan) |
 | 16 | `triage_plan` | W | `{ok: true, plan_id, count, expires_at, summary, actions, messages}` | `{ok: false, code, error}` — TriageError codes | belt closes the `before`/`after` ValueError leak | **v0.10** |
 | 17 | `triage_plan_delete` | W | same as triage_plan | same | same belt | **v0.10** |
 | 18 | `triage_apply` | W | `{ok: true, status, planned, acted, failures[], verified, pending[], …}` — per-message failures are data | `{ok: false, code, error}` | belt (carries `operation_id: plan_id`); audit `plan_finish` via plans.finish | **v0.10** |
 | 19 | `mailbox_create` | W | `{ok: true, existed, applescript, index_verified, mail_verified, warning}` | `{ok: false, code, error}` | audit `mailbox_create` event (created only) | **v0.10** |
 | 20 | `mailbox_delete` | W | `{ok: true, existed, deleted, mail_verified, method?, warning}` | `{ok: false, code, error}` (incl. the literal-only codes, §3.1) | audit `mailbox_delete` event (issued only) | **v0.10** |
 
-Shipped status (2026-07-30, branch v0.11): every "v0.11 — shipped" row
-above is live. The three bare-**list** tools (4–6) — whose v0.10 deferral
-existed because their registered outputSchema declared an array, so even a
-failure envelope would have violated the schema the client already held —
-and the two bare-dict tools (2, 7) took their one allowed break into
-envelopes; batch `errors[]` entries carry `code`; every send/cancel failure
-site carries its §3 code. The output surface is frozen by snapshot from
-this point (§8).
+The three bare-**list** tools (4–6) are the only ones whose v0.10 status is
+"conformance deferred, stated here": their registered outputSchema declares
+an array, so even a failure envelope would violate the schema the client
+already holds. They gain envelopes exactly once, at v0.11, together with the
+outputSchema snapshot freeze.
 
 ## 2. Envelope semantics
 
@@ -84,11 +81,7 @@ Every tool that returns an object speaks one envelope:
   spool id). It is the same id the audit ledger's `op` field carries (§6),
   so a failed operation can be threaded to its ledger events in one lookup.
   It is never minted *for* a failure: a validation reject that touched
-  nothing carries no `operation_id`. Enforced structurally — a caller-supplied
-  argument is echoed only when it has the exact shape of a minted id
-  (`<UTC stamp>-<12 hex>`, `ids.is_minted_id`), so a typo or a hostile
-  60 KB string is a reference to nothing and is dropped rather than
-  reflected.
+  nothing carries no `operation_id`.
 
 Rules:
 
@@ -161,8 +154,8 @@ tool-level code:
 | `no_result` | the script produced no line for this id |
 | `batch_timeout` | osascript was killed at the deadline; verification may still confirm the message independently |
 
-`get_emails_batch`'s `errors[]` entries are `{id, code, error}` as of v0.11
-(`code` from `not_found`/`invalid_input`).
+`get_emails_batch`'s `errors[]` entries are `{id, error}` prose today; they
+gain an `errors[].code` (from `not_found`/`invalid_input`) at v0.11.
 
 ### 3.3 osascript numeric map
 
@@ -244,7 +237,7 @@ message_id before retrying — never blind-resend.
 |------|-------------|------------|
 | `send_email` | **No** — every call composes a fresh Message-ID | `{ok: false}` before transport handoff (validation, allowlist, attachments, preflight) touched nothing: fix and retry freely. After an ambiguous transport outcome (timeout, crash): check for the returned/logged `message_id` (Bcc-to-self copy, audit `send` event) before resending |
 | `reply_email` | **No** — same as send_email | same as send_email |
-| `schedule_email` | **No per call** (fresh spool id + Message-ID each time), but the scheduled delivery itself is **at-least-once**, not exactly-once. The atomic manifest rename means only one dispatcher ever *claims* an entry, and a graph entry is never locally delivered while Exchange may still hold or have sent the draft — but a crash between the transport accepting the message and the `sending`→`sent` rename leaves the entry in `sending/`, and `_recover_stranded` requeues it after `STALE_SENDING_MINUTES` precisely because the outcome is not knowable from disk. That window re-delivers. Dedupe on the manifest's frozen `message_id` | `{ok: false}` scheduled nothing — retry freely. `{ok: true}` means the frozen .eml is durably spooled; do NOT re-schedule, use `list_scheduled`/`cancel_scheduled`. Dedupe key: the manifest's frozen `message_id` |
+| `schedule_email` | **No per call** (fresh spool id + Message-ID each time), but the scheduled delivery itself is exactly-once: the dispatcher's atomic manifest rename means one claim wins, and a graph entry is never locally delivered while Exchange may still hold or have sent the draft | `{ok: false}` scheduled nothing — retry freely. `{ok: true}` means the frozen .eml is durably spooled; do NOT re-schedule, use `list_scheduled`/`cancel_scheduled`. Dedupe key: the manifest's frozen `message_id` |
 | `cancel_scheduled` | **Effectively** — the pending→cancelled transition happens at most once (atomic rename fence); repeats and races return `{ok: false}` explaining the current state, mutating nothing | safe to retry until a terminal answer; graph revoke failures leave the entry pending with instructions (Exchange keeps the job until the revoke is CONFIRMED) |
 | `triage_plan` | Each call freezes a NEW plan file (durable artifact, zero mail mutation) | retry freely; superseded plans expire on their own (TTL 600 s) and are GC'd (7 d) |
 | `triage_plan_delete` | same as triage_plan | same |
@@ -259,11 +252,7 @@ recovered after 10 minutes (attempt consumed — the outcome was unknown).
 
 ## 5. Caps and TTLs (live config defaults)
 
-Caps on caller-supplied work REJECT, never truncate: an over-cap
-selection or batch is refused outright. Two rows below are NOT of that
-kind and do truncate, deliberately — the FTS hit cap (informational,
-derived state: newest hits kept) and the audit event/subject caps, whose
-shedding order is specified in §6. Values below are the defaults of
+Caps REJECT, never truncate. Values below are the defaults of
 `email_mcp/config.py` at v0.10; env overrides in parentheses.
 
 | Limit | Default | Knob |
@@ -294,9 +283,8 @@ shedding order is specified in §6. Values below are the defaults of
 The ledger indexes the truths already frozen elsewhere (plan files, spool
 manifests, Message-IDs) — it does not create truth. Storage: append-only
 monthly JSONL, `~/.email-mcp/audit/YYYY-MM.jsonl`, dir 0700, files 0600.
-ONE event per mutation. Three writer processes exist (server, launchd
-dispatcher, and — since v0.11 — the lifecycle/doctor CLI, see the
-`src` values below); each emit is a single `os.write` on an
+ONE event per mutation. Two writer processes exist (server + launchd
+dispatcher); each emit is a single `os.write` on an
 `O_RDWR|O_CREAT|O_APPEND` fd resolved per event (RDWR so the tail probe can `pread`; `O_APPEND` carries the atomicity), so lines never interleave
 and month rollover has no race.
 
@@ -335,13 +323,6 @@ at the point it becomes durable):
 | `plan_finish` | library (`plans.finish` — the one seam covering apply success, all failure sites, expiry AND gc's stale-claim finalisation) | applied / failed / expired; carries `Plan.summary` + compact per-message outcomes (`{id, code}` + pending ids) — this **outlives plan GC** |
 | `mailbox_create` | server tool layer | emitted only when actually created (idempotent no-op emits nothing) |
 | `mailbox_delete` | server tool layer | emitted only when a deletion was actually issued |
-| `doctor_fix` | cli (`doctor --fix`) | *added v0.11* — one event per applied/failed repair, outcome `fixed` / `failed`, detail `{repair, finding, action}`; every event of one `--fix` run shares one freshly-minted `op` |
-| `lifecycle` | cli | *added v0.11* — one event per lifecycle run, outcome `setup` / `update` / `uninstall`; detail carries names and counts only (identity *names*, agents, migrations, purge plan) — never addresses or secrets. The `uninstall` event is emitted BEFORE removal; with `--purge` it is destroyed with the ledger moments later (the documented deal — the receipts hint prints first) |
-
-The two `cli`-sourced rows are v0.11 additions under §8's allowance for new
-audit event types (additive — no `v` bump); with them the lifecycle CLI
-becomes a third writer process beside server and dispatcher, using the same
-single-`os.write` O_APPEND emit.
 
 Not ledger-worthy by design: FTS activity (derived state, rebuildable) and
 `_graph_leave` no-evidence passes (would spam one event per tick while
@@ -388,27 +369,14 @@ gains an `audit` check (dir exists, perms, writability).
   code never print; logging goes through `log.get_logger()` to the log
   file. (The audit CLI and dispatcher `main()` print by design — they are
   separate entry points whose stdout is not the MCP wire.)
-- **No `Exception` crosses the wire.** Every tool is total against the
-  `Exception` hierarchy — all 20, including the formerly array-shaped
-  `get_thread`/`list_mailboxes`/`list_recent`: any path that could raise is
-  either handled with a specific code or caught by a belt that logs the full
-  traceback and returns
+- **No exception crosses the wire.** Every tool is total: any path that
+  could raise is either handled with a specific code or caught by a belt
+  that logs the full traceback and returns
   `{ok: false, code: "internal_error", error, fix: "run doctor"}`.
-  (The v0.10 carve-out that excused those three retired when they gained
-  envelopes at v0.11 — verified by live poisoned-source probes.) The belt's
-  own message rendering is guarded too: an exception whose `__str__` or type
-  name raises still returns an envelope.
-  **The carve-out, stated deliberately:** the belt catches `Exception`, not
-  `BaseException`. `SystemExit`, `KeyboardInterrupt` and `GeneratorExit` are
-  control flow, not tool failures — swallowing them would make Ctrl-C and
-  interpreter shutdown unobservable, which is worse than the traceback. A
-  library that calls `sys.exit()` inside a tool can therefore still terminate
-  the server; that is a bug in the library, and the process dies loudly
-  rather than lying about it.
-- **Failure envelopes are bounded.** `error` is truncated past 2 000
-  characters (the full text goes to the log). Some exceptions quote their
-  input back — an `OSError` names the whole offending path — so an oversized
-  argument would otherwise return as an oversized envelope on the transport.
+  *v0.10 carve-out (audit finding F1):* the three array-shaped tools
+  (`get_thread`, `list_mailboxes`, `list_recent`) are un-belted until their
+  v0.11 envelope migration — §1 rows 4-6 govern; this sentence becomes
+  absolute at v0.11.
 - Every tool return is JSON-serializable (dataclasses/datetimes converted
   at the boundary).
 - **Secrets never appear in envelopes, logs, or audit events.** Secret
@@ -433,60 +401,11 @@ gains an `audit` check (dir exists, perms, writability).
   v0.11). Tool *descriptions* are excluded from the freeze — docstrings may
   evolve.
 - **outputSchema: frozen at v0.11**, after the bare shapes (§1, tools
-  2, 4–7) took their one allowed break into envelopes. That break was the
-  known normalization debt named in the roadmap and happened exactly once.
-  *Mechanism note (v0.11):* FastMCP (1.27) declares no outputSchema for
-  `-> dict` tools, so the freeze is structural —
-  `tests/snapshots/output_schemas.json` pins (a) the declared-schema map
-  (all `null` today; a future typed return trips it deliberately) and
-  (b) the success-envelope shape of ALL 20 tools, mutating tools
-  included, probed against the mail fixture with only the
-  transport/osascript/launchd boundaries faked. List shapes are
-  element-unions: a key or type change in any element breaks the
-  snapshot. `doctor` is pinned at envelope level only
-  (ok/read_only/checks + the ledger check) — its per-check diagnostics
-  vary with machine state by design (§2's documented exception). A
-  missing snapshot file fails the suite loudly (never a silent
-  re-freeze); regeneration is a deliberate act, stated explicitly in the
-  change that carries it.
+  2, 4–7) take their one allowed break into envelopes. That break is the
+  known normalization debt named in the roadmap and happens exactly once.
 - **Audit schema**: `v` is bumped only for breaking changes to the event
   envelope; adding optional fields does not bump it. Readers must ignore
   unknown fields and tolerate mixed `v` within one file month.
 - Spool manifests and plan files keep their compatibility story (older
   manifests without `identity`/`executor` fields keep working via
   defaults) — the ledger never requires migrating them.
-
-## 9. Known limitations
-
-This contract binds the **wire**: shapes, codes, idempotency, caps,
-receipts. It says nothing about the tool's *destructive surface* — the
-lifecycle paths that create, chmod and delete directories on your Mac,
-and the wizard that writes a file next to your credentials. That surface
-has its own document, and it is the one to read before trusting this tool
-with a real mailbox:
-
-**`docs/security-posture.md`** — what is fenced and by which mutation-proven
-test; every red-team finding deliberately NOT fixed, with its blast radius
-stated plainly; the threat-model boundary (this is a personal tool running
-as you — where the fences stop being meaningful); and the exact command to
-re-run the adversarial suite.
-
-The limitations that touch THIS contract's guarantees are named at their
-own rows and repeated here so they are not missed:
-
-- **Scheduled delivery is at-least-once, not exactly-once** (§4,
-  `schedule_email`): the crash window between transport handoff and the
-  `sending`→`sent` rename re-delivers. Dedupe on the frozen `Message-ID`.
-- **Audit events are at-most-once per mutation** (§6): the ledger is an
-  index of truth, never a second source of it. Absence of an event is not
-  proof a mutation did not happen.
-- **Secret *references* may appear in error prose** (§7): a Keychain item
-  name or an `op://` path can reach a transcript or the log file. Secret
-  *values* never leave the driver, and that is pinned by a sentinel test.
-- **`doctor`'s `ok` reports environment health, not tool failure** (§2,
-  §1 row 10) — the one documented exception to the envelope rule.
-
-`docs/security-posture.md` also carries findings this contract does not
-cover at all (env-driven path overrides, symlink discipline, config-file
-denial of service). Those are outside the wire, but they are not outside
-the tool.

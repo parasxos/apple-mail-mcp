@@ -10,20 +10,27 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING, Protocol
 
-from .. import config
+from .. import codes, config
+from ..envelope import ToolError
 
 if TYPE_CHECKING:
     from ..identities import Identity
 
 
-class SendError(Exception):
+class SendError(ToolError):
     """Raised for caller-fixable send failures (blocked recipient, dead
     transport, empty fields). The message is safe to surface verbatim.
 
     Moved here from `sender.py` in v0.7.0 so drivers can raise it without
     importing the composer; `sender` re-exports it, so `sender.SendError`
     stays the same class for every existing importer and `except` clause.
+
+    Every raise site names its §3.4 code (docs/v1-contract.md — frozen on
+    paper at v0.10, on the wire since v0.11); the class default covers a
+    bare `SendError("…")` from a replaced delivery seam.
     """
+
+    code = codes.DELIVERY_FAILED
 
 
 class MailTransport(Protocol):
@@ -71,7 +78,8 @@ def get_transport(identity: "Identity") -> MailTransport:
     if driver not in DRIVERS:
         raise SendError(
             f"[{identity.name}/{driver}] unknown transport driver "
-            f"{driver!r}. Available: {sorted(DRIVERS)}"
+            f"{driver!r}. Available: {sorted(DRIVERS)}",
+            code=codes.IDENTITY_MISCONFIGURED,
         )
     module_path, class_name = DRIVERS[driver].split(":", 1)
     cls = getattr(importlib.import_module(module_path), class_name)
@@ -84,5 +92,6 @@ def get_transport(identity: "Identity") -> MailTransport:
     except TypeError as e:
         raise SendError(
             f"[{identity.name}/{driver}] bad transport params: {e}. "
-            f"Fix the [{identity.name}] block in {config.identities_file()}."
+            f"Fix the [{identity.name}] block in {config.identities_file()}.",
+            code=codes.IDENTITY_MISCONFIGURED,
         ) from e

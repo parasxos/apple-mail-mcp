@@ -15,13 +15,12 @@ moves on. That makes overlapping dispatcher runs double-send-safe.
 from __future__ import annotations
 
 import json
-import os
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
-from . import config, ids
+from . import config, ids, state
 
-STATES = ("pending", "sending", "sent", "failed", "cancelled")
+STATES = state.SPOOL_STATES
 
 
 @dataclass
@@ -57,18 +56,18 @@ iso = ids.iso
 new_id = ids.new_id
 
 
-def _paths(state: str, id: str, *, create: bool = False) -> tuple[Path, Path]:
-    """Resolve one entry's (.eml, .json). create=False by DEFAULT: reading a
-    manifest must not materialise the spool tree, and load()/read_eml() are
-    reads. Only save() — which is about to write — passes create=True."""
-    d = config.spool_dir(create=create) / state
+def _paths(state: str, id: str) -> tuple[Path, Path]:
+    d = config.spool_dir() / state
     return d / f"{id}.eml", d / f"{id}.json"
 
 
 def save(raw: bytes, entry: Entry) -> None:
     """Write .eml + .json into pending/ (tmp-then-rename, so a crashed
-    writer never leaves a half-visible message)."""
-    eml, manifest = _paths("pending", entry.id, create=True)
+    writer never leaves a half-visible message). The one spool write seam
+    that goes through state adoption — every other operation renames or
+    rewrites inside the tree it guarantees."""
+    d = state.State.resolve().adopt().spool / "pending"
+    eml, manifest = d / f"{entry.id}.eml", d / f"{entry.id}.json"
     for path, data in ((eml, raw), (manifest, _dumps(entry))):
         tmp = path.with_suffix(path.suffix + ".tmp")
         tmp.write_bytes(data)
@@ -93,56 +92,14 @@ def read_eml(state: str, id: str) -> bytes:
 
 
 def entries(state: str) -> list[Entry]:
-    # create=False: a pure scan must not materialise the spool tree. doctor
-    # calls this, and creating here let a read-only diagnostic build the
-    # spool wherever the state root pointed. A missing dir simply globs to
-    # nothing, which is the honest answer for "what is queued".
-    d = config.spool_dir(create=False) / state
-    out: list[Entry] = []
-    unreadable: list[str] = []
-    try:
-        # os.listdir, NOT Path.glob: pathlib's glob SWALLOWS a permission
-        # error and yields nothing, so an unreadable directory was
-        # indistinguishable from an empty one and this handler never ran.
-        manifests = sorted(d / n for n in os.listdir(d)
-                           if n.endswith(".json"))
-    except FileNotFoundError:
-        # ABSENT is not UNREADABLE. A fresh install has no spool yet, and
-        # "empty" is the honest answer for a directory that does not
-        # exist — flagging it would make every clean install look broken.
-        unreadable_manifests[state] = []
-        return out
-    except OSError as e:
-        # A spool we are not allowed to READ is different: storing [] here
-        # erased the difference between "no messages" and "I was not
-        # allowed to check", so every surface downstream reported a clean
-        # `pending 0` over mail it simply could not see.
-        unreadable_manifests[state] = [f"<{state}/ unreadable: "
-                                       f"{e.strerror or e}>"]
-        return out
-    for manifest in manifests:
+    d = config.spool_dir() / state
+    out = []
+    for manifest in sorted(d.glob("*.json")):
         try:
             out.append(Entry(**json.loads(manifest.read_bytes())))
         except (json.JSONDecodeError, TypeError, OSError):
-            # Never crash the scan — but never lose the fact either. A
-            # manifest that does not parse was silently dropped from every
-            # count, so `pending 0` was indistinguishable between "nothing
-            # queued" and "a message we cannot read". doctor surfaces this.
-            unreadable.append(manifest.name)
-            continue
-    unreadable_manifests[state] = unreadable
+            continue  # half-written or foreign file; never crash the scan
     return out
-
-
-# Names of manifests the last entries() scan could not parse, per state.
-# Read by doctor; deliberately not an exception — a foreign file in the
-# spool must not break a read, only be reported.
-unreadable_manifests: dict[str, list[str]] = {}
-
-
-def unreadable(state: str) -> list[str]:
-    """Manifests in `state` that entries() could not parse, newest scan."""
-    return list(unreadable_manifests.get(state, []))
 
 
 def find(id: str) -> tuple[str, Entry] | None:

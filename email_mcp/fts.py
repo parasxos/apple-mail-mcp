@@ -2,7 +2,7 @@
 
 The Envelope Index only carries first-line snippets, so search silently
 misses message bodies. This module maintains a private SQLite database
-(config.fts_dir()/fts.db, 0700) with three tables:
+(<state root>/fts/fts.db, 0700) with three tables:
 
   meta      key/value: schema_version, last_rowid high-water mark, timestamps
   docs      per-message ledger: status indexed|partial|missing|error,
@@ -46,7 +46,7 @@ import urllib.parse
 from datetime import datetime, timezone
 from pathlib import Path
 
-from . import config
+from . import config, state
 from .log import get_logger
 from .sources.apple_mail_paths import find_emlx_path, mailbox_data_dir
 
@@ -96,7 +96,7 @@ def match_expr(query: str) -> str:
 
 def db_path() -> Path:
     """Where the index lives. Never creates directories (read-path purity)."""
-    return config.fts_dir(create=False) / _DB_NAME
+    return config.fts_dir() / _DB_NAME
 
 
 def status() -> dict:
@@ -154,14 +154,7 @@ class FtsIndex:
             "last_sync_at": None,
             "last_reconcile_at": None,
         }
-        try:
-            present = path.exists()
-        except OSError:
-            # Unreadable or refused root: "not built" is the honest answer
-            # for an index this process cannot even stat (check_fts is a
-            # SOFT hook — index trouble must never redden doctor further).
-            present = False
-        if not present:
+        if not path.exists():
             out["remedy"] = "python -m email_mcp.fts --build"
             return out
         try:
@@ -328,9 +321,9 @@ class FtsIndex:
         return conn
 
     def _open_rw(self) -> sqlite3.Connection:
-        """Open (creating on first use) the index db. The ONLY place that
-        creates the fts directory or the db file."""
-        path = config.fts_dir(create=True) / _DB_NAME
+        """Open (creating on first use) the index db. The ONLY fts write
+        seam: the directory comes from state adoption (the one door)."""
+        path = state.State.resolve().adopt().fts / _DB_NAME
         conn = sqlite3.connect(path)
         conn.row_factory = sqlite3.Row
         conn.isolation_level = None  # explicit BEGIN IMMEDIATE / COMMIT
@@ -609,10 +602,7 @@ def _plist_path() -> Path:
 
 
 def _log_path() -> Path:
-    # create=False: this only renders a path into a plist. Creating here
-    # built <root>/fts — DERIVED state that only `--build` may create — and
-    # the root with it, as a side effect of formatting a string.
-    return config.fts_dir(create=False).parent / "fts.log"
+    return config.fts_dir().parent / "fts.log"
 
 
 def _plist_content() -> str:
@@ -649,6 +639,7 @@ def _plist_content() -> str:
 
 
 def install_launchd() -> str:
+    state.State.resolve().adopt()  # the agent's log lands in the state root
     plist = _plist_path()
     plist.parent.mkdir(parents=True, exist_ok=True)
     plist.write_text(_plist_content())
@@ -664,13 +655,10 @@ def install_launchd() -> str:
 
 def uninstall_launchd() -> str:
     plist = _plist_path()
-    existed = plist.exists()   # report what happened, not what was intended
     subprocess.run(["launchctl", "bootout", f"gui/{os.getuid()}", str(plist)],
                    capture_output=True)
     if plist.exists():
         plist.unlink()
-    if not existed:
-        return f"no {LAUNCHD_LABEL} agent installed (nothing to remove)"
     return f"removed {LAUNCHD_LABEL}"
 
 
@@ -745,9 +733,6 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--install-launchd", action="store_true")
     parser.add_argument("--uninstall-launchd", action="store_true")
     args = parser.parse_args(argv)
-    rc = config.startup_guard("email-mcp fts")
-    if rc is not None:
-        return rc
 
     if args.install_launchd:
         print(install_launchd())

@@ -17,7 +17,7 @@ busy-loop.
 
 Auth: delegated device-code flow (Mail.ReadWrite + Mail.Send +
 offline_access), stdlib only — no msal. Token caches live at
-`config.graph_dir()/<identity>.token.json`, 0600 inside a 0700 dir,
+`<state root>/graph/<identity>.token.json`, 0600 inside a 0700 dir,
 rewritten atomically (tmp + rename). Access tokens refresh silently via
 the cached refresh_token; when refresh fails the GraphError names the fix:
 
@@ -42,7 +42,7 @@ from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
 from pathlib import Path
 
-from . import config
+from . import codes, config, state
 from .log import get_logger
 from .transports import SendError
 
@@ -67,7 +67,13 @@ class GraphError(SendError):
     catches it for free; schedule-time callers treat it as the signal to
     fall back to the launchd executor, reconcile-time callers as "leave
     the entry alone and retry next pass".
+
+    One code for the whole class: the Exchange lane was unavailable or
+    refused. Graph errors never reach the send/reply/schedule wire (the
+    fallback swallows them); they surface only through cancel_scheduled.
     """
+
+    code = codes.TRANSPORT_UNAVAILABLE
 
 
 class GraphTransportError(GraphError):
@@ -224,17 +230,17 @@ def _graph_reason(body: dict) -> str:
 
 
 # --------------------------------------------------------------------- #
-# token cache (config.graph_dir()/<name>.token.json, 0600 in 0700)       #
+# token cache (<state root>/graph/<name>.token.json, 0600 in 0700)       #
 # --------------------------------------------------------------------- #
 
 
 def _token_path(ident) -> Path:
     try:
-        d = config.graph_dir()
-    except OSError as e:
-        # An unwritable/uncreatable state dir must surface as a GraphError:
-        # schedule-time callers then fall back to launchd instead of
-        # leaking a raw OSError traceback through the tool.
+        d = state.State.resolve().adopt().graph
+    except OSError as e:  # RefusedError included
+        # An unadoptable state tree or broken graph leaf must surface as a
+        # GraphError: schedule-time callers then fall back to launchd
+        # instead of leaking a raw OSError traceback through the tool.
         raise GraphError(
             f"[{_name(ident)}/graph] cannot create/open the graph state "
             f"dir: {e}"
@@ -278,7 +284,7 @@ def _graph_cfg(ident) -> tuple[str, str]:
         raise GraphError(
             f"[{_name(ident)}/graph] identity has no usable graph config — "
             f"set tenant and client_id in [{_name(ident)}.graph] in "
-            f"{config.identities_file()} (see https://github.com/parasxos/email-mcp/blob/main/docs/graph-probe.md)."
+            f"{config.identities_file()} (see docs/graph-probe.md)."
         )
     return tenant, client_id
 
@@ -588,9 +594,6 @@ def main(argv: list[str] | None = None) -> int:
                        help="report identity NAME's token cache — purely "
                             "local, no network")
     args = parser.parse_args(argv)
-    rc = config.startup_guard("email-mcp graph")
-    if rc is not None:
-        return rc
     name = args.login or args.status
 
     from . import identities  # late: CLI-only dependency

@@ -17,6 +17,7 @@ import time
 from datetime import datetime, timedelta
 
 from . import audit, config, plans
+from .envelope import ToolError
 from .log import get_logger
 from .plans import Plan, PlanAction, PlanMessage
 from .sources.base import SearchQuery
@@ -31,12 +32,11 @@ ACTIONS = {"move_to", "mark_read", "mark_unread", "flag", "unflag"}
 DESTRUCTIVE = {"delete"}
 
 
-class TriageError(Exception):
-    """Caller-fixable triage failure with a machine-readable code."""
+class TriageError(ToolError):
+    """Caller-fixable triage failure with a machine-readable §3.1 code."""
 
     def __init__(self, code: str, message: str):
-        self.code = code
-        super().__init__(message)
+        super().__init__(message, code=code)
 
 
 # --------------------------------------------------------------------- #

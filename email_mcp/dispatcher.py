@@ -32,7 +32,7 @@ import sys
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-from . import audit, codes, config, identities, sender, spool
+from . import audit, codes, config, identities, sender, spool, state
 from .log import get_logger
 
 _log = get_logger()
@@ -144,11 +144,6 @@ def _recover_stranded(now: datetime) -> list[str]:
                        detail={"attempts": e.attempts})
             recovered.append(e.id)
     return recovered
-
-
-# Public seam for doctor --fix (email_mcp.repairs): the same function
-# under a stable name — no behavior change.
-recover_stranded = _recover_stranded
 
 
 # Exchange owns a graph entry until send_at + this grace: normal deferred
@@ -458,8 +453,7 @@ def _plist_path() -> Path:
 
 
 def _log_path() -> Path:
-    # Path only — resolving where the log lives must not create the spool.
-    d = config.spool_dir(create=False).parent
+    d = config.spool_dir().parent
     return d / "dispatcher.log"
 
 
@@ -496,12 +490,7 @@ def _plist_content() -> str:
 
 def _remove_legacy_plists() -> list[str]:
     """Boot out and delete every LEGACY_LABELS agent. Returns the labels
-    actually found (loaded or on disk). A launchctl that refuses or
-    reports nothing loaded is tolerated (returncode is only read as
-    "was it there"), but a MISSING launchctl raises OSError like every
-    other launchctl call here — callers must not report a removal they
-    could not verify, and both of ours (install_launchd's caller,
-    uninstall's agent loop) turn that into a reported failure."""
+    actually found (loaded or on disk); best-effort, never raises."""
     uid = os.getuid()
     removed: list[str] = []
     for label in LEGACY_LABELS:
@@ -516,12 +505,8 @@ def _remove_legacy_plists() -> list[str]:
     return removed
 
 
-# Public seam for doctor --fix (email_mcp.repairs): the same function
-# under a stable name — no behavior change.
-remove_legacy_plists = _remove_legacy_plists
-
-
 def install_launchd() -> str:
+    state.State.resolve().adopt()  # the agent's log lands in the state root
     migrated = _remove_legacy_plists()
     plist = _plist_path()
     plist.parent.mkdir(parents=True, exist_ok=True)
@@ -540,36 +525,17 @@ def install_launchd() -> str:
 def uninstall_launchd() -> str:
     removed_legacy = _remove_legacy_plists()
     plist = _plist_path()
-    # Report what actually happened. This said "removed <label>"
-    # unconditionally, so an uninstall that had just printed "nothing
-    # found" went on to claim two removals — self-contradictory, and it
-    # hides a bootout that silently did nothing.
-    existed = plist.exists()
     subprocess.run(["launchctl", "bootout", f"gui/{os.getuid()}", str(plist)],
                    capture_output=True)
     if plist.exists():
         plist.unlink()
     note = f" (+ legacy: {', '.join(removed_legacy)})" if removed_legacy else ""
-    if not existed and not removed_legacy:
-        return f"no {LAUNCHD_LABEL} agent installed (nothing to remove)"
-    if not existed:
-        return f"removed legacy: {', '.join(removed_legacy)}"
     return f"removed {LAUNCHD_LABEL}{note}"
 
 
 def status() -> dict:
-    # create=False: `--status` is a documented read-only overview. Resolving
-    # with create=True made *diagnosing* claim the state root — marker and
-    # all — so `doctor`'s honest "created on first use" depended on whether
-    # the user had run the overview first.
-    # A refused root makes every count below a LIE by omission: the scan
-    # honestly returns [] for a spool it cannot see, and `--status` is the
-    # command an operator runs to ask "is my queued mail moving?". Reporting
-    # a serene `"pending": 0` against a root `doctor` refuses to manage is
-    # the worst possible answer — indistinguishable from "nothing queued".
-    refusal = config.state_root_refusal()
-    out = {
-        "spool": str(config.spool_dir(create=False)),
+    return {
+        "spool": str(config.spool_dir()),
         "launchd_plist": str(_plist_path()),
         "launchd_installed": _plist_path().exists(),
         "counts": {s: len(spool.entries(s)) for s in spool.STATES},
@@ -581,47 +547,18 @@ def status() -> dict:
             for e in spool.entries("pending")
         ],
     }
-    # ONE shared definition of "is this report trustworthy" (email_mcp.
-    # health), so a surface cannot pick up half of it — which is exactly
-    # how a refused root and an unreadable manifest came to be flagged
-    # here and nowhere else.
-    from . import health
-
-    caveat = health.caveats(spool_states=spool.STATES, audit_query=None)
-    if caveat:
-        out.update(caveat)
-        # Drop the zeros rather than leave `jq .counts.pending` reading 0
-        # next to a flag it will not look at.
-        out["counts"] = None
-        out["pending"] = []
-    return out
 
 
-def main() -> int:
+def main(argv: list[str] | None = None) -> int:
     audit.set_process("dispatcher")  # tag this process's ledger events
     parser = argparse.ArgumentParser(prog="email_mcp.dispatcher")
     parser.add_argument("--status", action="store_true")
     parser.add_argument("--install-launchd", action="store_true")
     parser.add_argument("--uninstall-launchd", action="store_true")
-    args = parser.parse_args()
-    # Startup gate (mirrors server.main / cli.main): with a retired
-    # per-directory variable set, this agent would drain the DEFAULT spool
-    # while the operator's queued mail sat in the directory the variable
-    # named — delivering nothing and reporting success. Refuse instead.
-    retired = config.retired_state_var_error()
-    if retired is not None:
-        print(f"email-mcp dispatcher: {retired}", file=sys.stderr)
-        return 2
+    args = parser.parse_args(argv)
     if args.status:
-        report = status()
-        json.dump(report, sys.stdout, indent=2)
+        json.dump(status(), sys.stdout, indent=2)
         sys.stdout.write("\n")
-        if report.get("counts_are_meaningful") is False:
-            from . import health
-
-            for line in health.summarize(report):
-                print(f"email-mcp dispatcher: {line}", file=sys.stderr)
-            return 1
         return 0
     if args.install_launchd:
         print(install_launchd())

@@ -28,7 +28,7 @@ from email.parser import BytesHeaderParser
 from email.utils import formataddr, getaddresses, make_msgid, parseaddr
 from pathlib import Path
 
-from . import config, identities, transports
+from . import codes, config, identities, transports
 from .log import get_logger
 from .transports import SendError  # re-export: same class everywhere
 
@@ -68,7 +68,8 @@ def _reject_header_injection(fields: dict[str, object]) -> None:
                 raise SendError(
                     f"header_injection: control character (CR/LF/NUL) in "
                     f"`{name}`: {str(item)!r} — headers are single-line; "
-                    "put extra recipients in to/cc/bcc, extra text in body."
+                    "put extra recipients in to/cc/bcc, extra text in body.",
+                    code=codes.HEADER_INJECTION,
                 )
 
 
@@ -82,7 +83,8 @@ def _validate_bare_addresses(field: str, addrs: list[str]) -> None:
                 or any(c.isspace() or ord(c) < 0x20 for c in bare)):
             raise SendError(
                 f"invalid_recipient: {entry!r} in `{field}` is not a usable "
-                "address (want user@domain, optionally as 'Name <user@domain>')."
+                "address (want user@domain, optionally as 'Name <user@domain>').",
+                code=codes.INVALID_RECIPIENT,
             )
 
 
@@ -102,7 +104,8 @@ def _recipient_lists(
                 raise SendError(
                     f"invalid_recipient: control character (CR/LF/NUL) in "
                     f"`{name}`: {str(item)!r} — addresses are single-line, "
-                    "comma-separated."
+                    "comma-separated.",
+                    code=codes.INVALID_RECIPIENT,
                 )
         split = _split(raw)
         _validate_bare_addresses(name, split)
@@ -144,7 +147,8 @@ def _enforce_allowlist(recipients: list[str], ident: identities.Identity) -> Non
             f"on its allowlist — {', '.join(blocked)}. Sending is restricted "
             f"to {', '.join(sorted(allowed))} until EMAIL_MCP_SEND_ALLOW_ALL=1 "
             f"(or allow_all on [{ident.name}]) is set. (Trial-safety guard: "
-            "mistakes can only reach the identity's own address.)"
+            "mistakes can only reach the identity's own address.)",
+            code=codes.RECIPIENT_NOT_ALLOWED,
         )
 
 
@@ -180,16 +184,19 @@ def _load_attachments(
     total = 0
     for p in paths:
         if not p.exists():
-            raise SendError(f"attachment not found: {p}")
+            raise SendError(f"attachment not found: {p}",
+                            code=codes.ATTACHMENT_NOT_FOUND)
         if p.is_dir():
             raise SendError(
                 f"attachment is a directory: {p} — zip it first and attach "
-                "the archive."
+                "the archive.",
+                code=codes.ATTACHMENT_UNREADABLE,
             )
         try:
             data = p.read_bytes()
         except OSError as e:
-            raise SendError(f"cannot read attachment {p}: {e}") from e
+            raise SendError(f"cannot read attachment {p}: {e}",
+                            code=codes.ATTACHMENT_UNREADABLE) from e
         total += len(data)
         ctype, _ = mimetypes.guess_type(p.name)
         maintype, _, subtype = (ctype or "application/octet-stream").partition("/")
@@ -201,7 +208,8 @@ def _load_attachments(
             f"attachments total {total / (1024 * 1024):.1f} MB, over the "
             f"{budget:g} MB budget (base64 adds ~33% on top; servers commonly "
             "reject large mail). Shrink the set, or raise "
-            "EMAIL_MCP_MAX_ATTACH_MB if the recipient's server allows it."
+            "EMAIL_MCP_MAX_ATTACH_MB if the recipient's server allows it.",
+            code=codes.ATTACHMENTS_TOO_LARGE,
         )
     return loaded
 
@@ -331,7 +339,8 @@ def compose(
             refs = (references + " " + in_reply_to).strip()
             msg["References"] = refs
     except ValueError as e:
-        raise SendError(f"invalid header content: {e}") from e
+        raise SendError(f"invalid header content: {e}",
+                        code=codes.INVALID_HEADER) from e
     msg.set_content(f"{body}\n\n{quote_text}\n" if quote_text else body)
     msg.add_alternative(_html_body(body, quote_html), subtype="html")
     for data, maintype, subtype, filename in attachments or []:
@@ -503,11 +512,12 @@ def send_email(
     ident = identities.get(from_identity)
     to_l, cc_l, bcc_l = _recipient_lists(to, cc, bcc)
     if not to_l:
-        raise SendError("`to` is required (no valid recipient address).")
+        raise SendError("`to` is required (no valid recipient address).",
+                        code=codes.INVALID_INPUT)
     if not subject:
-        raise SendError("`subject` is required.")
+        raise SendError("`subject` is required.", code=codes.INVALID_INPUT)
     if not body.strip():
-        raise SendError("`body` is empty.")
+        raise SendError("`body` is empty.", code=codes.INVALID_INPUT)
 
     attach_loaded = _load_attachments(attachments)
 
@@ -526,7 +536,8 @@ def send_email(
 
     ok, bootstrapped = preflight(ident)
     if not ok:
-        raise SendError(_transport_unavailable(ident))
+        raise SendError(_transport_unavailable(ident),
+                        code=codes.TRANSPORT_UNAVAILABLE)
 
     if _is_default(ident):
         _deliver(msg)
@@ -550,7 +561,8 @@ def _parse_send_at(send_at: str) -> "datetime":
     try:
         dt = datetime.fromisoformat(send_at.replace("Z", "+00:00"))
     except ValueError as e:
-        raise SendError(f"invalid send_at (want ISO-8601): {send_at!r}") from e
+        raise SendError(f"invalid send_at (want ISO-8601): {send_at!r}",
+                        code=codes.INVALID_SEND_AT) from e
     if dt.tzinfo is None:
         dt = dt.astimezone()  # naive → local wall-clock
     return dt.astimezone(timezone.utc)
@@ -586,16 +598,18 @@ def schedule_email(
     if (now - when).total_seconds() > 120:
         raise SendError(
             f"send_at is in the past ({when.isoformat(timespec='seconds')}). "
-            "Use send_email for immediate delivery."
+            "Use send_email for immediate delivery.",
+            code=codes.SEND_AT_IN_PAST,
         )
 
     to_l, cc_l, bcc_l = _recipient_lists(to, cc, bcc)
     if not to_l:
-        raise SendError("`to` is required (no valid recipient address).")
+        raise SendError("`to` is required (no valid recipient address).",
+                        code=codes.INVALID_INPUT)
     if not subject:
-        raise SendError("`subject` is required.")
+        raise SendError("`subject` is required.", code=codes.INVALID_INPUT)
     if not body.strip():
-        raise SendError("`body` is empty.")
+        raise SendError("`body` is empty.", code=codes.INVALID_INPUT)
 
     attach_loaded = _load_attachments(attachments)
 

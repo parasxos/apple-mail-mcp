@@ -39,8 +39,8 @@ def test_refresh_mail_success_reports_no_delta_when_writer_idle(apple_source):
     assert result["ok"] is True
     assert result["error"] is None
     assert result["error_code"] is None
-    assert result["before"]["total"] == 4
-    assert result["after"]["total"] == 4
+    assert result["before"]["total"] == 6
+    assert result["after"]["total"] == 6
     assert result["new_messages"] == 0
     assert isinstance(result["applescript_duration_ms"], int)
 
@@ -89,8 +89,8 @@ def test_refresh_mail_maps_permission_denied(apple_source):
     assert result["error_code"] == -1743
     assert "Privacy & Security" in result["error"]
     # Snapshots still populated — caller can still see the current state.
-    assert result["before"]["total"] == 4
-    assert result["after"]["total"] == 4
+    assert result["before"]["total"] == 6
+    assert result["after"]["total"] == 6
     assert result["new_messages"] == 0
 
 

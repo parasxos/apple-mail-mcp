@@ -1,11 +1,11 @@
 """v0.10 S3 red team — the binding failure matrix (F1-F12) plus the
-adversarial hunts beyond it, run against the REAL config.audit_dir resolver.
+adversarial hunts beyond it, run against the REAL state resolver/adoption.
 
-This module shadows conftest's autouse ``audit_dir_guard`` on purpose: the
-conftest guard monkeypatches config.audit_dir to a pre-made lambda, which
-would hide resolver-level behaviour (mkdir, chmod healing, hostile parents,
-symlinks, dir-is-a-file). Here the guard pins ONLY the env var, so every
-test exercises the true production path end to end.
+This module shadows conftest's ``audit_dir_guard`` on purpose: the conftest
+fixture pre-adopts the tree, which would hide adoption-level behaviour
+(mkdir, chmod healing, hostile parents, symlinked/squatted leaves). Here
+the guard pins ONLY EMAIL_MCP_STATE_DIR, so every test exercises the true
+production path end to end.
 
 F11 (the mutation mandate) is executed by a scratchpad runner outside
 pytest — each mutation is applied to the source, its named killing test is
@@ -24,7 +24,7 @@ from pathlib import Path
 
 import pytest
 
-from email_mcp import audit, config, ids, plans, sender, server, spool, triage
+from email_mcp import audit, ids, plans, sender, server, spool, state, triage
 from email_mcp.plans import PlanAction
 from email_mcp.sources.base import SearchQuery
 
@@ -37,32 +37,20 @@ SENTINEL = "XSENTINELX-BODY-73c1-never-in-the-ledger"
 
 
 @pytest.fixture(autouse=True)
-def state_root_guard(tmp_path, monkeypatch):
-    """Shadow conftest's guard: conftest patches config.state_root, which
-    would defeat the real env-driven resolution these tests exercise."""
-    root = tmp_path / "state"
-    monkeypatch.setenv("EMAIL_MCP_STATE_DIR", str(root))
-    return root
-
-
-@pytest.fixture(autouse=True)
-def audit_dir_guard(state_root_guard):
-    """Derived from the pinned ROOT — one root is the whole point. Not
-    pre-created: emit's own mkdir path is part of the attack surface."""
-    yield state_root_guard / "audit"
+def audit_dir_guard(tmp_path, monkeypatch):
+    """Env pin ONLY (shadows conftest's adopted-tree fixture) — the red
+    team runs against the real resolver + adoption door. Nothing is
+    pre-created: emit's own adoption path is part of the attack surface.
+    Yields the audit leaf; its parent is the state root."""
+    monkeypatch.setenv("EMAIL_MCP_STATE_DIR", str(tmp_path / "state"))
+    yield tmp_path / "state" / "audit"
     audit.set_process("server")
+
 
 @pytest.fixture
 def send_env(monkeypatch, tmp_path, audit_dir_guard):
-    """Documented defaults + the whole state tree isolated under ONE root,
-    re-pinned after the EMAIL_MCP_* wipe (mirrors tests/test_audit_hooks.py).
-
-    The root is ``audit_dir_guard.parent``, NOT ``tmp_path``: tmp_path also
-    holds the mail fixture (V10/) and the identities file, and a non-empty
-    unmarked directory named by EMAIL_MCP_STATE_DIR is refused before any
-    filesystem effect — which would leave every mutation in this module
-    without a spool, a plan store or a ledger.
-    """
+    """Documented defaults, everything under the pinned state root, which
+    is re-pinned after the EMAIL_MCP_* wipe (mirrors test_audit_hooks)."""
     for k in list(os.environ):
         if k.startswith("EMAIL_MCP_"):
             monkeypatch.delenv(k, raising=False)
@@ -113,7 +101,7 @@ def _events(d: Path) -> list[dict]:
 
 
 def _seed(d: Path, month: str, records: list) -> Path:
-    d.mkdir(parents=True, exist_ok=True)
+    assert state.State.resolve().adopt().audit == d  # the one door
     path = d / f"{month}.jsonl"
     lines = [r if isinstance(r, str) else json.dumps(r) for r in records]
     path.write_text("\n".join(lines) + "\n", encoding="utf-8")
@@ -182,11 +170,11 @@ def _mint_ids(out_path: str, count: int) -> None:
             f.write(idm.new_id() + "\n")
 
 
-def _f6_schedule_then_die(audit_dir: str, spool_dir: str,
-                          identities: str, send_at: str) -> None:
+def _f6_schedule_then_die(state_root: str, identities: str,
+                          send_at: str) -> None:
     """Schedule (mutation lands durably in the spool), then die at the
     exact emit boundary — the documented at-most-once loss window."""
-    os.environ["EMAIL_MCP_STATE_DIR"] = str(Path(audit_dir).parent)
+    os.environ["EMAIL_MCP_STATE_DIR"] = state_root
     os.environ["EMAIL_MCP_IDENTITIES"] = identities
     os.environ["EMAIL_MCP_FROM_ADDR"] = "paris@example.org"
     from email_mcp import audit as aud
@@ -276,65 +264,47 @@ def test_f3_corrupt_binary_line_tolerated(audit_dir_guard):
 # --------------------------------------------------------------------- #
 
 
-def test_f4_unwritable_ledger_never_blocks_mail(
-    send_env, delivered, mail_fixture, tmp_path, monkeypatch,
-    email_mcp_warnings,
+def test_f4_broken_audit_leaf_never_blocks_mail(
+    send_env, delivered, mail_fixture, monkeypatch,
+    email_mcp_warnings, audit_dir_guard,
 ):
-    """The ledger — and ONLY the ledger — is unwritable (0500 leaf):
-    send/schedule/triage/mailbox flows all return their normal results,
-    every emit returns None, and each dropped event logs ONE warning.
+    """A file squatting on the audit leaf (the un-mkdir-able case, and one
+    only the ledger suffers — leaves are independent): send/schedule/
+    triage/mailbox flows all return their normal results, every emit
+    returns None, and each dropped event logs ONE warning."""
+    state.State.resolve().adopt()          # root + marker exist
+    audit_dir_guard.write_text("squatter")  # a FILE where the leaf belongs
 
-    Under the single-root model the fault has to be planted on the LEAF.
-    Making the whole root 0500 (what this test did while spool/plans/audit
-    had independent overrides) no longer isolates the ledger: the spool
-    lives under the same root, so scheduling would fail for want of
-    somewhere to freeze the message — a real inability to mutate, not an
-    audit failure blocking a mutation. The contract under test is the
-    latter, so the root stays healthy and the ledger alone is broken.
-    """
-    ro = tmp_path / "ro"
-    ro.mkdir()
-    monkeypatch.setenv("EMAIL_MCP_STATE_DIR", str(ro))
-    config.state_root()          # adopt the root (stamps the marker)
-    dead = ro / "audit"
-    dead.mkdir()
-    dead.chmod(0o500)            # pre-existing → never re-chmodded by us
-    try:
-        ok = server.tool_send_email(to="paris@example.org",
-                                    subject="f4-send", body="b")
-        assert ok["ok"] is True and ok["message_id"]
+    ok = server.tool_send_email(to="paris@example.org",
+                                subject="f4-send", body="b")
+    assert ok["ok"] is True and ok["message_id"]
 
-        sch = server.tool_schedule_email(to="paris@example.org",
-                                         subject="f4-sched", body="b",
-                                         send_at=_iso_in(60))
-        assert sch["ok"] is True and sch["id"]
-        assert spool.load("pending", sch["id"]) is not None
+    sch = server.tool_schedule_email(to="paris@example.org",
+                                     subject="f4-sched", body="b",
+                                     send_at=_iso_in(60))
+    assert sch["ok"] is True and sch["id"]
+    assert spool.load("pending", sch["id"]) is not None
 
-        plan = triage.build_plan(_mail_source(mail_fixture),
-                                 SearchQuery(unread_only=True),
-                                 [{"action": "mark_read"}])
-        assert plan.id and plans.load(plan.id) is not None
+    plan = triage.build_plan(_mail_source(mail_fixture),
+                             SearchQuery(unread_only=True),
+                             [{"action": "mark_read"}])
+    assert plan.id and plans.load(plan.id) is not None
 
-        monkeypatch.setattr(server, "_SOURCE", object())
-        monkeypatch.setattr(
-            server, "create_mailbox",
-            lambda src, account, path: {
-                "ok": True, "account": account, "path": path,
-                "existed": False, "applescript": "OK",
-                "index_verified": True, "mail_verified": True,
-                "warning": None,
-            })
-        mb = server.tool_mailbox_create(account="ACC", path="Archive/F4")
-        assert mb["ok"] is True
+    monkeypatch.setattr(server, "_SOURCE", object())
+    monkeypatch.setattr(
+        server, "create_mailbox",
+        lambda src, account, path: {
+            "ok": True, "account": account, "path": path,
+            "existed": False, "applescript": "OK",
+            "index_verified": True, "mail_verified": True,
+            "warning": None,
+        })
+    mb = server.tool_mailbox_create(account="ACC", path="Archive/F4")
+    assert mb["ok"] is True
 
-        assert audit.emit("send", outcome="sent") is None  # direct probe
-        # Pre-existing mode survives: nothing on the mutation path ever
-        # "heals" a directory it did not create.
-        assert stat.S_IMODE(dead.stat().st_mode) == 0o500
-    finally:
-        dead.chmod(0o700)
+    assert audit.emit("send", outcome="sent") is None  # direct probe
 
-    assert list(dead.iterdir()) == []   # not one byte of ledger was written
+    assert audit_dir_guard.read_text() == "squatter"  # never touched
     dropped = [r for r in email_mcp_warnings
                if "audit: emit" in r.getMessage()]
     # exactly ONE warning per dropped event: send, schedule, plan_create,
@@ -342,38 +312,31 @@ def test_f4_unwritable_ledger_never_blocks_mail(
     assert len(dropped) == 5
 
 
-def test_f4_unchmodable_0500_dir_drops_events_not_mail(
-    send_env, delivered, tmp_path, monkeypatch,
+def test_f4_refused_state_drops_events_not_mail(
+    send_env, delivered, monkeypatch, audit_dir_guard,
 ):
-    """A 0500 dir the process cannot heal (stand-in for an other-owner
-    dir): resolver pinned past the chmod, emit -> None, mail flows on."""
-    frozen = tmp_path / "frozen"
-    frozen.mkdir()
-    frozen.chmod(0o500)
-    monkeypatch.setattr(config, "audit_dir", lambda create=True: frozen)
-    try:
-        out = server.tool_send_email(to="paris@example.org",
-                                     subject="f4b", body="b")
-        assert out["ok"] is True
-        assert audit.emit("send", outcome="sent") is None
-        assert list(frozen.iterdir()) == []
-    finally:
-        frozen.chmod(0o700)
+    """A refused resolution (stand-in for any unadoptable root): emit ->
+    None, while an immediate send — which needs no state tree — flows."""
+    monkeypatch.setattr(
+        state.State, "resolve",
+        staticmethod(lambda: state.Refused("state root refused (test)")),
+    )
+    out = server.tool_send_email(to="paris@example.org",
+                                 subject="f4b", body="b")
+    assert out["ok"] is True
+    assert audit.emit("send", outcome="sent") is None
+    assert not audit_dir_guard.parent.exists()  # nothing was ever written
 
 
-def test_f4_owned_0500_dir_self_heals(audit_dir_guard):
-    """A pre-existing 0500 ledger dir is NOT silently re-chmodded — since
-    v0.11 only directories this tool created are its to mode. The event is
-    dropped (receipts lost, mail unaffected) and `doctor --fix` repairs the
-    mode on request. The old self-heal was the same surprise-chmod that
-    three release gates kept finding ways to abuse."""
-    audit_dir_guard.mkdir(parents=True)
-    audit_dir_guard.chmod(0o500)
-    try:
-        assert audit.emit("send", outcome="sent") is None  # dropped, no raise
-        assert stat.S_IMODE(audit_dir_guard.stat().st_mode) == 0o500
-    finally:
-        audit_dir_guard.chmod(0o700)
+def test_f4_owned_0500_leaf_self_heals(audit_dir_guard):
+    """Real adoption on an OWNED 0500 audit leaf restores 0700, so the
+    event is recorded rather than dropped — chmod accidents on the user's
+    own ledger cost nothing (documented behaviour)."""
+    leaf = state.State.resolve().adopt().audit
+    leaf.chmod(0o500)
+    assert audit.emit("send", outcome="sent") is not None
+    assert stat.S_IMODE(leaf.stat().st_mode) == 0o700
+    assert len(_lines(leaf)) == 1
 
 
 # --------------------------------------------------------------------- #
@@ -427,7 +390,7 @@ def test_f6_kill_between_mutation_and_emit(send_env, tmp_path,
 
     ctx = multiprocessing.get_context("spawn")
     p = ctx.Process(target=_f6_schedule_then_die, args=(
-        str(audit_dir_guard), str(tmp_path / "spool"),
+        str(audit_dir_guard.parent),
         str(tmp_path / "no-identities.toml"), _iso_in(60)))
     p.start()
     p.join(timeout=120)
@@ -724,38 +687,30 @@ def test_megabyte_single_fields_stay_capped(audit_dir_guard):
             assert key in rec
 
 
-def test_symlinked_state_root_works(tmp_path, monkeypatch):
-    """Relocating the ROOT with a link is supported (a symlinked managed
-    LEAF is the refused case — see test_config_state_dirs)."""
-    target = tmp_path / "real-state"
+def test_symlinked_audit_leaf_refused(tmp_path, audit_dir_guard):
+    """v0.11 policy: the managed tree is real directories — a symlinked
+    leaf refuses, the event drops, and the link target is never written
+    (the v0.10 follow-the-link behaviour is deliberately gone)."""
+    target = tmp_path / "real-ledger"
     target.mkdir()
-    link = tmp_path / "link"
-    link.symlink_to(target)
-    monkeypatch.setenv("EMAIL_MCP_STATE_DIR", str(link))
-    op = audit.emit("send", outcome="sent")
-    assert op is not None
-    assert len(list((target / "audit").glob("*.jsonl"))) == 1  # through the link
-    assert [e["op"] for e in audit.query()["events"]] == [op]
+    state.State.resolve().adopt()          # root + marker, no leaves yet
+    audit_dir_guard.symlink_to(target)
+    assert audit.emit("send", outcome="sent") is None  # dropped, no raise
+    assert list(target.iterdir()) == []    # nothing through the link
 
 
-def test_audit_dir_is_a_regular_file(tmp_path, monkeypatch):
+def test_audit_leaf_is_a_regular_file(audit_dir_guard):
     from email_mcp import doctor
 
-    root = tmp_path / "state"
-    root.mkdir()
-    monkeypatch.setenv("EMAIL_MCP_STATE_DIR", str(root))
-    config.state_root()   # adopt FIRST: otherwise the imposter file alone
-    # makes the root non-empty and unmarked, and the refusal — not the
-    # squatting file — is what emit would be reporting.
-    imposter = root / "audit"
-    imposter.write_text("I am a file, not a directory")
+    state.State.resolve().adopt()
+    audit_dir_guard.write_text("I am a file, not a directory")
     assert audit.emit("send", outcome="sent") is None  # dropped, no raise
     assert audit.query() == {"events": [], "files_scanned": 0,
                              "skipped_lines": 0}
     out = server.tool_audit()
     assert out["ok"] is True and out["events"] == []
     assert isinstance(doctor.check_audit(), dict)  # no crash
-    assert imposter.read_text() == "I am a file, not a directory"
+    assert audit_dir_guard.read_text() == "I am a file, not a directory"
 
 
 def test_concurrent_query_while_appending(audit_dir_guard):

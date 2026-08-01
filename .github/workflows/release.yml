@@ -1,83 +1,28 @@
 name: release
 
-# Releases are cut by deliberately pushing a semver tag:
-#
-#     git tag -a v0.11.0 -m 'v0.11.0' && git push origin v0.11.0
-#
-# This replaces .github/workflows/auto-tag.yml, which minted a date-based
-# YYMMDD.PUBLIC.BUILD tag (260522.0.1 … 260522.0.3) on every push to main.
-# Those tags never matched the version the package reports about itself
-# (email_mcp.__version__), so no tag could be pointed at as "v0.11.0", and
-# tagging happened without anyone asking for it. Nothing about how users
-# install changes: README installs from the git URL, so a tag is the whole
-# release artifact — this workflow only guarantees the tag is green, is
-# semver, agrees with __version__, and gets a GitHub Release to hang notes
-# on. The date-based tags already pushed stay valid and are untouched.
-
 on:
   push:
-    tags: ['v*']
-  workflow_dispatch:
-    inputs:
-      tag:
-        description: 'Tag to release (e.g. v0.11.0). Use to catch up on a tag pushed before this workflow existed.'
-        required: true
-        type: string
-
-permissions:
-  contents: read
+    tags: ["v*"]
 
 jobs:
-  # No release without a green suite. Same job the branch gate runs.
-  test:
+  ci:
     uses: ./.github/workflows/ci.yml
 
-  publish:
-    name: publish GitHub Release
-    needs: test
-    runs-on: ubuntu-latest
-    timeout-minutes: 10
+  release:
+    needs: ci
+    runs-on: macos-latest
     permissions:
       contents: write
-    env:
-      GH_TOKEN: ${{ github.token }}
-      TAG: ${{ inputs.tag || github.ref_name }}
-
     steps:
       - uses: actions/checkout@v4
-        with:
-          ref: ${{ inputs.tag || github.ref_name }}
-          fetch-depth: 0
-
-      - name: Tag is semver and agrees with email_mcp.__version__
+      - name: verify the tag matches __version__
         run: |
-          if [[ ! "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
-            echo "::error::'$TAG' is not vMAJOR.MINOR.PATCH"
+          version="$(python3 -c 'import email_mcp; print(email_mcp.__version__)')"
+          if [ "${GITHUB_REF_NAME}" != "v${version}" ]; then
+            echo "tag ${GITHUB_REF_NAME} != v${version}" >&2
             exit 1
           fi
-          # Read the literal rather than importing: the runtime deps are
-          # not installed in this job, and __init__ is the single source
-          # setuptools derives the wheel version from.
-          module=$(python - <<'PY'
-          import pathlib, re
-          src = pathlib.Path("email_mcp/__init__.py").read_text()
-          m = re.search(r'^__version__\s*=\s*"([^"]+)"', src, re.M)
-          print(m.group(1) if m else "")
-          PY
-          )
-          if [[ "$TAG" != "v$module" ]]; then
-            echo "::error::tag $TAG disagrees with email_mcp.__version__ ($module)"
-            exit 1
-          fi
-          echo "$TAG matches __version__ $module"
-
-      - name: Create the release
-        run: |
-          if gh release view "$TAG" >/dev/null 2>&1; then
-            echo "release $TAG already exists — nothing to do"
-            exit 0
-          fi
-          gh release create "$TAG" \
-            --title "$TAG" \
-            --generate-notes \
-            --verify-tag
+      - name: create the GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "${GITHUB_REF_NAME}" --title "${GITHUB_REF_NAME}" --generate-notes

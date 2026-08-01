@@ -2,8 +2,8 @@
 
 Fixture facts (tests/conftest.py): rowids 100/101/300 have .emlx bodies
 ("retracted" / "See attached" / HTML "Hello"+"Bye" with a script `noise()`),
-rowid 200 has NO .emlx. The autouse fts_dir_guard derives <root>/fts
-at a per-test tmp dir.
+rowid 200 has NO .emlx. The autouse state_dir_guard points
+EMAIL_MCP_STATE_DIR at a per-test tmp root (the index lives in its fts/).
 """
 from __future__ import annotations
 
@@ -309,9 +309,8 @@ def test_hostile_fts_syntax_never_raises(mail_fixture):
 
 def test_status_and_matching_on_absent_index_create_nothing(
         monkeypatch, tmp_path, capsys):
-    root = tmp_path / "never-created"
-    target = root / "fts"
-    monkeypatch.setenv("EMAIL_MCP_STATE_DIR", str(root))
+    target = tmp_path / "never-created"
+    monkeypatch.setenv("EMAIL_MCP_STATE_DIR", str(target))
 
     idx = FtsIndex()
     st = idx.status()

@@ -254,59 +254,23 @@ def mail_fixture(tmp_path: Path) -> Path:
     return mail_dir
 
 
-@pytest.fixture
-def audit_dir_guard(state_root_guard) -> Path:
-    """The ledger directory under the pinned root. Derived, not pinned
-    separately — one root is the whole point."""
-    return state_root_guard / "audit"
-
-
-@pytest.fixture
-def fts_dir_guard(state_root_guard) -> Path:
-    """The FTS index directory under the pinned root."""
-    return state_root_guard / "fts"
-
-
 @pytest.fixture(autouse=True)
-def audit_process_guard():
-    """Restore audit's process tag around EVERY test.
-
-    ``audit.set_process`` is module-global, and anything that runs
-    ``repairs.run_fixes()`` or a lifecycle command sets it to "cli" and
-    leaves it there. The next test to assert ``src == "server"`` then fails
-    — but only in some orderings, which is how it stayed hidden: in the
-    repo the modules that set it happen to sort after the modules that
-    assert it. Restoring here makes the suite order-independent.
-    """
-    from email_mcp import audit
-
-    before = audit._PROCESS
-    yield
-    audit.set_process(before)
+def state_dir_guard(tmp_path_factory, monkeypatch) -> Path:
+    """Pin the managed state tree (spool/plans/graph/fts/audit) to a fresh
+    per-test root for EVERY test — nothing in the suite may ever resolve,
+    adopt, or write ~/.email-mcp. Module fixtures that wipe every
+    EMAIL_MCP_* variable re-pin this same root themselves."""
+    root = tmp_path_factory.mktemp("state-root")
+    monkeypatch.setenv("EMAIL_MCP_STATE_DIR", str(root))
+    return root
 
 
-@pytest.fixture(autouse=True)
-def state_root_guard(tmp_path_factory, monkeypatch) -> Path:
-    """Point the ENTIRE state tree at a per-test tmp root for EVERY test.
+@pytest.fixture
+def audit_dir_guard(state_dir_guard) -> Path:
+    """The audit leaf under the pinned state root, created through the one
+    effectful door (name kept: the ledger suites address the directory).
+    test_audit.py / test_audit_redteam.py shadow this fixture on purpose:
+    their tests exercise emit's own adoption path on a virgin root."""
+    from email_mcp import state
 
-    One guard replaces the old per-directory fts/audit pins: since v0.11
-    every managed directory derives from a single root, so isolating the
-    root isolates the spool, plans, graph, index and ledger together, and
-    nothing in the suite can touch (or create) the developer's own
-    ~/.email-mcp.
-
-    Belt on top of the env pin: several test modules wipe every EMAIL_MCP_*
-    variable in their own autouse fixtures, which run AFTER this one — the
-    env pin alone would not survive them, and any mutation-path emit would
-    land in the REAL ledger. So the resolver is pinned too.
-    tests/test_config_state_dirs.py shadows this fixture by name on purpose:
-    its tests exercise the real env-driven resolution inside a fake HOME.
-    """
-    from email_mcp import config
-
-    d = tmp_path_factory.mktemp("state-root")
-    monkeypatch.setenv("EMAIL_MCP_STATE_DIR", str(d))
-    monkeypatch.setattr(config, "state_root", lambda create=True: d)
-    return d
-
-
+    return state.State.resolve().adopt().audit

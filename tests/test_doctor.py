@@ -15,10 +15,8 @@ from email_mcp import doctor, identities, server
 from email_mcp.transports import SendError
 
 CHECK_NAMES = {
-    "state_root",  # added at v0.11: a refused root went unreported
     "mail_store", "automation", "accessibility", "identities",
     "transports", "dispatcher", "spool_plans", "fts", "graph",
-    "audit",  # folded into checks at v0.11 (contract §1 row 10)
 }
 
 
@@ -84,39 +82,18 @@ def test_run_shape_and_all_green(tmp_path):
         assert isinstance(check["detail"], str) and check["detail"], name
     assert "4 messages" in report["checks"]["mail_store"]["detail"]
     assert report["checks"]["graph"]["ok"] is True
-    # Absent index is a fresh install, not a fault — and statting it must
-    # not create the directory (read-path purity).
+    # Absent index is a fresh install, not a fault — and doctor is a pure
+    # reader: running it must not create ANY of the state tree.
     fts_check = report["checks"]["fts"]
     assert fts_check["ok"] is True
     assert "not built" in fts_check["detail"]
     assert "--build" in fts_check["fix"]
-    assert not (tmp_path / "fts").exists()
+    assert not (tmp_path / "state").exists()
 
 
 def test_read_only_flag_is_reflected(monkeypatch):
     monkeypatch.setenv("EMAIL_MCP_READ_ONLY", "1")
     assert doctor.run()["read_only"] is True
-
-
-def test_audit_check_folded_into_checks_with_deprecated_mirror():
-    """v0.11: the ledger check is the tenth member of `checks`; the
-    top-level `audit` key stays as a deprecated mirror of the same dict
-    (v0.10 readers keep working, §8 additive-only)."""
-    report = doctor.run()
-    assert "audit" in report["checks"]
-    assert report["audit"] is report["checks"]["audit"]
-    assert report["checks"]["audit"]["ok"] is True
-
-
-def test_red_audit_check_reddens_the_doctor(monkeypatch):
-    monkeypatch.setattr(
-        doctor, "_CHECKS",
-        tuple((n, (lambda: {"ok": False, "detail": "ledger broken"})
-               if n == "audit" else f) for n, f in doctor._CHECKS),
-    )
-    report = doctor.run()
-    assert report["ok"] is False
-    assert report["checks"]["audit"]["ok"] is False
 
 
 # --------------------------------------------------------------------- #
@@ -269,10 +246,8 @@ def test_check_audit_flags_file_where_dir_belongs(monkeypatch, tmp_path):
     the audit path must read as a fault, not a fresh install."""
     bogus = tmp_path / "audit"
     bogus.write_text("not a directory")
-    # conftest's audit_dir_guard monkeypatches config.audit_dir itself
-    # (env alone is inert here) — override the getter, per its docstring.
     from email_mcp import config, doctor
-    monkeypatch.setattr(config, "audit_dir", lambda create=True: bogus)
+    monkeypatch.setattr(config, "audit_dir", lambda: bogus)
     res = doctor.check_audit()
     assert res["ok"] is False
     assert "not a directory" in res["detail"]

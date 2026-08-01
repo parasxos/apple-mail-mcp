@@ -1,13 +1,12 @@
 """Audit ledger core (email_mcp.audit + email_mcp.ids) — v0.10 S1.
 
-Every test here runs against the REAL env-driven resolver: the autouse
-fixtures below pin EMAIL_MCP_STATE_DIR at a per-test tmp root and derive
-the ledger from it, shadowing conftest's patched resolver by name.
+The autouse fixture below shadows conftest's adopted-tree guard: it pins
+only EMAIL_MCP_STATE_DIR, so emit's own adoption path (dir creation,
+permissions, refusal-drops) is exercised for real in this file.
 """
 from __future__ import annotations
 
 import json
-import logging
 import multiprocessing
 import os
 import random
@@ -17,24 +16,18 @@ from pathlib import Path
 
 import pytest
 
-from email_mcp import audit
+from email_mcp import audit, state
 
 
 @pytest.fixture(autouse=True)
-def state_root_guard(tmp_path, monkeypatch):
-    """Shadow conftest's guard: conftest patches config.state_root, which
-    would defeat the real env-driven resolution these tests exercise."""
-    root = tmp_path / "state"
-    monkeypatch.setenv("EMAIL_MCP_STATE_DIR", str(root))
-    return root
-
-
-@pytest.fixture(autouse=True)
-def audit_dir_guard(state_root_guard):
-    """Derived from the pinned ROOT — one root is the whole point. Not
-    pre-created: emit's own mkdir path is part of the attack surface."""
-    yield state_root_guard / "audit"
+def audit_dir_guard(tmp_path, monkeypatch):
+    """Pin the state root inside tmp — nothing here may ever touch
+    ~/.email-mcp — and reset the process tag afterwards. The audit leaf
+    is handed out un-created: emit's own adoption is under test."""
+    monkeypatch.setenv("EMAIL_MCP_STATE_DIR", str(tmp_path / "state"))
+    yield tmp_path / "state" / "audit"
     audit.set_process("server")
+
 
 def _lines(d: Path) -> list[str]:
     out: list[str] = []
@@ -44,8 +37,9 @@ def _lines(d: Path) -> list[str]:
 
 
 def _seed(d: Path, month: str, records: list) -> Path:
-    """Write a monthly file from dicts (serialized) and/or raw lines."""
-    d.mkdir(parents=True, exist_ok=True)
+    """Write a monthly file from dicts (serialized) and/or raw lines —
+    through the adoption door, so the tree stays marker-resolvable."""
+    assert state.State.resolve().adopt().audit == d
     path = d / f"{month}.jsonl"
     lines = [r if isinstance(r, str) else json.dumps(r) for r in records]
     path.write_text("\n".join(lines) + "\n", encoding="utf-8")
@@ -135,26 +129,26 @@ def test_emit_never_raises_and_returns_none_when_unwritable(
 ):
     parent = tmp_path / "ro"
     parent.mkdir()
-    monkeypatch.setenv("EMAIL_MCP_STATE_DIR", str(parent))
-    parent.chmod(0o500)  # audit dir cannot be created underneath
+    monkeypatch.setenv("EMAIL_MCP_STATE_DIR", str(parent / "state"))
+    parent.chmod(0o500)  # the state root cannot be created underneath
     try:
         assert audit.emit("send", outcome="sent") is None  # no raise
     finally:
         parent.chmod(0o700)
-    assert not (parent / "audit").exists()
+    assert not (parent / "state").exists()
 
 
-def test_env_overridden_dir_never_chmods_parent(audit_dir_guard,
-                                                state_root_guard):
-    """Gate regression: the state root's PARENT is never ours — chmod'ing
-    it can raise (root-owned temp roots) and would cost the event. Since
-    v0.11 nothing pre-existing is chmodded at all, so this holds by
-    construction rather than by a fence."""
-    parent = state_root_guard.parent
-    parent.chmod(0o755)
+def test_state_root_parent_never_chmodded(tmp_path, monkeypatch):
+    """The root's parent is not ours — chmod'ing it can raise (root-owned
+    temp roots) and would cost the event. Adoption locks down the root
+    itself and stops there."""
+    root = tmp_path / "state"
+    monkeypatch.setenv("EMAIL_MCP_STATE_DIR", str(root))
+    tmp_path.chmod(0o755)
     assert audit.emit("send", outcome="sent") is not None
-    assert len(_lines(audit_dir_guard)) == 1  # the event landed
-    assert stat.S_IMODE(parent.stat().st_mode) == 0o755  # parent untouched
+    assert len(_lines(root / "audit")) == 1        # the event landed
+    assert stat.S_IMODE(root.stat().st_mode) == 0o700
+    assert stat.S_IMODE(tmp_path.stat().st_mode) == 0o755  # parent untouched
 
 
 def test_emit_file_and_dir_permissions(audit_dir_guard):
@@ -165,202 +159,6 @@ def test_emit_file_and_dir_permissions(audit_dir_guard):
     assert stat.S_IMODE(files[0].stat().st_mode) == 0o600
 
 
-# ---------------------------------------------------------------------- #
-# symlink discipline — the writer must never act through a redirection    #
-# ---------------------------------------------------------------------- #
-
-
-@pytest.fixture
-def email_mcp_warnings():
-    """The email_mcp logger has propagate=False (stdout is the wire), so
-    caplog never sees it — attach a collector directly."""
-    records: list[logging.LogRecord] = []
-
-    class _Collector(logging.Handler):
-        def emit(self, record):  # noqa: D102
-            if record.levelno >= logging.WARNING:
-                records.append(record)
-
-    handler = _Collector()
-    logging.getLogger("email_mcp").addHandler(handler)
-    yield records
-    logging.getLogger("email_mcp").removeHandler(handler)
-
-
-def _victim_dir(tmp_path: Path) -> tuple[Path, Path]:
-    """A 0755 directory holding one file, standing in for whatever a
-    planted link points at. Returns (dir, its file)."""
-    victim = tmp_path / "victim"
-    victim.mkdir()
-    keep = victim / "keep.txt"
-    keep.write_text("victim content")
-    victim.chmod(0o755)
-    return victim, keep
-
-
-def test_emit_refuses_symlinked_default_ledger_dir(tmp_path, monkeypatch,
-                                                   email_mcp_warnings):
-    """A link squatting on ~/.email-mcp/audit must cost the event, not the
-    victim: mkdir and chmod both follow it, so `doctor --fix` would have
-    tightened an arbitrary directory to 0700 and filed the ledger inside."""
-    monkeypatch.delenv("EMAIL_MCP_STATE_DIR", raising=False)
-    home = tmp_path / "home"
-    (home / ".email-mcp").mkdir(parents=True)
-    monkeypatch.setenv("HOME", str(home))
-    victim, keep = _victim_dir(tmp_path)
-    link = home / ".email-mcp" / "audit"
-    link.symlink_to(victim)
-
-    assert audit.emit("send", outcome="sent") is None  # dropped, no raise
-
-    assert stat.S_IMODE(victim.stat().st_mode) == 0o755
-    assert list(victim.glob("*.jsonl")) == []
-    assert sorted(p.name for p in victim.iterdir()) == ["keep.txt"]
-    assert keep.read_text() == "victim content"
-    assert link.is_symlink() and os.readlink(link) == str(victim)
-    # Degraded to a warning, never an exception (contract §6). Match the
-    # diagnosis rather than the word "symlink" — pytest names its tmp dir
-    # after the test, so "symlink" is in every path logged here.
-    assert any("refusing to create state or set modes through it"
-               in r.getMessage() for r in email_mcp_warnings)
-
-
-def test_emit_refuses_symlinked_month_file(audit_dir_guard, tmp_path):
-    """Nobody but the writer names a YYYY-MM.jsonl, so a link there is a
-    squatter: O_NOFOLLOW must refuse it rather than append the event to
-    the target and fchmod the target to 0600."""
-    from email_mcp import config, ids
-
-    config.state_root()   # adopt before planting the leaf (see below)
-    audit_dir_guard.mkdir(parents=True)
-    audit_dir_guard.chmod(0o700)
-    victim = tmp_path / "notes.txt"
-    victim.write_text("victim content")
-    victim.chmod(0o644)
-    month = audit_dir_guard / f"{ids.iso(ids.utcnow())[:7]}.jsonl"
-    month.symlink_to(victim)
-
-    assert audit.emit("send", outcome="sent") is None  # dropped, no raise
-
-    assert victim.read_text() == "victim content"
-    assert stat.S_IMODE(victim.stat().st_mode) == 0o644
-    assert month.is_symlink()
-
-
-def test_emit_chmods_the_fd_it_wrote_not_the_path(audit_dir_guard, tmp_path):
-    """0600 is set through the open fd, so a link swapped onto the month
-    path between the write and the chmod cannot redirect it — the window a
-    path-based chmod leaves to the second writer process."""
-    from email_mcp import config, ids
-
-    # Adopt the root BEFORE planting the ledger dir under it: an explicitly
-    # overridden root that already holds files and carries no ownership
-    # marker is refused before any effect, so without this the emit under
-    # test would never reach its write — and the assertions below would
-    # hold vacuously.
-    config.state_root()
-    audit_dir_guard.mkdir(parents=True)
-    audit_dir_guard.chmod(0o700)
-    victim = tmp_path / "notes.txt"
-    victim.write_text("victim content")
-    victim.chmod(0o644)
-    month = audit_dir_guard / f"{ids.iso(ids.utcnow())[:7]}.jsonl"
-    real_write = os.write
-
-    def swapping_write(fd, data):
-        n = real_write(fd, data)
-        month.unlink()                 # the attacker's window
-        month.symlink_to(victim)
-        return n
-
-    os.write = swapping_write  # narrow window: only emit runs under it
-    try:
-        assert audit.emit("send", outcome="sent") is not None
-    finally:
-        os.write = real_write
-
-    assert stat.S_IMODE(victim.stat().st_mode) == 0o644
-    assert victim.read_text() == "victim content"
-
-
-def test_default_path_never_chmods_a_symlinked_state_root(tmp_path,
-                                                          monkeypatch):
-    """~/.email-mcp relocated with a link (a supported shape) is followed —
-    the ledger dir under it is ours to create 0700 — but chmod resolves
-    through the link, so the link's target keeps its own mode."""
-    monkeypatch.delenv("EMAIL_MCP_STATE_DIR", raising=False)
-    home = tmp_path / "home"
-    home.mkdir()
-    monkeypatch.setenv("HOME", str(home))
-    victim, keep = _victim_dir(tmp_path)
-    (home / ".email-mcp").symlink_to(victim)
-
-    assert audit.emit("send", outcome="sent") is not None
-
-    assert stat.S_IMODE(victim.stat().st_mode) == 0o755  # target untouched
-    assert keep.read_text() == "victim content"
-    ledger = victim / "audit"
-    assert stat.S_IMODE(ledger.stat().st_mode) == 0o700  # ours, so ours to set
-    assert len(_lines(ledger)) == 1
-
-
-def test_env_overridden_symlinked_root_never_chmods_its_target(tmp_path,
-                                                               monkeypatch):
-    """An operator who points EMAIL_MCP_STATE_DIR at a link chose to follow
-    it (relocating the whole tree onto another volume is the supported
-    shape), so events still land — but the mode of whatever it points at is
-    not ours to set: chmod resolves through the link, and we did not create
-    the target.
-
-    Replaces the retired EMAIL_MCP_AUDIT_DIR variant of this test: the
-    ledger has no override of its own any more, so the only way to aim it
-    at a link is to relocate the root.
-    """
-    target = tmp_path / "real-state"
-    target.mkdir()
-    target.chmod(0o755)
-    link = tmp_path / "link"
-    link.symlink_to(target)
-    monkeypatch.setenv("EMAIL_MCP_STATE_DIR", str(link))
-
-    assert audit.emit("send", outcome="sent") is not None
-
-    ledger = target / "audit"
-    assert len(_lines(ledger)) == 1                      # followed the link
-    assert stat.S_IMODE(target.stat().st_mode) == 0o755  # target untouched
-    assert stat.S_IMODE(ledger.stat().st_mode) == 0o700  # WE made the leaf
-    files = list(ledger.glob("*.jsonl"))
-    assert stat.S_IMODE(files[0].stat().st_mode) == 0o600  # the file is ours
-
-
-def test_symlinked_ledger_leaf_is_refused_under_an_overridden_root(
-    tmp_path, monkeypatch, email_mcp_warnings,
-):
-    """The leaf counterpart: a link squatting on <root>/audit is refused
-    even when the root itself was named by the operator. A relocated ROOT
-    is a choice; a redirected LEAF is a squat."""
-    from email_mcp import config
-
-    root = tmp_path / "state"
-    root.mkdir()
-    monkeypatch.setenv("EMAIL_MCP_STATE_DIR", str(root))
-    config.state_root()   # adopt: otherwise the link alone makes the root
-    # non-empty and unmarked, and the ROOT refusal — not the leaf one —
-    # is what stops the emit.
-    victim, keep = _victim_dir(tmp_path)
-    (root / "audit").symlink_to(victim)
-
-    assert audit.emit("send", outcome="sent") is None  # dropped, no raise
-
-    assert stat.S_IMODE(victim.stat().st_mode) == 0o755
-    assert sorted(p.name for p in victim.iterdir()) == ["keep.txt"]
-    assert keep.read_text() == "victim content"
-    # Match the diagnosis, not the word "symlink": pytest names its tmp dir
-    # after the test, so "symlink" appears in every path this test logs.
-    assert any("refusing to create state or set modes through it"
-               in r.getMessage() for r in email_mcp_warnings)
-
-
 def test_set_process_tags_src(audit_dir_guard):
     audit.set_process("dispatcher")
     audit.emit("deliver", outcome="sent")
@@ -369,7 +167,8 @@ def test_set_process_tags_src(audit_dir_guard):
 
 
 def _hammer(dir_str: str, src: str, count: int) -> None:
-    """Spawned-process worker: emit `count` events into the given ledger."""
+    """Spawned-process worker: emit `count` events into the given ledger
+    (dir_str is the audit leaf; its parent is the state root)."""
     os.environ["EMAIL_MCP_STATE_DIR"] = str(Path(dir_str).parent)
     from email_mcp import audit as aud
     aud.set_process(src)
@@ -468,13 +267,12 @@ def test_query_prunes_months_and_filters_fields(audit_dir_guard):
 
 
 def test_query_absent_dir_returns_empty(tmp_path, monkeypatch):
-    root = tmp_path / "never-created"
-    missing = root / "audit"
-    monkeypatch.setenv("EMAIL_MCP_STATE_DIR", str(root))
+    missing = tmp_path / "never-created"
+    monkeypatch.setenv("EMAIL_MCP_STATE_DIR", str(missing))
     assert audit.query() == {
         "events": [], "files_scanned": 0, "skipped_lines": 0,
     }
-    assert not missing.exists()  # create=False never mkdirs
+    assert not missing.exists()  # read paths never create
 
 
 def test_cli_tail_and_status(audit_dir_guard, capsys):
@@ -505,7 +303,7 @@ def test_detail_fence_strips_bodies_and_secrets_recursively(tmp_path, monkeypatc
     """Audit finding F2: the no-bodies guarantee must be a structural fence,
     not call-site discipline — denylisted keys never reach the ledger, at
     any nesting depth, and the redaction itself is on record."""
-    monkeypatch.setenv("EMAIL_MCP_STATE_DIR", str(tmp_path))
+    monkeypatch.setenv("EMAIL_MCP_STATE_DIR", str(tmp_path / "state"))
     from email_mcp import audit
     audit.emit(
         "send", outcome="sent", operation_id="op-fence-1",
@@ -516,7 +314,7 @@ def test_detail_fence_strips_bodies_and_secrets_recursively(tmp_path, monkeypatc
             "reason": "ok-to-keep",
         },
     )
-    line = next((tmp_path / "audit").glob("*.jsonl")).read_text()
+    line = next((tmp_path / "state" / "audit").glob("*.jsonl")).read_text()
     assert "SECRET BODY TEXT" not in line
     assert "tok-123" not in line and "hunter2" not in line
     assert '"keep": "yes"' in line.replace("  ", " ") or '"keep":"yes"' in line
@@ -529,8 +327,7 @@ def test_detail_fence_strips_bodies_and_secrets_recursively(tmp_path, monkeypatc
 def test_plan_finish_survives_malformed_result(tmp_path, monkeypatch):
     """Audit finding F5: a shaped-data surprise in the finish result must
     neither raise out of plans.finish nor lose the plan_finish event."""
-    monkeypatch.setenv("EMAIL_MCP_STATE_DIR", str(tmp_path))
-    monkeypatch.setenv("EMAIL_MCP_STATE_DIR", str(tmp_path))
+    monkeypatch.setenv("EMAIL_MCP_STATE_DIR", str(tmp_path / "state"))
     from email_mcp import audit, plans
     plan = plans.Plan(
         id=plans.new_id(), created_at=plans.iso(plans.utcnow()),

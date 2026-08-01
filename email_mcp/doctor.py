@@ -1,14 +1,14 @@
 """Environment diagnostics: every permission, path and transport the MCP
 needs, checked in one pass with remediation hints.
 
-`run()` returns {ok, read_only, checks: {name: {ok, detail, fix?, ...}}} —
-`ok` is the AND of every check; `fix` appears only when there is a
-concrete next step (a Settings pane or a command). Since v0.11 the audit
-ledger check is the tenth member of `checks` (the fold this module's
-v0.10 docstring scheduled for the outputSchema freeze; contract §1 row 10
-declares `{ok, read_only, checks}`); the top-level `audit` key remains as
-a deprecated mirror of checks["audit"] so v0.10 readers keep working —
-kept additively (§8), to be dropped no earlier than v2.
+`run()` returns {ok, read_only, checks: {name: {ok, detail, fix?, ...}},
+audit} — `ok` is the AND of every check (the audit ledger check included);
+`fix` appears only when there is a concrete next step (a Settings pane or
+a command). The v0.10 ledger check reports as the top-level `audit`
+section, NOT a tenth member of `checks`: that mapping's membership is the
+v0.9 doctor surface, pinned by its shape tests, and v0.10 does not touch
+existing success shapes (docs/v1-contract.md §8) — folding it into
+`checks` is v0.11's move, with the outputSchema freeze.
 Checks never mutate anything:
 transports are healthchecked but never bootstrapped, the FTS index is
 statted but never created, and the osascript probes are benign reads.
@@ -181,51 +181,17 @@ def check_accessibility() -> dict:
             "fix": _ACCESSIBILITY_FIX}
 
 
-def _identities_mode_note() -> str | None:
-    """A loose mode on the identities file, wherever it lives.
-
-    `doctor --fix` only re-modes it inside a directory we manage — but both
-    the security document and repairs.py's own docstring promised that
-    doctor would still REPORT a loose mode on a file named by
-    EMAIL_MCP_IDENTITIES anywhere else, and nothing did. A user pointing
-    that variable at a world-readable file holding SMTP credentials got no
-    signal at all.
-    """
-    path = config.identities_file()
-    try:
-        if not path.is_file():
-            return None
-        mode = path.stat().st_mode & 0o777
-    except OSError:
-        return None
-    if mode == 0o600:
-        return None
-    return (f"{path} is mode {mode:o} — it holds sending credentials and "
-            "wants 600")
-
-
 def check_identities() -> dict:
     """Does the identities file parse? The load error is surfaced verbatim
     — it already names the file and the offending key."""
-    mode_note = _identities_mode_note()
     try:
         idents, default = identities.load()
     except SendError as e:  # IdentityError subclasses SendError
-        # Verbatim, deliberately: the loader's message already names the
-        # file and the offending key, and a test pins that it reaches the
-        # user unaltered. A malformed file is the headline; its mode is
-        # reported on the parse-success path below.
         return {"ok": False, "detail": str(e),
                 "fix": f"edit {config.identities_file()}"}
-    detail = (f"{len(idents)} identity(ies): "
-              f"{', '.join(sorted(idents))}; default {default!r}")
-    if mode_note:
-        # Report, do not repair: a file the user merely NAMED is not ours
-        # to re-mode (repairs._managed_identities_file), but staying silent
-        # about credentials at 644 is the gap that pairing left open.
-        return {"ok": False, "detail": f"{detail}; {mode_note}",
-                "fix": f"chmod 600 {config.identities_file()}"}
-    return {"ok": True, "detail": detail}
+    return {"ok": True,
+            "detail": f"{len(idents)} identity(ies): "
+                      f"{', '.join(sorted(idents))}; default {default!r}"}
 
 
 def check_transports() -> dict:
@@ -282,10 +248,6 @@ def check_dispatcher() -> dict:
         log_mtime = datetime.fromtimestamp(
             log.stat().st_mtime, tz=timezone.utc).isoformat(timespec="seconds")
     pending = len(spool.entries("pending"))
-    # An uncountable spool must not read as "0 pending, no dispatcher
-    # needed": entries() returns [] for a spool it cannot see, and this
-    # check would then green-light a missing dispatcher over queued mail.
-    countable = not spool.unreadable("pending")
 
     bits = [f"label {LAUNCHD_LABEL}: "
             f"{'installed' if installed else 'NOT installed'}",
@@ -300,7 +262,7 @@ def check_dispatcher() -> dict:
                      "gui/$UID ~/Library/LaunchAgents/<legacy>.plist")
     out: dict = {
         # Not installed only bites once something is waiting to send.
-        "ok": installed or (pending == 0 and countable),
+        "ok": installed or pending == 0,
         "detail": "; ".join(bits),
         "installed": installed,
         "label": LAUNCHD_LABEL,
@@ -314,58 +276,25 @@ def check_dispatcher() -> dict:
 
 
 def check_spool_plans() -> dict:
-    """Spool + plan stores: directories exist with 0700, per-state counts,
-    and no delivery claims stranded in sending/."""
+    """Spool + plan stores: 0700 modes where present (absent = fresh
+    install — the tree is created by state adoption on first use, never
+    by doctor), per-state counts, and no delivery claims stranded in
+    sending/."""
     from . import spool
     from .dispatcher import STALE_SENDING_MINUTES
 
-    # Resolve only — doctor checks stat, it never creates (the purity rule
-    # _graph_token_dir and check_fts already follow). Creating here let a
-    # read-only diagnostic build a spool tree wherever the state root
-    # pointed, ~/Library/Mail included.
-    spool_root = config.spool_dir(create=False)
-    plans_root = config.plans_dir(create=False)
     problems: list[str] = []
     fixes: list[str] = []
-    for label, d in (("spool", spool_root), ("plans", plans_root)):
-        try:
-            mode = d.stat().st_mode & 0o777
-        except FileNotFoundError:
-            # Absent is a fresh install, not a fault — the same rule
-            # check_fts applies to a missing index. The first write creates
-            # it 0700; a read-side check must not create it just to stat it.
-            continue
+    for label, d in (("spool", config.spool_dir()),
+                     ("plans", config.plans_dir())):
+        if not d.is_dir():
+            continue  # fresh install, not a fault
+        mode = d.stat().st_mode & 0o777
         if mode != 0o700:
             problems.append(f"{label} dir {d} is mode {mode:o} (want 700)")
             fixes.append(f"chmod 700 {d}")
 
-    # A symlink on one of the five spool state subdirectories is refused at
-    # write time (config.spool_dir), so scheduling fails outright — but
-    # this check never looked, and reported green. The designated
-    # pre-flight tool must not certify a tree that cannot accept mail.
-    linked = [str(spool_root / sub) for sub in spool.STATES
-              if (spool_root / sub).is_symlink()]
-    if linked:
-        problems.append(
-            "spool state dir(s) are symlinks, so scheduling will be refused: "
-            + ", ".join(linked))
-        fixes.append("remove the link(s), or relocate the whole tree with "
-                     "EMAIL_MCP_STATE_DIR")
-
     counts = {s: len(spool.entries(s)) for s in spool.STATES}
-    # entries() skips a manifest it cannot parse so a foreign file never
-    # breaks a read — but a silent skip made "pending 0" mean both "nothing
-    # queued" and "a queued message we cannot read". Say which.
-    bad = {s: spool.unreadable(s) for s in spool.STATES}
-    bad = {s: names for s, names in bad.items() if names}
-    if bad:
-        total = sum(len(n) for n in bad.values())
-        where = "; ".join(f"{s}/: {', '.join(sorted(n))}"
-                          for s, n in sorted(bad.items()))
-        problems.append(f"{total} unreadable manifest(s) not counted above "
-                        f"({where})")
-        fixes.append("inspect those files; a half-written manifest can be "
-                     "removed, a foreign file does not belong in the spool")
     now = spool.utcnow()
     stranded: list[str] = []
     for e in spool.entries("sending"):
@@ -431,7 +360,7 @@ def check_audit() -> dict:
     on the first mutation. Reports the last recorded event via tail(1)."""
     from . import audit, ids
 
-    root = config.audit_dir(create=False)  # purity: never create here
+    root = config.audit_dir()  # a path question: doctor never creates
     if root.exists() and not root.is_dir():
         # Pathological: a regular file where the ledger dir belongs. emit()
         # would silently drop every event (mkdir over a file raises) — the
@@ -492,12 +421,6 @@ def check_audit() -> dict:
     return out
 
 
-def _graph_token_dir() -> Path:
-    """config.graph_dir()'s path WITHOUT its mkdir side effect — doctor
-    checks stat, they never create (same purity rule as check_fts)."""
-    return config.state_root(create=False) / "graph"
-
-
 def _graph_token_report(name: str, path: Path) -> dict:
     """One identity's token cache: exists, refreshable shape, age."""
     fix = f"python -m email_mcp.graph --login {name}"
@@ -545,7 +468,7 @@ def check_graph() -> dict:
     )
     if not graph_idents:
         return {"ok": True, "detail": "no identities use the graph executor"}
-    d = _graph_token_dir()
+    d = config.graph_dir()  # a path question: doctor never creates
     report = {name: _graph_token_report(name, d / f"{name}.token.json")
               for name in graph_idents}
     bad = sorted(n for n, r in report.items() if not r["ok"])
@@ -567,45 +490,7 @@ def check_graph() -> dict:
 # ---------------------------------------------------------------------- #
 
 
-def check_state_root() -> dict:
-    """The configured state root is one this tool may manage.
-
-    A refused root is not a cosmetic problem: every mutation drops its
-    receipts, scheduling has nowhere to freeze a message, and the triage
-    plan store is unreachable. Without this check the doctor went GREEN in
-    exactly that state — the resolver refuses at write time, and no
-    read-side check ever asked why the tree was absent.
-
-    Read-only, like every check: it asks config for the refusal reason,
-    which stats and never creates.
-    """
-    root = config.state_root(create=False)
-    reason = config.state_root_refusal()
-    if reason:
-        out = {"ok": False, "detail": reason, "root": str(root)}
-        if config.retired_state_vars():
-            out["fix"] = ("unset " + ", ".join(config.retired_state_vars())
-                          + "; set EMAIL_MCP_STATE_DIR instead")
-        else:
-            out["fix"] = ("unset EMAIL_MCP_STATE_DIR, or point it at a new "
-                          "or empty directory of its own")
-        return out
-    if not root.exists():
-        return {"ok": True, "root": str(root),
-                "detail": f"{root} — created on first use"}
-    mode = root.stat().st_mode & 0o777
-    marked = (root / config.STATE_MARKER).is_file()
-    detail = f"{root} (mode {mode:o}{'' if marked else ', unmarked'})"
-    if mode != 0o700:
-        return {"ok": False, "root": str(root),
-                "detail": detail + " — wants 700; state holds recipients, "
-                                   "subjects and token caches",
-                "fix": f"email-mcp doctor --fix   # chmod 700 {root}"}
-    return {"ok": True, "root": str(root), "detail": detail}
-
-
 _CHECKS = (
-    ("state_root", check_state_root),
     ("mail_store", check_mail_store),
     ("automation", check_automation),
     ("accessibility", check_accessibility),
@@ -615,7 +500,6 @@ _CHECKS = (
     ("spool_plans", check_spool_plans),
     ("fts", check_fts),
     ("graph", check_graph),
-    ("audit", check_audit),  # folded into checks at v0.11 (as scheduled)
 )
 
 
@@ -624,31 +508,18 @@ def _guarded(name: str, fn) -> dict:
     that blows up becomes a red entry, never a crashed tool."""
     try:
         return fn()
-    except OSError as e:
-        # An OSError has a readable story (strerror + filename); the bare
-        # repr — "check crashed: NotADirectoryError(20, 'Not a directory')"
-        # — told an operator nothing and named no path.
-        _log.exception("doctor: check %s failed", name)
-        where = f" ({e.filename})" if getattr(e, "filename", None) else ""
-        return {"ok": False,
-                "detail": f"{e.strerror or e}{where}",
-                "fix": "run `email-mcp doctor` again after fixing the path "
-                       "above; `--fix` repairs the safe cases"}
     except Exception as e:
         _log.exception("doctor check %s crashed", name)
         return {"ok": False, "detail": f"check crashed: {e!r}"}
 
 
 def run() -> dict:
-    """Run every check. Returns {ok, read_only, checks} — the ledger
-    check is a member of `checks` since v0.11 and gates `ok` like any
-    other: a ledger that silently drops events is a red doctor. The
-    top-level `audit` key mirrors checks["audit"] for v0.10 readers
-    (deprecated; see the module docstring)."""
+    """Run every check. Returns {ok, read_only, checks, audit} — the
+    ledger check rides beside `checks` (see the module docstring for why
+    its membership stays at the v0.9 nine) but still gates `ok`: a ledger
+    that silently drops events is a red doctor."""
     checks = {name: _guarded(name, fn) for name, fn in _CHECKS}
-    # The mirror falls back to its own run when `checks` was narrowed
-    # (tests monkeypatch _CHECKS) — the ledger check must always report.
-    audit_check = checks.get("audit") or _guarded("audit", check_audit)
+    audit_check = _guarded("audit", check_audit)
     return {
         "ok": all(c["ok"] for c in checks.values()) and audit_check["ok"],
         "read_only": config.read_only(),

@@ -16,9 +16,8 @@ import json
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Iterable
 
-from . import audit, config, ids
+from . import audit, config, ids, state
 
 STATUSES = ("draft", "applied", "failed", "expired")
 
@@ -68,15 +67,12 @@ iso = ids.iso
 new_id = ids.new_id
 
 
-def _path(plan_id: str, *, create: bool = False) -> Path:
-    """create=False by DEFAULT: resolving a plan's path is a read, and
-    load() must not materialise the plan store just to look for a file
-    that may not exist. Only save() — about to write — passes True."""
-    return config.plans_dir(create=create) / f"{plan_id}.json"
+def _path(plan_id: str) -> Path:
+    return config.plans_dir() / f"{plan_id}.json"
 
 
-def _claim_path(plan_id: str, *, create: bool = False) -> Path:
-    return config.plans_dir(create=create) / f"{plan_id}.json.applying"
+def _claim_path(plan_id: str) -> Path:
+    return config.plans_dir() / f"{plan_id}.json.applying"
 
 
 def _revive(data: dict) -> Plan:
@@ -87,7 +83,8 @@ def _revive(data: dict) -> Plan:
 
 
 def save(plan: Plan) -> None:
-    path = _path(plan.id, create=True)
+    # The one plan write seam: the store comes to exist via state adoption.
+    path = state.State.resolve().adopt().plans / f"{plan.id}.json"
     tmp = path.with_suffix(path.suffix + ".tmp")
     tmp.write_bytes(json.dumps(asdict(plan), indent=2).encode())
     tmp.rename(path)
@@ -109,7 +106,7 @@ def claim(plan_id: str) -> Plan | None:
     already applied/finished, or unknown id (caller disambiguates via
     load()). A finished plan's file is renamed back untouched."""
     try:
-        _path(plan_id).rename(_claim_path(plan_id, create=True))
+        _path(plan_id).rename(_claim_path(plan_id))
     except FileNotFoundError:
         return None
     try:
@@ -166,11 +163,7 @@ def expire(plan: Plan) -> None:
 
 def all_plans() -> list[Plan]:
     out = []
-    try:
-        found = sorted(config.plans_dir(create=False).glob("*.json"))
-    except OSError:
-        return []
-    for path in found:
+    for path in sorted(config.plans_dir().glob("*.json")):
         try:
             out.append(_revive(json.loads(path.read_bytes())))
         except (json.JSONDecodeError, TypeError, OSError):
@@ -178,31 +171,15 @@ def all_plans() -> list[Plan]:
     return out
 
 
-def gc(now: datetime | None = None,
-       plan_ids: Iterable[str] | None = None) -> int:
+def gc(now: datetime | None = None) -> int:
     """Housekeeping, called lazily from build_plan/apply_plan: drop plan
     files older than 7 days; finalise a stale .applying (crashed apply)
-    as failed after 2x TTL so its plan id stops reading as in-flight.
-
-    ``plan_ids`` narrows the sweep to those plans' files and nothing
-    else. The whole-directory sweep is only ours to run when we own the
-    directory: EMAIL_MCP_STATE_DIR can point at a tree the user also
-    keeps files in, so a caller that merely wants ITS OWN detected
-    claims finalised (repairs, via doctor --fix, which promises never to
-    delete user data) passes the ids it detected."""
+    as failed after 2x TTL so its plan id stops reading as in-flight."""
     now = now or utcnow()
-    scope = None if plan_ids is None else set(plan_ids)
     removed = 0
     horizon = now - timedelta(days=7)
     stale = now - timedelta(seconds=2 * config.triage_ttl_seconds())
-    # create=False: a sweep over a store that does not exist finds
-    # nothing, which is the honest answer — it must not create the store
-    # in order to garbage-collect it.
-    for path in config.plans_dir(create=False).glob("*.json*"):
-        if scope is not None:
-            head, sep, _ = path.name.partition(".json")
-            if not sep or head not in scope:
-                continue
+    for path in config.plans_dir().glob("*.json*"):
         try:
             mtime = datetime.fromtimestamp(path.stat().st_mtime, tz=timezone.utc)
         except OSError:

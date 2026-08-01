@@ -1,8 +1,7 @@
 """Apple Mail source.
 
-Reads the Envelope Index SQLite database read-only (`mode=ro`, honoring
-WAL — see `_connect_readonly`) and resolves message bodies from `.emlx`
-files on demand. No writes. No network.
+Reads the Envelope Index SQLite database in immutable mode and resolves
+message bodies from `.emlx` files on demand. No writes. No network.
 
 Designed to be safe against the Mail.app version drift documented in the
 plan: every column we read is verified via PRAGMA at startup, and missing
@@ -131,11 +130,7 @@ class AppleMailSource:
         """Return {table_name: {column_names}} for the tables we touch.
 
         Apple's schema drifts across macOS versions; we never SELECT * and we
-        check before referencing a column. A table that fails to probe is
-        recorded as absent so callers degrade — but if EVERY table fails the
-        file is not a readable index at all, and degrading would report a
-        corrupt store as an empty one (thread() returning []), so the error
-        is re-raised for the belt to code as mail_unavailable.
+        check before referencing a column.
         """
         wanted = (
             "messages",
@@ -150,19 +145,13 @@ class AppleMailSource:
         )
         out: dict[str, set[str]] = {}
         cur = self._conn.cursor()
-        failure: sqlite3.DatabaseError | None = None
         for table in wanted:
             try:
                 rows = cur.execute(f"PRAGMA table_info({table})").fetchall()
-            except sqlite3.DatabaseError as e:
+            except sqlite3.DatabaseError:
                 out[table] = set()
-                failure = e
                 continue
             out[table] = {r[1] for r in rows}
-        # A valid-but-empty index probes clean (empty rows, no exception),
-        # so `failure` is what separates "unreadable" from "no such table".
-        if failure is not None and not any(out.values()):
-            raise failure
         return out
 
     def _have(self, table: str, column: str) -> bool:
@@ -602,11 +591,7 @@ class AppleMailSource:
             raise LookupError(f"message {rowid} not found")
         emlx_path = build_emlx_path(self._mail_dir, row["url"] or "", rowid)
         if not emlx_path.exists():
-            # The ordinary IMAP-not-downloaded case: the store is fine, this
-            # message's bytes just are not local. §3.5 files a vanished
-            # attachment under not_found — LookupError, like the unknown
-            # part below; FileNotFoundError would read as an unusable store.
-            raise LookupError(f"no local .emlx for message {rowid}")
+            raise FileNotFoundError(f"no local .emlx for message {rowid}")
 
         parsed_parts = _parse_emlx_parts(emlx_path)
         if attachment_id not in parsed_parts:

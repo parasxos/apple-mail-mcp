@@ -12,7 +12,7 @@ import subprocess
 import time
 from pathlib import Path
 
-from .. import config
+from .. import codes, config
 from ..log import get_logger
 from . import SendError
 
@@ -145,7 +145,8 @@ class SshSendmailTransport:
             )
         except FileNotFoundError as e:
             _log.error("deliver failed: ssh not found on PATH")
-            raise SendError(f"{self._prefix} ssh not found on PATH.") from e
+            raise SendError(f"{self._prefix} ssh not found on PATH.",
+                            code=codes.TRANSPORT_UNAVAILABLE) from e
         except subprocess.TimeoutExpired as e:
             _log.error(
                 "deliver timed out after %.0fs: %s — master passed check but the "
@@ -158,7 +159,8 @@ class SshSendmailTransport:
                 "master looked alive but the session hung (stale "
                 "ControlMaster). The socket has been reset; retry once and "
                 "the send will re-bootstrap. Log: "
-                f"{config.log_file() or 'disabled'}."
+                f"{config.log_file() or 'disabled'}.",
+                code=codes.DELIVERY_FAILED,
             ) from e
         if proc.returncode != 0:
             err = (proc.stderr or b"").decode("utf-8", "replace").strip()
@@ -168,7 +170,8 @@ class SshSendmailTransport:
             )
             raise SendError(
                 f"{self._prefix} delivery failed (exit {proc.returncode}): "
-                f"{err or 'no stderr'}"
+                f"{err or 'no stderr'}",
+                code=codes.DELIVERY_FAILED,
             )
         _log.info("deliver ok: %s (%.1fs)", msgid, time.monotonic() - t0)
 

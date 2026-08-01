@@ -15,16 +15,7 @@ import re
 import secrets
 from datetime import datetime, timezone
 
-# The shape `new_id` mints, as a matcher. Contract §2 says operation_id is
-# "never minted *for* a failure" — so a caller-supplied argument only earns
-# a place in a failure envelope if it LOOKS like an id we minted. Anything
-# else (a typo, a hostile 60 KB string) is a reference to nothing.
-_ID_RE = re.compile(r"\A\d{8}T\d{6}Z-[0-9a-f]{12}\Z")
-
-
-def is_minted_id(value: str) -> bool:
-    """True when `value` has the exact shape of an id this module mints."""
-    return bool(_ID_RE.match(value))
+_ID_RE = re.compile(r"\d{8}T\d{6}Z-[0-9a-f]{12}")
 
 
 def utcnow() -> datetime:
@@ -38,3 +29,10 @@ def iso(dt: datetime) -> str:
 def new_id(now: datetime | None = None) -> str:
     stamp = (now or utcnow()).strftime("%Y%m%dT%H%M%SZ")
     return f"{stamp}-{secrets.token_hex(6)}"
+
+
+def is_minted_id(value: object) -> bool:
+    """True iff ``value`` is a string in the minted vocabulary above —
+    the proof the envelope boundary's operation_id gate demands
+    (contract §2: an id is minted here or it was never minted)."""
+    return isinstance(value, str) and _ID_RE.fullmatch(value) is not None

@@ -2,17 +2,13 @@
 
 The ledger indexes the truths already frozen elsewhere (spool manifests,
 plan files, Message-IDs) — it does not create truth. Schema v1 is specified
-in docs/v1-contract.md §6. Storage: monthly JSONL files under
-config.audit_dir() — ~/.email-mcp/audit/YYYY-MM.jsonl, dir 0700, files 0600.
+in docs/v1-contract.md §6. Storage: monthly JSONL files under the state
+tree's audit leaf — ~/.email-mcp/audit/YYYY-MM.jsonl, dir 0700, files 0600.
 
 Two writer processes exist (server + launchd dispatcher), so an append is
 one os.write on an O_APPEND fd opened per event — lines never interleave —
 and each emit resolves the monthly path from its own timestamp, which
 dissolves the month-rollover race.
-
-The writer never follows a symlink onto a victim: the ledger directory is
-fenced in config.audit_dir and the month file is opened O_NOFOLLOW and
-chmodded through its own fd.
 
 Emit-failure policy: log-and-continue, absolute. emit() NEVER raises; an
 unwritable ledger must never block mail. Events never contain message
@@ -31,10 +27,9 @@ import argparse
 import json
 import os
 import re
-import sys
 from datetime import datetime
 
-from . import config, ids
+from . import config, ids, state
 from .log import get_logger
 
 _log = get_logger()
@@ -42,11 +37,6 @@ _log = get_logger()
 SCHEMA_VERSION = 1
 MAX_EVENT_BYTES = 16384
 SUBJECT_MAX_CHARS = 200
-
-# O_NOFOLLOW is POSIX-only; where it is missing the flag degrades to 0 and
-# the ledger keeps its other properties (append atomicity, single write).
-_LEDGER_FLAGS = (os.O_RDWR | os.O_CREAT | os.O_APPEND
-                 | getattr(os, "O_NOFOLLOW", 0))
 
 _ENVELOPE = ("v", "ts", "op", "src", "event", "outcome")
 # Schema v1's closed optional-field vocabulary (contract §6); anything
@@ -140,13 +130,13 @@ def emit(
                 value = value[:SUBJECT_MAX_CHARS]
             record[key] = value
         line = _fit(record)
-        # Month resolved from this event's own ts: no rollover race.
-        path = config.audit_dir() / f"{ts[:7]}.jsonl"
+        # Month resolved from this event's own ts: no rollover race. The
+        # ledger dir comes from state adoption — a refused root or broken
+        # leaf raises here and is dropped by the fence below (§6:
+        # log-and-continue, absolute).
+        path = state.State.resolve().adopt().audit / f"{ts[:7]}.jsonl"
         # O_RDWR (not O_WRONLY) so the torn-tail probe below can pread.
-        # O_NOFOLLOW: nobody but this writer names a YYYY-MM.jsonl, so a
-        # link there is a squatter — open fails (ELOOP) rather than
-        # appending an event to, and tightening the mode of, its target.
-        fd = os.open(path, _LEDGER_FLAGS, 0o600)
+        fd = os.open(path, os.O_RDWR | os.O_CREAT | os.O_APPEND, 0o600)
         try:
             # Torn-tail heal: a previous crash/short write can leave the
             # file without a trailing newline; appending straight after it
@@ -159,19 +149,10 @@ def emit(
             if size and os.pread(fd, 1, size - 1) != b"\n":
                 line = b"\n" + line
             os.write(fd, line + b"\n")
-            # launchd agents run with a permissive umask. fchmod, not
-            # chmod: it names the fd we just wrote, so no re-resolution
-            # of the path (and no link) can stand between the two.
-            os.fchmod(fd, 0o600)
         finally:
             os.close(fd)
+        os.chmod(path, 0o600)  # launchd agents run with a permissive umask
         return op
-    except (config.AuditDirRefused, config.StateDirRefused) as e:
-        # A refused ledger location (symlink squat, override at $HOME or
-        # above) costs receipts, never a mutation — same emit-failure
-        # policy as any other drop.
-        _log.warning("audit: emit(%s) dropped — %s", event, e)
-        return None
     except Exception:
         _log.warning("audit: emit(%s) failed; event dropped", event,
                      exc_info=True)
@@ -266,21 +247,13 @@ def query(
         limit = 50
     limit = max(1, min(limit, 500))
 
-    # A read must answer, never raise: an unreadable or refused root makes
-    # even the is_dir() probe throw (mode 000), and "no events" is the
-    # honest answer for a ledger this process cannot see.
-    try:
-        root = config.audit_dir(create=False)
-        readable = root.is_dir()
-    except OSError:
-        readable = False
-    if not readable:
+    root = config.audit_dir()  # a path question: read paths never create
+    if not root.is_dir():
         return {"events": [], "files_scanned": 0, "skipped_lines": 0}
 
     events: list[dict] = []
     files_scanned = 0
     skipped = 0
-    unreadable_files: list[str] = []
     for path in sorted(root.iterdir()):
         if not _MONTH_FILE.fullmatch(path.name):
             continue
@@ -292,10 +265,6 @@ def query(
         try:
             text = path.read_text(encoding="utf-8", errors="replace")
         except OSError:
-            # An unreadable month file is not an empty one. Dropping it
-            # silently made "no events" and "a ledger we cannot read" the
-            # same response.
-            unreadable_files.append(path.name)
             continue
         files_scanned += 1
         for raw in text.splitlines():
@@ -329,16 +298,11 @@ def query(
     # in favor of the later-appended line.
     events.reverse()
     events.sort(key=lambda r: str(r.get("ts", "")), reverse=True)
-    out = {
+    return {
         "events": events[:limit],
         "files_scanned": files_scanned,
         "skipped_lines": skipped,
     }
-    if unreadable_files:
-        # Additive and CONDITIONAL: a healthy ledger returns exactly the
-        # v0.10 shape, so the frozen output surface does not move.
-        out["unreadable_files"] = unreadable_files
-    return out
 
 
 def tail(n: int = 20) -> list[dict]:
@@ -351,24 +315,9 @@ def tail(n: int = 20) -> list[dict]:
 # ---------------------------------------------------------------------- #
 
 
-def _warn_unreadable(out: dict) -> None:
-    """Say when the ledger could not be fully read. Printing only the
-    events made an unreadable month file look like an empty one."""
-    names = out.get("unreadable_files")
-    if names:
-        print(f"warning: {len(names)} ledger file(s) could not be read "
-              f"({', '.join(sorted(names))}) — events above are incomplete",
-              file=sys.stderr)
-
-
 def _print_status() -> None:
-    root = config.audit_dir(create=False)
-    try:
-        readable = root.is_dir()
-    except OSError as e:
-        print(f"dir: {root} (unreadable: {e.strerror})")
-        return
-    if not readable:
+    root = config.audit_dir()
+    if not root.is_dir():
         print(f"dir: {root} (absent — no events recorded yet)")
         return
     months = sorted(
@@ -377,9 +326,7 @@ def _print_status() -> None:
     print(f"dir: {root}")
     span = f" ({months[0][:7]} … {months[-1][:7]})" if months else ""
     print(f"files: {len(months)}{span}")
-    probe = query(limit=1)
-    _warn_unreadable(probe)
-    last = probe["events"]
+    last = query(limit=1)["events"]
     if last:
         print(f"last event: {last[0].get('ts', '-')} "
               f"{last[0].get('event', '?')}/{last[0].get('outcome', '?')}")
@@ -408,9 +355,6 @@ def main(argv: list[str] | None = None) -> int:
                         help="ledger directory, file count, last event")
     args = parser.parse_args(argv)
 
-    rc = config.startup_guard("email-mcp audit")
-    if rc is not None:
-        return rc
     set_process("cli")
     if args.status:
         _print_status()
@@ -418,7 +362,6 @@ def main(argv: list[str] | None = None) -> int:
     if args.tail is not None:
         for rec in tail(args.tail):
             print(json.dumps(rec, separators=(",", ":"), ensure_ascii=False))
-        _warn_unreadable(query(limit=args.tail))
         return 0
     filters = (args.since, args.until, args.tool, args.event,
                args.plan_id, args.op, args.limit)
@@ -432,7 +375,6 @@ def main(argv: list[str] | None = None) -> int:
     )
     for rec in out["events"]:  # newest first, like the audit tool
         print(json.dumps(rec, separators=(",", ":"), ensure_ascii=False))
-    _warn_unreadable(out)
     return 0
 
 

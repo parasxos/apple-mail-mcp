@@ -20,6 +20,7 @@ def _clean_send_env(monkeypatch, tmp_path):
             monkeypatch.delenv(k, raising=False)
     monkeypatch.setenv("EMAIL_MCP_FROM_ADDR", "paris.moschovakos@cern.ch")
     monkeypatch.setenv("EMAIL_MCP_FROM_NAME", "Paris Moschovakos")
+    monkeypatch.setenv("EMAIL_MCP_STATE_DIR", str(tmp_path / "state"))
     monkeypatch.setenv("EMAIL_MCP_IDENTITIES", str(tmp_path / "no-identities.toml"))
 
 
@@ -84,14 +85,13 @@ def test_crlf_subject_rejected_on_send_and_schedule(
     assert "header_injection" in str(ei.value)
     assert capture_delivery == []  # {ok:false}, never a traceback or a send
 
-    monkeypatch.setenv("EMAIL_MCP_STATE_DIR", str(tmp_path))
     with pytest.raises(sender.SendError) as ei:
         sender.schedule_email(
             to="paris.moschovakos@cern.ch", subject=hostile, body="b",
             send_at="2036-01-01T09:00:00+00:00",
         )
     assert "header_injection" in str(ei.value)
-    assert list((tmp_path / "spool").rglob("*.json")) == []  # nothing frozen
+    assert list((tmp_path / "state").rglob("*.json")) == []  # nothing frozen
 
 
 def test_crlf_in_raw_recipient_rejected_before_split(capture_delivery):

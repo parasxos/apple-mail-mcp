@@ -2,66 +2,23 @@ name: ci
 
 on:
   push:
-    # Every branch, not just main. The v0.11 fixture regression
-    # (tests written against a 6-row conftest that never existed) lived
-    # on a release branch and would have sailed past a main-only filter.
-    branches: ['**']
+    branches: [main]
   pull_request:
-  # release.yml delegates to this workflow on a v* tag, so tag pushes are
-  # covered exactly once — adding tags here would only duplicate the run.
   workflow_call:
 
-# Only the latest commit per ref survives; older in-flight runs are cancelled.
-concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
-
-permissions:
-  contents: read
-
 jobs:
-  # macos-latest only, and deliberately so. This suite drives Mail.app via
-  # osascript, the `security` CLI and launchd; `lifecycle._step_preflight`
-  # refuses outright when sys.platform != "darwin". Measured on a HEAD
-  # snapshot with sys.platform forced to "linux" and the macOS binaries off
-  # PATH: 23 of 452 tests fail, all in test_lifecycle_setup.py,
-  # test_lifecycle_redteam.py, test_lifecycle_update.py and test_repairs.py.
-  # A ubuntu leg would therefore need a file-level deselect list that goes
-  # stale the moment a macOS-coupled test lands in any other file, so the
-  # gate runs where the project is actually supported. This is why the
-  # shared parasxos/.github plugin-ci.yml is not reused here: it hardcodes
-  # runs-on: ubuntu-latest with no runner input, and its size-budget step
-  # uses GNU `stat -c%s`, which does not exist on macOS.
   test:
-    name: pytest (python ${{ matrix.python-version }})
     runs-on: macos-latest
-    timeout-minutes: 20
     strategy:
       fail-fast: false
       matrix:
-        # 3.11 is the floor (requires-python, tomllib) and the development
-        # interpreter; 3.14 is the newest the package claims and the wheel
-        # has been installed and exercised on.
-        python-version: ['3.11', '3.14']
-
+        python: ["3.11", "3.14"]
     steps:
       - uses: actions/checkout@v4
-
-      - name: Set up Python ${{ matrix.python-version }}
-        uses: actions/setup-python@v5
+      - uses: actions/setup-python@v5
         with:
-          python-version: ${{ matrix.python-version }}
+          python-version: ${{ matrix.python }}
           cache: pip
-          # Required: setup-python's pip cache globs `**/requirements.txt`
-          # by default, and this project has none — the step then fails and
-          # the job dies before pytest ever runs. Dependencies live in
-          # pyproject.toml, so point the cache key at it.
           cache-dependency-path: pyproject.toml
-
-      - name: Install
-        run: |
-          python -m pip install --upgrade pip
-          pip install -e ".[dev]"
-
-      - name: pytest
-        run: pytest -q tests
+      - run: python -m pip install -e ".[dev]"
+      - run: python -m pytest -q tests
