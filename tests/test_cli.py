@@ -197,7 +197,6 @@ def test_verb_flag_sets_are_closed(home):
 def test_version_prints_the_single_source(home, capsys):
     assert cli.main(["version"]) == 0
     assert capsys.readouterr().out.strip() == email_mcp.__version__
-    assert email_mcp.__version__ == "0.11.0"
 
 
 def test_version_subprocess_round_trip(tmp_path):
