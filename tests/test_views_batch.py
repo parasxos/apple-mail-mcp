@@ -17,6 +17,8 @@ from email_mcp.fts import FtsIndex
 from email_mcp.server import (
     tool_get_email,
     tool_get_emails_batch,
+    tool_list_recent,
+    tool_list_scheduled,
     tool_search_emails,
 )
 from email_mcp.sources.apple_mail import AppleMailSource
@@ -113,6 +115,38 @@ def test_batch_of_huge_bad_ids_cannot_flood_the_wire(src):
     out = tool_get_emails_batch(["Z" * 60000] * 50)
     assert out["ok"] is True and len(out["errors"]) == 50
     assert len(json.dumps(out).encode("utf-8")) < 250_000
+
+
+# --------------------------------------------------------------------- #
+# page cap — search / list_recent / list_scheduled (§5)                  #
+# --------------------------------------------------------------------- #
+# Caps reject, never truncate — and the page cap is the server's own
+# survival: `limit` had no ceiling, so a 20,000-row page pulled the whole
+# corpus into one envelope and took the server down on the first real
+# user's machine (2026-08-01).
+
+
+@pytest.mark.parametrize("call", [
+    lambda: tool_search_emails(limit=501),
+    lambda: tool_search_emails(limit=20000),
+    lambda: tool_search_emails(limit=0),
+    lambda: tool_search_emails(limit=-5),
+    lambda: tool_list_recent(limit=501),
+    lambda: tool_list_recent(limit=0),
+    lambda: tool_list_scheduled(limit=501),
+    # `[-limit:]` with limit=0 is `[0:]` — the WHOLE spool, the opposite
+    # of "give me nothing"; the gate closes the slice hole too.
+    lambda: tool_list_scheduled(limit=0),
+])
+def test_over_cap_pages_reject_outright(src, call):
+    out = call()
+    assert out["ok"] is False and out["code"] == "invalid_input"
+    assert "500" in out["error"]
+
+
+def test_at_cap_page_passes(src):
+    assert tool_search_emails(limit=500)["ok"] is True
+    assert tool_list_recent(limit=500)["ok"] is True
 
 
 # --------------------------------------------------------------------- #

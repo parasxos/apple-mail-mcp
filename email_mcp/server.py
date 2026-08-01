@@ -216,6 +216,7 @@ def tool_search_emails(
     limit: int = 50,
     offset: int = 0,
 ) -> SearchPage:
+    _check_page(limit)
     q = SearchQuery(
         query=query,
         from_addr=from_addr,
@@ -255,6 +256,18 @@ def tool_search_emails(
 # Payload views for get_email / get_emails_batch, smallest first.
 _VIEWS = ("minimal", "metadata", "full")
 _BATCH_MAX_IDS = 50
+
+# One page of search/list/scheduled results. Caps REJECT, never truncate
+# (contract §5) — and they exist for the server's own survival: `limit` had
+# no ceiling, so a 20,000-row search pulled the whole corpus into a single
+# envelope and took the server down on the first real user's machine.
+_PAGE_MAX = 500
+
+
+def _check_page(limit: int) -> None:
+    if not 0 < limit <= _PAGE_MAX:
+        raise InvalidInput(f"limit {limit} is outside 1..{_PAGE_MAX} — "
+                           "lower it and paginate")
 
 
 def _shape_email(msg: Email, view: str) -> Email | EmailMetadata | EmailMinimal:
@@ -315,6 +328,7 @@ def tool_list_recent(
     account: str | None = None,
     limit: int = 50,
 ) -> RecentPage:
+    _check_page(limit)
     return RecentPage(messages=list(_source().recent(mailbox, account, limit)))
 
 
@@ -560,6 +574,9 @@ def tool_list_scheduled(state: str | None = None, limit: int = 50) -> dict:
     if state and state not in spool.STATES:
         raise InvalidInput(f"unknown state {state!r} "
                            f"(want one of {spool.STATES})")
+    # The page gate also closes the slice hole: `[-limit:]` with limit=0
+    # is `[0:]` — the WHOLE spool, the opposite of "give me nothing".
+    _check_page(limit)
     states = [state] if state else list(spool.STATES)
     return {
         "dispatcher_installed": _plist_path().exists(),

@@ -265,7 +265,7 @@ Caps REJECT, never truncate. Values below are the defaults of
 | apply script timeout | auto: max(60, min(300, 30 + 0.6·n)) s | `EMAIL_MCP_TRIAGE_TIMEOUT` (>0 overrides) |
 | apply/mailbox verify | 3 polls × 2.0 s | `EMAIL_MCP_TRIAGE_VERIFY_POLLS` / `…_VERIFY_INTERVAL` |
 | batch read | 50 ids | fixed (`_BATCH_MAX_IDS`) |
-| search / list default page | 50 | `limit` parameter |
+| search / list / scheduled page | default 50, **max 500** | `limit` parameter (1..500; over-cap rejects `invalid_input` — added 2026-08-01 after an uncapped 20k-row page took the server down) |
 | attachment budget per message | 20 MB pre-base64 | `EMAIL_MCP_MAX_ATTACH_MB` |
 | body bytes served per message | 2 000 000 | `EMAIL_MCP_MAX_BODY_BYTES` |
 | scheduled-send attempts | 5, backoff 2/5/15/45/120 min | `EMAIL_MCP_SEND_RETRIES` (backoff fixed) |
