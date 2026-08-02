@@ -14,6 +14,20 @@
     "subject": "str",
     "was_due": "str"
   },
+  "create_draft": {
+    "account": "str",
+    "cc": [
+      "str"
+    ],
+    "draft_id": "str",
+    "folder": "str",
+    "message_id": "str",
+    "ok": "bool",
+    "subject": "str",
+    "to": [
+      "str"
+    ]
+  },
   "doctor": "dict",
   "get_attachment": {
     "attachment": {

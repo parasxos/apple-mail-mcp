@@ -404,6 +404,7 @@ def test_setup_interactive_smtp_identity_never_stores_the_secret(
         "",                       # port -> 587
         "",                       # username -> from_addr
         "",                       # keychain item -> email-mcp-smtp
+        "n",                      # Microsoft/Exchange mailbox? -> no
         "n",                      # dispatcher agent
         "n",                      # fts agent
         "n",                      # fts build
@@ -452,6 +453,7 @@ def test_setup_reconfigure_is_backup_first(home, smoke, monkeypatch):
         "",                       # display name
         "pipe",                   # driver
         "sendmail -t",            # delivery command
+        "n",                      # Microsoft/Exchange mailbox? -> no
         "n", "n", "n",            # agents + fts build
     ])
     assert lifecycle.setup() == 0

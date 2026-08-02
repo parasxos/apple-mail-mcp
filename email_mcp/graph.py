@@ -476,6 +476,56 @@ def _iso_utc(when: datetime) -> str:
     return when.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
+def create_mime_draft(ident, raw: bytes) -> str:
+    """File our composer's MIME as a PLAIN draft in Exchange's Drafts —
+    the send path with the transport removed (docs/draft-design.md,
+    panel decision 2026-08-02).
+
+    Exactly two arguments by design: arming — the deferred-time property
+    and the submission call — lives ONLY in create_deferred_draft's own
+    body, so no shared helper can ever grow a draft into a transmission
+    (tests pin this lexically). Returns the Graph message id — the
+    durable draft_id; Envelope Index ROWIDs are rewritten by sync and
+    are never used as draft identity."""
+    status, draft = _graph(
+        "POST", "/me/messages", ident,
+        body=base64.b64encode(raw), ctype="text/plain",
+    )
+    if status != 201 or "id" not in draft:
+        raise GraphError(
+            f"[{_name(ident)}/graph] draft create failed "
+            f"(HTTP {status}): {_graph_reason(draft)}"
+        )
+    return str(draft["id"])
+
+
+def draft_receipt(ident, draft_id: str) -> dict:
+    """The acceptance readback for a filed draft (docs/draft-design.md):
+    {is_draft, internet_message_id, in_drafts_folder}. All three true or
+    the draft does not count as created — evidence, never assertion."""
+    status, msg = _graph(
+        "GET",
+        f"/me/messages/{urllib.parse.quote(draft_id)}"
+        "?$select=isDraft,internetMessageId,parentFolderId", ident,
+    )
+    if status != 200:
+        raise GraphError(
+            f"[{_name(ident)}/graph] draft readback failed "
+            f"(HTTP {status}): {_graph_reason(msg)}"
+        )
+    status, folder = _graph("GET", "/me/mailFolders/drafts", ident)
+    if status != 200 or "id" not in folder:
+        raise GraphError(
+            f"[{_name(ident)}/graph] cannot resolve the Drafts folder "
+            f"(HTTP {status}): {_graph_reason(folder)}"
+        )
+    return {
+        "is_draft": bool(msg.get("isDraft")),
+        "internet_message_id": str(msg.get("internetMessageId") or ""),
+        "in_drafts_folder": str(msg.get("parentFolderId")) == str(folder["id"]),
+    }
+
+
 def create_deferred_draft(ident, raw: bytes, when: datetime) -> str:
     """Hand the frozen .eml to Exchange for deferred transmission.
 

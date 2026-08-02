@@ -57,7 +57,7 @@ def _render(schemas: dict) -> str:
 
 def test_output_schemas_match_snapshot():
     current = derived_schemas()
-    assert len(current) == 20
+    assert len(current) == 21
     if not SNAPSHOT.exists():
         # The freeze must be self-defending: a deleted snapshot fails
         # loudly instead of silently re-freezing whatever the types now
@@ -92,7 +92,7 @@ def test_no_tool_declares_a_structured_output_schema(monkeypatch):
     monkeypatch.delenv("EMAIL_MCP_READ_ONLY", raising=False)
     mcp = server._build_mcp_server()
     tools = asyncio.run(mcp.list_tools())
-    assert len(tools) == 20
+    assert len(tools) == 21
     assert {t.name: t.outputSchema for t in tools} == \
         {t.name: None for t in tools}
 
@@ -202,7 +202,10 @@ def _compare(oracle, derived, path: str, skips: set, bad: list) -> None:
 def test_derived_shapes_agree_with_the_shipped_oracle():
     oracle = json.loads(ORACLE.read_text(encoding="utf-8"))["success_shapes"]
     derived = derived_schemas()
-    assert set(oracle) == set(derived)  # same 20 tools
+    # The oracle is the SHIPPED v0.11 surface; tools added since
+    # (create_draft, 2026-08-02) are additive and frozen by the live
+    # snapshot above, not by the oracle.
+    assert set(oracle) <= set(derived)
 
     skips: set = set()
     bad: list = []

@@ -153,6 +153,15 @@ too); R1 the tool (#21, 10 mutating / 11 read-only / 21 total, contract +
 freeze rows in the same change); R2 docs; R3 Camilla (two config lines +
 one device login); R4 nothing until a real ask.
 
+*R0 DONE 2026-08-02 (binding fence dab2b8f; config + live re-login,
+bound to paris.moschovakos@cern.ch). R1 DONE 2026-08-02: tool #21 with
+the three-legged readback, `drafts` identity capability, wizard
+Exchange step (tenant `organizations` — probed live, no GUID needed),
+`draft` audit event, call-graph invariant tests. R2 rode along
+(reference.md "Drafts", contract §1/§3/§6 rows). Next: R3 = Camilla's
+enable; manual acceptance (edit in OWA/phone, hand-send to Outlook,
+verify rendering) still owed for the RC record.*
+
 ## What is deliberately NOT here
 
 - **No `send_draft`.** The invariant is the feature.

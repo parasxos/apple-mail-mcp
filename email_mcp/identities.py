@@ -21,12 +21,19 @@ from .transports import DRIVERS, SendError
 # driver parameter and lands in `params`.
 _KNOWN_FIELDS = {
     "from_addr", "from_name", "driver", "allowlist", "allow_all", "bcc_self",
-    "executor", "graph",
+    "executor", "graph", "drafts",
 }
 
 # Schedule executors an identity may name: the local launchd spool
 # (default, universal) or Exchange-side deferred send via Microsoft Graph.
 _EXECUTORS = {"launchd", "graph"}
+
+# Draft-filing lanes an identity may DECLARE (never inferred, never
+# fallen back to — for a draft the location IS the artifact, see
+# docs/draft-design.md, panel decision 2026-08-02). "none" refuses with
+# a fix; "graph" files our composer's MIME into Exchange's Drafts. An
+# enum so "gmail" stays addable without a breaking change.
+_DRAFT_LANES = {"none", "graph"}
 
 
 class IdentityError(SendError):
@@ -57,7 +64,13 @@ class Identity:
     # universal) or Exchange-side deferred send. Immediate sends always
     # use `driver` — the executor is a schedule-time capability only.
     executor: str = "launchd"
-    # [name.graph] table (tenant + client_id) when executor = "graph".
+    # Where create_draft may file: "none" (default — refuse with a fix)
+    # or "graph" (Exchange Drafts via our own MIME). Third disposition of
+    # a composed message beside `driver` (send now) and `executor`
+    # (send later); declared, never inferred.
+    drafts: str = "none"
+    # [name.graph] table (tenant + client_id) when executor or drafts
+    # names "graph".
     graph: dict = field(default_factory=dict)
 
     def __post_init__(self) -> None:
@@ -173,6 +186,12 @@ def load() -> tuple[dict[str, Identity], str]:
                 f"{path}: identity [{name}] has unknown executor "
                 f"{executor!r}. Available: {sorted(_EXECUTORS)}"
             )
+        drafts = str(t.get("drafts", "none")).strip() or "none"
+        if drafts not in _DRAFT_LANES:
+            raise IdentityError(
+                f"{path}: identity [{name}] has unknown drafts lane "
+                f"{drafts!r}. Available: {sorted(_DRAFT_LANES)}"
+            )
         graph = t.get("graph", {})
         if not isinstance(graph, dict):
             raise IdentityError(
@@ -180,14 +199,16 @@ def load() -> tuple[dict[str, Identity], str]:
                 f"write a [{name}.graph] block with `tenant` and "
                 "`client_id` keys."
             )
-        if executor == "graph":
+        if executor == "graph" or drafts == "graph":
+            claim = ('executor = "graph"' if executor == "graph"
+                     else 'drafts = "graph"')
             missing = [
                 k for k in ("tenant", "client_id")
                 if not str(graph.get(k, "")).strip()
             ]
             if missing:
                 raise IdentityError(
-                    f'{path}: identity [{name}] has executor = "graph" but '
+                    f"{path}: identity [{name}] has {claim} but "
                     f"[{name}.graph] is missing {missing} — set the tenant "
                     "and public-client application id proven by "
                     "tools/graph_probe.py (see docs/graph-probe.md)."
@@ -206,6 +227,7 @@ def load() -> tuple[dict[str, Identity], str]:
             allow_all=bool(t.get("allow_all", not allowlist)),
             bcc_self=bool(t.get("bcc_self", True)),
             executor=executor,
+            drafts=drafts,
             graph=dict(graph),
         )
     return identities, default

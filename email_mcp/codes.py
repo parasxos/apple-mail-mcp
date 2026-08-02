@@ -118,6 +118,10 @@ AUTH_FAILED = "auth_failed"
 CREDENTIALS_UNAVAILABLE = "credentials_unavailable"
 IDENTITY_MISCONFIGURED = "identity_misconfigured"
 UNKNOWN_IDENTITY = "unknown_identity"
+# create_draft on an identity without a drafts lane (additive, 2026-08-02
+# — contract §3/§8). Not "misconfigured": nothing is wrong, the
+# capability is simply not declared/possible for this identity.
+DRAFT_UNSUPPORTED = "draft_unsupported"
 
 SEND_CODES_V011 = frozenset({
     HEADER_INJECTION, INVALID_RECIPIENT, RECIPIENT_NOT_ALLOWED,

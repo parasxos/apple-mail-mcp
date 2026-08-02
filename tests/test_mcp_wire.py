@@ -11,7 +11,7 @@ and an empty stdout, a bar that a server doing nothing at all clears.
 So this module is the only place that launches `email-mcp` the way
 ~/.claude.json launches it (bare, no arguments — the compatibility promise
 of contract §7), performs a genuine `initialize` handshake, and asserts
-against what comes back over the wire: the frozen twenty tools, the eleven
+against what comes back over the wire: the frozen twenty-one tools, the eleven
 read-side tools under EMAIL_MCP_READ_ONLY=1, the §2 envelope on a real
 tool call, and the purity of stdout, which *is* the transport.
 
@@ -39,7 +39,8 @@ READ_ONLY_TOOLS = {
     "list_scheduled", "doctor", "audit",
 }
 MUTATING_TOOLS = {
-    "send_email", "reply_email", "schedule_email", "cancel_scheduled",
+    "send_email",
+    "create_draft", "reply_email", "schedule_email", "cancel_scheduled",
     "triage_plan", "triage_plan_delete", "triage_apply", "mailbox_create",
     "mailbox_delete",
 }
@@ -130,7 +131,7 @@ def test_bare_invocation_completes_a_real_initialize_handshake(
     assert init.capabilities.tools is not None
 
 
-def test_tools_list_over_the_wire_is_exactly_the_frozen_twenty(
+def test_tools_list_over_the_wire_is_exactly_the_frozen_twenty_one(
     tmp_path, mail_fixture,
 ):
     async def body(session, init):
@@ -138,7 +139,7 @@ def test_tools_list_over_the_wire_is_exactly_the_frozen_twenty(
 
     names = _talk(_server_env(tmp_path, mail_fixture), body)
     assert names == ALL_TOOLS
-    assert len(names) == 20
+    assert len(names) == 21
 
 
 def test_read_only_wire_surface_is_exactly_the_eleven_read_tools(

@@ -27,7 +27,7 @@ def _strip_descriptions(node):
 
 
 def _current_schemas(monkeypatch) -> dict:
-    """{tool name: inputSchema} for the full 20-tool surface."""
+    """{tool name: inputSchema} for the full 21-tool surface."""
     monkeypatch.delenv("EMAIL_MCP_READ_ONLY", raising=False)
     mcp = server._build_mcp_server()
     try:
@@ -49,7 +49,7 @@ def _render(schemas: dict) -> str:
 
 def test_input_schemas_match_snapshot(monkeypatch):
     current = _current_schemas(monkeypatch)
-    assert len(current) == 20
+    assert len(current) == 21  # +create_draft, additive 2026-08-02
     if not SNAPSHOT.exists():
         # The freeze must be self-defending: a deleted snapshot fails loudly
         # instead of silently re-freezing whatever the code now emits

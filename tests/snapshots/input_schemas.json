@@ -95,6 +95,58 @@
     "title": "cancel_scheduledArguments",
     "type": "object"
   },
+  "create_draft": {
+    "properties": {
+      "body": {
+        "title": "Body",
+        "type": "string"
+      },
+      "cc": {
+        "anyOf": [
+          {
+            "type": "string"
+          },
+          {
+            "type": "null"
+          }
+        ],
+        "default": null,
+        "title": "Cc"
+      },
+      "from_identity": {
+        "anyOf": [
+          {
+            "type": "string"
+          },
+          {
+            "type": "null"
+          }
+        ],
+        "default": null,
+        "title": "From Identity"
+      },
+      "in_reply_to": {
+        "default": "",
+        "title": "In Reply To",
+        "type": "string"
+      },
+      "subject": {
+        "title": "Subject",
+        "type": "string"
+      },
+      "to": {
+        "title": "To",
+        "type": "string"
+      }
+    },
+    "required": [
+      "to",
+      "subject",
+      "body"
+    ],
+    "title": "create_draftArguments",
+    "type": "object"
+  },
   "doctor": {
     "properties": {},
     "title": "doctorArguments",

@@ -214,8 +214,49 @@ def _identity_rows() -> list[plan.Row]:
         print(f"unknown driver {driver!r} — skipping identity setup.")
         return [plan.PrintOnly(f"no identity configured — unknown driver "
                                f"{driver!r}")]
+    lines += _exchange_lines(name, from_addr)
     return [plan.WriteFile(path, "\n".join(lines) + "\n", mode=0o600,
                            backup=True)]
+
+
+# The generic work-account endpoint and Microsoft's own public client:
+# no tenant GUID to look up, no app to register — the two facts that let
+# the wizard ask ONE plain question instead of quoting documentation.
+_MS_TENANT = "organizations"
+_MS_CLIENT_ID = "14d82eec-204b-4c2f-b7e8-296a70dab67e"
+
+
+def _exchange_lines(name: str, from_addr: str) -> list[str]:
+    """Offer the Exchange extras — drafts and lid-closed scheduling — in
+    the user's words, and do the sign-in HERE, while the human is
+    present. A capability the user must read about in a doc is a
+    capability they do not have (first-user finding, 2026-08-01)."""
+    if not _yn(f"\nIs {from_addr} a Microsoft/Exchange mailbox "
+               "(you read it in Outlook or OWA)?", default=False):
+        return []
+    print("Exchange extras: drafts filed in your real Drafts folder, and "
+          "scheduled sends that fire even with the laptop closed.")
+    if not _yn("Enable them now (one browser sign-in)?", default=True):
+        return []
+    from . import graph
+    from .identities import Identity
+
+    ident = Identity(name=name, from_addr=from_addr, drafts="graph",
+                     graph={"tenant": _MS_TENANT, "client_id": _MS_CLIENT_ID})
+    try:
+        graph.device_login(ident)          # prints the code; binds to /me
+    except Exception as e:                 # noqa: BLE001 — user-facing step
+        # Not fatal: the identity is still written WITHOUT the lane, so
+        # setup finishes and the retry command is the whole remedy.
+        print(f"sign-in did not complete ({e})")
+        print(f"  enable later with: email-mcp setup   (or: python -m "
+              f"email_mcp.graph --login {name})")
+        return []
+    print("drafts + lid-closed scheduling enabled.")
+    return ['executor = "graph"', 'drafts = "graph"', "",
+            f"[{name}.graph]",
+            f"tenant = {json.dumps(_MS_TENANT)}",
+            f"client_id = {json.dumps(_MS_CLIENT_ID)}"]
 
 
 def _agent_rows() -> list[plan.Row]:

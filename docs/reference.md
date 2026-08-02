@@ -286,6 +286,30 @@ The seven read tools are **read-only on disk**. `refresh_mail` nudges Mail.app v
 | `mailbox_delete(account, path)` | Delete an EMPTY mailbox; idempotent. Outcome decided by live re-probe (Mail's delete verb lies); escalates to UI scripting when the verb has no effect (needs Accessibility permission). |
 | `reply_email(id, body, reply_all?, cc?, bcc?, include_history?, attachments?, from_identity?)` | Reply to message `id`, threading via In-Reply-To / References / `Re:` subject. Quotes the original below the reply (attribution + `>` block, HTML blockquote) like a normal client; `include_history=False` for a bare reply. Defaults to the original sender only; `reply_all=True` also Ccs the original To+Cc minus your own address. `attachments` as in `send_email`. |
 
+## Drafts (`create_draft`)
+
+Files a draft in the identity's own Drafts folder — **and stops.** The
+tool has no way to send it: no send verb, no promote path, no fallback
+(for a draft the location IS the artifact; docs/draft-design.md). The
+draft is created server-side, so it appears in Mail.app, Outlook web and
+the phone, ready for you to edit and send from any client. Composition
+uses the same Outlook-safe composer as `send_email` — never Mail.app's
+scripted compose, which corrupts drafts at rest (security-posture §2.12).
+
+Drafts are a **declared, per-identity capability**: `drafts = "graph"`
+plus a `[name.graph]` block (Microsoft/Exchange mailboxes — CERN, o365,
+outlook.com work accounts). `email-mcp setup` enables it with one plain
+question and one browser sign-in; the sign-in is bound to the identity's
+own address and refused otherwise. Identities without a lane get
+`{ok: false, code: "draft_unsupported"}` carrying the enable steps — the
+tool never files into a different account instead.
+
+Success is verified against Exchange, three legs or failure: the message
+is a draft, it is OUR message (`internetMessageId` matches), and it sits
+in the Drafts folder. `draft_id` is the server-side id; find the local
+copy by subject or Message-ID once Mail syncs. No attachments on drafts
+(v1); `in_reply_to` is accepted for threading.
+
 ## Scheduled send (`schedule_email` / `list_scheduled` / `cancel_scheduled`)
 
 The MCP's "Send Later" — same semantics as Mail.app's native feature (which

@@ -55,6 +55,7 @@ Conformance is staged deliberately:
 | 18 | `triage_apply` | W | `{ok: true, status, planned, acted, failures[], verified, pending[], …}` — per-message failures are data | `{ok: false, code, error}` | belt (carries `operation_id: plan_id`); audit `plan_finish` via plans.finish | **v0.10** |
 | 19 | `mailbox_create` | W | `{ok: true, existed, applescript, index_verified, mail_verified, warning}` | `{ok: false, code, error}` | audit `mailbox_create` event (created only) | **v0.10** |
 | 20 | `mailbox_delete` | W | `{ok: true, existed, deleted, mail_verified, method?, warning}` | `{ok: false, code, error}` (incl. the literal-only codes, §3.1) | audit `mailbox_delete` event (issued only) | **v0.10** |
+| 21 | `create_draft` | W | `{ok: true, draft_id, message_id, to, cc, subject, folder, account}` — files our composer's MIME into the identity's own Drafts via Graph, NEVER sends (docs/draft-design.md); verified by three-legged readback (isDraft / our internetMessageId / the drafts folder) | `{ok: false, code, error}` — `draft_unsupported` when the identity declares no drafts lane (no fallback, ever) | **new at 2026-08-02** (additive, §8) — audit `draft` event on both terminals | born conformant |
 
 The three bare-**list** tools (4–6) are the only ones whose v0.10 status is
 "conformance deferred, stated here": their registered outputSchema declares
@@ -140,6 +141,10 @@ failure dicts (no exception class behind them):
 | `not_empty` | mailbox_delete | mailbox holds messages — only empty ones are deletable |
 | `accessibility_denied` | mailbox_delete (**literal-only**) | UI fallback blocked — Accessibility permission missing (osa −1719/−25211/−1743 in the System Events context) |
 | `delete_failed` | mailbox_delete (**literal-only**) | mailbox survived both the delete verb and the UI path (phantom Exchange folder) |
+
+`draft_unsupported` (additive 2026-08-02) — `create_draft` on an identity
+without a declared drafts lane. Not a misconfiguration: the capability is
+simply not declared/possible; the prose carries the enable steps.
 
 ### 3.2 Item-level codes (`failures[].code` inside triage_apply)
 
@@ -325,6 +330,7 @@ at the point it becomes durable):
 | `plan_finish` | library (`plans.finish` — the one seam covering apply success, all failure sites, expiry AND gc's stale-claim finalisation) | applied / failed / expired; carries `Plan.summary` + compact per-message outcomes (`{id, code}` + pending ids) — this **outlives plan GC** |
 | `mailbox_create` | server tool layer | emitted only when actually created (idempotent no-op emits nothing) |
 | `mailbox_delete` | server tool layer | emitted only when a deletion was actually issued |
+| `draft` | server tool layer | additive 2026-08-02: create_draft's both terminals — records COMPOSITION, not transmission (detail: draft_id, account; recipients on the event so the ledger is never blind to what was composed) |
 
 Not ledger-worthy by design: FTS activity (derived state, rebuildable) and
 `_graph_leave` no-evidence passes (would spam one event per tick while

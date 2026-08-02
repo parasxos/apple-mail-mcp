@@ -29,7 +29,10 @@ from .config import source_name
 from .envelope import InvalidInput, NotFound
 from .log import get_logger
 from .plans import PlanAction
-from .sender import SendError, SendResult, reply_email, schedule_email, send_email
+from .sender import (
+    DraftResult, SendError, SendResult, create_draft, reply_email,
+    schedule_email, send_email,
+)
 from .triage import (
     apply_plan, build_delete_plan, build_plan, create_mailbox, delete_mailbox,
 )
@@ -524,6 +527,34 @@ def tool_send_email(
 
 
 @envelope.tool
+def tool_create_draft(
+    to: str,
+    subject: str,
+    body: str,
+    cc: str | None = None,
+    in_reply_to: str = "",
+    from_identity: str | None = None,
+) -> DraftResult:
+    """The `draft` audit event records composition, not transmission
+    (contract §6, additive 2026-08-02) — the ledger is never blind to
+    what was composed, even though nothing leaves the machine."""
+    try:
+        res = create_draft(
+            to=to, subject=subject, body=body, cc=cc,
+            in_reply_to=in_reply_to, from_identity=from_identity,
+        )
+    except SendError as e:
+        audit.emit("draft", outcome="failed", tool="create_draft",
+                   subject=subject, detail={"error": str(e)[:300]})
+        raise
+    audit.emit("draft", outcome="created", tool="create_draft",
+               message_id=res.message_id, identity=from_identity,
+               to=res.to, cc=res.cc or None, subject=res.subject,
+               detail={"draft_id": res.draft_id, "account": res.account})
+    return res
+
+
+@envelope.tool
 def tool_reply_email(
     id: str,
     body: str,
@@ -874,8 +905,8 @@ def tool_audit(
 
 
 def _build_mcp_server():
-    """Build the FastMCP Server: twenty tools, or exactly the eleven
-    read-side tools when EMAIL_MCP_READ_ONLY=1 — the mutating nine are
+    """Build the FastMCP Server: twenty-one tools, or exactly the eleven
+    read-side tools when EMAIL_MCP_READ_ONLY=1 — the mutating ten are
     lexically gated below, so in a read-only session they never exist."""
     from mcp.server.fastmcp import FastMCP  # type: ignore
 
@@ -1104,6 +1135,40 @@ def _build_mcp_server():
             return tool_send_email(
                 to=to, subject=subject, body=body, cc=cc, bcc=bcc,
                 attachments=attachments, from_identity=from_identity,
+            )
+
+        @mcp.tool()
+        def create_draft(
+            to: str,
+            subject: str,
+            body: str,
+            cc: str | None = None,
+            in_reply_to: str = "",
+            from_identity: str | None = None,
+        ) -> dict:
+            """Create a DRAFT in the identity's own Drafts folder — it is
+            NEVER sent, and this tool has no way to send it. The draft
+            appears in Mail.app, Outlook web and the phone (it is filed
+            server-side), ready for the human to edit and send from their
+            own mail client.
+
+            Only identities with a declared drafts lane can file
+            (currently Exchange/Microsoft accounts, drafts = "graph" in
+            ~/.email-mcp/identities.toml — `email-mcp setup` enables it
+            with one browser sign-in). Other identities return
+            {ok: false, code: "draft_unsupported"} with the enable steps;
+            the tool never files into a different account instead.
+
+            `to`/`cc` are comma-separated address strings. `body` is
+            plain text (paragraph breaks preserved; an HTML alternative
+            is composed automatically). Attachments are not supported on
+            drafts. Returns {ok, draft_id, message_id, to, cc, subject,
+            folder, account} — `draft_id` is the server-side id; search
+            locally by subject once Mail syncs.
+            """
+            return tool_create_draft(
+                to=to, subject=subject, body=body, cc=cc,
+                in_reply_to=in_reply_to, from_identity=from_identity,
             )
 
         @mcp.tool()

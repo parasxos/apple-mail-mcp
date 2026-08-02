@@ -50,6 +50,22 @@ class SendResult:
     error: str | None = None
 
 
+@dataclass
+class DraftResult:
+    """A draft filed in the identity's own Drafts folder — intent handed
+    back, never executed (docs/draft-design.md). `draft_id` is the Graph
+    message id (durable); `message_id` is the composer-minted Message-ID,
+    the cross-store join key a local search can find once Mail syncs."""
+    ok: bool
+    draft_id: str
+    message_id: str
+    to: list[str]
+    cc: list[str] = field(default_factory=list)
+    subject: str = ""
+    folder: str = "drafts"
+    account: str = ""
+
+
 # --------------------------------------------------------------------- #
 # address handling                                                      #
 # --------------------------------------------------------------------- #
@@ -568,6 +584,74 @@ def send_email(
         subject=subject,
         attachments=[fn for _, _, _, fn in attach_loaded],
         bootstrapped=bootstrapped,
+    )
+
+
+def create_draft(
+    *,
+    to: str | list[str],
+    subject: str,
+    body: str,
+    cc: str | list[str] | None = None,
+    in_reply_to: str = "",
+    from_identity: str | None = None,
+) -> DraftResult:
+    """File a draft in the identity's own Drafts folder — and stop.
+
+    Intent handed back, never executed (docs/draft-design.md): our
+    composer's bytes go to the DECLARED drafts lane or nowhere — no
+    fallback, ever, because for a draft the location IS the artifact
+    (a fallback that files elsewhere may publish the body to a third
+    party — security-posture §2.12). No allowlist check (nothing
+    transmits; the ledger still records recipients at the tool layer)
+    and no Bcc-to-self (a human will edit and send this; Exchange
+    populates Sent Items natively)."""
+    ident = identities.get(from_identity)
+    if ident.drafts != "graph":
+        raise SendError(
+            f"create_draft is not available for identity [{ident.name}]: "
+            f'drafts require drafts = "graph" and a [{ident.name}.graph] '
+            "block in ~/.email-mcp/identities.toml. Run `email-mcp setup` "
+            "(one browser sign-in) to enable it, or compose the text and "
+            "paste it yourself — see docs/reference.md, 'Drafts'.",
+            code=codes.DRAFT_UNSUPPORTED,
+        )
+    to_l, cc_l, _ = _recipient_lists(to, cc, None)
+    if not to_l:
+        raise SendError("`to` is required (no valid recipient address).",
+                        code=codes.INVALID_INPUT)
+    if not subject:
+        raise SendError("`subject` is required.", code=codes.INVALID_INPUT)
+    if not body.strip():
+        raise SendError("`body` is empty.", code=codes.INVALID_INPUT)
+
+    msg = compose(to=to_l, subject=subject, body=body, cc=cc_l, bcc=[],
+                  in_reply_to=in_reply_to, identity=ident)
+
+    from . import graph
+
+    draft_id = graph.create_mime_draft(ident, msg.as_bytes())
+    receipt = graph.draft_receipt(ident, draft_id)
+    if not (receipt["is_draft"]
+            and receipt["internet_message_id"] == msg["Message-ID"]
+            and receipt["in_drafts_folder"]):
+        # Evidence, never assertion: a draft we cannot read back as OUR
+        # message, in Drafts, unarmed, was not created — say exactly
+        # which leg failed.
+        raise graph.GraphError(
+            f"[{ident.name}/graph] draft readback failed verification "
+            f"(is_draft={receipt['is_draft']}, "
+            f"message_id_match="
+            f"{receipt['internet_message_id'] == msg['Message-ID']}, "
+            f"in_drafts_folder={receipt['in_drafts_folder']}) — check "
+            "the Drafts folder yourself before retrying."
+        )
+    return DraftResult(
+        ok=True,
+        draft_id=draft_id,
+        message_id=msg["Message-ID"],
+        to=to_l, cc=cc_l, subject=subject,
+        account=_bare(ident.from_addr),
     )
 
 

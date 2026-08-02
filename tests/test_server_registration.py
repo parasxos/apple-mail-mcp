@@ -1,4 +1,4 @@
-"""Registration-surface tests: the twenty-tool default surface, and the
+"""Registration-surface tests: the twenty-one-tool default surface, and the
 exact eleven read-side tools under EMAIL_MCP_READ_ONLY=1.
 
 The gate is lexical — in a read-only session the mutating nine are never
@@ -25,6 +25,7 @@ READ_ONLY_TOOLS = {
 
 MUTATING_TOOLS = {
     "send_email",
+    "create_draft",
     "reply_email",
     "schedule_email",
     "cancel_scheduled",
@@ -47,11 +48,11 @@ def _tool_names(mcp) -> set[str]:
         return {t.name for t in mcp._tool_manager.list_tools()}
 
 
-def test_default_surface_is_exactly_twenty(monkeypatch):
+def test_default_surface_is_exactly_twenty_one(monkeypatch):
     monkeypatch.delenv("EMAIL_MCP_READ_ONLY", raising=False)
     names = _tool_names(server._build_mcp_server())
     assert names == ALL_TOOLS
-    assert len(names) == 20
+    assert len(names) == 21
 
 
 def test_read_only_surface_is_exactly_eleven(monkeypatch):

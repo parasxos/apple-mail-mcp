@@ -465,6 +465,7 @@ def check_graph() -> dict:
     graph_idents = sorted(
         name for name, ident in idents.items()
         if getattr(ident, "executor", "launchd") == "graph"
+        or getattr(ident, "drafts", "none") == "graph"   # drafts lane too
     )
     if not graph_idents:
         return {"ok": True, "detail": "no identities use the graph executor"}
