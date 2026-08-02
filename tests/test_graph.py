@@ -89,13 +89,17 @@ def _ident(name="cern", executor="graph"):
 
 
 def _seed_token(name="cern", access="acc-token", refresh="ref-token",
-                expires_in=3600.0):
+                expires_in=3600.0, bound_to="someone@example.org"):
     path = state.State.resolve().adopt().graph / f"{name}.token.json"
     path.write_text(json.dumps({
         "access_token": access,
         "refresh_token": refresh,
         "expires_at": time.time() + expires_in,
         "scope": "Mail.ReadWrite Mail.Send",
+        # Matches _ident().from_addr — the binding every login since
+        # 2026-08-02 proves via GET /me. bound_to="" models a stale
+        # pre-binding cache.
+        "bound_to": bound_to,
     }))
     path.chmod(0o600)
     return path
@@ -203,6 +207,7 @@ def test_device_login_polls_writes_0600_cache_in_0700_dir(
         (400, {"error": "slow_down"}),
         (200, {"access_token": "acc-new", "refresh_token": "ref-new",
                "expires_in": 3599, "scope": "Mail.ReadWrite Mail.Send"}),
+        (200, {"mail": "someone@example.org"}),  # GET /me binding proof
     )
     path = graph.device_login(_ident())
 
@@ -211,8 +216,64 @@ def test_device_login_polls_writes_0600_cache_in_0700_dir(
     cache = json.loads(path.read_text())
     assert cache["access_token"] == "acc-new"
     assert cache["refresh_token"] == "ref-new"
+    assert cache["bound_to"] == "someone@example.org"
     assert _mode(path) == 0o600
     assert _mode(path.parent) == 0o700
+
+
+def test_device_login_refuses_wrong_mailbox_and_writes_no_cache(
+    monkeypatch, sleeps,
+):
+    """The binding fence at its strongest point: the human is present.
+    Signing in as somebody else's mailbox must refuse BEFORE a cache
+    exists — a token for the wrong account never becomes state (panel
+    finding 2026-08-02: the wrong-account draft is an egress bug)."""
+    _fake(
+        monkeypatch,
+        (200, {"device_code": "DC", "user_code": "X", "interval": 1,
+               "expires_in": 900, "verification_uri": "u"}),
+        (200, {"access_token": "acc-new", "refresh_token": "ref-new",
+               "expires_in": 3599}),
+        (200, {"mail": "somebody.else@example.org"}),
+    )
+    with pytest.raises(GraphError) as ei:
+        graph.device_login(_ident())
+    s = str(ei.value)
+    assert "somebody.else@example.org" in s
+    assert "someone@example.org" in s
+    graph_dir = state.State.resolve().adopt().graph
+    assert list(graph_dir.glob("*.token.json")) == []  # nothing cached
+
+
+def test_token_refuses_unbound_cache(monkeypatch):
+    """A cache without a binding (pre-2026-08 login) is refused with the
+    login fix — never trusted on faith."""
+    _seed_token(bound_to="")
+    fake = _fake(monkeypatch)  # any HTTP call would blow up
+    with pytest.raises(GraphError) as ei:
+        graph._token(_ident())
+    assert "no mailbox binding" in str(ei.value)
+    assert "python -m email_mcp.graph --login cern" in str(ei.value)
+    assert fake.calls == []  # pure refusal, no network
+
+
+def test_token_refuses_binding_identity_mismatch(monkeypatch):
+    """identities.toml edited to a different from_addr over an old cache:
+    the token is for the OLD mailbox — refuse, naming both addresses."""
+    _seed_token(bound_to="old.mailbox@example.org")
+    fake = _fake(monkeypatch)
+    with pytest.raises(GraphError) as ei:
+        graph._token(_ident())
+    s = str(ei.value)
+    assert "old.mailbox@example.org" in s and "someone@example.org" in s
+    assert fake.calls == []
+
+
+def test_token_refresh_preserves_the_binding(monkeypatch):
+    path = _seed_token(expires_in=-10)
+    _fake(monkeypatch, (200, {"access_token": "acc-2", "expires_in": 3599}))
+    assert graph._token(_ident()) == "acc-2"
+    assert json.loads(path.read_text())["bound_to"] == "someone@example.org"
 
 
 def test_device_login_refusal_passes_aadsts_verbatim(monkeypatch):

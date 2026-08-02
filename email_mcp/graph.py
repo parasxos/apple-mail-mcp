@@ -263,7 +263,8 @@ def _write_cache(path: Path, data: dict) -> None:
     path.chmod(0o600)
 
 
-def _cache_dict(tok: dict, fallback_refresh: str = "") -> dict:
+def _cache_dict(tok: dict, fallback_refresh: str = "",
+                bound_to: str = "") -> dict:
     now = time.time()
     return {
         "access_token": tok.get("access_token", ""),
@@ -273,7 +274,31 @@ def _cache_dict(tok: dict, fallback_refresh: str = "") -> dict:
         "expires_at": now + float(tok.get("expires_in") or 0),
         "scope": tok.get("scope", ""),
         "obtained_at": now,
+        # The mailbox this token was PROVEN to be (GET /me at login).
+        # A cache without a binding is refused by _token — the wrong-
+        # account draft/send is the failure this field exists to prevent.
+        "bound_to": bound_to,
     }
+
+
+def _bare_addr(addr: str) -> str:
+    """lowercased bare address ("Name <a@b>" → "a@b")."""
+    return str(addr or "").split("<")[-1].strip(" >").lower()
+
+
+def _signed_in_addr(ident, access_token: str) -> str:
+    """Who Graph says this token IS: GET /me, preferring `mail` (the
+    mailbox's SMTP address) over userPrincipalName."""
+    status, me = _request(
+        "GET", f"{GRAPH}/me", ident,
+        headers={"Authorization": f"Bearer {access_token}"},
+    )
+    if status != 200:
+        raise GraphError(
+            f"[{_name(ident)}/graph] cannot verify the signed-in mailbox "
+            f"(GET /me → HTTP {status}): {_graph_reason(me)}"
+        )
+    return _bare_addr(str(me.get("mail") or me.get("userPrincipalName") or ""))
 
 
 def _graph_cfg(ident) -> tuple[str, str]:
@@ -309,6 +334,25 @@ def _token(ident) -> str:
             f"[{_name(ident)}/graph] unreadable token cache {path}: {e} — {fix}"
         ) from e
 
+    # The binding gate, at the ONE place every operation gets its token:
+    # a cache must carry the mailbox it was proven to be at login, and it
+    # must be the mailbox this identity claims to send as. Pure (no
+    # network): the proof happened at login; this only refuses drift —
+    # a pre-binding cache, or an identities.toml edited to a different
+    # from_addr over a token for the old mailbox.
+    bound = _bare_addr(cache.get("bound_to", ""))
+    expected = _bare_addr(ident.from_addr)
+    if not bound:
+        raise GraphError(
+            f"[{_name(ident)}/graph] token cache carries no mailbox "
+            f"binding (pre-2026-08 login) — {fix}"
+        )
+    if bound != expected:
+        raise GraphError(
+            f"[{_name(ident)}/graph] token cache is bound to {bound!r} "
+            f"but this identity sends as {expected!r} — refusing. {fix}"
+        )
+
     try:
         expires_at = float(cache.get("expires_at") or 0)
     except (TypeError, ValueError):
@@ -337,7 +381,8 @@ def _token(ident) -> str:
             f"[{_name(ident)}/graph] token refresh failed: "
             f"{_aad_reason(tok)} — {fix}"
         )
-    _write_cache(path, _cache_dict(tok, fallback_refresh=refresh))
+    _write_cache(path, _cache_dict(tok, fallback_refresh=refresh,
+                                   bound_to=bound))  # binding survives refresh
     _log.info("graph: refreshed access token for identity %r", _name(ident))
     return tok["access_token"]
 
@@ -386,10 +431,24 @@ def device_login(ident) -> Path:
             ident,
         )
         if status == 200 and "access_token" in tok:
+            # Bind BEFORE the cache exists: the human who can fix a
+            # wrong-mailbox sign-in is present exactly now. A token for
+            # somebody else's mailbox never becomes a cache at all —
+            # the wrong-account draft/schedule is unrepresentable
+            # downstream because _token refuses unbound caches.
+            signed_in = _signed_in_addr(ident, tok["access_token"])
+            expected = _bare_addr(ident.from_addr)
+            if signed_in != expected:
+                raise GraphError(
+                    f"[{_name(ident)}/graph] you signed in as "
+                    f"{signed_in!r} but this identity sends as "
+                    f"{expected!r} — refusing to cache the token. Rerun "
+                    f"the login with the right Microsoft account."
+                )
             path = _token_path(ident)
-            _write_cache(path, _cache_dict(tok))
-            _log.info("graph: device login complete for identity %r",
-                      _name(ident))
+            _write_cache(path, _cache_dict(tok, bound_to=signed_in))
+            _log.info("graph: device login complete for identity %r "
+                      "(bound to %s)", _name(ident), signed_in)
             return path
         err = tok.get("error", "")
         if err == "authorization_pending":
