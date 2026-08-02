@@ -499,8 +499,14 @@ class FtsIndex:
         also vanished from the Envelope Index is dropped (mini-reconcile)."""
         now = time.time()
         rows = conn.execute(
+            # 'error' retries too: an extraction error can be as transient
+            # as a missing file (a crawl raced Mail mid-write), but error
+            # docs were never re-attempted — 8 one-shot verdicts sat
+            # permanent on a live estate until RC P04 refused the index
+            # (2026-08-02). Same backoff, same attempt cap.
             "SELECT rowid, attempts, last_attempt FROM docs "
-            "WHERE status = 'missing' AND attempts < ? ORDER BY rowid",
+            "WHERE status IN ('missing', 'error') AND attempts < ? "
+            "ORDER BY rowid",
             (_MAX_ATTEMPTS,),
         ).fetchall()
         due = [
