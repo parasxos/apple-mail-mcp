@@ -966,13 +966,22 @@ def run(specs: Sequence[PhaseSpec], ctx: Context, state: RunState,
     for spec in specs:
         state.begin(spec)
         ctx.lane = lane_at_entry
-        result = execute(spec, ctx, impls)
+        strict_base = None
         if (spec.sentinel_strict and baseline is not None
+                and not ctx.dry_run):
+            # The strict claim is PHASE-LOCAL — "THIS phase touched
+            # nothing real" — so it needs a witness at the phase door.
+            # Judged against the RUN-start baseline, P16 was convicted
+            # of P08/P09's legitimate prod churn (cancelled manifests,
+            # audit events, index metadata — live pass 2026-08-02).
+            strict_base = ctx.sentinel.capture()
+        result = execute(spec, ctx, impls)
+        if (spec.sentinel_strict and strict_base is not None
                 and result.status in SETTLED and not ctx.dry_run):
             # The phase whose whole claim is "the real estate is
             # untouched" gets its claim checked immediately, with zero
             # expected churn allowed.
-            strict = ctx.sentinel.verify(baseline, strict=True)
+            strict = ctx.sentinel.verify(strict_base, strict=True)
             if not strict.clean:
                 result.status = FAIL
                 result.detail.append("strict sentinel: " + strict.render())

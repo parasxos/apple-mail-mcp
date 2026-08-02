@@ -535,6 +535,34 @@ def test_a_strict_sentinel_phase_fails_on_churn_a_normal_phase_tolerates(
     assert "strict sentinel" in sink.getvalue()
 
 
+def test_strict_phase_is_not_convicted_of_an_earlier_phases_churn(
+        tmp_path, estate):
+    """The 2026-08-02 live-pass regression: P08's legitimate prod churn
+    (cancelled manifests, ledger events, index metadata) landed between
+    the run baseline and P16, and the strict check — judged against the
+    RUN-start baseline — convicted P16 of it. The strict claim is
+    PHASE-LOCAL, witnessed at the phase door: earlier churn cannot
+    convict a clean strict phase."""
+    def prod_churn(ctx):
+        (estate / "audit" / "2026-07.jsonl").write_text('{"a":1}\n{"b":2}\n')
+
+    def clean_purge(ctx):
+        pass
+
+    plan = (runner.PhaseSpec("P08", "schedule via graph", runner.PROD,
+                             "the tenant holds the deferred draft"),
+            runner.PhaseSpec("P16", "uninstall + purge", runner.SANDBOX,
+                             "estate byte-identical", sentinel_strict=True))
+    sink = io.StringIO()
+    code = runner.main(_live_args(tmp_path), plan=plan,
+                       implementations={"P08": prod_churn,
+                                        "P16": clean_purge},
+                       sentinel=runner.Sentinel(estate, probe=_agents()),
+                       sink=sink)
+    assert "strict sentinel" not in sink.getvalue()
+    assert code == runner.EXIT_OK  # audit/* churn is expected run churn
+
+
 def test_report_is_written_live_and_marks_manual_steps_unchecked(tmp_path, estate):
     plan = (runner.PhaseSpec("P01", "wheel install", runner.SANDBOX, "installs"),
             runner.PhaseSpec("P09", "lid-closed", runner.PROD, "delivers",
