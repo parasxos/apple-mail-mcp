@@ -575,6 +575,21 @@ def _verify(source, plan: Plan, acted: set[int],
 
 
 def apply_plan(source, plan_id: str) -> dict:
+    """Wraps _apply_plan with the §2 threading rule, in ONE place: every
+    refusal about an EXISTING plan carries the plan id as operation_id
+    (the durable artifact was minted before the failure — the envelope
+    threads to its ledger events). plan_not_found carries nothing: the
+    caller's claim is not proof an artifact exists. Found by RC P10
+    (2026-08-02): typed refusals dropped the id the contract promises."""
+    try:
+        return _apply_plan(source, plan_id)
+    except TriageError as e:
+        if e.code != "plan_not_found" and not e.operation_id:
+            e.operation_id = plan_id
+        raise
+
+
+def _apply_plan(source, plan_id: str) -> dict:
     plans.gc()
     plan = plans.claim(plan_id)
     if plan is None:

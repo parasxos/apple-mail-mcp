@@ -450,6 +450,10 @@ def test_apply_expired_double_apply_and_claim(src, db, fake_osa, monkeypatch):
     with pytest.raises(triage.TriageError) as ei:
         triage.apply_plan(src, plan.id)
     assert ei.value.code == "plan_expired"
+    # §2 threading (RC P10, 2026-08-02): a refusal about an EXISTING plan
+    # carries the plan id — the durable artifact was minted before the
+    # failure, so the envelope threads to its ledger events.
+    assert ei.value.operation_id == plan.id
     assert plans.load(plan.id).status == "expired"
     monkeypatch.delenv("EMAIL_MCP_TRIAGE_TTL")
 
@@ -465,6 +469,7 @@ def test_apply_expired_double_apply_and_claim(src, db, fake_osa, monkeypatch):
     with pytest.raises(triage.TriageError) as ei:
         triage.apply_plan(src, plan2.id)
     assert ei.value.code == "plan_already_applied"
+    assert ei.value.operation_id == plan2.id
 
     # Claim race
     db.execute("UPDATE messages SET read=0 WHERE ROWID=100")
@@ -945,3 +950,12 @@ def test_preflight_account_check_and_automation_denied(src, db, fake_osa):
         return subprocess.CompletedProcess([], 0, "OK 100\n", "")
     fake_osa.batch = batch
     assert triage.apply_plan(src, plan3.id)["verified"] == 1
+
+
+def test_plan_not_found_refusal_threads_nothing(src):
+    """The other half of the §2 rule: not_found is a CLAIM, not an
+    artifact — no operation_id is ever minted for a failure."""
+    with pytest.raises(triage.TriageError) as ei:
+        triage.apply_plan(src, "20990101T000000Z-000000000000")
+    assert ei.value.code == "plan_not_found"
+    assert ei.value.operation_id is None
