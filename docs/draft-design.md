@@ -173,8 +173,10 @@ text), and the damage was baked into the sent copy (Envelope Index
 1326812). Editing + hand-sending + the native Sent Items copy all worked
 mechanically. Fix, same day (3805c45): **draft parts are re-encoded
 base64** — no continuation semantics to fumble; the send/schedule paths
-keep QP (months in production, transmit-side clean). Round 2 (base64
-draft filed, awaiting one OWA glance). The kept-identity upgrade path
+keep QP (months in production, transmit-side clean). Round 2 (2026-08-02,
+base64 draft opened in OWA's editor): **PASS** — every word intact,
+paragraph breaks preserved, non-ASCII clean, no artifacts. **Manual
+acceptance closed.** The kept-identity upgrade path
 (c34e343) lets a returning user gain the lane behind "reconfigure? → n";
 R3 enable instructions sent to the first user 2026-08-02.
 
