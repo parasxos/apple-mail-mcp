@@ -323,7 +323,15 @@ def test_spool_plans_check_survives_mode_000_and_names_chmod(monkeypatch,
     finally:
         os.chmod(spool_dir, 0o700)
         os.chmod(plans_dir, 0o700)
+    # The load-bearing claims, true on every runtime: the check RETURNS
+    # (it used to raise OSError out of the counts scan), goes red, and
+    # names the chmod remedy. The counts line differs by Python version:
+    # 3.11's pathlib glob RAISES on an unreadable dir (the measured
+    # crash → the degradation note fires); 3.14's glob swallows it and
+    # serves zero counts. Either way the report names the mode fault —
+    # the reader is never left with a green lie.
     assert out["ok"] is False
     assert f"chmod 700 {spool_dir}" in out["fix"]
     assert f"chmod 700 {plans_dir}" in out["fix"]
-    assert "unreadable" in out["detail"]  # counts degraded, not invented
+    assert ("unreadable" in out["detail"]          # 3.11: glob raised
+            or "mode 0" in out["detail"])          # 3.14: named anyway
