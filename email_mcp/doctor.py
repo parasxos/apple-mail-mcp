@@ -226,14 +226,17 @@ def check_transports() -> dict:
            "default": default,
            "identities": report}
     if not all_ok:
-        # Aggregate the drivers' OWN remedies — a failing check that
-        # names no fix is the one thing every other check here avoids
-        # (RC P03, 2026-08-02). Each unhealthy lane speaks for itself;
-        # doctor never invents a remedy it does not own.
-        fixes = [f"[{n}] {r['fix']}" for n, r in sorted(report.items())
-                 if not r.get("ok") and r.get("fix")]
-        out["fix"] = "; ".join(fixes) if fixes else (
-            "inspect the unhealthy identity(ies) in `identities` above")
+        # §1.7, degradation names its remedy — this was the one red check
+        # with no fix string, caught by the first live RC pass (P03,
+        # 2026-08-02). A cold SSH socket is a STATE, and the remedy is
+        # simply to let the next send self-heal it (identity bootstrap) or
+        # nudge it by hand.
+        bad = sorted(n for n, r in report.items() if not r.get("ok"))
+        out["fix"] = (
+            f"unhealthy: {', '.join(bad)} — a cold SSH socket self-heals "
+            "on the next send (identity `bootstrap`); or nudge it: run "
+            "the identity's bootstrap script, or check credentials for "
+            "smtp identities (see each identity's error above)")
     return out
 
 
