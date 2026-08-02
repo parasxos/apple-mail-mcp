@@ -1076,7 +1076,8 @@ def _p01_wheel_install(ctx: Context) -> None:
     built = ctx.sh([pip, "wheel", "--no-deps", "-w", dist, ctx.repo_root],
                    timeout=900, check=True)
     if built.dry:
-        ctx.sh([pip, "install", dist / "email_mcp-<built>.whl"])
+        ctx.sh([pip, "install", "--force-reinstall", "--no-deps",
+                dist / "email_mcp-<built>.whl"])
         ctx.sh([_venv_bin(ctx, "email-mcp"), "version"])
         return
     wheels = sorted(dist.glob("email_mcp-*.whl"))
@@ -1085,7 +1086,14 @@ def _p01_wheel_install(ctx: Context) -> None:
                 f"found {len(wheels)}")
     wheel = wheels[0]
     expected = wheel.name.split("-")[1]
-    ctx.sh([pip, "install", wheel], timeout=900, check=True)
+    # --force-reinstall is load-bearing: the version is identical between
+    # builds, so a plain install sees "already satisfied" and keeps the
+    # PREVIOUS pass's code — the RC would validate stale bytes forever
+    # and every later phase would test yesterday's build (found live
+    # 2026-08-02, when a fixed doctor check kept reporting the old
+    # answer). --no-deps because the wheel's deps are already there.
+    ctx.sh([pip, "install", "--force-reinstall", "--no-deps", wheel],
+           timeout=900, check=True)
     # cwd far from the checkout: the reported version must come from the
     # installed wheel, unreachable by a repo-tree import.
     ran = ctx.sh([_venv_bin(ctx, "email-mcp"), "version"],

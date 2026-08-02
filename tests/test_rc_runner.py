@@ -3049,3 +3049,17 @@ def test_rm_tree_removes_a_sandbox_tree(tmp_path, estate):
     ctx.rm_tree(target)
     assert not target.exists()
     ctx.rm_tree(target)  # idempotent: absent is fine
+
+
+def test_p01_force_reinstalls_the_wheel_it_just_built(tmp_path, estate,
+                                                      monkeypatch):
+    """The version never changes between builds, so a plain `pip install`
+    keeps the previous pass's code and the whole RC validates stale bytes
+    (found live 2026-08-02). The install must force."""
+    ctx = make_ctx(tmp_path, estate, dry_run=True)
+    runner.IMPLEMENTATIONS["P01"](ctx)
+    # Match the pip VERB, not the substring: the tmp_path in this test is
+    # named after the test itself and contains "install".
+    installs = [i for i in ctx.intents if "/pip install" in i]
+    assert installs, "P01 must install the wheel"
+    assert all("--force-reinstall" in i for i in installs), installs
