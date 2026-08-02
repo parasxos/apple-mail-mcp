@@ -704,6 +704,36 @@ class Context:
         path.chmod(mode)
         return path
 
+    def rm_tree(self, path: Path) -> Path:
+        """Remove a scratch tree, behind the SAME fences as write: never
+        inside the real state root, never outside the run's own write
+        roots, nothing at all in a dry run.
+
+        A phase that means "from scratch" has to be able to say so. P02
+        learned this live (2026-08-02): leftovers from an earlier pass
+        made the wizard ask one EXTRA question, every scripted answer
+        shifted by one, and the `y` meant for the Exchange prompt landed
+        on "build the FTS index?" — a full crawl of the real store.
+        """
+        import shutil
+
+        path = Path(path)
+        target = self._resolve(path)
+        guarded = self._resolve(self.sentinel.root)
+        if self._within(target, guarded):
+            raise UnsafeAction(
+                f"refusing to remove inside the real state root: {path}")
+        if not any(self._within(target, root) for root in self.write_roots):
+            raise UnsafeAction(
+                f"{path} is outside the run's write roots "
+                f"({', '.join(str(r) for r in self.write_roots)})")
+        if self.dry_run:
+            self.intents.append(f"rm -r: {path}")
+            self.note(f"would remove `{path}`")
+            return path
+        shutil.rmtree(target, ignore_errors=True)
+        return path
+
     @staticmethod
     def _resolve(path: Path) -> Path:
         # strict=False: a not-yet-created scratch path still resolves.
@@ -1076,6 +1106,12 @@ def _p02_scripted_setup(ctx: Context) -> None:
     # to the shipped wizard (test_rc_runner.py).
     fixture = ctx.repo_root / "tests" / "fixtures" / "setup_answers.json"
     answers = json.loads(fixture.read_text(encoding="utf-8"))["answers"]
+    root = ctx.sandbox_home / STATE_ROOT_NAME
+    # FROM SCRATCH, always: "scripted setup" means a first install, and a
+    # leftover tree makes the wizard ask an extra question that shifts
+    # every answer by one (measured live 2026-08-02 — the shifted `y`
+    # started an FTS crawl over the real store and hung the phase).
+    ctx.rm_tree(root)
     ran = ctx.sh([_venv_bin(ctx, "email-mcp"), "setup"],
                  stdin_text="".join(a["answer"] + "\n" for a in answers),
                  timeout=300)
@@ -1083,7 +1119,21 @@ def _p02_scripted_setup(ctx: Context) -> None:
         return
     ctx.require(ran.ok, f"setup exited {ran.rc}: "
                         f"{(ran.err or ran.out).strip()[:200]}")
-    root = ctx.sandbox_home / STATE_ROOT_NAME
+    # The fixture carries the PROMPTS as well as the answers, so a
+    # misfeed is detectable instead of silent: every prompt must appear
+    # in the transcript, in fixture order. A wizard that grew, lost or
+    # reordered a question fails here, naming the drift.
+    cursor, drift = 0, []
+    for a in answers:
+        hit = ran.out.find(a["prompt"], cursor)
+        if hit < 0:
+            drift.append(a["prompt"])
+        else:
+            cursor = hit + len(a["prompt"])
+    ctx.require(not drift,
+                "the wizard did not ask what the fixture answers, in "
+                "order — missing/reordered: " + "; ".join(drift[:3])
+                + ". Update tests/fixtures/setup_answers.json.")
     loose = [str(d) for d in [root, *root.rglob("*")]
              if d.is_dir() and d.stat().st_mode & 0o777 != 0o700]
     ctx.require(not loose, "tree not 0700: " + ", ".join(loose))

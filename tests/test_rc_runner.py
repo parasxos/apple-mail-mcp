@@ -804,7 +804,16 @@ def _p02_spawn(ctx, *, ident_mode=0o600, secret=False, fts_db=False,
             (root / "fts" / "fts.db").write_text("db")
         entry = command if command is not None else \
             str(ctx.sandbox_home / "venv" / "bin" / "python")
+        # The wizard echoes each prompt on stdout; the body pins them in
+        # fixture order so a shifted answer (a leftover tree adds an
+        # extra question — live finding 2026-08-02) fails legibly
+        # instead of misfeeding every later answer.
+        prompts = "".join(
+            a["prompt"] + ": " for a in json.loads(
+                (_REPO / "tests" / "fixtures" / "setup_answers.json")
+                .read_text(encoding="utf-8"))["answers"])
         return _Proc(0, (
+            prompts +
             "MCP client config (claude mcp add-json):\n"
             "{\n"
             '  "mcpServers": {\n'
@@ -2999,3 +3008,44 @@ def test_missing_mail_store_is_not_fatal_to_the_runner(monkeypatch):
 
     monkeypatch.setattr("email_mcp.config.mail_dir", _boom)
     assert runner._default_mail_dir(None) is None
+
+
+# --------------------------------------------------------------------- #
+# rm_tree — the fenced scratch removal P02 needs (live finding 2026-08-02)
+# --------------------------------------------------------------------- #
+
+
+def test_rm_tree_refuses_the_real_state_root(tmp_path, estate):
+    ctx = make_ctx(tmp_path, estate, dry_run=False)
+    victim = ctx.sentinel.root / "spool"
+    victim.mkdir(parents=True, exist_ok=True)
+    with pytest.raises(runner.UnsafeAction):
+        ctx.rm_tree(victim)
+    assert victim.is_dir()  # untouched
+
+
+def test_rm_tree_refuses_outside_the_write_roots(tmp_path, estate):
+    ctx = make_ctx(tmp_path, estate, dry_run=False)
+    outside = tmp_path.parent / "elsewhere-outside"
+    outside.mkdir(exist_ok=True)
+    with pytest.raises(runner.UnsafeAction):
+        ctx.rm_tree(outside)
+    assert outside.is_dir()
+
+
+def test_rm_tree_is_a_noop_in_a_dry_run(tmp_path, estate):
+    ctx = make_ctx(tmp_path, estate, dry_run=True)
+    target = ctx.sandbox_home / ".email-mcp"
+    (target / "spool").mkdir(parents=True, exist_ok=True)
+    ctx.rm_tree(target)
+    assert target.is_dir()  # planned, not performed
+    assert any("rm -r" in i for i in ctx.intents)
+
+
+def test_rm_tree_removes_a_sandbox_tree(tmp_path, estate):
+    ctx = make_ctx(tmp_path, estate, dry_run=False)
+    target = ctx.sandbox_home / ".email-mcp"
+    (target / "spool").mkdir(parents=True, exist_ok=True)
+    ctx.rm_tree(target)
+    assert not target.exists()
+    ctx.rm_tree(target)  # idempotent: absent is fine

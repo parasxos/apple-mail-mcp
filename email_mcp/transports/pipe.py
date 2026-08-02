@@ -90,9 +90,15 @@ class PipeTransport:
 
     def healthcheck(self) -> dict:
         found = bool(shutil.which(self.argv[0]))
-        return {
+        out = {
             "driver": self.name,
             "command": self.command,
             "executable_found": found,
             "ok": found,
         }
+        if not found:
+            # The driver owns its own remedy (RC P03).
+            out["fix"] = (f"{self.argv[0]} is not on PATH — install it, or "
+                          f"point this identity's `command` at an MTA that "
+                          "exists")
+        return out

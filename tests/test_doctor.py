@@ -252,3 +252,49 @@ def test_check_audit_flags_file_where_dir_belongs(monkeypatch, tmp_path):
     assert res["ok"] is False
     assert "not a directory" in res["detail"]
     assert "mv " in res["fix"]
+
+
+# --------------------------------------------------------------------- #
+# a red check ALWAYS names a fix (RC P03, 2026-08-02)                    #
+# --------------------------------------------------------------------- #
+
+
+def test_unhealthy_transport_check_carries_the_drivers_own_fix(monkeypatch):
+    """The transports check used to go red with no `fix` at all — the one
+    thing every other doctor check avoids. The remedy comes from the
+    driver that knows its lane, aggregated per identity."""
+    from email_mcp import doctor as doc
+    from email_mcp.identities import Identity
+
+    ident = Identity(name="cern", from_addr="p@cern.ch",
+                     driver="ssh_sendmail",
+                     params={"host": "lxplus.cern.ch", "user": "pm",
+                             "socket": "/tmp/sock-x"})
+    monkeypatch.setattr(doc.identities, "load",
+                        lambda: ({"cern": ident}, "cern"))
+    # This file's autouse fixture stubs every transport healthy; here we
+    # want the REAL driver's own report — that is the thing under test.
+    from email_mcp.transports import get_transport as real_get_transport
+    monkeypatch.setattr(doc, "get_transport", real_get_transport)
+    monkeypatch.setattr(
+        "email_mcp.transports.ssh_sendmail.SshSendmailTransport.socket_alive",
+        lambda self: False)
+    out = doc.check_transports()
+    assert out["ok"] is False
+    assert out["fix"], "a red transports check must name a fix"
+    assert "cern" in out["fix"]
+    assert "ControlMaster" in out["fix"]  # the ssh driver's own remedy
+
+
+def test_healthy_transport_check_carries_no_fix(monkeypatch):
+    from email_mcp import doctor as doc
+    from email_mcp.identities import Identity
+
+    ident = Identity(name="local", from_addr="p@x.org", driver="pipe",
+                     params={"command": "/bin/cat"})
+    monkeypatch.setattr(doc.identities, "load",
+                        lambda: ({"local": ident}, "local"))
+    from email_mcp.transports import get_transport as real_get_transport
+    monkeypatch.setattr(doc, "get_transport", real_get_transport)
+    out = doc.check_transports()
+    assert out["ok"] is True and "fix" not in out

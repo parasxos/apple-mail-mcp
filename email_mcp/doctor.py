@@ -220,11 +220,21 @@ def check_transports() -> dict:
         all_ok = all_ok and bool(result.get("ok"))
         report[name] = result
     healthy = sum(1 for r in report.values() if r.get("ok"))
-    return {"ok": all_ok,
-            "detail": f"{healthy}/{len(report)} transport(s) healthy; "
-                      f"default {default!r}",
-            "default": default,
-            "identities": report}
+    out = {"ok": all_ok,
+           "detail": f"{healthy}/{len(report)} transport(s) healthy; "
+                     f"default {default!r}",
+           "default": default,
+           "identities": report}
+    if not all_ok:
+        # Aggregate the drivers' OWN remedies — a failing check that
+        # names no fix is the one thing every other check here avoids
+        # (RC P03, 2026-08-02). Each unhealthy lane speaks for itself;
+        # doctor never invents a remedy it does not own.
+        fixes = [f"[{n}] {r['fix']}" for n, r in sorted(report.items())
+                 if not r.get("ok") and r.get("fix")]
+        out["fix"] = "; ".join(fixes) if fixes else (
+            "inspect the unhealthy identity(ies) in `identities` above")
+    return out
 
 
 def check_dispatcher() -> dict:

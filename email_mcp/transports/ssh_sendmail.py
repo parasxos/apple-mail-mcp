@@ -192,9 +192,13 @@ class SshSendmailTransport:
 
     def healthcheck(self) -> dict:
         """Report the socket state without bootstrapping or killing anything
-        (`ssh -O check` is read-only)."""
+        (`ssh -O check` is read-only).
+
+        An unhealthy report carries its own `fix`: the driver knows the
+        remedy for its own lane, so doctor never has to guess one (RC
+        P03 found a red transports check with no fix at all)."""
         alive = self.socket_alive()
-        return {
+        out = {
             "driver": self.name,
             "host": self.host,
             "user": self.user,
@@ -203,3 +207,16 @@ class SshSendmailTransport:
             "socket_alive": alive,
             "ok": alive,
         }
+        if not alive:
+            out["fix"] = (
+                f"run {self.bootstrap} to re-establish the session"
+                if self.bootstrap else
+                f"establish the ControlMaster (2FA): ssh -fN -o "
+                f"ControlMaster=yes -o ControlPath={self.socket} "
+                f"{self.user}@{self.host}"
+            ) + " — a cold socket is a state, not damage: the next send "
+            if self.bootstrap:
+                out["fix"] += "bootstraps it headlessly."
+            else:
+                out["fix"] += "will report it until the session exists."
+        return out

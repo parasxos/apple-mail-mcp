@@ -244,6 +244,22 @@ class SmtpTransport:
         except (SendError, smtplib.SMTPException, OSError) as e:
             info["ok"] = False
             info["error"] = str(e)
+            # The driver owns its own remedy (RC P03): a failing lane must
+            # say what to do, and the three ways this lane fails have
+            # three different answers.
+            if isinstance(e, SendError):
+                info["fix"] = (f"store the password: security "
+                               f"add-generic-password -a {self.username} "
+                               f"-s {self._secret_ref} -w")
+            elif isinstance(e, OSError):
+                info["fix"] = (f"check {self.host}:{self.port} is "
+                               "reachable from here (corporate submission "
+                               "hosts are often intranet-only — VPN, or "
+                               "use the ssh_sendmail lane)")
+            else:
+                info["fix"] = (f"the server refused the login for "
+                               f"{self.username} — re-check the username "
+                               f"and the stored secret ({self._secret_ref})")
             return info
         finally:
             if server is not None:
