@@ -588,11 +588,10 @@ def test_the_shipped_plan_is_the_nineteen_phases_of_the_w3_document():
     assert all(s.lane in (runner.SANDBOX, runner.PROD, runner.BOTH)
                for s in runner.PLAN)
     assert all(s.acceptance for s in runner.PLAN)
-    # R2 attaches bodies stage by stage; S1 bound the sandbox core, S2
-    # the mutation story, S3 the prod lane plus the added P19 drafts.
-    assert set(runner.IMPLEMENTATIONS) == {"P01", "P02", "P03", "P04", "P05",
-                                           "P06", "P07", "P08", "P09", "P10",
-                                           "P11", "P12", "P14", "P17", "P19"}
+    # R2 attached bodies stage by stage; S4 (failure matrix, v0.9
+    # upgrade, uninstall+purge, the once-ever walk) closed the set —
+    # every planned phase now has a body.
+    assert set(runner.IMPLEMENTATIONS) == {s.id for s in runner.PLAN}
 
 
 def test_the_runner_and_the_plan_document_agree():
@@ -2212,3 +2211,670 @@ def test_p19_names_the_missing_identity_shape(tmp_path, estate):
     result = run_phase("P19", ctx)
     assert result.status == runner.FAIL
     assert any("refusal half needs one" in d for d in result.detail)
+
+
+# --------------------------------------------------------------------- #
+# 8. the S4 bodies — P13, P15, P16, P18: failure matrix + closure        #
+# --------------------------------------------------------------------- #
+#
+# Same discipline once more, with one addition: P13's ten injections
+# only mean something against a COHERENT estate, so its scripted spawn
+# is a small world — the fake dispatcher obeys whatever sink the body
+# armed, the ledger accrues events exactly where the real one would
+# (and stays silent exactly where a kill would silence it), and doctor
+# renders from the same mutable state. The negative tests then flip one
+# world rule at a time: a reconciler that backfills FM3's lost event, a
+# recovery that delivers twice, a fuse that misses the build.
+
+
+def test_s4_dry_run_plans_the_failure_and_lifecycle_story(tmp_path, estate):
+    """A bare P13,P15,P16,P18 selection must print every planned effect
+    and spawn nothing (the autouse fence would raise): the kill fuses,
+    the FM tool sessions, the chmod + doctor --fix pair, the v0.9
+    worktree walk, both uninstall invocations — with P18 PENDING, never
+    invented."""
+    sink = io.StringIO()
+    code = runner.main(
+        ["--state-dir", str(tmp_path / "rcstate"),
+         "--phase", "P13,P15,P16,P18"],
+        sentinel=runner.Sentinel(estate, probe=_agents()), sink=sink)
+    text = sink.getvalue()
+
+    assert code == runner.EXIT_OK
+    for phase, title in (("P13", "failure matrix FM1-FM10"),
+                         ("P15", "upgrade from v0.9"),
+                         ("P16", "uninstall + purge"),
+                         ("P18", "fresh macOS user account walk")):
+        assert f"{phase} · {title}" in text
+    for intent in ("kill -9", "fts --status --json",
+                   "fts --rebuild --limit 200",
+                   "p13-fm4-good: tools/call schedule_email",
+                   "p13-fm4-wire: tools/call cancel_scheduled, "
+                   "list_scheduled",
+                   "p13-fm7-apply: tools/call triage_apply, triage_apply, "
+                   "audit",
+                   "chmod 000", "doctor --fix",
+                   "p13-fm9: tools/call create_draft",
+                   "p13-fm10: tools/call search_emails, triage_plan",
+                   "p13-fm3: tools/call schedule_email",
+                   "worktree add --detach", runner._V09_REF,
+                   "rc-p15-v09-schedule.py", "email-mcp update",
+                   "-m email_mcp.dispatcher",
+                   "uninstall --yes", "uninstall --purge --yes",
+                   "rc-sandbox.token.json"):
+        assert intent in text, f"the dry run never planned: {intent}"
+    assert "MANUAL — PENDING" in text, "P18 stays a human's verdict"
+    assert "(0 phase(s) with no body yet)" in text, \
+        "every planned phase must be bound after S4"
+
+
+# -- P13 ---------------------------------------------------------------- #
+
+
+class _P13World:
+    """One mutable sandbox estate behind every P13 route.
+
+    The fake dispatcher reads the sink the body armed and behaves the
+    way the real one would under it: a kill-before-cat sink strands the
+    claim with no bytes and no event; a cat-then-kill sink delivers the
+    bytes, strands the claim, and emits NOTHING — the silence FM3's
+    whole demonstration rests on. Doctor and audit render from the same
+    files, so the body's cross-surface requirements are tested against
+    one estate rather than per-call canned answers."""
+
+    def __init__(self, ctx):
+        self.ctx = ctx
+        self.root = ctx.sandbox_home / ".email-mcp"
+        self.spool = self.root / "spool"
+        self.store = ctx.sandbox_home / "rc-outbox" / "delivered.mbox"
+        self.month = self.root / "audit" / "2026-08.jsonl"
+        self.fts_built_at = "2026-08-02T00:00:00+00:00"  # P04 built it
+        self.applies = 0
+        # the mutants the negative tests flip
+        self.reconcile_fm3 = False
+        self.double_deliver = False
+        self.fuse_misses = False
+        for leaf in ("spool/pending", "spool/sending", "spool/sent",
+                     "plans", "graph", "fts", "audit"):
+            (self.root / leaf).mkdir(parents=True, exist_ok=True)
+        (self.root / "fts" / "fts.db").write_text("rc-fake-sqlite")
+        self.month.write_text("")
+        self.store.parent.mkdir(parents=True, exist_ok=True)
+        self.store.write_text("")
+
+    # -- shared state ------------------------------------------------- #
+
+    def _fts_state(self):
+        db = self.root / "fts" / "fts.db"
+        if not db.exists():
+            return "absent"
+        return "ready" if db.read_text().startswith("rc-fake-sqlite") \
+            else "error"
+
+    def emit(self, event, outcome, op, message_id=None):
+        line = {"v": 1, "ts": "2026-08-02T12:00:00+00:00", "op": op,
+                "event": event, "outcome": outcome}
+        if message_id:
+            line["message_id"] = message_id
+        with self.month.open("a") as fh:
+            fh.write(json.dumps(line) + "\n")
+
+    def _append_store(self, mid):
+        with self.store.open("a") as fh:
+            fh.write(f"Message-ID: {mid}\n\nx\n")
+
+    # -- routes ------------------------------------------------------- #
+
+    def kill_build(self, call):
+        if self.fuse_misses:
+            return _Proc(0, "rc=0\n")
+        (self.root / "fts" / "fts.db").write_text("rc-fake-sqlite")
+        self.fts_built_at = None
+        return _Proc(0, "rc=137\n")
+
+    def fts_status(self, call):
+        return _Proc(0, json.dumps({
+            "state": self._fts_state(), "built_at": self.fts_built_at,
+            "docs": {"indexed": 200, "partial": 0, "missing": 0,
+                     "error": 0, "total": 200}}))
+
+    def fts_rebuild(self, call):
+        (self.root / "fts" / "fts.db").write_text("rc-fake-sqlite")
+        self.fts_built_at = "2026-08-02T12:34:56+00:00"
+        return _Proc(0, "{}")
+
+    def dispatch(self, call):
+        from datetime import datetime, timedelta, timezone
+
+        now = datetime.now(timezone.utc)
+        sink = (self.ctx.sandbox_home / "rc-outbox"
+                / "sink.sh").read_text()
+        kills, accepts = "kill -9" in sink, "/bin/cat" in sink
+        for mf in sorted((self.spool / "sending").glob("*.json")):
+            entry = json.loads(mf.read_text())
+            nxt = entry.get("next_attempt_at")
+            if not nxt or datetime.fromisoformat(nxt) \
+                    > now - timedelta(minutes=10):
+                continue
+            entry["next_attempt_at"] = None
+            (self.spool / "pending" / mf.name).write_text(
+                json.dumps(entry))
+            mf.unlink()
+            eml = mf.with_suffix(".eml")
+            if eml.exists():
+                eml.rename(self.spool / "pending" / eml.name)
+            self.emit("recover", "requeued", entry["id"])
+        for mf in sorted((self.spool / "pending").glob("*.json")):
+            try:
+                entry = json.loads(mf.read_text())
+            except ValueError:
+                continue  # the corrupt manifest, skipped like entries()
+            if datetime.fromisoformat(entry["send_at"]) > now:
+                continue
+            mf.rename(self.spool / "sending" / mf.name)
+            eml = self.spool / "pending" / f"{entry['id']}.eml"
+            if eml.exists():
+                eml.rename(self.spool / "sending" / eml.name)
+            if accepts:
+                self._append_store(entry["message_id"])
+            if kills:
+                if accepts and self.reconcile_fm3:
+                    # the D11 mutant: a "helpful" reconciler backfills
+                    # the deliver event the kill lost
+                    self.emit("deliver", "sent", entry["id"],
+                              entry["message_id"])
+                return _Proc(-9, "", "Killed: 9")
+            if self.double_deliver:
+                self._append_store(entry["message_id"])
+            for name in (f"{entry['id']}.json", f"{entry['id']}.eml"):
+                src = self.spool / "sending" / name
+                if src.exists():
+                    src.rename(self.spool / "sent" / name)
+            entry["status"] = "sent"
+            (self.spool / "sent" / f"{entry['id']}.json").write_text(
+                json.dumps(entry))
+            self.emit("deliver", "sent", entry["id"],
+                      entry["message_id"])
+        return _Proc(0, "{}")
+
+    def doctor(self, call):
+        from datetime import datetime, timedelta, timezone
+
+        now = datetime.now(timezone.utc)
+        stranded = []
+        try:
+            claims = sorted((self.spool / "sending").glob("*.json"))
+        except OSError:
+            claims = []
+        for mf in claims:
+            try:
+                entry = json.loads(mf.read_text())
+            except (ValueError, OSError):
+                continue
+            nxt = entry.get("next_attempt_at")
+            if nxt and datetime.fromisoformat(nxt) \
+                    <= now - timedelta(minutes=10):
+                stranded.append(entry["id"])
+        modes_ok = all(
+            stat.S_IMODE(os.lstat(d).st_mode) == 0o700
+            for d in (self.spool, self.root / "plans"))
+        sp = {"ok": modes_ok and not stranded,
+              "stranded_sending": stranded}
+        fixes = []
+        if not modes_ok:
+            fixes.append(f"chmod 700 {self.spool}; "
+                         f"chmod 700 {self.root / 'plans'}")
+        if stranded:
+            fixes.append("python -m email_mcp.dispatcher   # one pass "
+                         "recovers stranded claims")
+        if fixes:
+            sp["fix"] = "; ".join(fixes)
+        state = self._fts_state()
+        fts_check = {"ok": state != "error",
+                     "status": {"state": state,
+                                "built_at": self.fts_built_at}}
+        if state == "error":
+            fts_check["fix"] = "python -m email_mcp.fts --rebuild"
+        return _Proc(0, json.dumps({
+            "ok": True, "audit": {"ok": True},
+            "checks": {"spool_plans": sp, "fts": fts_check}}))
+
+    def doctor_fix(self, call):
+        assert call["stdin"] == "doctor_fix\n", \
+            "doctor --fix must be fed its typed confirmation"
+        for d in (self.spool, self.root / "plans"):
+            os.chmod(d, 0o700)
+        return _Proc(0, "repaired\n")
+
+    def chmod(self, call):
+        for p in call["argv"][2:]:
+            os.chmod(p, int(call["argv"][1], 8))
+        return _Proc(0)
+
+    def audit_env(self, args):
+        events, skipped = [], 0
+        for line in self.month.read_text().splitlines():
+            try:
+                event = json.loads(line)
+            except ValueError:
+                skipped += 1
+                continue
+            wanted = args.get("operation_id") or args.get("plan_id")
+            if wanted and event.get("op") != wanted:
+                continue
+            events.append(event)
+        return {"ok": True, "events": list(reversed(events)),
+                "files_scanned": 1, "skipped_lines": skipped}
+
+    def tool(self, tool, args, call):
+        mail = call["env"].get("EMAIL_MCP_MAIL_DIR", "")
+        if mail.endswith("rc-p13-fm10-no-store"):
+            return {"ok": False, "code": "mail_unavailable",
+                    "error": "cannot read the store",
+                    "fix": "run doctor"}
+        if tool == "schedule_email":
+            key = args["subject"].split()[1]      # fm4-good / fm2 / fm3
+            sid, mid = f"sched-{key}", f"<rc-p13-{key}@rc>"
+            (self.spool / "pending" / f"{sid}.json").write_text(
+                json.dumps({"id": sid, "status": "pending",
+                            "send_at": args["send_at"],
+                            "message_id": mid,
+                            "subject": args["subject"],
+                            "next_attempt_at": None}))
+            (self.spool / "pending" / f"{sid}.eml").write_text("x")
+            self.emit("schedule", "scheduled", sid, mid)
+            return {"ok": True, "id": sid, "message_id": mid,
+                    "executor": "launchd", "send_at": args["send_at"],
+                    "subject": args["subject"]}
+        if tool == "cancel_scheduled":
+            path = self.spool / "pending" / f"{args['id']}.json"
+            try:
+                json.loads(path.read_text())
+            except ValueError:
+                return {"ok": False, "code": "invalid_input",
+                        "error": "manifest unreadable",
+                        "fix": "run doctor"}
+            raise AssertionError("P13 only cancels the corrupt entry")
+        if tool == "list_scheduled":
+            pend = []
+            for mf in sorted((self.spool / "pending").glob("*.json")):
+                try:
+                    pend.append(json.loads(mf.read_text())["id"])
+                except ValueError:
+                    continue
+            return {"ok": True, "dispatcher_installed": False,
+                    "pending": pend}
+        if tool == "search_emails":
+            return {"ok": True, "results": [],
+                    "fts": {"state": self._fts_state()}}
+        if tool == "list_mailboxes":
+            return {"ok": True, "mailboxes": _BOXES}
+        if tool == "triage_plan":
+            assert call["env"].get("EMAIL_MCP_TRIAGE_TTL") == "0", \
+                "FM7's plan must freeze already-expired"
+            (self.root / "plans" / "tp-13.json").write_text("{}")
+            self.emit("plan_create", "created", "tp-13")
+            return {"ok": True, "plan_id": "tp-13", "count": 2,
+                    "summary": "rc p13 plan",
+                    "actions": args["actions"],
+                    "messages": [{"id": "11", "mailbox": "INBOX"}]}
+        if tool == "triage_apply":
+            self.applies += 1
+            if self.applies == 1:
+                self.emit("plan_finish", "expired", "tp-13")
+            return {"ok": False, "code": "plan_expired",
+                    "error": "plan tp-13 expired",
+                    "operation_id": "tp-13"}
+        if tool == "create_draft":
+            return {"ok": False, "code": "transport_unavailable",
+                    "error": "[rcgraph/graph] no token cache at "
+                             f"{self.root / 'graph'}/rcgraph.token.json "
+                             "— run: python -m email_mcp.graph --login "
+                             "rcgraph"}
+        if tool == "audit":
+            return self.audit_env(args)
+        raise AssertionError(f"unscripted tool: {tool}")
+
+
+def _p13_spawn(world):
+    return ScriptedSpawn(
+        (lambda a: a[0] == "/bin/sh" and "kill -9" in a[2],
+         world.kill_build),
+        (lambda a: "fts" in a and "--status" in a, world.fts_status),
+        (lambda a: "fts" in a and "--rebuild" in a, world.fts_rebuild),
+        (lambda a: a[-1].endswith("rc-p13-fm1-probe.py"),
+         lambda c: _Proc(0, json.dumps({"rowid": 7, "token": "hello",
+                                        "hits": [7]}))),
+        _session_route(world.tool),
+        (lambda a: a[1:] == ["-m", "email_mcp.dispatcher"],
+         world.dispatch),
+        (lambda a: a[-1] == "--doctor", world.doctor),
+        (lambda a: a[-2:] == ["doctor", "--fix"], world.doctor_fix),
+        (lambda a: a[0] == "chmod", world.chmod),
+    )
+
+
+def test_p13_all_ten_injections_pass_and_leave_the_fm3_exhibit(
+        tmp_path, estate, monkeypatch):
+    ctx = make_ctx(tmp_path, estate, dry_run=False)
+    ctx.repo_root = _REPO
+    world = _P13World(ctx)
+    monkeypatch.setattr(runner, "_spawn", _p13_spawn(world))
+    result = run_phase("P13", ctx)
+    assert result.status == runner.PASS, result.detail
+
+    # every FM left its own evidence line
+    for fm in (f"FM{n}" for n in range(1, 11)):
+        assert any(d.startswith(f"{fm}:") for d in result.detail), \
+            f"{fm} left no evidence"
+
+    # the FM3 exhibit: delivered bytes, unsettled claim, silent ledger
+    spool = ctx.sandbox_home / ".email-mcp" / "spool"
+    assert (spool / "sending" / "sched-fm3.json").exists()
+    assert not (spool / "sent" / "sched-fm3.json").exists()
+    store = (ctx.sandbox_home / "rc-outbox" / "delivered.mbox").read_text()
+    assert store.count("<rc-p13-fm3@rc>") == 1, "the delivery was real"
+    assert not any('"deliver"' in ln and "sched-fm3" in ln
+                   for ln in world.month.read_text().splitlines()), \
+        "no deliver event may exist for the FM3 entry"
+
+    # FM2 delivered exactly once; FM4's corrupt sibling parked untouched
+    assert store.count("<rc-p13-fm2@rc>") == 1
+    assert (spool / "pending" / "sched-fm4-bad.json").read_text() \
+        == '{"id": "torn mid-write'
+
+    # the ledger-worthy mutations were recorded for a later P12 rerun
+    assert [(m["event"], m["op"]) for m in _mints(ctx)] == [
+        ("schedule", "sched-fm4-good"), ("schedule", "sched-fm4-bad"),
+        ("deliver", "sched-fm4-good"),
+        ("schedule", "sched-fm2"), ("recover", "sched-fm2"),
+        ("deliver", "sched-fm2"),
+        ("plan_create", "tp-13"), ("plan_finish", "tp-13"),
+        ("schedule", "sched-fm3"),
+    ]
+
+
+def test_p13_fails_when_the_fm3_window_is_reconciled_away(
+        tmp_path, estate, monkeypatch):
+    """The D11 test: a reconciler that backfills the deliver event the
+    kill lost would make the ledger claim exactly-once — FM3 must fail
+    rather than bless it."""
+    ctx = make_ctx(tmp_path, estate, dry_run=False)
+    ctx.repo_root = _REPO
+    world = _P13World(ctx)
+    world.reconcile_fm3 = True
+    monkeypatch.setattr(runner, "_spawn", _p13_spawn(world))
+    result = run_phase("P13", ctx)
+    assert result.status == runner.FAIL
+    assert any("reconciled away" in d for d in result.detail), \
+        result.detail
+
+
+def test_p13_fails_on_a_double_send_after_recovery(
+        tmp_path, estate, monkeypatch):
+    ctx = make_ctx(tmp_path, estate, dry_run=False)
+    ctx.repo_root = _REPO
+    world = _P13World(ctx)
+    world.double_deliver = True
+    monkeypatch.setattr(runner, "_spawn", _p13_spawn(world))
+    result = run_phase("P13", ctx)
+    assert result.status == runner.FAIL
+    assert any("double send" in d for d in result.detail), result.detail
+
+
+def test_p13_fails_when_the_fuse_misses_the_build(
+        tmp_path, estate, monkeypatch):
+    """A build that finished before the kill demonstrates nothing — FM1
+    must refuse to count it."""
+    ctx = make_ctx(tmp_path, estate, dry_run=False)
+    ctx.repo_root = _REPO
+    world = _P13World(ctx)
+    world.fuse_misses = True
+    monkeypatch.setattr(runner, "_spawn", _p13_spawn(world))
+    result = run_phase("P13", ctx)
+    assert result.status == runner.FAIL
+    assert any("did not interrupt" in d for d in result.detail), \
+        result.detail
+
+
+# -- P15 ---------------------------------------------------------------- #
+
+
+def _p15_spawn(ctx, *, version="0.9.0", update_rc=0):
+    """Scripted v0.9 upgrade: the generator writes the old-shape spool
+    entry under the v0.9 home (asserting it ran with the worktree on
+    PYTHONPATH), update stamps meta, doctor --fix retires the legacy
+    plist and tightens v0.9's 0755 spool subdirs, the dispatcher
+    delivers the frozen entry."""
+    v09home = ctx.sandbox_home / "rc-v09-home"
+    v09root = v09home / ".email-mcp"
+    worktree = ctx.sandbox_home / "rc-v09-src"
+    store = v09home / "rc-outbox" / "delivered.mbox"
+
+    def generate(call):
+        assert call["env"]["HOME"] == str(v09home), \
+            "the v0.9 generator must run against the v0.9 home"
+        assert call["env"]["PYTHONPATH"] == str(worktree), \
+            "the generator must import the worktree's bytes"
+        pending = v09root / "spool" / "pending"
+        pending.mkdir(parents=True, exist_ok=True)
+        os.chmod(pending, 0o755)          # v0.9's umask-mode subdirs
+        (pending / "v09-1.json").write_text(json.dumps(
+            {"id": "v09-1", "status": "pending",
+             "send_at": call["argv"][-1], "message_id": "<rc-p15@rc>",
+             "subject": call["argv"][-2]}))
+        (pending / "v09-1.eml").write_text("Message-ID: <rc-p15@rc>\n\nx")
+        return _Proc(0, json.dumps({"version": version, "id": "v09-1",
+                                    "message_id": "<rc-p15@rc>"}))
+
+    def update(call):
+        assert call["stdin"] == "update\n", \
+            "update must be fed its typed confirmation"
+        if update_rc:
+            return _Proc(update_rc, "", "migration exploded")
+        v09root.mkdir(parents=True, exist_ok=True)
+        (v09root / "meta.json").write_text('{"state_version": 1}')
+        return _Proc(0, "migrated\n")
+
+    def fix(call):
+        assert call["stdin"] == "doctor_fix\n"
+        (v09home / "Library" / "LaunchAgents"
+         / "com.paris.email-mcp-dispatcher.plist").unlink(missing_ok=True)
+        os.chmod(v09root / "spool" / "pending", 0o700)
+        return _Proc(0, "fixed\n")
+
+    def dispatch(call):
+        assert call["env"]["HOME"] == str(v09home)
+        assert call["env"].get("PYTHONPATH") != str(worktree), \
+            "the CURRENT wheel must deliver, not the v0.9 bytes"
+        pending = v09root / "spool" / "pending"
+        sent = v09root / "spool" / "sent"
+        sent.mkdir(parents=True, exist_ok=True)
+        entry = json.loads((pending / "v09-1.json").read_text())
+        entry["status"] = "sent"
+        (sent / "v09-1.json").write_text(json.dumps(entry))
+        (pending / "v09-1.json").unlink()
+        store.parent.mkdir(parents=True, exist_ok=True)
+        with store.open("a") as fh:
+            fh.write("Message-ID: <rc-p15@rc>\n\nx\n")
+        return _Proc(0, "{}")
+
+    return ScriptedSpawn(
+        (lambda a: a[:3] == ["git", "cat-file", "-e"],
+         lambda c: _Proc(0)),
+        (lambda a: a[:3] == ["git", "worktree", "remove"],
+         lambda c: _Proc(0)),
+        (lambda a: a[:3] == ["git", "worktree", "prune"],
+         lambda c: _Proc(0)),
+        (lambda a: a[:3] == ["git", "worktree", "add"],
+         lambda c: _Proc(0)),
+        (lambda a: len(a) > 1 and a[1].endswith("rc-p15-v09-schedule.py"),
+         generate),
+        (lambda a: a[-1] == "update", update),
+        (lambda a: a[-2:] == ["doctor", "--fix"], fix),
+        (lambda a: a[1:] == ["-m", "email_mcp.dispatcher"], dispatch),
+    )
+
+
+def test_p15_lets_the_v09_bytes_write_and_the_wheel_migrate(
+        tmp_path, estate, monkeypatch):
+    ctx = make_ctx(tmp_path, estate, dry_run=False)
+    ctx.repo_root = _REPO
+    spawn = _p15_spawn(ctx)
+    monkeypatch.setattr(runner, "_spawn", spawn)
+    result = run_phase("P15", ctx)
+    assert result.status == runner.PASS, result.detail
+
+    # the worktree pinned the exact v0.9 ref, and no launchd was touched
+    add = next(c["argv"] for c in spawn.calls
+               if c["argv"][:3] == ["git", "worktree", "add"])
+    assert add[-1] == runner._V09_REF and "--detach" in add
+    assert not any(c["argv"][0] == "launchctl" for c in spawn.calls), \
+        "P15 must never load a dispatcher label from the sandbox"
+
+    # the v0.9 config the body wrote: pipe transport, self-only
+    v09root = ctx.sandbox_home / "rc-v09-home" / ".email-mcp"
+    ident = (v09root / "identities.toml").read_text()
+    assert 'driver = "pipe"' in ident and _SB_ADDR in ident
+    # the legacy plist is gone and the frozen entry delivered
+    assert not (ctx.sandbox_home / "rc-v09-home" / "Library"
+                / "LaunchAgents"
+                / "com.paris.email-mcp-dispatcher.plist").exists()
+    assert (v09root / "spool" / "sent" / "v09-1.json").exists()
+    assert any("__version__ 0.9.0" in d for d in result.detail)
+
+
+def test_p15_fails_when_the_current_bytes_answer(
+        tmp_path, estate, monkeypatch):
+    """The 'not a fixture' rule has teeth: a generator that ran the
+    installed package instead of the worktree fakes the whole upgrade."""
+    ctx = make_ctx(tmp_path, estate, dry_run=False)
+    ctx.repo_root = _REPO
+    monkeypatch.setattr(runner, "_spawn",
+                        _p15_spawn(ctx, version="0.11.0"))
+    result = run_phase("P15", ctx)
+    assert result.status == runner.FAIL
+    assert any("old code did not write the state" in d
+               for d in result.detail), result.detail
+
+
+def test_p15_unregisters_the_worktree_even_when_the_upgrade_fails(
+        tmp_path, estate, monkeypatch):
+    """A stale worktree registration would refuse the next pass's add —
+    the finally must remove it on the failure path too."""
+    ctx = make_ctx(tmp_path, estate, dry_run=False)
+    ctx.repo_root = _REPO
+    spawn = _p15_spawn(ctx, update_rc=1)
+    monkeypatch.setattr(runner, "_spawn", spawn)
+    result = run_phase("P15", ctx)
+    assert result.status == runner.FAIL
+    assert any("`email-mcp update` exited 1" in d for d in result.detail)
+    git_removes = [i for i, c in enumerate(spawn.calls)
+                   if c["argv"][:3] == ["git", "worktree", "remove"]]
+    update_at = next(i for i, c in enumerate(spawn.calls)
+                     if c["argv"][-1] == "update")
+    assert git_removes and git_removes[-1] > update_at, \
+        "the worktree must be removed after the failing step"
+
+
+# -- P16 ---------------------------------------------------------------- #
+
+
+def _p16_spawn(ctx, *, really_purge=True):
+    root = ctx.sandbox_home / ".email-mcp"
+    logs = ctx.sandbox_home / "Library" / "Logs"
+
+    def sweep(call):
+        (root / "graph" / "rc-sandbox.token.json").unlink(missing_ok=True)
+        return _Proc(0, "state kept — pass --purge to remove\n")
+
+    def purge(call):
+        if really_purge:
+            import shutil
+            shutil.rmtree(root, ignore_errors=True)
+            if logs.is_dir():
+                for p in logs.glob("email-mcp*.log*"):
+                    p.unlink()
+        return _Proc(0, "removed\n")
+
+    return ScriptedSpawn(
+        (lambda a: a[-2:] == ["uninstall", "--yes"], sweep),
+        (lambda a: a[-3:] == ["uninstall", "--purge", "--yes"], purge),
+    )
+
+
+def test_p16_sweeps_the_cache_keeps_the_tree_then_purges_it(
+        tmp_path, estate, monkeypatch):
+    ctx = make_ctx(tmp_path, estate, dry_run=False)
+    spawn = _p16_spawn(ctx)
+    monkeypatch.setattr(runner, "_spawn", spawn)
+    result = run_phase("P16", ctx)
+    assert result.status == runner.PASS, result.detail
+
+    assert not (ctx.sandbox_home / ".email-mcp").exists()
+    # both invocations ran under the sandbox HOME, in order
+    homes = [c["env"].get("HOME") for c in spawn.calls]
+    assert homes == [str(ctx.sandbox_home)] * 2
+    assert spawn.calls[0]["argv"][-2:] == ["uninstall", "--yes"]
+    assert spawn.calls[1]["argv"][-3:] == ["uninstall", "--purge",
+                                           "--yes"]
+    assert any("strict sentinel" in d for d in result.detail), \
+        "the byte-identical claim belongs to the runner's strict verify"
+
+
+def test_p16_fails_when_the_purge_leaves_the_tree(
+        tmp_path, estate, monkeypatch):
+    ctx = make_ctx(tmp_path, estate, dry_run=False)
+    monkeypatch.setattr(runner, "_spawn",
+                        _p16_spawn(ctx, really_purge=False))
+    result = run_phase("P16", ctx)
+    assert result.status == runner.FAIL
+    assert any("survived the purge" in d for d in result.detail), \
+        result.detail
+
+
+def test_p16_refuses_to_run_uninstall_over_a_product_plist(
+        tmp_path, estate, monkeypatch):
+    """uninstall boots out every product plist it finds, and those
+    labels live in the SHARED per-user domain — a product plist in the
+    sandbox would aim the bootout at the operator's real agents, so the
+    body must stop before the verb ever runs."""
+    ctx = make_ctx(tmp_path, estate, dry_run=False)
+    agents = ctx.sandbox_home / "Library" / "LaunchAgents"
+    agents.mkdir(parents=True)
+    (agents / "com.email-mcp.dispatcher.plist").write_text("<plist/>")
+    spawn = ScriptedSpawn()
+    monkeypatch.setattr(runner, "_spawn", spawn)
+    result = run_phase("P16", ctx)
+    assert result.status == runner.FAIL
+    assert any("displace the operator" in d for d in result.detail), \
+        result.detail
+    assert spawn.calls == [], \
+        "no uninstall may run over the shared label space"
+
+
+# -- P18 ---------------------------------------------------------------- #
+
+
+def test_p18_unattended_stays_pending(tmp_path, estate):
+    ctx = make_ctx(tmp_path, estate, dry_run=False, answer=None)
+    result = run_phase("P18", ctx)
+    assert result.status == runner.PENDING
+
+
+def test_p18_prompt_carries_the_walk_protocol_and_takes_the_verdict(
+        tmp_path, estate):
+    prompts = []
+
+    def answer(prompt):
+        prompts.append(prompt)
+        return "pass: 11 min, only the FDA pane needed explaining"
+
+    ctx = make_ctx(tmp_path, estate, dry_run=False, answer=answer)
+    result = run_phase("P18", ctx)
+    assert result.status == runner.PASS
+    assert any("11 min" in d for d in result.detail)
+    assert len(prompts) == 1
+    for token in ("STOPWATCH", "pipx", "15 minutes", "archaeology",
+                  "ONCE ever", "search_emails"):
+        assert token in prompts[0], f"the protocol lost: {token}"

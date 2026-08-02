@@ -9,9 +9,9 @@ Context, Report, Sentinel, the phase registry, the
 resume/--phase/--dry-run plumbing and the manual-step protocol. Phase
 bodies attach through ``@implements`` (S1 bound the sandbox core
 P01–P05; S2 binds the mutation story P06–P07 and P10–P12; S3 the prod
-lane P08/P09/P14/P17 and the added P19 drafts phase, below); a
-phase with no body is reported as ``unimplemented`` rather than
-silently passing.
+lane P08/P09/P14/P17 and the added P19 drafts phase; S4 closes R2 with
+the failure matrix P13, the v0.9 upgrade P15, uninstall+purge P16 and
+the once-ever P18 walk — every planned phase now has a body).
 
 Two rules shape everything here.
 
@@ -1529,6 +1529,16 @@ def _mint(started: str, lane: str, event: str, outcome: str, *,
             "op": op, "message_id": message_id}
 
 
+def _fixture_addr(ctx: Context) -> str:
+    """The sandbox's own address — the fixture's From: answer, the one
+    spelling every sandbox phase treats as 'self'."""
+    fixture = json.loads(
+        (ctx.repo_root / "tests" / "fixtures" / "setup_answers.json")
+        .read_text(encoding="utf-8"))["answers"]
+    return next(a["answer"] for a in fixture
+                if "From: address" in a["prompt"])
+
+
 def _arm_sandbox_identity(ctx: Context) -> tuple[str, Path]:
     """Fence the sandbox transport before anything can send.
 
@@ -1542,10 +1552,7 @@ def _arm_sandbox_identity(ctx: Context) -> tuple[str, Path]:
     rewrite is what makes "a sandbox send can never reach a real
     recipient" structural rather than hoped. Idempotent — P06 and P07
     each call it so neither depends on the other having run."""
-    fixture = json.loads(
-        (ctx.repo_root / "tests" / "fixtures" / "setup_answers.json")
-        .read_text(encoding="utf-8"))["answers"]
-    addr = next(a["answer"] for a in fixture if "From: address" in a["prompt"])
+    addr = _fixture_addr(ctx)
     store = ctx.sandbox_home / "rc-outbox" / "delivered.mbox"
     sink = ctx.write(
         ctx.sandbox_home / "rc-outbox" / "sink.sh",
@@ -2494,6 +2501,785 @@ def _p19_drafts(ctx: Context) -> tuple[str, str]:
         "yourself.\n"
         "4. Confirm the received copy renders clean.\n"
         "Answer `pass: <what you saw>` / `fail: <what broke>`.")
+    return ctx.manual(replace(spec, acceptance=steps))
+
+
+# --------------------------------------------------------------------- #
+# phase bodies — R2, stage S4: the failure matrix and the lifecycle      #
+# closure (P13, P15, P16, P18)                                           #
+# --------------------------------------------------------------------- #
+#
+# P13 injects the plan's ten failures into the sandbox estate and judges
+# each against its own "expected" column, one evidence line per FM.
+# Ordering is load-bearing: FM3 runs LAST because its whole point (the
+# plan's rule the stage brief names D11: the at-most-once window is
+# DEMONSTRATED, never reconciled) is that nothing ticks the spool after
+# the injected kill — a later dispatcher pass would requeue the stranded
+# claim and quietly turn the exhibit into a re-delivery. P15 builds a
+# REAL v0.9 estate with the v0.9 bytes themselves (a detached worktree
+# at the release commit) and lets the current wheel migrate and operate
+# it. P16 closes the sandbox life story with the product's own uninstall
+# verb, then the runner's strict Sentinel proves the real estate
+# byte-identical. P18 is the once-ever human walk: its body IS the
+# protocol text.
+
+_V09_REF = "75c6f93"                # the v0.9.0 release commit (P15)
+_LEGACY_LABEL = PROD_LABELS[2]      # pre-v0.8 label the migration retires
+
+# FM1's fuse: long enough that an unbounded rebuild over the attached
+# real store is provably still crawling when the SIGKILL lands.
+_FM1_KILL_AFTER_S = 2.0
+
+
+def _sandbox_spool(ctx: Context) -> Path:
+    return ctx.sandbox_home / STATE_ROOT_NAME / "spool"
+
+
+def _sink(ctx: Context, script: str) -> Path:
+    """(Re)write the sandbox delivery sink. P13 swaps the sink under the
+    armed identity to place a kill at an exact point of the delivery
+    path; _arm_sandbox_identity restores the plain delivering one."""
+    return ctx.write(ctx.sandbox_home / "rc-outbox" / "sink.sh", script,
+                     mode=0o700)
+
+
+def _kill_sink(store: Path, *, deliver: bool) -> str:
+    """A sink that SIGKILLs its parent — the dispatcher — either before
+    accepting the bytes (FM2: the crash lands ahead of the transport
+    handoff) or right after appending them (FM3: the delivery is real,
+    but the sending→sent rename and the deliver emit never run). $PPID
+    IS the dispatcher: the pipe transport execs the command directly,
+    no intermediate shell."""
+    accept = f'/bin/cat >> "{store}"\n' if deliver else ""
+    return "#!/bin/sh\n" + accept + "kill -9 $PPID\nexit 0\n"
+
+
+def _dispatch_once(ctx: Context, *, timeout: float = 300) -> Ran:
+    """One dispatcher pass over the sandbox spool — invoked directly,
+    not via launchd: P13 kills this process on purpose, and a launchd
+    agent would resurrect it on the next tick, destroying the exhibit."""
+    return ctx.sh([_venv_bin(ctx, "python"), "-m", "email_mcp.dispatcher"],
+                  timeout=timeout)
+
+
+def _fm_schedule(ctx: Context, tag: str, addr: str, subject: str, *,
+                 offset_s: int = 0) -> tuple[str, str]:
+    send_at = datetime.now(timezone.utc) + timedelta(seconds=offset_s)
+    env = _mcp_session(ctx, tag, [
+        ("schedule_email", {"to": addr, "subject": subject,
+                            "body": "RC P13 failure-matrix entry.",
+                            "send_at": send_at.isoformat(
+                                timespec="seconds")})])[0]
+    ctx.require(env["ok"] is True and env.get("executor") == "launchd",
+                f"{tag}: schedule_email answered "
+                f"{env.get('code') or env.get('executor')!r}")
+    return env["id"], env["message_id"]
+
+
+def _op_events(ctx: Context, tag: str, sid: str) -> list[dict]:
+    env = _mcp_session(ctx, tag,
+                       [("audit", {"operation_id": sid, "limit": 50})])[0]
+    ctx.require(env["ok"] is True, f"{tag}: the audit read failed: "
+                                   f"{env.get('code')} {env.get('error')}")
+    return env.get("events") or []
+
+
+def _fm1_kill_mid_build(ctx: Context) -> None:
+    """FM1 — kill -9 mid-FTS-build: rebuildable, no partial rows served,
+    the interruption visible on the doctor surface."""
+    email_mcp = _venv_bin(ctx, "email-mcp")
+    killed = ctx.sh([
+        "/bin/sh", "-c",
+        f'"{email_mcp}" fts --rebuild >/dev/null 2>&1 & P=$!; '
+        f"sleep {_FM1_KILL_AFTER_S}; kill -9 $P 2>/dev/null; "
+        'wait $P; echo "rc=$?"'], timeout=180)
+    ctx.require("rc=137" in killed.out,
+                "FM1: the fuse did not interrupt the rebuild "
+                f"({(killed.out or killed.err).strip()[:80]!r}) — a build "
+                "that finished demonstrates nothing")
+    status = json.loads(ctx.sh([email_mcp, "fts", "--status", "--json"],
+                               timeout=120, check=True).out)
+    ctx.require(status.get("state") == "ready",
+                "FM1: the killed build left the db unreadable (state "
+                f"{status.get('state')!r}) — corrupted, not resumable")
+    ctx.require(status.get("built_at") is None,
+                "FM1: built_at survived the kill — the build was not "
+                "interrupted mid-flight")
+    searched = _mcp_session(ctx, "p13-fm1", [
+        ("search_emails", {"query": "the", "limit": 5})])[0]
+    ctx.require(searched["ok"] is True,
+                "FM1: search died over the interrupted index: "
+                f"{searched.get('code')}")
+    report = json.loads(ctx.sh([email_mcp, "--doctor"], timeout=300).out)
+    named = (report["checks"].get("fts") or {}).get("status") or {}
+    ctx.require(named.get("built_at") is None,
+                "FM1: doctor's fts check does not surface the "
+                "interrupted build")
+    ctx.sh([email_mcp, "fts", "--rebuild", "--limit", "200"], timeout=900,
+           check=True)
+    probe = ctx.write(ctx.sandbox_home / "rc-p13-fm1-probe.py", _FTS_PROBE)
+    hit = json.loads(ctx.sh([_venv_bin(ctx, "python"), probe], timeout=120,
+                            check=True).out)
+    ctx.require(hit["rowid"] is not None and hit["rowid"] in hit["hits"],
+                "FM1: the rebuilt index does not round-trip a MATCH")
+    ctx.note("FM1: rebuild SIGKILLed at "
+             f"{_FM1_KILL_AFTER_S:.0f}s → db opens clean with built_at "
+             "null (doctor's fts status names it, soft by contract); "
+             "search stayed up — hits re-enter through the live Envelope "
+             "Index, so a partial index cannot serve phantom rows; "
+             f"--rebuild --limit 200 → MATCH {hit['token']!r} round-trips")
+
+
+def _fm4_corrupt_manifest(ctx: Context, addr: str, store: Path, stamp: str,
+                          started: str) -> list[dict]:
+    """FM4 — a corrupt spool manifest: coded envelope, the entry parked
+    where it lies, siblings deliver unaffected."""
+    good_id, good_mid = _fm_schedule(ctx, "p13-fm4-good", addr,
+                                     f"rc-p13 fm4-good {stamp}")
+    bad_id, bad_mid = _fm_schedule(ctx, "p13-fm4-bad", addr,
+                                   f"rc-p13 fm4-bad {stamp}",
+                                   offset_s=3600)
+    victim = _sandbox_spool(ctx) / "pending" / f"{bad_id}.json"
+    torn = '{"id": "torn mid-write'
+    ctx.write(victim, torn)
+    ran = _dispatch_once(ctx)
+    ctx.require(ran.ok, "FM4: the pass died over the corrupt manifest: "
+                        f"{(ran.err or ran.out).strip()[:200]}")
+    ctx.require((_sandbox_spool(ctx) / "sent" / f"{good_id}.json").exists()
+                and good_mid in store.read_text(encoding="utf-8"),
+                "FM4: the healthy sibling did not deliver — the corrupt "
+                "manifest took the pass down with it")
+    ctx.require(victim.read_text(encoding="utf-8") == torn,
+                "FM4: the pass rewrote or moved the corrupt manifest "
+                "instead of parking it untouched")
+    cancel, listing = _mcp_session(ctx, "p13-fm4-wire", [
+        ("cancel_scheduled", {"id": bad_id}),
+        ("list_scheduled", {}),
+    ])
+    ctx.require(cancel["ok"] is False and bool(cancel.get("code")),
+                "FM4: touching the corrupt entry must yield a coded "
+                f"envelope, got {cancel.get('code') or 'ok=true'}")
+    ctx.require(listing["ok"] is True and bad_id not in json.dumps(listing),
+                "FM4: the listing choked on the corrupt manifest")
+    ctx.note(f"FM4: {bad_id} corrupted in pending/ → cancel answers coded "
+             f"{cancel['code']}, the listing skips it, and sibling "
+             f"{good_id} delivered — parked in place, nothing lost")
+    return [
+        _mint(started, SANDBOX, "schedule", "scheduled", op=good_id,
+              message_id=good_mid),
+        _mint(started, SANDBOX, "schedule", "scheduled", op=bad_id,
+              message_id=bad_mid),
+        _mint(started, SANDBOX, "deliver", "sent", op=good_id,
+              message_id=good_mid),
+    ]
+
+
+def _fm2_kill_mid_dispatcher(ctx: Context, addr: str, store: Path,
+                             stamp: str, started: str
+                             ) -> tuple[float, list[dict]]:
+    """FM2 — kill -9 mid-dispatcher, BEFORE the transport handoff: the
+    claim strands in sending/, doctor names it, one recovery pass
+    delivers exactly once. Also measures, on that healthy delivery, the
+    width of the handoff→durable window FM3 then exhibits."""
+    email_mcp = _venv_bin(ctx, "email-mcp")
+    sid, mid = _fm_schedule(ctx, "p13-fm2", addr, f"rc-p13 fm2 {stamp}")
+    _sink(ctx, _kill_sink(store, deliver=False))
+    ran = _dispatch_once(ctx)
+    ctx.require(not ran.ok, "FM2: the dispatcher survived its own kill — "
+                            "nothing was injected")
+    claimed = _sandbox_spool(ctx) / "sending" / f"{sid}.json"
+    ctx.require(claimed.exists(),
+                f"FM2: no stranded claim in sending/ for {sid}")
+    ctx.require(mid not in store.read_text(encoding="utf-8"),
+                "FM2: bytes reached the store before the handoff — the "
+                "kill landed in FM3's window, not this one")
+    # Staleness is judged from the manifest's own stamps, so the
+    # 10-minute recovery clock is reached by aging the stamp, not by
+    # waiting it out inside an RC pass.
+    manifest = json.loads(claimed.read_text(encoding="utf-8"))
+    manifest["next_attempt_at"] = (
+        datetime.now(timezone.utc) - timedelta(minutes=15)
+    ).isoformat(timespec="seconds")
+    ctx.write(claimed, json.dumps(manifest, indent=2))
+    report = json.loads(ctx.sh([email_mcp, "--doctor"], timeout=300).out)
+    sp = report["checks"].get("spool_plans") or {}
+    ctx.require(sid in (sp.get("stranded_sending") or [])
+                and "dispatcher" in str(sp.get("fix")),
+                "FM2: doctor does not name the stranded claim and its "
+                "one-pass recovery")
+    _arm_sandbox_identity(ctx)          # restore the delivering sink
+    ran = _dispatch_once(ctx)
+    ctx.require(ran.ok, "FM2: the recovery pass failed: "
+                        f"{(ran.err or ran.out).strip()[:200]}")
+    sent = _sandbox_spool(ctx) / "sent" / f"{sid}.json"
+    ctx.require(sent.exists(), f"FM2: {sid} was not recovered to sent/")
+    ctx.require(store.read_text(encoding="utf-8").count(mid) == 1,
+                "FM2: the recovered delivery is not exactly-once in the "
+                "store — a double send")
+    events = [(e.get("event"), e.get("outcome"))
+              for e in _op_events(ctx, "p13-fm2-audit", sid)]
+    ctx.require(events.count(("recover", "requeued")) == 1
+                and events.count(("deliver", "sent")) == 1,
+                "FM2: expected one recover/requeued + one deliver/sent, "
+                f"got {events}")
+    window_ms = max(0.0, (sent.stat().st_mtime - store.stat().st_mtime)
+                    * 1000.0)
+    ctx.note("FM2: killed mid-delivery (pre-handoff) → claim stranded in "
+             "sending/, doctor names it; one recovery pass requeued "
+             f"(attempt consumed) and delivered {mid} exactly once — no "
+             "double send")
+    return window_ms, [
+        _mint(started, SANDBOX, "schedule", "scheduled", op=sid,
+              message_id=mid),
+        _mint(started, SANDBOX, "recover", "requeued", op=sid),
+        _mint(started, SANDBOX, "deliver", "sent", op=sid, message_id=mid),
+    ]
+
+
+def _fm3_at_most_once_window(ctx: Context, addr: str, store: Path,
+                             stamp: str, started: str,
+                             window_ms: float) -> list[dict]:
+    """FM3 — the at-most-once window, DEMONSTRATED (D11). The kill lands
+    AFTER the transport handoff: the delivery is real, the system does
+    not know it, and the ledger's record of it is lost — never
+    duplicated. Nothing here reconciles the exhibit away."""
+    sid, mid = _fm_schedule(ctx, "p13-fm3", addr, f"rc-p13 fm3 {stamp}")
+    _sink(ctx, _kill_sink(store, deliver=True))
+    ran = _dispatch_once(ctx)
+    ctx.require(not ran.ok, "FM3: the dispatcher survived the "
+                            "post-handoff kill — nothing was injected")
+    ctx.require(store.read_text(encoding="utf-8").count(mid) == 1,
+                "FM3: the delivery never reached the store — the kill "
+                "landed before the handoff, which is FM2's window")
+    spool = _sandbox_spool(ctx)
+    ctx.require((spool / "sending" / f"{sid}.json").exists()
+                and not (spool / "sent" / f"{sid}.json").exists(),
+                "FM3: the manifest settled — the kill missed the window")
+    events = [e.get("event") for e in _op_events(ctx, "p13-fm3-audit", sid)]
+    ctx.require("schedule" in events,
+                "FM3: even the schedule event is missing — the ledger "
+                "cannot testify about this entry at all")
+    ctx.require("deliver" not in events,
+                "FM3: a deliver event exists for a delivery the "
+                "dispatcher never recorded — the window was reconciled "
+                "away, not demonstrated (D11)")
+    _arm_sandbox_identity(ctx)   # sink hygiene; the stranded claim stays
+    ctx.note("FM3: the at-most-once window, DEMONSTRATED — the bytes "
+             f"left the sender exactly once, yet {sid} still sits in "
+             "sending/ and the ledger holds no deliver event: the RECORD "
+             "of the delivery is lost, never duplicated. The window "
+             "(transport handoff → durable sent/ rename) measured "
+             f"{window_ms:.0f} ms on FM2's healthy delivery. Left as the "
+             "exhibit: a recovery pass would consume an attempt and "
+             "REDELIVER (the documented at-least-once trade) — v1.0 "
+             "claims exactly-once for neither, and nothing here "
+             "reconciles the gap away")
+    return [_mint(started, SANDBOX, "schedule", "scheduled", op=sid,
+                  message_id=mid)]
+
+
+def _fm5_corrupt_fts_db(ctx: Context) -> None:
+    """FM5 — corrupt FTS db: search degrades to snippet-only, doctor
+    offers the rebuild, and running the offered fix heals it."""
+    email_mcp = _venv_bin(ctx, "email-mcp")
+    ctx.write(ctx.sandbox_home / STATE_ROOT_NAME / "fts" / "fts.db",
+              "FM5: garbage where an SQLite header should be\n")
+    searched = _mcp_session(ctx, "p13-fm5", [
+        ("search_emails", {"query": "the", "limit": 5})])[0]
+    ctx.require(searched["ok"] is True,
+                "FM5: search died over the corrupt index "
+                f"({searched.get('code')}) instead of degrading")
+    ctx.require((searched.get("fts") or {}).get("state") == "error",
+                "FM5: the envelope hides the corrupt index — state "
+                f"{(searched.get('fts') or {}).get('state')!r}")
+    report = json.loads(ctx.sh([email_mcp, "--doctor"], timeout=300).out)
+    fts_check = report["checks"].get("fts") or {}
+    ctx.require(fts_check.get("ok") is False
+                and "--rebuild" in str(fts_check.get("fix")),
+                "FM5: doctor does not offer the rebuild")
+    ctx.sh([email_mcp, "fts", "--rebuild", "--limit", "200"], timeout=900,
+           check=True)
+    status = json.loads(ctx.sh([email_mcp, "fts", "--status", "--json"],
+                               timeout=120, check=True).out)
+    ctx.require(status.get("state") == "ready",
+                "FM5: the offered rebuild did not heal the index (state "
+                f"{status.get('state')!r})")
+    ctx.note("FM5: corrupt fts.db → search stayed ok (snippet-only, "
+             "fts.state error in the envelope), doctor offered "
+             "--rebuild, and running the offered fix restored ready")
+
+
+def _fm6_corrupt_ledger_line(ctx: Context) -> None:
+    """FM6 — a torn ledger line is skipped-and-counted, never fatal."""
+    months = sorted((ctx.sandbox_home / STATE_ROOT_NAME / "audit")
+                    .glob("*.jsonl"))
+    ctx.require(bool(months),
+                "FM6: no ledger month to corrupt — the earlier "
+                "sub-checks should have written events")
+    month = months[-1]
+    ctx.write(month, month.read_text(encoding="utf-8")
+              + 'FM6 torn line {"half":\n')
+    env = _mcp_session(ctx, "p13-fm6", [("audit", {"limit": 500})])[0]
+    ctx.require(env["ok"] is True and env.get("skipped_lines", 0) >= 1,
+                "FM6: the torn line was not skipped-and-counted "
+                f"(skipped_lines {env.get('skipped_lines')})")
+    ctx.require(bool(env.get("events")),
+                "FM6: the ledger stopped serving over one torn line")
+    ctx.note(f"FM6: one torn line in {month.name} → audit reports "
+             f"skipped_lines {env['skipped_lines']} and keeps serving "
+             f"{len(env['events'])} event(s)")
+
+
+def _fm7_duplicate_apply(ctx: Context, started: str) -> list[dict]:
+    """FM7 — duplicate triage_apply of one plan: single-shot per
+    contract §4 — no second mutation, no second event."""
+    account, mailbox, _target = _triage_selection(ctx, "p13-fm7")
+    plan_env = _mcp_session(ctx, "p13-fm7-plan", [
+        ("triage_plan", {"account": account, "mailbox": mailbox,
+                         "limit": 3,
+                         "actions": [{"action": "flag", "color": 1}]})],
+        extra_env=_TTL_EXPIRED)[0]
+    ctx.require(plan_env["ok"] is True,
+                f"FM7: triage_plan failed: {plan_env.get('code')} "
+                f"{plan_env.get('error')}")
+    pid = plan_env["plan_id"]
+    first, second, ledger = _mcp_session(ctx, "p13-fm7-apply", [
+        ("triage_apply", {"plan_id": pid}),
+        ("triage_apply", {"plan_id": pid}),
+        ("audit", {"plan_id": pid, "limit": 50}),
+    ])
+    for label, env in (("first", first), ("second", second)):
+        ctx.require(env["ok"] is False
+                    and env.get("code") == "plan_expired",
+                    f"FM7: the {label} apply answered "
+                    f"{env.get('code') or 'ok=true'}, not the coded "
+                    "single-shot refusal")
+    names = sorted(e.get("event") for e in ledger.get("events") or [])
+    ctx.require(ledger["ok"] is True
+                and names == ["plan_create", "plan_finish"],
+                f"FM7: the duplicate apply changed the ledger: {names}")
+    ctx.note(f"FM7: plan {pid} applied twice → plan_expired both times, "
+             "and the ledger still holds exactly plan_create + one "
+             "plan_finish — no second mutation, no second event "
+             "(contract §4 single-shot)")
+    return [
+        _mint(started, SANDBOX, "plan_create", "created", op=pid),
+        _mint(started, SANDBOX, "plan_finish", "expired", op=pid),
+    ]
+
+
+def _fm8_chmod_000_doctor_fix(ctx: Context) -> None:
+    """FM8 — chmod 000, then doctor --fix proves the repair in anger.
+    The leaves, not the root: an unlistable ROOT is a refused resolution
+    by design (state policy) — the repair claim is about a tree doctor
+    can still see into."""
+    email_mcp = _venv_bin(ctx, "email-mcp")
+    root = ctx.sandbox_home / STATE_ROOT_NAME
+    leaves = (root / "spool", root / "plans")
+    ctx.sh(["chmod", "000", *leaves], check=True)
+    report = json.loads(ctx.sh([email_mcp, "--doctor"], timeout=300).out)
+    sp = report["checks"].get("spool_plans") or {}
+    ctx.require(sp.get("ok") is False
+                and "chmod 700" in str(sp.get("fix")),
+                "FM8: doctor does not name the chmod repair")
+    fixed = ctx.sh([email_mcp, "doctor", "--fix"],
+                   stdin_text="doctor_fix\n", timeout=300)
+    ctx.require(fixed.ok, f"FM8: doctor --fix exited {fixed.rc}: "
+                          f"{(fixed.err or fixed.out).strip()[:200]}")
+    loose = [str(d) for d in leaves if d.stat().st_mode & 0o777 != 0o700]
+    ctx.require(not loose,
+                "FM8: the repair left modes loose: " + ", ".join(loose))
+    after = json.loads(ctx.sh([email_mcp, "--doctor"], timeout=300).out)
+    ctx.require((after["checks"].get("spool_plans") or {}).get("ok")
+                is True,
+                "FM8: doctor still red after its own repair")
+    ctx.note("FM8: spool/ + plans/ chmod 000 → doctor names chmod 700, "
+             "doctor --fix repairs to 0700 in anger, and the check is "
+             "green again")
+
+
+def _fm9_token_cache_removed(ctx: Context, addr: str, stamp: str) -> None:
+    """FM9 — token cache removed: a coded failure naming the cache and
+    the sign-in fix, never a traceback. A second identity ON the graph
+    drafts lane, never signed in, is exactly the estate a removed cache
+    leaves behind — the failure path is the cache's ABSENCE, and how it
+    became absent does not reach it."""
+    sink = ctx.sandbox_home / "rc-outbox" / "sink.sh"
+    root = ctx.sandbox_home / STATE_ROOT_NAME
+    ctx.write(root / "identities.toml",
+              'default = "main"\n\n[main]\n'
+              f'from_addr = "{addr}"\n'
+              'driver = "pipe"\n'
+              f'command = "{sink}"\n'
+              f'allowlist = ["{addr}"]\n\n'
+              '[rcgraph]\n'
+              'from_addr = "rc-p13-fm9@example.invalid"\n'
+              'driver = "pipe"\n'
+              f'command = "{sink}"\n'
+              'drafts = "graph"\n\n'
+              '[rcgraph.graph]\n'
+              'tenant = "organizations"\n'
+              'client_id = "00000000-0000-0000-0000-000000000000"\n')
+    cache = root / "graph" / "rcgraph.token.json"
+    ctx.require(not cache.exists(),
+                f"FM9: a token cache already sits at {cache} — the "
+                "injection needs its absence")
+    refused = _mcp_session(ctx, "p13-fm9", [
+        ("create_draft", {"to": addr, "subject": f"rc-p13 fm9 {stamp}",
+                          "body": "This must never be filed.",
+                          "from_identity": "rcgraph"})])[0]
+    ctx.require(refused["ok"] is False
+                and refused.get("code") == "transport_unavailable",
+                "FM9: the missing cache answered "
+                f"{refused.get('code') or 'ok=true'}, not the graph "
+                "lane's coded refusal")
+    err = refused.get("error") or ""
+    ctx.require("no token cache" in err and "--login rcgraph" in err,
+                "FM9: the refusal does not name the cache or the "
+                "sign-in fix")
+    _arm_sandbox_identity(ctx)          # restore the one-identity file
+    ctx.note("FM9: absent token cache → create_draft refuses coded "
+             "transport_unavailable naming the cache path and "
+             "`--login rcgraph` — a fix, never a traceback")
+
+
+def _fm10_store_vanishes(ctx: Context) -> None:
+    """FM10 — the Mail store vanishes mid-session: the sandbox-safe
+    stand-in for Mail.app quitting (same mail_unavailable class; a live
+    mid-osascript quit needs the prod lane's real Mail.app)."""
+    plans_dir = ctx.sandbox_home / STATE_ROOT_NAME / "plans"
+    before = sorted(os.listdir(plans_dir))
+    ghost = ctx.sandbox_home / "rc-p13-fm10-no-store"   # never created
+    searched, planned = _mcp_session(ctx, "p13-fm10", [
+        ("search_emails", {"limit": 5}),
+        ("triage_plan", {"limit": 3,
+                         "actions": [{"action": "flag", "color": 1}]}),
+    ], extra_env={"EMAIL_MCP_MAIL_DIR": str(ghost)})
+    for tool, env in (("search_emails", searched),
+                      ("triage_plan", planned)):
+        ctx.require(env["ok"] is False
+                    and env.get("code") == "mail_unavailable",
+                    f"FM10: {tool} answered "
+                    f"{env.get('code') or 'ok=true'}, not the coded "
+                    "mail_unavailable")
+    ctx.require(sorted(os.listdir(plans_dir)) == before,
+                "FM10: a plan artifact was minted against a vanished "
+                "store — half-applied state")
+    ctx.note("FM10: the store vanished mid-session → both tools answer "
+             "coded mail_unavailable and no artifact was minted — "
+             "nothing half-applied (Mail.app's quit is exhibited as the "
+             "store going unreadable: the same coded class, the only "
+             "injection the read-only sandbox store allows)")
+
+
+@implements("P13")
+def _p13_failure_matrix(ctx: Context) -> None:
+    stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+    started = _now()
+    addr, store = _arm_sandbox_identity(ctx)
+    if ctx.dry_run:
+        email_mcp = _venv_bin(ctx, "email-mcp")
+        python = _venv_bin(ctx, "python")
+        ctx.sh(["/bin/sh", "-c",
+                f'"{email_mcp}" fts --rebuild >/dev/null 2>&1 & P=$!; '
+                f"sleep {_FM1_KILL_AFTER_S}; kill -9 $P 2>/dev/null; "
+                'wait $P; echo "rc=$?"'])
+        ctx.sh([email_mcp, "fts", "--status", "--json"])
+        ctx.sh([email_mcp, "fts", "--rebuild", "--limit", "200"])
+        _mcp_session(ctx, "p13-fm4-good", [
+            ("schedule_email", {"to": addr,
+                                "subject": "rc-p13 fm4-good <stamp>",
+                                "body": "RC P13 failure-matrix entry.",
+                                "send_at": "<now>"})])
+        ctx.sh([python, "-m", "email_mcp.dispatcher"])
+        _mcp_session(ctx, "p13-fm4-wire", [
+            ("cancel_scheduled", {"id": "<corrupt-id>"}),
+            ("list_scheduled", {})])
+        _sink(ctx, _kill_sink(store, deliver=False))
+        ctx.sh([email_mcp, "--doctor"])
+        _mcp_session(ctx, "p13-fm7-apply", [
+            ("triage_apply", {"plan_id": "<plan-id>"}),
+            ("triage_apply", {"plan_id": "<plan-id>"}),
+            ("audit", {"plan_id": "<plan-id>", "limit": 50})])
+        ctx.sh(["chmod", "000",
+                ctx.sandbox_home / STATE_ROOT_NAME / "spool",
+                ctx.sandbox_home / STATE_ROOT_NAME / "plans"])
+        ctx.sh([email_mcp, "doctor", "--fix"], stdin_text="doctor_fix\n")
+        _mcp_session(ctx, "p13-fm9", [
+            ("create_draft", {"to": addr,
+                              "subject": "rc-p13 fm9 <stamp>",
+                              "body": "This must never be filed.",
+                              "from_identity": "rcgraph"})])
+        _mcp_session(ctx, "p13-fm10", [
+            ("search_emails", {"limit": 5}),
+            ("triage_plan", {"limit": 3,
+                             "actions": [{"action": "flag",
+                                          "color": 1}]})])
+        _mcp_session(ctx, "p13-fm3", [
+            ("schedule_email", {"to": addr,
+                                "subject": "rc-p13 fm3 <stamp>",
+                                "body": "RC P13 failure-matrix entry.",
+                                "send_at": "<now>"})])
+        return
+    _fm1_kill_mid_build(ctx)
+    mints = _fm4_corrupt_manifest(ctx, addr, store, stamp, started)
+    window_ms, fm2 = _fm2_kill_mid_dispatcher(ctx, addr, store, stamp,
+                                              started)
+    mints += fm2
+    _fm5_corrupt_fts_db(ctx)
+    _fm6_corrupt_ledger_line(ctx)
+    mints += _fm7_duplicate_apply(ctx, started)
+    _fm8_chmod_000_doctor_fix(ctx)
+    _fm9_token_cache_removed(ctx, addr, stamp)
+    _fm10_store_vanishes(ctx)
+    # FM3 is deliberately LAST: its exhibit is a stranded claim nothing
+    # may tick afterwards (D11 — demonstrated, never reconciled).
+    mints += _fm3_at_most_once_window(ctx, addr, store, stamp, started,
+                                      window_ms)
+    _record_mints(ctx, mints)
+    ctx.note("FM1-FM10: every injection produced its coded surface and "
+             "no mail was lost — FM3's delivery reached the store, "
+             "FM2's delivered exactly once, FM4's sibling delivered, "
+             "and the refusal paths mutated nothing")
+
+
+# The v0.9 bytes themselves freeze the spool entry — the generator
+# prints the version it ran, so a PYTHONPATH slip (the current package
+# answering instead) fails the phase rather than faking the upgrade.
+_V09_SCHEDULE = '''\
+"""P15 generator: v0.9's own code writes the state (not a fixture)."""
+import json
+import sys
+
+import email_mcp
+from email_mcp import sender
+
+entry = sender.schedule_email(to=sys.argv[1], subject=sys.argv[2],
+                              body="RC P15 v0.9-frozen entry.",
+                              send_at=sys.argv[3])
+print(json.dumps({"version": email_mcp.__version__, "id": entry.id,
+                  "message_id": entry.message_id}))
+'''
+
+
+def _legacy_plist(ctx: Context, worktree: Path) -> str:
+    """The pre-v0.8 agent the migration retires. Plan-text correction
+    (S4): v0.9's own label is ALREADY the shipped one — the com.paris
+    label predates v0.8, and v0.9 merely names it in LEGACY_LABELS —
+    so this file reproduces the never-migrated install that the
+    legacy_launchd check exists for. File only, never bootstrapped:
+    loading ANY dispatcher label from the sandbox reaches the shared
+    per-user launchd domain (§2)."""
+    python = _venv_bin(ctx, "python")
+    return f"""<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key><string>{_LEGACY_LABEL}</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>{python}</string>
+        <string>-m</string>
+        <string>email_mcp.dispatcher</string>
+    </array>
+    <key>WorkingDirectory</key><string>{worktree}</string>
+    <key>StartInterval</key><integer>60</integer>
+</dict>
+</plist>
+"""
+
+
+@implements("P15")
+def _p15_upgrade_from_v09(ctx: Context) -> None:
+    stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+    addr = _fixture_addr(ctx)
+    email_mcp = _venv_bin(ctx, "email-mcp")
+    python = _venv_bin(ctx, "python")
+    worktree = ctx.sandbox_home / "rc-v09-src"
+    v09home = ctx.sandbox_home / "rc-v09-home"
+    v09root = v09home / STATE_ROOT_NAME
+    store = v09home / "rc-outbox" / "delivered.mbox"
+    plist = (v09home / "Library" / "LaunchAgents"
+             / f"{_LEGACY_LABEL}.plist")
+    # Two environments over ONE estate: the v0.9 bytes (worktree on
+    # PYTHONPATH) write it, the current wheel (no PYTHONPATH) operates
+    # it. Its own home keeps the upgrade story clean of P13's battered
+    # sandbox estate.
+    v09env = {"HOME": str(v09home), "PYTHONPATH": str(worktree)}
+    cur = {"HOME": str(v09home)}
+
+    present = ctx.sh(["git", "cat-file", "-e", _V09_REF],
+                     cwd=ctx.repo_root, timeout=60)
+    ctx.require(present.ok,
+                f"the v0.9 ref {_V09_REF} is not in this repository — "
+                "the upgrade story needs the real v0.9 bytes, not a "
+                "stand-in")
+    # A crashed earlier pass may have left the worktree registered.
+    ctx.sh(["git", "worktree", "remove", "--force", worktree],
+           cwd=ctx.repo_root, timeout=60)
+    ctx.sh(["git", "worktree", "prune"], cwd=ctx.repo_root, timeout=60)
+    added = ctx.sh(["git", "worktree", "add", "--detach", worktree,
+                    _V09_REF], cwd=ctx.repo_root, timeout=120)
+    try:
+        sink = ctx.write(v09home / "rc-outbox" / "sink.sh",
+                         "#!/bin/sh\n"
+                         f'exec /bin/cat >> "{store}"\n', mode=0o700)
+        ctx.write(v09root / "identities.toml",
+                  'default = "main"\n\n[main]\n'
+                  f'from_addr = "{addr}"\n'
+                  'from_name = "RC v0.9"\n'
+                  'driver = "pipe"\n'
+                  f'command = "{sink}"\n'
+                  f'allowlist = ["{addr}"]\n')
+        gen = ctx.write(ctx.sandbox_home / "rc-p15-v09-schedule.py",
+                        _V09_SCHEDULE)
+        frozen_at = datetime.now(timezone.utc).isoformat(
+            timespec="seconds")
+        ran = ctx.sh([python, gen, addr, f"rc-p15 v09 {stamp}",
+                      frozen_at], extra_env=v09env, timeout=120)
+        ctx.write(plist, _legacy_plist(ctx, worktree), mode=0o644)
+        migrated = ctx.sh([email_mcp, "update"], stdin_text="update\n",
+                          timeout=300, extra_env=cur)
+        fixed = ctx.sh([email_mcp, "doctor", "--fix"],
+                       stdin_text="doctor_fix\n", timeout=300,
+                       extra_env=cur)
+        delivered = ctx.sh([python, "-m", "email_mcp.dispatcher"],
+                           timeout=300, extra_env=cur)
+    finally:
+        # Unregister the worktree pass or fail — a stale registration
+        # would refuse the next pass's add.
+        ctx.sh(["git", "worktree", "remove", "--force", worktree],
+               cwd=ctx.repo_root, timeout=60)
+    if ctx.dry_run:
+        return
+
+    ctx.require(added.ok, f"git worktree add {_V09_REF} failed: "
+                          f"{(added.err or added.out).strip()[:200]}")
+    ctx.require(ran.ok, "the v0.9 generator failed: "
+                        f"{(ran.err or ran.out).strip()[:200]}")
+    frozen = json.loads(ran.out)
+    ctx.require(frozen.get("version") == "0.9.0",
+                f"the generator ran version {frozen.get('version')!r} — "
+                "the old code did not write the state")
+    sid, mid = frozen["id"], frozen["message_id"]
+    ctx.require(migrated.ok,
+                f"`email-mcp update` exited {migrated.rc}: "
+                f"{(migrated.err or migrated.out).strip()[:200]}")
+    meta = json.loads((v09root / "meta.json").read_text(encoding="utf-8"))
+    ctx.require(isinstance(meta.get("state_version"), int),
+                "update did not stamp meta.json — no migration ran")
+    ctx.require(fixed.ok, f"doctor --fix exited {fixed.rc}: "
+                          f"{(fixed.err or fixed.out).strip()[:200]}")
+    ctx.require(not plist.exists(),
+                f"the legacy plist survived doctor --fix: {plist}")
+    ctx.require((v09root / "spool" / "pending").stat().st_mode & 0o777
+                == 0o700,
+                "doctor --fix left v0.9's spool subdirs loose")
+    ctx.require(delivered.ok,
+                f"the dispatcher pass exited {delivered.rc}: "
+                f"{(delivered.err or delivered.out).strip()[:200]}")
+    sent = v09root / "spool" / "sent" / f"{sid}.json"
+    ctx.require(sent.exists(),
+                f"the v0.9-frozen entry {sid} did not deliver")
+    # Judged after the pass, so the old-shape evidence is read from the
+    # settled manifest — the delivery moved it out of pending/.
+    manifest = json.loads(sent.read_text(encoding="utf-8"))
+    ctx.require(manifest.get("message_id") == mid
+                and mid in store.read_text(encoding="utf-8"),
+                f"{sid} delivered but the frozen Message-ID does not "
+                "match what reached the store")
+    ctx.note(f"v0.9 bytes (worktree @ {_V09_REF}, __version__ 0.9.0) "
+             f"wrote the estate: a v0.9 config, frozen spool entry {sid} "
+             f"(manifest keys: {', '.join(sorted(manifest))}), and the "
+             "legacy plist standing in for the never-migrated pre-v0.8 "
+             "install (v0.9's own label is already the shipped one — "
+             "plan-text correction)")
+    ctx.note("current wheel operated it: update stamped state_version "
+             f"{meta['state_version']}, doctor --fix retired "
+             f"{_LEGACY_LABEL} (bootout of an unloaded label is its "
+             "goal state) and pulled v0.9's 0755 spool subdirs to 0700, "
+             f"and one dispatcher pass delivered {mid} from the "
+             "v0.9-frozen entry")
+
+
+@implements("P16")
+def _p16_uninstall_purge(ctx: Context) -> None:
+    email_mcp = _venv_bin(ctx, "email-mcp")
+    root = ctx.sandbox_home / STATE_ROOT_NAME
+    agents = ctx.sandbox_home / "Library" / "LaunchAgents"
+    logs = ctx.sandbox_home / "Library" / "Logs"
+    cache = root / "graph" / "rc-sandbox.token.json"
+    if ctx.dry_run:
+        ctx.write(cache, '{"refresh_token": "rc-fixture"}\n')
+        ctx.sh([email_mcp, "uninstall", "--yes"])
+        ctx.sh([email_mcp, "uninstall", "--purge", "--yes"])
+        return
+    # The §2 gate, BEFORE the verb runs: uninstall boots out every
+    # product plist it finds, and those labels live in the SHARED
+    # per-user launchd domain — a product plist in the sandbox would
+    # aim the bootout at the operator's real agents. The sandbox never
+    # installs one (P07 runs under an RC-owned label), so the honest
+    # sandbox reading of "removes the agents" is that the plan names no
+    # launchd action at all; the real agents' story is P17's, on prod.
+    strays = [f"{label}.plist" for label in PROD_LABELS
+              if (agents / f"{label}.plist").exists()]
+    ctx.require(not strays,
+                "product agent plist(s) sit in the sandbox LaunchAgents "
+                "— uninstall would boot their labels out of the shared "
+                "per-user domain and displace the operator's agents: "
+                + ", ".join(strays))
+    # A cache for the sweep to remove — minted here because the sandbox
+    # never signs into a real tenant; the claim under test is REMOVAL.
+    ctx.write(cache, '{"refresh_token": "rc-fixture"}\n')
+    kept = ctx.sh([email_mcp, "uninstall", "--yes"], timeout=300,
+                  check=True)
+    ctx.require(not cache.exists(),
+                "the token cache survived the uninstall sweep")
+    ctx.require(root.is_dir() and "state kept" in kept.out,
+                "the no-purge uninstall did not keep the state tree")
+    purged = ctx.sh([email_mcp, "uninstall", "--purge", "--yes"],
+                    timeout=300, check=True)
+    ctx.require(not root.exists(),
+                f"the state tree survived the purge: {root}")
+    leftover = sorted(p.name for p in logs.glob("email-mcp*.log*")) \
+        if logs.is_dir() else []
+    ctx.require(not leftover,
+                "log files survived the purge: " + ", ".join(leftover))
+    ctx.require("boot out launchd agent" not in kept.out + purged.out,
+                "uninstall planned a launchd action from the sandbox — "
+                "the shared label space (§2)")
+    ctx.note("uninstall --yes removed the planted token cache and kept "
+             "the tree; --purge removed the tree and the sandbox logs; "
+             "no launchd action was planned (no product plists in the "
+             "sandbox — the agents' story is P17's, on the prod lane)")
+    ctx.note("the byte-identical claim for the REAL estate is judged by "
+             "the runner's strict sentinel, immediately after this body")
+
+
+@implements("P18")
+def _p18_fresh_account_walk(ctx: Context) -> tuple[str, str]:
+    """Once-ever, and the body IS the protocol: the runner stages
+    nothing, because a fresh account only proves the roadmap's claim
+    when a human walks it cold."""
+    spec = PLAN_BY_ID["P18"]
+    steps = (
+        "The roadmap's lifecycle claim, tested the only honest way. "
+        "Recorded ONCE ever — a pass here is skipped by later runs.\n"
+        "1. Create a brand-new macOS user account (System Settings → "
+        "Users & Groups), log into it, and START THE STOPWATCH at "
+        "first login.\n"
+        "2. Install with pipx: the published package, or the wheel this "
+        "RC built. Nothing else crosses over from your account.\n"
+        "3. Run `email-mcp setup` and follow ONLY what it prints — "
+        "permissions (Full Disk Access when doctor names it), the MCP "
+        "client config, the smoke test. Consulting anything the product "
+        "did not print is archaeology and fails the walk.\n"
+        "4. Register the printed config in an MCP client and drive one "
+        "search_emails + one get_email in the new account's session.\n"
+        "5. STOP THE STOPWATCH at the first successful read — the walk "
+        "passes under 15 minutes.\n"
+        "Answer `pass: <minutes> min, <what needed explaining>` or "
+        "`fail: <where the archaeology started>`.")
     return ctx.manual(replace(spec, acceptance=steps))
 
 

@@ -264,3 +264,53 @@ mechanics rode along:
   inside the state root and the prod dispatcher legitimately appends to
   it when a pass hands it work (P08/P09 schedule against the real
   spool). A REMOVED log stays material.
+
+**S4** (2026-08-02) closes R2: the failure matrix P13, the v0.9 upgrade
+P15, uninstall+purge P16, and the once-ever P18 walk — every planned
+phase now has a body. What rode along:
+
+- **P13** runs FM1–FM10 as named sub-checks in one sandbox pass, one
+  evidence line each. Ordering is load-bearing: FM3 runs LAST and
+  leaves its stranded claim as the exhibit — the at-most-once window is
+  DEMONSTRATED (the bytes reached the delivery store exactly once, no
+  sent/ manifest, no deliver event on the ledger) and its size measured
+  (transport handoff → durable rename, taken on FM2's healthy
+  delivery), never reconciled away by a recovery pass or a ledger
+  backfill; a backfilled event fails the phase. The kills are placed
+  exactly, not raced: the sandbox delivery sink itself SIGKILLs the
+  dispatcher before (FM2) or after (FM3) accepting the bytes.
+  Plan-text corrections: FM1's interrupted build surfaces in doctor's
+  fts status (`built_at` null) while the check stays soft by contract —
+  the loud surface is the search envelope; FM5's snippet-only degrade
+  needed a one-word product fix (`fts.rowids_matching` now swallows
+  every `sqlite3.Error`, per its own docstring — a corrupt db
+  previously escaped as a coded search failure); FM8 chmods the tree's
+  LEAVES (an unlistable root is a refused resolution by state policy);
+  FM10's "Mail.app quit" is exhibited as the store vanishing
+  mid-session — the sandbox-safe injection for the same
+  `mail_unavailable` class.
+- **P15** verifies `75c6f93` is in the repo, generates the estate with
+  the v0.9 bytes themselves (a detached worktree; the generator prints
+  the `__version__` it ran — anything but 0.9.0 fails the phase), and
+  lets the current wheel operate it: `update` stamps meta.json,
+  `doctor --fix` retires the legacy label and pulls v0.9's 0755 spool
+  subdirs to 0700, and one dispatcher pass delivers the v0.9-frozen
+  entry. Plan-text correction: v0.9's own agent label is ALREADY
+  `com.email-mcp.dispatcher` — `com.paris.*` predates v0.8 (v0.9 names
+  it in its LEGACY_LABELS) — so the legacy plist is planted as the
+  never-migrated pre-v0.8 install, file only: bootstrapping ANY
+  dispatcher label from the sandbox reaches the shared per-user domain
+  (§2), which also leaves the plist-drift re-render to P17's prod lane.
+- **P16** proves both halves with the product's own verb: `uninstall
+  --yes` removes a planted token cache and keeps the tree, `--purge`
+  removes the tree and the sandbox logs — and it refuses to run at all
+  if a product-label plist sits in the sandbox LaunchAgents, because
+  uninstall would boot that label out of the SHARED domain and displace
+  the operator's agents (the honest sandbox reading of "removes the
+  agents": the plan names no launchd action; the agents' story is
+  P17's). The byte-identical claim stays the strict Sentinel's, judged
+  by the runner immediately after the body.
+- **P18** binds the protocol itself — account, stopwatch, pipx, setup
+  by its own printed words only, first read under 15 minutes, no
+  archaeology — and ends at its manual gate: the verdict is the
+  human's, recorded once ever.

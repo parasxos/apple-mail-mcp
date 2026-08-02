@@ -325,3 +325,18 @@ def test_status_and_matching_on_absent_index_create_nothing(
     assert "absent" in out
     assert "--build" in out
     assert not target.exists()
+
+
+def test_corrupt_db_degrades_matching_to_no_hits(mail_fixture):
+    """A corrupt fts.db raises plain sqlite3.DatabaseError ("file is not
+    a database"), which the old OperationalError-only catch let escape —
+    turning a body search into a coded failure instead of the snippet-only
+    degrade the docstring promises (RC failure matrix FM5). status() must
+    keep reporting the corruption so doctor can offer the rebuild."""
+    idx = FtsIndex(mail_base=mail_fixture)
+    idx.build()
+    fts.db_path().write_text("garbage where an SQLite header should be")
+
+    assert idx.rowids_matching("retracted") == []
+    st = idx.status()
+    assert st["state"] == "error"

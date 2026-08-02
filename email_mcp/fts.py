@@ -207,7 +207,10 @@ class FtsIndex:
                 "ORDER BY rowid DESC LIMIT ?",
                 (expr, cap),
             ).fetchall()
-        except sqlite3.OperationalError as e:
+        except sqlite3.Error as e:
+            # The whole class, not just OperationalError: a corrupt db
+            # raises plain DatabaseError, and the docstring's promise is
+            # that search degrades to snippet-only, never dies (RC FM5).
             get_logger().warning("fts: MATCH failed for %r: %s", expr, e)
             return []
         finally:
