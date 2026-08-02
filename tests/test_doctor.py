@@ -298,3 +298,32 @@ def test_healthy_transport_check_carries_no_fix(monkeypatch):
     monkeypatch.setattr(doc, "get_transport", real_get_transport)
     out = doc.check_transports()
     assert out["ok"] is True and "fix" not in out
+
+
+def test_spool_plans_check_survives_mode_000_and_names_chmod(monkeypatch,
+                                                             tmp_path):
+    """RC P13 FM8 (2026-08-02): a mode-000 spool made the counts scan
+    raise OUT of the whole check — doctor died of the exact fault it
+    exists to diagnose, and the chmod remedy went unread. The check must
+    report the mode problem, name `chmod 700`, and degrade the counts."""
+    import os
+
+    from email_mcp import doctor, state
+
+    for k in list(os.environ):
+        if k.startswith("EMAIL_MCP_"):
+            monkeypatch.delenv(k, raising=False)
+    monkeypatch.setenv("EMAIL_MCP_STATE_DIR", str(tmp_path / "state"))
+    w = state.State.resolve().adopt()
+    spool_dir, plans_dir = w.spool, w.plans
+    os.chmod(spool_dir, 0o000)
+    os.chmod(plans_dir, 0o000)
+    try:
+        out = doctor.check_spool_plans()
+    finally:
+        os.chmod(spool_dir, 0o700)
+        os.chmod(plans_dir, 0o700)
+    assert out["ok"] is False
+    assert f"chmod 700 {spool_dir}" in out["fix"]
+    assert f"chmod 700 {plans_dir}" in out["fix"]
+    assert "unreadable" in out["detail"]  # counts degraded, not invented

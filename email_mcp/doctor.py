@@ -307,17 +307,26 @@ def check_spool_plans() -> dict:
             problems.append(f"{label} dir {d} is mode {mode:o} (want 700)")
             fixes.append(f"chmod 700 {d}")
 
-    counts = {s: len(spool.entries(s)) for s in spool.STATES}
-    now = spool.utcnow()
     stranded: list[str] = []
-    for e in spool.entries("sending"):
-        try:
-            ref = datetime.fromisoformat(e.next_attempt_at or e.send_at)
-        except ValueError:
-            stranded.append(e.id)
-            continue
-        if (now - ref).total_seconds() / 60 >= STALE_SENDING_MINUTES:
-            stranded.append(e.id)
+    try:
+        counts = {s: len(spool.entries(s)) for s in spool.STATES}
+        now = spool.utcnow()
+        for e in spool.entries("sending"):
+            try:
+                ref = datetime.fromisoformat(e.next_attempt_at or e.send_at)
+            except ValueError:
+                stranded.append(e.id)
+                continue
+            if (now - ref).total_seconds() / 60 >= STALE_SENDING_MINUTES:
+                stranded.append(e.id)
+    except OSError as e:
+        # Doctor must REPORT the fault it exists to diagnose, never die
+        # of it: a mode-000 spool made the counts scan raise out of the
+        # whole check while the chmod remedy above went unread (RC P13
+        # FM8, 2026-08-02). The modes loop has already named the fix.
+        counts = {}
+        problems.append(f"spool unreadable ({e.strerror or e}) — "
+                        "counts unavailable")
     if stranded:
         problems.append(f"{len(stranded)} stranded claim(s) in sending/: "
                         f"{', '.join(sorted(stranded))}")
