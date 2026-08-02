@@ -178,7 +178,7 @@ def _identity_rows() -> list[plan.Row]:
     path = config.identities_file()
     if path.exists() and not _yn(f"{path} exists — reconfigure it "
                                  f"(the current file is kept as .bak)?"):
-        return [plan.Kept(path, "existing identities kept")]
+        return _upgrade_rows(path)
     print("\nSending identity (leave the address empty to skip — "
           "reading mail needs none):")
     from_addr = _ask("From: address")
@@ -226,23 +226,26 @@ _MS_TENANT = "organizations"
 _MS_CLIENT_ID = "14d82eec-204b-4c2f-b7e8-296a70dab67e"
 
 
-def _exchange_lines(name: str, from_addr: str) -> list[str]:
+def _exchange_enable(name: str, from_addr: str,
+                     graph_cfg: dict | None = None) -> bool:
     """Offer the Exchange extras — drafts and lid-closed scheduling — in
     the user's words, and do the sign-in HERE, while the human is
     present. A capability the user must read about in a doc is a
     capability they do not have (first-user finding, 2026-08-01)."""
     if not _yn(f"\nIs {from_addr} a Microsoft/Exchange mailbox "
                "(you read it in Outlook or OWA)?", default=False):
-        return []
+        return False
     print("Exchange extras: drafts filed in your real Drafts folder, and "
           "scheduled sends that fire even with the laptop closed.")
     if not _yn("Enable them now (one browser sign-in)?", default=True):
-        return []
+        return False
     from . import graph
     from .identities import Identity
 
-    ident = Identity(name=name, from_addr=from_addr, drafts="graph",
-                     graph={"tenant": _MS_TENANT, "client_id": _MS_CLIENT_ID})
+    ident = Identity(
+        name=name, from_addr=from_addr, drafts="graph",
+        graph=graph_cfg or {"tenant": _MS_TENANT,
+                            "client_id": _MS_CLIENT_ID})
     try:
         graph.device_login(ident)          # prints the code; binds to /me
     except Exception as e:                 # noqa: BLE001 — user-facing step
@@ -251,12 +254,60 @@ def _exchange_lines(name: str, from_addr: str) -> list[str]:
         print(f"sign-in did not complete ({e})")
         print(f"  enable later with: email-mcp setup   (or: python -m "
               f"email_mcp.graph --login {name})")
-        return []
+        return False
     print("drafts + lid-closed scheduling enabled.")
+    return True
+
+
+def _exchange_lines(name: str, from_addr: str) -> list[str]:
+    if not _exchange_enable(name, from_addr):
+        return []
     return ['executor = "graph"', 'drafts = "graph"', "",
             f"[{name}.graph]",
             f"tenant = {json.dumps(_MS_TENANT)}",
             f"client_id = {json.dumps(_MS_CLIENT_ID)}"]
+
+
+def _upgrade_rows(path) -> list[plan.Row]:
+    """KEPT identities can still gain the Exchange extras: nothing is
+    rewritten — the missing lines are inserted into the default
+    identity's block (backup first). A capability gated behind
+    "reconfigure everything" is a capability a returning user never
+    enables — and reconfiguring would clobber a working transport."""
+    from . import identities as ident_mod
+
+    try:
+        idents, default = ident_mod.load()
+    except Exception as e:  # noqa: BLE001 — foreign/unreadable file: keep
+        return [plan.Kept(path, f"existing identities kept ({e})")]
+    ident = idents[default]
+    if ident.drafts != "none" or not ident.from_addr:
+        return [plan.Kept(path, "existing identities kept")]
+    have_graph = all(str(ident.graph.get(k, "")).strip()
+                     for k in ("tenant", "client_id"))
+    cfg = ident.graph if have_graph else None
+    if not _exchange_enable(default, ident.from_addr, graph_cfg=cfg):
+        return [plan.Kept(path, "existing identities kept")]
+    inner = ['drafts   = "graph"']
+    if ident.executor != "graph":
+        inner.append('executor = "graph"')
+    text = path.read_text()
+    out, inserted = [], False
+    for line in text.splitlines():
+        out.append(line)
+        if not inserted and line.strip() == f"[{default}]":
+            out += inner
+            inserted = True
+    if not inserted:  # header not found textually — never guess
+        print(f"could not locate [{default}] in {path} — add "
+              f'drafts = "graph" to it yourself')
+        return [plan.Kept(path, "existing identities kept")]
+    new = "\n".join(out) + "\n"
+    if not have_graph:
+        new += ("\n" + f"[{default}.graph]\n"
+                f"tenant = {json.dumps(_MS_TENANT)}\n"
+                f"client_id = {json.dumps(_MS_CLIENT_ID)}\n")
+    return [plan.WriteFile(path, new, mode=0o600, backup=True)]
 
 
 def _agent_rows() -> list[plan.Row]:

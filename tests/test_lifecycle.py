@@ -10,6 +10,7 @@ import json
 import os
 import stat
 import subprocess
+import textwrap
 from pathlib import Path
 
 import pytest
@@ -465,10 +466,48 @@ def test_setup_keep_existing_identities(home, smoke, monkeypatch, capsys):
     root = state.State.resolve().adopt().root
     old = 'default = "o"\n\n[o]\nfrom_addr = "o@x.org"\ndriver = "pipe"\ncommand = "cat"\n'
     (root / "identities.toml").write_text(old)
-    _script(monkeypatch, ["n", "n", "n", "n"])  # keep + no agents + no fts
+    # keep + not-a-Microsoft-mailbox + no agents + no fts
+    _script(monkeypatch, ["n", "n", "n", "n", "n"])
     assert lifecycle.setup() == 0
     assert (root / "identities.toml").read_text() == old
     assert "existing identities kept" in capsys.readouterr().out
+
+
+def test_setup_kept_identities_can_still_gain_the_drafts_lane(
+    home, smoke, monkeypatch, capsys,
+):
+    """The Camilla path: a returning user answers "n" to reconfigure
+    (their working transport must survive untouched) and STILL gets the
+    Exchange question — the missing lines are inserted, nothing else
+    moves, and the old file is the .bak."""
+    root = state.State.resolve().adopt().root
+    old = textwrap.dedent("""\
+        default = "main"
+
+        [main]
+        from_addr = "camilla@example.org"
+        driver = "ssh_sendmail"
+        host = "lxplus.example.org"
+        user = "cv"
+        socket = "~/.ssh/s"
+    """)
+    (root / "identities.toml").write_text(old)
+    logins = []
+    monkeypatch.setattr("email_mcp.graph.device_login",
+                        lambda ident: logins.append(ident.from_addr))
+    # keep + IS a Microsoft mailbox + enable now + no agents + no fts
+    _script(monkeypatch, ["n", "y", "y", "n", "n", "n"])
+    assert lifecycle.setup() == 0
+    assert logins == ["camilla@example.org"]     # signed in during setup
+    text = (root / "identities.toml").read_text()
+    assert 'drafts   = "graph"' in text
+    assert 'executor = "graph"' in text
+    assert '[main.graph]' in text
+    assert 'host = "lxplus.example.org"' in text  # transport untouched
+    assert (root / "identities.toml.bak").read_text() == old
+    from email_mcp import identities
+    idents, default = identities.load()
+    assert idents[default].drafts == "graph"     # parses and declares
 
 
 def test_setup_refused_root_exits_nonzero(home, monkeypatch, tmp_path,
