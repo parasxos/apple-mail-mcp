@@ -126,6 +126,12 @@ def test_draft_filed_verified_and_faithful(monkeypatch):
     assert "Apple-Mail-URLShare" not in html
     # A human will edit and send this: no Bcc-to-self on a draft.
     assert msg["Bcc"] is None
+    # Draft parts are BASE64, never quoted-printable: OWA's editor
+    # mangles QP soft breaks in MIME-created drafts ("sent" → "se=t",
+    # measured 2026-08-02, first acceptance run).
+    for part in msg.walk():
+        if part.get_content_type() in ("text/plain", "text/html"):
+            assert part["Content-Transfer-Encoding"] == "base64"
 
 
 def test_declared_guard_blocks_the_send_but_not_the_draft(monkeypatch):
