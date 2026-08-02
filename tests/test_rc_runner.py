@@ -973,11 +973,17 @@ def _p04_status(**overrides):
     return status
 
 
-def _p04_spawn(*, probe=None, status=None):
+def _p04_spawn(*, probe=None, status=None, missing=None):
     probe = probe if probe is not None else \
         {"rowid": 7, "token": "hello", "hits": [7, 9]}
+    # The prod half consults a second probe whenever the status reports
+    # un-indexed docs: are they explained by an absent local body?
+    missing = missing if missing is not None else \
+        {"checked": 3, "storeless_mailboxes": 1, "unexplained": []}
     return ScriptedSpawn(
         (lambda a: "--build" in a, lambda c: _Proc(0, '{"scanned": 200}')),
+        (lambda a: a[-1].endswith("p04_missing_probe.py"),
+         lambda c: _Proc(0, json.dumps(missing))),
         (lambda a: a[-1].endswith("rc-p04-probe.py"),
          lambda c: _Proc(0, json.dumps(probe))),
         (lambda a: "--status" in a,
@@ -1008,9 +1014,10 @@ def test_p04_builds_probes_the_sandbox_and_reads_the_prod_status(
 @pytest.mark.parametrize("probe, status, symptom", [
     # the indexed doc does not come back out of a MATCH query
     ({"rowid": 7, "token": "hello", "hits": []}, None, "not searchable"),
-    # holes in the prod index
-    (None, _p04_status(docs={"indexed": 100, "partial": 0, "missing": 3,
-                             "error": 0, "total": 103}), "not full"),
+    # extraction errors in the prod index (missing is judged by the
+    # explanation probe instead — see the dedicated test below)
+    (None, _p04_status(docs={"indexed": 100, "partial": 0, "missing": 0,
+                             "error": 2, "total": 102}), "extraction errors"),
     # a prod index nobody has synced for days
     (None, _p04_status(built_at="2026-07-20T00:00:00+00:00",
                        last_sync_at="2026-07-20T00:00:00+00:00"), "stale"),
@@ -3063,3 +3070,20 @@ def test_p01_force_reinstalls_the_wheel_it_just_built(tmp_path, estate,
     installs = [i for i in ctx.intents if "/pip install" in i]
     assert installs, "P01 must install the wheel"
     assert all("--force-reinstall" in i for i in installs), installs
+
+
+def test_p04_prod_fails_when_a_missing_doc_has_a_local_body(tmp_path, estate,
+                                                            monkeypatch):
+    """"Full" is EXPLAINED, not zero: a doc whose .emlx is on disk yet
+    went un-indexed is a real indexing failure and must fail the phase,
+    while server-side-only bodies (no local store) are fine."""
+    ctx = make_ctx(tmp_path, estate, dry_run=False)
+    status = _p04_status(docs={"indexed": 10, "partial": 0, "missing": 3,
+                               "error": 0, "total": 13})
+    monkeypatch.setattr(runner, "_spawn", _p04_spawn(
+        status=status,
+        missing={"checked": 3, "storeless_mailboxes": 0,
+                 "unexplained": [{"rowid": 9, "mailbox": "m"}]}))
+    with pytest.raises(runner.PhaseFailure) as e:
+        runner.IMPLEMENTATIONS["P04"](ctx)
+    assert "should have indexed" in str(e.value)
