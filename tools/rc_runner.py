@@ -3325,6 +3325,27 @@ def _p18_fresh_account_walk(ctx: Context) -> tuple[str, str]:
 # --------------------------------------------------------------------- #
 
 
+def _default_mail_dir(explicit: str | None) -> Path | None:
+    """The Mail store the sandbox borrows, READ-ONLY (plan §1).
+
+    Defaulted rather than demanded: the plan says the sandbox's one
+    borrowing from reality is the mail, so a bare `--execute` that
+    attaches nothing is not a stricter run — it is a run whose every
+    read phase is testing an empty Mac (first live pass, 2026-08-02:
+    P03 failed on "Library/Mail does not exist" inside the sandbox
+    HOME). Resolution failure is not fatal here: the phases that need a
+    store say so themselves.
+    """
+    if explicit:
+        return Path(explicit).expanduser()
+    try:
+        sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+        from email_mcp.config import mail_dir
+        return mail_dir()
+    except Exception:      # noqa: BLE001 — no store on this Mac; phases judge
+        return None
+
+
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         prog="rc_runner",
@@ -3356,7 +3377,8 @@ def build_parser() -> argparse.ArgumentParser:
                         f"(default ~/{STATE_ROOT_NAME})")
     p.add_argument("--sandbox-home", default=None)
     p.add_argument("--mail-dir", default=None,
-                   help="Mail store attached read-only in the sandbox lane")
+                   help="Mail store attached read-only in the sandbox lane "
+                        "(default: the operator's own, resolved live)")
     p.add_argument("--report", default=None)
     return p
 
@@ -3461,8 +3483,7 @@ def main(argv: Sequence[str] | None = None, *,
                   if args.sandbox_home else state_dir / "sandbox-home",
                   real_home=real_home, state_dir=state_dir, sentinel=watcher,
                   report=report,
-                  mail_dir=Path(args.mail_dir).expanduser()
-                  if args.mail_dir else None,
+                  mail_dir=_default_mail_dir(args.mail_dir),
                   answer=answer if answer is not None
                   else (_stdin_answer if args.interactive else None))
 

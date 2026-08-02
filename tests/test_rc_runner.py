@@ -2975,3 +2975,27 @@ def test_the_full_dry_run_reaches_every_phase_and_writes_nothing(
     assert not report.exists(), "--report leaked into a dry run"
     assert _fingerprint(estate) == before, \
         "the dry run modified the estate the Sentinel witnesses"
+
+
+def test_sandbox_borrows_the_real_mail_store_by_default(monkeypatch, tmp_path):
+    """Plan §1: the sandbox's one borrowing from reality is the mail,
+    read-only. A bare --execute that attaches nothing is not a stricter
+    run — it is a run whose read phases test an empty Mac (first live
+    pass, 2026-08-02: P03 failed on a missing Library/Mail INSIDE the
+    sandbox home). An explicit --mail-dir still wins."""
+    store = tmp_path / "V10"
+    store.mkdir()
+    monkeypatch.setattr("email_mcp.config.mail_dir", lambda: store)
+    assert runner._default_mail_dir(None) == store
+    assert runner._default_mail_dir(str(tmp_path / "other")) == \
+        tmp_path / "other"
+
+
+def test_missing_mail_store_is_not_fatal_to_the_runner(monkeypatch):
+    """No store on this Mac -> None, and the phases that need one say so
+    themselves; the runner does not refuse to start."""
+    def _boom():
+        raise FileNotFoundError("no Mail here")
+
+    monkeypatch.setattr("email_mcp.config.mail_dir", _boom)
+    assert runner._default_mail_dir(None) is None
