@@ -89,6 +89,70 @@ remaining choice is Lane B (IMAP APPEND — our bytes exactly, at the cost
 of a new protocol + credential surface) or a documented "not possible
 here". Decision: Paris's.**
 
+## PANEL DECISION — Lane C: Graph MIME-create (2026-08-02)
+
+A three-expert panel (Mail.app platform, protocols/provider APIs, concept
+guardian) converged unanimously on a lane this note had not named:
+
+> **Lane C — `POST /me/messages` with our composer's base64 MIME, via the
+> Graph machinery `executor = "graph"` already owns.** It is the first
+> third of `create_deferred_draft` (graph.py) with the deferred-time PATCH
+> and the `/send` amputated: the send path with the transport removed.
+> `Mail.ReadWrite` is already consented at CERN (calibration 2026-07-29,
+> whose Phase-A verdict literally includes `mime_create: true`).
+
+**The decision rule:** a draft may only be filed into the Drafts folder of
+the mailbox that owns its From address, by a lane that can prove it landed
+there; if the identity has no such lane, `create_draft` REFUSES — it never
+files elsewhere, and it never falls back. (Unlike `schedule_email`'s
+graph→launchd fallback, which is safe because both executors deliver the
+same message: for a draft the location IS the artifact, and a fallback
+that files elsewhere may publish the body to a third party — see
+security-posture §2.12.)
+
+**Lane A is closed permanently, twice over:** the fidelity failure above,
+and a measured SECURITY finding — unmatched `sender` silently exfiltrates
+the draft body to a third-party IMAP server with exit 0 (posture §2.12).
+The panel also completed the founding bug's causal story: the
+`blockquote type="cite"` wrapper is semantic, so Mail derives an empty
+plain part at rest and a `> `-quoted one on send — blank-in-Outlook was
+this all along. **Lane B is rejected:** on Exchange it duplicates a kept
+promise (Graph OAuth + a second protocol into the same mailbox), its
+Drafts-folder resolution is not portable (this store spells it four ways,
+including `Πρόχειρα`), and it buys coverage nobody asked for.
+
+**Corrections to this note's own contract:**
+- `draft_id` is the **Graph message id**, never an Envelope Index ROWID —
+  rowids are rewritten by server sync within minutes (measured). The
+  cross-store join key is the composer-minted Message-ID
+  (= Exchange `internetMessageId`); local visibility is reported
+  best-effort (`local_*` fields, null until Mail syncs), never required.
+- The no-transport invariant is pinned by an **AST call-graph
+  reachability test** from the tool function, not by grep — graph.py
+  legitimately contains `/send`.
+- Acceptance readback, all three or failure: `isDraft: true`;
+  `internetMessageId` == ours; `parentFolderId` == the well-known
+  `drafts` folder.
+
+**Coverage at v1:** CERN Exchange identities only (both current users);
+hotmail = probe-then-enable later (`consumers` tenant, zero new code);
+Gmail/IMAP/local = documented refusal with a fix string. The capability is
+DECLARED per identity — `drafts = "graph"` beside `driver` and `executor`,
+an enum so `"gmail"` stays addable — never inferred, never fallen back to.
+
+**v1 excludes:** `send_draft` (the invariant is the feature),
+`update_draft`/`list_drafts`/`delete_draft` (the client's UI; reads
+already work), attachments (Graph single-request MIME is size-limited —
+the parameter is absent, not ignored), any folder parameter (the seam
+"file it elsewhere" would re-enter through), quoted reply history
+(`in_reply_to` passes through as a header; the quote block is v1.1).
+
+**Rollout:** R0 restore the lost `[cern.graph]` config + re-login + an
+identity-binding check (`GET /me` vs `from_addr` — hardens scheduling
+too); R1 the tool (#21, 10 mutating / 11 read-only / 21 total, contract +
+freeze rows in the same change); R2 docs; R3 Camilla (two config lines +
+one device login); R4 nothing until a real ask.
+
 ## What is deliberately NOT here
 
 - **No `send_draft`.** The invariant is the feature.

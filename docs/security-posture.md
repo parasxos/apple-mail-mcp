@@ -663,6 +663,25 @@ requeues it after 10 minutes precisely because the outcome is not knowable
 from disk. **That window re-delivers.** Dedupe on the manifest's frozen
 `Message-ID`. Contract §4 states this on the `schedule_email` row.
 
+### 2.12 CLOSED BY LANE REJECTION — AppleScript draft save is silent cross-account egress
+
+Measured live 2026-08-02 (three-expert draft-lane panel; evidence in the
+panel record referenced from `docs/draft-design.md`): scripting Mail.app's
+`make new outgoing message … save` with a `sender` string Mail does not
+recognize **returns exit 0, no error — and Mail silently files the draft
+under an arbitrary other account, uploading the message body to that
+account's IMAP server** (reproduced against a forgotten third-party
+mail.com account; the folder is live and server-synced). `save` returns
+nothing inspectable, so no API surface detects the misroute at save time.
+Combined with the body corruption the same panel traced end-to-end (empty
+`text/plain` at rest; `> `-quoted plain + `blockquote type="cite"`-wrapped
+HTML on delivery — the founding bug, on the save path), **any AppleScript
+compose/save path is rejected permanently for drafts.** The shipped
+`create_draft` lane (Microsoft Graph MIME-create) makes the misroute
+unrepresentable — in Graph, `/me` *is* the authenticated mailbox — and the
+never-sends invariant protocol-enforced. A future contributor tempted by
+"AppleScript save is simpler" must treat this entry as the refusal.
+
 ---
 
 ## 3. What the tool will never do
