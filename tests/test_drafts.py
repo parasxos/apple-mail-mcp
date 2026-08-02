@@ -36,6 +36,10 @@ def _draft_env(monkeypatch, tmp_path):
         'default = "cern"\n\n[cern]\n'
         'from_addr = "camilla@example.org"\n'
         'driver = "pipe"\ncommand = "cat"\n'
+        # Guard ENGAGED on purpose: the no-allowlist-jurisdiction row
+        # below is only a real pin if a send to the same stranger would
+        # actually be blocked.
+        "allow_all = false\n"
         'drafts = "graph"\nexecutor = "graph"\n\n'
         "[cern.graph]\n"
         'tenant = "organizations"\nclient_id = "app-123"\n\n'
@@ -124,12 +128,17 @@ def test_draft_filed_verified_and_faithful(monkeypatch):
     assert msg["Bcc"] is None
 
 
-def test_declared_allowlist_does_not_block_a_draft(monkeypatch):
-    """Nothing transmits, so the send guard has no jurisdiction: a
-    guard-engaged identity may still DRAFT to a stranger."""
-    monkeypatch.setenv("EMAIL_MCP_SEND_ALLOW_ALL", "0")
+def test_declared_guard_blocks_the_send_but_not_the_draft(monkeypatch):
+    """Nothing transmits, so the send guard has no jurisdiction over
+    drafts. The fixture identity DECLARES allow_all = false, and the pin
+    proves it has teeth: the same stranger is blocked on send_email and
+    accepted on create_draft, in the same environment."""
     fake = _FakeGraph()
     monkeypatch.setattr(graph, "_http", fake)
+    blocked = server.tool_send_email(to="stranger@example.org",
+                                     subject="s", body="b")
+    assert blocked["ok"] is False
+    assert blocked["code"] == "recipient_not_allowed"  # guard is LIVE
     out = server.tool_create_draft(to="stranger@example.org",
                                    subject="s", body="b")
     assert out["ok"] is True
@@ -196,13 +205,50 @@ def _called_names(fn) -> set[str]:
     return names
 
 
+def _reachable_calls(fn) -> set[str]:
+    """Every name CALLED anywhere reachable from `fn` within email_mcp —
+    a transitive walk, not a hand-picked inventory: a new intermediate
+    helper is discovered, not trusted. Name resolution deliberately
+    over-approximates (a called name is looked up in every email_mcp
+    module), which can only make this test stricter, never blinder."""
+    import email_mcp
+    from email_mcp import (audit, config, envelope, identities,  # noqa: F401
+                           spool)
+    modules = [server, sender, graph, identities, envelope, audit,
+               config, spool]
+    seen_fns: set = set()
+    called: set[str] = set()
+
+    def walk(f):
+        f = getattr(f, "__wrapped__", f)
+        if f in seen_fns or getattr(f, "__module__", "").split(".")[0] \
+                != "email_mcp":
+            return
+        seen_fns.add(f)
+        try:
+            names = _called_names(f)
+        except (OSError, TypeError):
+            return
+        called.update(names)
+        for name in names:
+            for mod in modules:
+                cand = getattr(mod, name, None)
+                if inspect.isfunction(cand):
+                    walk(cand)
+
+    walk(fn)
+    return called
+
+
 def test_no_transmission_primitive_reachable_from_create_draft():
-    reached = (_called_names(server.tool_create_draft.__wrapped__)
-               if hasattr(server.tool_create_draft, "__wrapped__")
-               else _called_names(server.tool_create_draft))
-    reached |= _called_names(sender.create_draft)
-    reached |= _called_names(graph.create_mime_draft)
-    reached |= _called_names(graph.draft_receipt)
+    """The panel's invariant pin: an AST call-graph REACHABILITY check
+    from the tool function down — refactoring the draft path through a
+    helper that reaches a transmission primitive fails here, whatever
+    the helper is named."""
+    reached = _reachable_calls(server.tool_create_draft)
+    # The walk must genuinely descend: the leaf Graph calls only appear
+    # via sender.create_draft — their presence proves transitivity.
+    assert "create_mime_draft" in reached and "draft_receipt" in reached
     assert not (reached & _FORBIDDEN_CALLS), reached & _FORBIDDEN_CALLS
 
 

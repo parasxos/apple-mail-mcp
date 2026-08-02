@@ -637,14 +637,17 @@ def create_draft(
             and receipt["in_drafts_folder"]):
         # Evidence, never assertion: a draft we cannot read back as OUR
         # message, in Drafts, unarmed, was not created — say exactly
-        # which leg failed.
+        # which leg failed, and name the server-side artifact that DOES
+        # exist (this is the one failure with an orphan to reconcile;
+        # the id also rides into the failed audit event via the error).
         raise graph.GraphError(
             f"[{ident.name}/graph] draft readback failed verification "
             f"(is_draft={receipt['is_draft']}, "
             f"message_id_match="
             f"{receipt['internet_message_id'] == msg['Message-ID']}, "
-            f"in_drafts_folder={receipt['in_drafts_folder']}) — check "
-            "the Drafts folder yourself before retrying."
+            f"in_drafts_folder={receipt['in_drafts_folder']}) — a draft "
+            f"WAS created (id {draft_id}); check your Drafts before "
+            "retrying."
         )
     return DraftResult(
         ok=True,

@@ -708,10 +708,11 @@ These are design commitments, not incidental behavior:
   (50 vs 200 messages).
 - **Caps reject, never truncate** on the mutation paths — an over-cap
   selection is refused, never silently trimmed to fit.
-- **`EMAIL_MCP_READ_ONLY=1` removes the nine mutating tools from the
-  registration**, verified at 11 tools registered vs 20. They do not exist
-  in that session; there is no runtime check to bypass.
-- **No exception crosses the MCP wire** (contract §7): every one of the 20
+- **`EMAIL_MCP_READ_ONLY=1` removes the ten mutating tools from the
+  registration** (create_draft joined them 2026-08-02), verified at 11
+  tools registered vs 21. They do not exist in that session; there is no
+  runtime check to bypass.
+- **No exception crosses the MCP wire** (contract §7): every one of the 21
   tools is wrapped in a belt that maps exceptions to coded failure
   envelopes and logs the traceback to the log file, never to stdout.
 

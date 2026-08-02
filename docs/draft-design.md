@@ -34,13 +34,18 @@ additive per §8) records composition, not transmission.
 
 ## The surface (one tool, additive)
 
-`create_draft(to, subject, body, cc?, bcc?, from_identity?, in_reply_to?)`
-→ `{ok, draft_id, mailbox, account}` — tool #21, in the MUTATING set (it
-writes to the mail store's Drafts); READ_ONLY stays 11. Success is
-**verified against the store**: after filing, the Drafts mailbox is
-re-read through the Envelope Index until the new message appears, and the
-returned `draft_id` is its ROWID — the same id `get_email` accepts. A
-draft you cannot immediately read back was not created.
+`create_draft(to, subject, body, cc?, in_reply_to?, from_identity?)`
+→ `{ok, draft_id, message_id, to, cc, subject, folder, account}` — tool
+#21, in the MUTATING set; READ_ONLY stays 11. *(As shipped 2026-08-02:
+no `bcc` — a draft a human will edit carries no Bcc-to-self, and a user
+bcc belongs to the send they will perform; no `local_*` fields — local
+visibility follows Mail's own sync and is found via the returned
+`message_id`, a scope cut from the panel's best-effort-poll suggestion.)*
+Success is **verified against the authoritative store for the lane**
+(Exchange, via the three-legged readback below — the original
+Envelope-Index/ROWID wording here predated the panel's finding that
+rowids are rewritten by sync). A draft that cannot be read back as ours,
+in Drafts, unarmed, was not created.
 
 Composition uses the tool's own RFC-822 composer (plain+HTML,
 Outlook-safe) — never a scripted compose window.
