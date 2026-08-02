@@ -1,14 +1,15 @@
 #!/usr/bin/env python3
-"""v1.0-rc runner core — the harness the 18-phase RC programme rides on.
+"""v1.0-rc runner core — the harness the 19-phase RC programme rides on.
 
-``docs/w3-rc-plan.md`` is the plan this file executes: 18 phases across
+``docs/w3-rc-plan.md`` is the plan this file executes: 19 phases across
 two lanes — a *sandbox* lane (a throwaway ``$HOME`` with the real Mail
 store attached read-only through ``EMAIL_MCP_MAIL_DIR``) and a *prod*
 lane (self-only sends on the real estate). R1 shipped the core:
 Context, Report, Sentinel, the phase registry, the
 resume/--phase/--dry-run plumbing and the manual-step protocol. Phase
 bodies attach through ``@implements`` (S1 bound the sandbox core
-P01–P05; S2 binds the mutation story P06–P07 and P10–P12, below); a
+P01–P05; S2 binds the mutation story P06–P07 and P10–P12; S3 the prod
+lane P08/P09/P14/P17 and the added P19 drafts phase, below); a
 phase with no body is reported as ``unimplemented`` rather than
 silently passing.
 
@@ -41,11 +42,12 @@ import fnmatch
 import hashlib
 import json
 import os
+import re
 import sys
 import tempfile
 import time
 import tomllib
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Callable, Iterable, Sequence
@@ -91,10 +93,13 @@ RC_DIRNAME = ".email-mcp-rc"
 
 # Paths under ~/.email-mcp a run is allowed to churn. The ledger gains an
 # event per mutation by design, the spool moves manifests between states,
-# the index rebuilds, plans are written and GC'd, and a Graph send
-# rotates its token cache. Everything else — identities.toml, meta.json,
-# an unknown new file at the root — is material drift.
-EXPECTED_CHANGE = ("audit/*", "spool/*", "fts/*", "plans/*", "graph/*.token.json")
+# the index rebuilds, plans are written and GC'd, a Graph send rotates
+# its token cache, and the prod dispatcher appends to its own log when
+# the pass hands it work (P08/P09 schedule against the real spool).
+# Everything else — identities.toml, meta.json, an unknown new file at
+# the root — is material drift.
+EXPECTED_CHANGE = ("audit/*", "spool/*", "fts/*", "plans/*",
+                   "graph/*.token.json", "dispatcher.log")
 # Removal is judged separately and more harshly: a vanished token cache
 # is always reported, even though rewriting one is routine.
 EXPECTED_REMOVAL = ("spool/*", "plans/*", "fts/*")
@@ -147,7 +152,7 @@ def _now() -> str:
 
 
 # --------------------------------------------------------------------- #
-# the plan: 18 phases (bodies attach via @implements)                    #
+# the plan: 19 phases (bodies attach via @implements)                    #
 # --------------------------------------------------------------------- #
 
 
@@ -219,6 +224,11 @@ PLAN: tuple[PhaseSpec, ...] = (
     PhaseSpec("P18", "fresh macOS user account walk", PROD,
               "a brand-new macOS account reaches a working read-only server "
               "in under 15 minutes with no archaeology", manual=True, once=True),
+    PhaseSpec("P19", "drafts", PROD,
+              "create_draft files a base64 draft into the identity's own "
+              "Drafts via the Graph lane (three-legged readback); a "
+              "lane-less identity refuses draft_unsupported; a human edits, "
+              "hand-sends and confirms rendering", manual=True),
 )
 
 PLAN_BY_ID = {spec.id: spec for spec in PLAN}
@@ -880,7 +890,14 @@ def execute(spec: PhaseSpec, ctx: Context,
     started = time.monotonic()
     try:
         if spec.manual:
-            status, evidence = ctx.manual(spec)
+            # A manual phase may bind a body (S3): the human cannot act
+            # on a bare acceptance line when the phase needs real setup —
+            # a deferred send armed, doctor run on both sides of a revoke
+            # — so the body stages its effects through ctx and ends at
+            # its own ctx.manual gate, returning that gate's verdict.
+            # Unbound manual phases keep the bare protocol.
+            fn = implementations.get(spec.id)
+            status, evidence = fn(ctx) if fn is not None else ctx.manual(spec)
             if evidence:
                 result.detail.append(f"operator: {evidence}")
             result.status = status
@@ -2041,6 +2058,443 @@ def _p12_audit_inspection(ctx: Context) -> None:
              f"call ({unrelated} unrelated live-estate event(s) outside "
              f"this run's claim); spool ids and plan ids ride as op, "
              f"Message-IDs on the send events")
+
+
+# --------------------------------------------------------------------- #
+# phase bodies — R2, stage S3: the prod lane (P08, P09, P14, P17, P19)   #
+# --------------------------------------------------------------------- #
+#
+# These phases operate the operator's REAL install — real identities,
+# real Graph tokens, real agents — so they only ever run under --execute
+# with a human present, and every recipient is read out of the real
+# identities file (self-only by construction), never typed into a phase.
+# The manual halves go through ctx.manual with the EXACT steps in the
+# prompt; a bound manual body returns that gate's verdict, so an
+# unattended pass still ends PENDING — never invented. P19 is the phase
+# the plan predates: tool #21 (create_draft, 2026-08-02) files intent
+# back to the human and never sends (docs/draft-design.md).
+
+# The two shipped agents P17 re-bootstraps. PROD_LABELS also carries the
+# v0.9 legacy label, which is P15's sandbox business — resurrecting it
+# on the real estate would undo the very migration P15 proves.
+_P17_AGENTS = PROD_LABELS[:2]
+
+# Poll budgets, module-level so a test can shrink them (the S2 rule).
+_P17_TICK_DEADLINE_S = 90.0   # the plan's own number: observed to tick
+_P17_TICK_POLL_S = 5.0
+
+# P09's lead time: long enough to close the lid with margin, short
+# enough that the operator is still at the machine when it fires.
+_P09_LEAD_MIN = 10
+
+
+def _prod_identity_where(ctx: Context, cond, need: str) -> tuple[str, str]:
+    """The first identity in the REAL identities file satisfying `cond`,
+    as (name, from_addr) — a read, not an effect, and the tree never
+    holds a secret value (P02's claim). The prod lane tests the
+    operator's actual capabilities, so an estate without the shape a
+    phase needs is a finding with a name, never a silent skip."""
+    path = ctx.sentinel.root / "identities.toml"
+    if not path.is_file():
+        raise PhaseFailure(
+            f"no identities.toml under {ctx.sentinel.root} — {need}")
+    data = tomllib.loads(path.read_text(encoding="utf-8"))
+    for name, table in data.items():
+        if not isinstance(table, dict):
+            continue  # top-level scalars: `default`
+        addr = str(table.get("from_addr", "")).strip()
+        if addr and cond(table):
+            return name, addr
+    raise PhaseFailure(f"no identity in {path} {need}")
+
+
+# What the tenant holds for one spool entry, read through the shipped
+# seam — the same verbs the dispatcher's reconcile pass trusts. "held"
+# is the deferred-draft proof: /send was accepted yet the message is
+# still a draft, which only PidTagDeferredSendTime can arrange.
+_GRAPH_STATUS_PROBE = '''\
+"""P08 probe: tenant-side status of a deferred draft (shipped seam)."""
+import json
+import sys
+
+from email_mcp import graph, identities
+
+ident = identities.get(sys.argv[1])
+print(json.dumps({"status": graph.draft_status(ident, sys.argv[2],
+                                               sys.argv[3])}))
+'''
+
+
+@implements("P08")
+def _p08_schedule_graph(ctx: Context) -> None:
+    stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+    started = _now()
+    probe = ctx.write(ctx.sandbox_home / "rc-p08-status.py",
+                      _GRAPH_STATUS_PROBE)
+    if ctx.dry_run:
+        _mcp_session(ctx, "p08-schedule", [
+            ("schedule_email", {"to": "<the graph identity's own address>",
+                                "subject": f"rc-p08 {stamp}",
+                                "body": "RC P08 deferred self-send.",
+                                "send_at": "<now + 1h>",
+                                "from_identity": "<graph-identity>"})])
+        ctx.sh([_venv_bin(ctx, "python"), probe, "<graph-identity>",
+                "<draft-id>", "<message-id>"])
+        _mcp_session(ctx, "p08-cancel",
+                     [("cancel_scheduled", {"id": "<spool-id>"})])
+        return
+    name, addr = _prod_identity_where(
+        ctx, lambda t: t.get("executor") == "graph",
+        'with executor = "graph" — the Graph schedule lane needs one')
+    send_at = (datetime.now(timezone.utc)
+               + timedelta(hours=1)).isoformat(timespec="seconds")
+    env = _mcp_session(ctx, "p08-schedule", [
+        ("schedule_email", {"to": addr, "subject": f"rc-p08 {stamp}",
+                            "body": "RC P08 deferred self-send.",
+                            "send_at": send_at, "from_identity": name})])[0]
+    ctx.require(env["ok"] is True, f"schedule_email failed: "
+                                   f"{env.get('code')} {env.get('error')}")
+    sid, mid = env["id"], env["message_id"]
+    if env.get("executor") != "graph":
+        # The silent graph→launchd fallback is a kept promise for a user
+        # and a failed phase for the RC: the lane under test never ran.
+        # Disarm first — a failed phase must not leave a real send
+        # pending on a one-hour fuse.
+        _mcp_session(ctx, "p08-cancel",
+                     [("cancel_scheduled", {"id": sid})])
+        raise PhaseFailure(
+            f"entry {sid} fell back to executor {env.get('executor')!r} — "
+            "Exchange never took the schedule (check `python -m "
+            "email_mcp.graph --status`)")
+    draft_id = env.get("graph_draft_id")
+    ctx.require(bool(draft_id),
+                f"entry {sid} took the graph executor but carries no "
+                "graph_draft_id — nothing to verify against the tenant")
+    # The cancel is issued before the tenant evidence is judged: a probe
+    # failure must not leave an armed deferred draft behind.
+    held = ctx.sh([_venv_bin(ctx, "python"), probe, name, draft_id, mid],
+                  timeout=120)
+    cancel = _mcp_session(ctx, "p08-cancel",
+                          [("cancel_scheduled", {"id": sid})])[0]
+    ctx.require(held.ok, f"tenant status probe exited {held.rc}: "
+                         f"{(held.err or held.out).strip()[:200]}")
+    held_status = json.loads(held.out)["status"]
+    ctx.require(held_status == "held",
+                f"the tenant does not hold {draft_id} as a deferred draft "
+                f"(draft_status {held_status!r}) — PidTagDeferredSendTime "
+                "never armed")
+    ctx.require(cancel["ok"] is True and cancel.get("status") == "cancelled",
+                f"cancel_scheduled answered {cancel.get('code') or cancel}")
+    gone = ctx.sh([_venv_bin(ctx, "python"), probe, name, draft_id, mid],
+                  timeout=120, check=True)
+    gone_status = json.loads(gone.out)["status"]
+    ctx.require(gone_status == "cancelled_externally",
+                f"after the cancel the tenant reports {gone_status!r} — "
+                "the deferred draft was not removed cleanly")
+    _record_mints(ctx, [
+        _mint(started, PROD, "schedule", "scheduled", op=sid,
+              message_id=mid),
+        _mint(started, PROD, "cancel", "cancelled", op=sid),
+    ])
+    ctx.note(f"{sid}: Exchange held deferred draft {draft_id} "
+             f"(send_at {send_at}); cancelled — envelope cancelled, "
+             "tenant confirms the draft gone, nothing sent")
+
+
+@implements("P09")
+def _p09_lid_closed(ctx: Context) -> tuple[str, str]:
+    spec = PLAN_BY_ID["P09"]
+    started = _now()
+    if ctx.dry_run:
+        _mcp_session(ctx, "p09-schedule", [
+            ("schedule_email", {"to": "<the graph identity's own address>",
+                                "subject": "rc-p09 lid-closed <stamp>",
+                                "body": "RC P09 lid-closed delivery.",
+                                "send_at": f"<now + {_P09_LEAD_MIN}m>",
+                                "from_identity": "<graph-identity>"})])
+        return ctx.manual(spec)
+    if ctx.answer is None:
+        # Arming a real deferred send with nobody at the lid would burn
+        # the evidence window on every unattended pass — stage nothing;
+        # the bare protocol records PENDING with the re-run instruction.
+        return ctx.manual(spec)
+    name, addr = _prod_identity_where(
+        ctx, lambda t: t.get("executor") == "graph",
+        'with executor = "graph" — lid-closed delivery is the Graph '
+        "executor's claim")
+    stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+    send_at = datetime.now(timezone.utc) + timedelta(minutes=_P09_LEAD_MIN)
+    subject = f"rc-p09 lid-closed {stamp}"
+    env = _mcp_session(ctx, "p09-schedule", [
+        ("schedule_email", {"to": addr, "subject": subject,
+                            "body": "RC P09 lid-closed delivery.",
+                            "send_at": send_at.isoformat(timespec="seconds"),
+                            "from_identity": name})])[0]
+    ctx.require(env["ok"] is True, f"schedule_email failed: "
+                                   f"{env.get('code')} {env.get('error')}")
+    ctx.require(env.get("executor") == "graph",
+                f"entry {env.get('id')} fell back to "
+                f"{env.get('executor')!r} — a launchd entry cannot deliver "
+                "with the lid closed; fix the graph lane and re-run")
+    sid, mid = env["id"], env["message_id"]
+    _record_mints(ctx, [
+        _mint(started, PROD, "schedule", "scheduled", op=sid,
+              message_id=mid)])
+    hhmm = send_at.strftime("%H:%M:%S")
+    steps = (
+        f"Entry {sid} is armed at Exchange: subject {subject!r}, send_at "
+        f"{hhmm} UTC, self-only to {addr}.\n"
+        f"1. CLOSE THE LID NOW and note the time; keep it closed until "
+        f"after {hhmm} UTC.\n"
+        "2. Reopen, let Mail sync, and find the delivered copy (subject "
+        f"above). Compare its Date header to {hhmm} UTC — Exchange fires "
+        "the deferred time to the second (calibration 2026-07-29); the "
+        "spool entry reconciles to sent/ after the dispatcher's 10-minute "
+        "grace.\n"
+        "3. Answer `pass: delivered <Date>, lid down <time>` — the two "
+        "timestamps ARE the evidence. If it never arrives, answer "
+        f"`fail: …` (the entry stays visible in list_scheduled as {sid}).")
+    return ctx.manual(replace(spec, acceptance=steps))
+
+
+@implements("P14")
+def _p14_permission_revoke(ctx: Context) -> tuple[str, str]:
+    spec = PLAN_BY_ID["P14"]
+    email_mcp = _venv_bin(ctx, "email-mcp")
+    if ctx.dry_run:
+        ctx.sh([email_mcp, "doctor"])    # baseline: green before the revoke
+        ctx.sh([email_mcp, "doctor"])    # revoked: red, naming the pane
+        ctx.sh([email_mcp, "--doctor"])  # the JSON behind the fix check
+        ctx.sh([email_mcp, "doctor"])    # regranted: green again
+        return ctx.manual(spec)
+    if ctx.answer is None:
+        return ctx.manual(spec)
+    # Baseline first: if the estate is not green BEFORE the revoke, the
+    # phase would blame Full Disk Access for someone else's failure.
+    before = ctx.sh([email_mcp, "doctor"], timeout=300)
+    ctx.require(before.ok,
+                "prod doctor is not green before the revoke — fix the "
+                "estate (P03) before P14 can isolate the FDA claim: "
+                + (before.err or before.out).strip()[:200])
+    revoke = (
+        "System Settings → Privacy & Security → Full Disk Access: turn "
+        "OFF the entry for the app that runs this server (the terminal "
+        "app, or the venv python if granted directly). Do NOT delete the "
+        "row — you will turn it back on in the next step.\n"
+        "Answer `pass` once revoked; doctor runs next and must name this "
+        "exact pane as the fix.")
+    verdict = ctx.manual(replace(spec, acceptance=revoke))
+    if verdict[0] != PASS:
+        return verdict
+    if verdict[1]:
+        ctx.note(f"operator (revoke): {verdict[1]}")
+    revoked = ctx.sh([email_mcp, "doctor"], timeout=300)
+    revoked_json = ctx.sh([email_mcp, "--doctor"], timeout=300)
+    ctx.require(not revoked.ok,
+                "doctor stayed green with Full Disk Access revoked — the "
+                "revoke did not bite this binary; toggle the entry that "
+                "actually grants it and re-run")
+    ctx.require("Traceback" not in revoked.out + revoked.err,
+                "doctor crashed instead of reporting the revocation")
+    report = json.loads(revoked_json.out)
+    red = {name: c
+           for name, c in {**report["checks"], "audit": report["audit"]}
+           .items() if not c["ok"]}
+    unfixed = sorted(name for name, c in red.items() if not c.get("fix"))
+    ctx.require(not unfixed, "revoked-side failure(s) name no fix: "
+                             + ", ".join(unfixed))
+    ctx.require(any("Full Disk Access" in str(c.get("fix"))
+                    for c in red.values()),
+                "no revoked-side failure names the Full Disk Access pane "
+                f"— doctor blamed something else: {sorted(red)}")
+    for name, c in sorted(red.items()):
+        ctx.note(f"revoked {name}: {c['detail']} — fix: {c['fix']}")
+    regrant = (
+        "Turn the same Full Disk Access entry back ON (restart the app "
+        "if Settings asks), then answer `pass`. Doctor runs once more "
+        "and every check must be green again.")
+    verdict = ctx.manual(replace(spec, acceptance=regrant))
+    if verdict[0] != PASS:
+        return verdict
+    if verdict[1]:
+        ctx.note(f"operator (regrant): {verdict[1]}")
+    after = ctx.sh([email_mcp, "doctor"], timeout=300)
+    fails = "; ".join(line for line in after.out.splitlines()
+                      if line.startswith("FAIL"))
+    ctx.require(after.ok, "doctor is not green after the regrant: "
+                          + (fails or (after.err or after.out)
+                             .strip()[:200]))
+    ctx.note("doctor: green → revoked names the FDA pane → green again")
+    return PASS, ""
+
+
+@implements("P17")
+def _p17_teardown(ctx: Context) -> None:
+    uid = os.getuid()
+    agents = ctx.real_home / "Library" / "LaunchAgents"
+    dispatcher = _P17_AGENTS[0]
+    if ctx.dry_run:
+        for label in _P17_AGENTS:
+            ctx.sh(["launchctl", "bootout", f"gui/{uid}/{label}"])
+            ctx.sh(["launchctl", "bootstrap", f"gui/{uid}",
+                    agents / f"{label}.plist"])
+        ctx.sh(["launchctl", "print", f"gui/{uid}/{dispatcher}"])
+        return
+    for label in _P17_AGENTS:
+        plist = agents / f"{label}.plist"
+        if not plist.exists():
+            # The FTS agent is a setup OPTION; the dispatcher is the
+            # phase's whole claim.
+            ctx.require(label != dispatcher,
+                        f"{plist} is not installed — there is no prod "
+                        "dispatcher to re-bootstrap; run `email-mcp "
+                        "update` first")
+            ctx.note(f"{label}: not installed on this estate — skipped")
+            continue
+        # Re-bootstrap = bootout + bootstrap of the EXISTING plist —
+        # deliberately NOT --install-launchd through the sandbox wheel,
+        # which would re-render the plist around the RC's venv python
+        # and leave an agent pointing into a sandbox that gets purged.
+        ctx.sh(["launchctl", "bootout", f"gui/{uid}/{label}"])
+        ctx.sh(["launchctl", "bootstrap", f"gui/{uid}", plist], check=True)
+        ctx.note(f"{label}: re-bootstrapped from {plist}")
+
+    def ticked():
+        ran = ctx.sh(["launchctl", "print", f"gui/{uid}/{dispatcher}"],
+                     timeout=30)
+        if not ran.ok:
+            return None
+        runs = re.search(r"\bruns = (\d+)", ran.out)
+        clean = re.search(r"last exit code = 0\b", ran.out)
+        if runs and int(runs.group(1)) >= 1 and clean:
+            return f"runs = {runs.group(1)}, last exit code = 0"
+        return None
+
+    # bootout reset launchd's counters, so runs >= 1 with a clean exit
+    # can only mean a tick that happened AFTER the re-bootstrap.
+    hit = _poll(_P17_TICK_DEADLINE_S, _P17_TICK_POLL_S, ticked)
+    ctx.require(hit is not None,
+                "the dispatcher was re-bootstrapped but launchd shows no "
+                f"completed run within {_P17_TICK_DEADLINE_S:.0f}s")
+    ctx.note(f"dispatcher ticked after re-bootstrap ({hit}) — the run is "
+             "over because the real dispatcher ran again, not because "
+             "the runner said so")
+
+
+# Tenant-side readback for a filed draft, through the shipped seams:
+# graph.draft_receipt for the three acceptance legs, plus the stored
+# MIME ($value) for the transfer encoding — OWA's editor mangles
+# quoted-printable soft breaks when loading a MIME-created draft
+# (measured 2026-08-02, draft-design.md round 1), so the parts must be
+# base64 AT REST, not merely in what the composer handed over.
+_DRAFT_READBACK_PROBE = '''\
+"""P19 probe: what the tenant stores for one filed draft."""
+import email
+import json
+import sys
+import urllib.parse
+
+from email_mcp import graph, identities
+
+ident = identities.get(sys.argv[1])
+draft_id = sys.argv[2]
+out = graph.draft_receipt(ident, draft_id)
+status, body = graph._graph(
+    "GET", "/me/messages/" + urllib.parse.quote(draft_id) + "/$value", ident)
+if status != 200:
+    raise SystemExit(f"$value readback failed: HTTP {status}")
+msg = email.message_from_string(body.get("raw", ""))
+out["text_parts"] = sorted(
+    (part.get_content_type(),
+     (part.get("Content-Transfer-Encoding") or "").strip().lower())
+    for part in msg.walk()
+    if part.get_content_type() in ("text/plain", "text/html"))
+print(json.dumps(out))
+'''
+
+
+@implements("P19")
+def _p19_drafts(ctx: Context) -> tuple[str, str]:
+    spec = PLAN_BY_ID["P19"]
+    stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+    probe = ctx.write(ctx.sandbox_home / "rc-p19-readback.py",
+                      _DRAFT_READBACK_PROBE)
+    body_text = ("RC P19 draft — edit me, then send me by hand.\n\n"
+                 "Second paragraph, so the editor round-trip has real "
+                 "soft-break material to preserve.")
+    if ctx.dry_run:
+        _mcp_session(ctx, "p19-draft", [
+            ("create_draft", {"to": "<the drafts identity's own address>",
+                              "subject": f"rc-p19 draft {stamp}",
+                              "body": body_text,
+                              "from_identity": "<drafts-identity>"}),
+            ("create_draft", {"to": "<the drafts identity's own address>",
+                              "subject": f"rc-p19 refused {stamp}",
+                              "body": "This must never be filed.",
+                              "from_identity": "<lane-less identity>"})])
+        ctx.sh([_venv_bin(ctx, "python"), probe, "<drafts-identity>",
+                "<draft-id>"])
+        return ctx.manual(spec)
+    name, addr = _prod_identity_where(
+        ctx, lambda t: t.get("drafts") == "graph",
+        'with drafts = "graph" — the drafts lane needs one')
+    bare, _bare_addr = _prod_identity_where(
+        ctx, lambda t: t.get("drafts", "none") != "graph",
+        "WITHOUT a drafts lane — the refusal half needs one")
+    subject = f"rc-p19 draft {stamp}"
+    created, refused = _mcp_session(ctx, "p19-draft", [
+        ("create_draft", {"to": addr, "subject": subject,
+                          "body": body_text, "from_identity": name}),
+        ("create_draft", {"to": addr, "subject": f"rc-p19 refused {stamp}",
+                          "body": "This must never be filed.",
+                          "from_identity": bare}),
+    ])
+    ctx.require(created["ok"] is True,
+                f"create_draft failed: {created.get('code')} "
+                f"{created.get('error')}")
+    draft_id, mid = created["draft_id"], created["message_id"]
+    ctx.require(refused["ok"] is False
+                and refused.get("code") == "draft_unsupported",
+                f"identity [{bare}] declares no drafts lane yet "
+                f"create_draft answered {refused.get('code') or 'ok=true'} "
+                "— the refusal must be draft_unsupported, never a "
+                "fallback that files elsewhere")
+    ctx.require("identities.toml" in (refused.get("error") or ""),
+                "the draft_unsupported refusal names no fix")
+    # Independent readback — evidence, never the tool's own report: the
+    # three legs again, plus what a client's editor will actually load.
+    ran = ctx.sh([_venv_bin(ctx, "python"), probe, name, draft_id],
+                 timeout=120, check=True)
+    got = json.loads(ran.out)
+    legs = (got["is_draft"] is True
+            and got["internet_message_id"] == mid
+            and got["in_drafts_folder"] is True)
+    ctx.require(legs, f"three-legged readback failed for {draft_id}: "
+                      f"is_draft={got['is_draft']}, message_id_match="
+                      f"{got['internet_message_id'] == mid}, "
+                      f"in_drafts_folder={got['in_drafts_folder']}")
+    ctx.require(bool(got["text_parts"])
+                and all(cte == "base64"
+                        for _ctype, cte in got["text_parts"]),
+                f"the stored draft is not base64: {got['text_parts']} — "
+                "OWA's editor mangles quoted-printable (measured "
+                "2026-08-02)")
+    ctx.note(f"draft {draft_id} filed into {addr}'s Drafts by [{name}]: "
+             f"isDraft, our Message-ID ({mid}), the drafts folder, "
+             f"base64 text parts; [{bare}] refused draft_unsupported "
+             "with the fix, filing nothing")
+    steps = (
+        f"A draft is filed: subject {subject!r}, in {addr}'s Drafts.\n"
+        "1. Open it in OWA or the phone's Outlook — the CLIENT's editor "
+        "is the thing under test, so do not read it through this tool.\n"
+        "2. Check every word survived: no 'se=t' / '=aragraph' "
+        "artifacts, paragraph break intact (round 1 caught the QP bug "
+        "exactly here).\n"
+        "3. Edit the body (add a line), then send it by hand — to "
+        "yourself.\n"
+        "4. Confirm the received copy renders clean.\n"
+        "Answer `pass: <what you saw>` / `fail: <what broke>`.")
+    return ctx.manual(replace(spec, acceptance=steps))
 
 
 # --------------------------------------------------------------------- #

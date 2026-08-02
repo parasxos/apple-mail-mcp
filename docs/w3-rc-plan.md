@@ -9,7 +9,7 @@ is the thing to read before an RC pass and the thing to update when a
 phase's meaning changes — the runner's `PLAN` table mirrors it and the
 suite asserts the two agree.*
 
-Sections: 1 the two lanes · 2 the Sentinel · 3 the phases P01–P18 ·
+Sections: 1 the two lanes · 2 the Sentinel · 3 the phases P01–P19 ·
 4 running it · 5 what "passed" means.
 
 ---
@@ -59,7 +59,8 @@ After the pass it takes both again and says exactly what changed. It
 distinguishes the churn a run legitimately produces — the ledger gains
 an event per mutation, the spool moves manifests between states, the
 index rebuilds, plans are written and GC'd, a Graph send rotates its
-token cache — from anything that touched `identities.toml`, `meta.json`,
+token cache, the dispatcher appends to its own log when the pass hands
+it work — from anything that touched `identities.toml`, `meta.json`,
 an unknown new file, or the agents. A *removed* token cache is always
 material, even though rewriting one is routine.
 
@@ -104,6 +105,7 @@ PENDING rather than inventing a verdict).
 | **P16** | uninstall + purge | sandbox | auto (strict) | `email-mcp uninstall` removes the sandbox agents and token caches and purges its tree; the Sentinel then proves, in strict mode, that the real estate is byte-identical and the prod agents untouched. |
 | **P17** | teardown | prod | auto | The prod agents are re-bootstrapped and the dispatcher is **observed to tick within 90 s** — the run is not over because the runner said so, it is over because the real dispatcher ran again. |
 | **P18** | fresh macOS user account walk | prod | **MANUAL, once** | A brand-new macOS account reaches a working read-only server in under 15 minutes with no archaeology — the roadmap's lifecycle claim, tested by the only honest method. Recorded once; later passes skip it. |
+| **P19** | drafts | prod | **MANUAL** | `create_draft` files a draft into the identity's own Drafts via the Graph lane — verified by the three-legged readback (isDraft / our internetMessageId / the drafts folder) re-read through the shipped seams, and the stored parts are base64 (OWA's editor mangles quoted-printable — measured 2026-08-02); an identity WITHOUT a declared drafts lane refuses `draft_unsupported` and files nothing. The human half: open the draft in OWA/the phone, edit, hand-send, confirm rendering — how round 1 caught the QP bug. |
 
 ### The failure matrix (P13)
 
@@ -168,8 +170,8 @@ RC has passed when:
    lanes, with the Sentinel clean at the end;
 2. that pass has been repeated — `--soak-report` shows the repetitions,
    and a phase that is green only sometimes is not green;
-3. the three MANUAL steps have a recorded operator verdict with
-   evidence, P18 at least once ever;
+3. the four MANUAL steps (P09, P14, P18, P19) have a recorded operator
+   verdict with evidence, P18 at least once ever;
 4. the report for the passing run is committed. The artifact carries the
    proof — that is the whole point of v1.0.
 
@@ -178,7 +180,7 @@ RC has passed when:
 `tools/rc_runner.py` ships **R1**: the runner core — Context, Report,
 Sentinel, the phase registry, resume / `--phase` / `--dry-run` plumbing
 and the manual-step protocol, covered by `tests/test_rc_runner.py`. The
-18 phase bodies are R2; they attach with `@implements("P07")` and until
+phase bodies are R2; they attach with `@implements("P07")` and until
 they do, a phase reports `unimplemented` rather than passing silently —
 a live pass stops at the first hole in the life story.
 
@@ -232,3 +234,33 @@ read*:
   Message-IDs ride the send events. Estate events (`lifecycle`,
   `doctor_fix`) belong to the lifecycle story, not the mail-mutation
   families, and are outside the count.
+
+**S3** (2026-08-02) binds the prod lane P08, P09, P14, P17 — and adds
+**P19 "drafts"**, a phase this plan predates: tool #21 (`create_draft`,
+shipped 2026-08-02) files our composer's MIME into the identity's own
+Drafts via the Graph lane and never sends (`docs/draft-design.md`). Its
+automated half proves the filing — the three-legged readback (isDraft /
+our internetMessageId / the drafts folder) re-read through the shipped
+seams, plus the stored parts base64, because OWA's editor mangles
+quoted-printable when loading a MIME-created draft (measured
+2026-08-02) — and the refusal: an identity without a declared drafts
+lane answers `draft_unsupported` with a fix and files nothing. Its
+manual half is the round-1 protocol that caught the QP bug: open the
+draft in OWA/the phone, edit, hand-send, confirm rendering. Three
+mechanics rode along:
+
+- **Manual phases can now bind bodies.** P09 and P14 need real setup —
+  a deferred send armed, doctor run on both sides of the revoke —
+  before a human can act, so a bound manual body stages its effects
+  through ctx and ends at its own `ctx.manual` gate, with the EXACT
+  steps in the prompt, returning that gate's verdict. Unattended, P09
+  arms nothing and the step stays PENDING; a verdict is never invented.
+- **P17 re-bootstraps the EXISTING prod plists** (bootout + bootstrap),
+  deliberately not `--install-launchd` through the sandbox wheel, which
+  would re-render the plist around the RC's own venv python. The tick
+  is observed through `launchctl print` — a completed run with exit 0
+  after the counters reset — inside the 90 s budget.
+- **`dispatcher.log` joined the expected-churn globs**: the log lives
+  inside the state root and the prod dispatcher legitimately appends to
+  it when a pass hands it work (P08/P09 schedule against the real
+  spool). A REMOVED log stays material.

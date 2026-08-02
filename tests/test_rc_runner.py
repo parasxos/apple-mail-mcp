@@ -579,18 +579,20 @@ def test_soak_report_aggregates_every_journal(tmp_path):
     assert "| P13 | failure matrix FM1-FM10 | 1 | 1 |" in text
 
 
-def test_the_shipped_plan_is_the_eighteen_phases_of_the_w3_document():
-    assert [s.id for s in runner.PLAN] == [f"P{n:02d}" for n in range(1, 19)]
-    assert [s.id for s in runner.PLAN if s.manual] == ["P09", "P14", "P18"]
+def test_the_shipped_plan_is_the_nineteen_phases_of_the_w3_document():
+    assert [s.id for s in runner.PLAN] == [f"P{n:02d}" for n in range(1, 20)]
+    assert [s.id for s in runner.PLAN if s.manual] == ["P09", "P14", "P18",
+                                                       "P19"]
     assert [s.id for s in runner.PLAN if s.once] == ["P18"]
     assert [s.id for s in runner.PLAN if s.sentinel_strict] == ["P16"]
     assert all(s.lane in (runner.SANDBOX, runner.PROD, runner.BOTH)
                for s in runner.PLAN)
     assert all(s.acceptance for s in runner.PLAN)
     # R2 attaches bodies stage by stage; S1 bound the sandbox core, S2
-    # the mutation story.
+    # the mutation story, S3 the prod lane plus the added P19 drafts.
     assert set(runner.IMPLEMENTATIONS) == {"P01", "P02", "P03", "P04", "P05",
-                                           "P06", "P07", "P10", "P11", "P12"}
+                                           "P06", "P07", "P08", "P09", "P10",
+                                           "P11", "P12", "P14", "P17", "P19"}
 
 
 def test_the_runner_and_the_plan_document_agree():
@@ -600,7 +602,7 @@ def test_the_runner_and_the_plan_document_agree():
     doc = _RUNNER_PATH.parent.parent / "docs" / "w3-rc-plan.md"
     rows = re.findall(r"^\| \*\*(P\d\d)\*\* \| ([^|]+) \| ([^|]+) \| ([^|]+) \|",
                       doc.read_text(encoding="utf-8"), flags=re.M)
-    assert len(rows) == 18, "the phase table must list every phase once"
+    assert len(rows) == 19, "the phase table must list every phase once"
     for (pid, title, lane, mode), spec in zip(rows, runner.PLAN):
         assert pid == spec.id
         assert title.strip() == spec.title, f"{pid} title drifted"
@@ -1636,3 +1638,577 @@ def test_p12_refuses_to_pass_with_nothing_recorded(tmp_path, estate,
     assert result.status == runner.FAIL
     assert any("no mutation expectations recorded" in d
                for d in result.detail)
+
+
+# --------------------------------------------------------------------- #
+# 7. the S3 bodies — P08/P09/P14/P17/P19, the prod lane                   #
+# --------------------------------------------------------------------- #
+#
+# Same discipline again: the dry run proves each body's complete command
+# plan, the live paths run against a scripted _spawn, and the estate the
+# bodies read (the REAL identities file, the REAL LaunchAgents dir) is
+# the tmp_path stand-in — $HOME is redirected for every test here.
+
+def _graph_identities(estate, *, drafts=True, bare=True):
+    """The prod identities file the S3 bodies read: a CERN identity on
+    the graph executor (optionally with the drafts lane) plus a plain
+    gmail identity with no lane — the refusal half's subject."""
+    text = ('default = "cern"\n\n[cern]\n'
+            'from_addr = "operator@cern.ch"\n'
+            'driver = "ssh_sendmail"\nexecutor = "graph"\n')
+    if drafts:
+        text += 'drafts = "graph"\n'
+    if bare:
+        text += ('\n[gmail]\nfrom_addr = "operator@gmail.com"\n'
+                 'driver = "smtp"\n')
+    (estate / "identities.toml").write_text(text)
+
+
+def test_s3_dry_run_plans_the_whole_prod_story(tmp_path, estate):
+    """A bare P08,P09,P14,P17,P19 selection must print every planned
+    effect and spawn nothing (the autouse fence would raise): the tool
+    sessions, the two tenant probes, doctor on both sides of the revoke,
+    and the launchd re-bootstrap — with every manual phase PENDING, not
+    invented."""
+    sink = io.StringIO()
+    code = runner.main(
+        ["--state-dir", str(tmp_path / "rcstate"),
+         "--phase", "P08,P09,P14,P17,P19"],
+        sentinel=runner.Sentinel(estate, probe=_agents()), sink=sink)
+    text = sink.getvalue()
+
+    assert code == runner.EXIT_OK
+    for phase, title in (("P08", "schedule via graph"),
+                         ("P09", "lid-closed delivery"),
+                         ("P14", "permission revoke / regrant"),
+                         ("P17", "teardown"), ("P19", "drafts")):
+        assert f"{phase} · {title}" in text
+    for intent in ("p08-schedule: tools/call schedule_email",
+                   "rc-p08-status.py",
+                   "p08-cancel: tools/call cancel_scheduled",
+                   "p09-schedule: tools/call schedule_email",
+                   "bin/email-mcp doctor", "bin/email-mcp --doctor",
+                   "launchctl bootout gui/", "launchctl bootstrap gui/",
+                   "launchctl print gui/",
+                   "p19-draft: tools/call create_draft, create_draft",
+                   "rc-p19-readback.py"):
+        assert intent in text, f"the dry run never planned: {intent}"
+    assert text.count("MANUAL — PENDING") == 3, \
+        "P09, P14 and P19 must stay PENDING on a dry run"
+    assert "(0 phase(s) with no body yet)" in text, \
+        "every S3 phase must be bound"
+
+
+def test_a_bound_manual_body_stages_and_returns_the_gates_verdict(
+        tmp_path, estate):
+    """The S3 seam: a manual phase with a body runs the body, which ends
+    at its own ctx.manual gate — so an unattended pass still ends
+    PENDING, never an invented PASS from the body having merely run."""
+    spec = runner.PhaseSpec("P09", "lid-closed", runner.PROD, "delivers",
+                            manual=True)
+    staged = []
+
+    def body(ctx):
+        staged.append(True)
+        ctx.note("armed the send")
+        return ctx.manual(spec)
+
+    ctx = make_ctx(tmp_path, estate, dry_run=False, answer=None)
+    result = runner.execute(spec, ctx, {"P09": body})
+    assert staged == [True], "the bound body must run"
+    assert result.status == runner.PENDING
+
+    ctx = make_ctx(tmp_path, estate, dry_run=False,
+                   answer=lambda p: "pass: lid shut, delivered on time")
+    result = runner.execute(spec, ctx, {"P09": body})
+    assert result.status == runner.PASS
+    assert any("lid shut" in d for d in result.detail)
+
+
+# -- P08 ---------------------------------------------------------------- #
+
+
+def _p08_respond(ctx, *, executor="graph", draft_id="AAMkAD-1"):
+    def respond(tool, args, call):
+        if tool == "schedule_email":
+            assert call["env"].get("HOME") == os.environ["HOME"], \
+                "the prod schedule must run under the real HOME"
+            return {"ok": True, "id": "sched-p08", "send_at": args["send_at"],
+                    "message_id": "<rc-p08@rc>", "executor": executor,
+                    "graph_draft_id": draft_id if executor == "graph"
+                    else None, "subject": args["subject"]}
+        if tool == "cancel_scheduled":
+            return {"ok": True, "id": args["id"], "status": "cancelled",
+                    "subject": "rc-p08", "was_due": args.get("send_at", "t")}
+        raise AssertionError(f"unscripted tool: {tool}")
+
+    return respond
+
+
+def _p08_probe_route(statuses):
+    """The tenant-status probe answers a scripted sequence: what Exchange
+    holds before the cancel, then after it."""
+    feed = iter(statuses)
+    return (lambda a: len(a) > 1 and a[1].endswith("rc-p08-status.py"),
+            lambda c: _Proc(0, json.dumps({"status": next(feed)})))
+
+
+def test_p08_arms_a_deferred_draft_and_cancels_it_cleanly(
+        tmp_path, estate, monkeypatch):
+    _graph_identities(estate)
+    ctx = make_ctx(tmp_path, estate, dry_run=False)
+    spawn = ScriptedSpawn(_session_route(_p08_respond(ctx)),
+                          _p08_probe_route(["held", "cancelled_externally"]))
+    monkeypatch.setattr(runner, "_spawn", spawn)
+    result = run_phase("P08", ctx)
+    assert result.status == runner.PASS, result.detail
+
+    # Self-only by construction: the recipient and the identity both come
+    # from the real identities file, never from the phase.
+    sched = json.loads(
+        (ctx.sandbox_home / "rc-p08-schedule.calls.json").read_text())
+    assert sched[0]["arguments"]["to"] == "operator@cern.ch"
+    assert sched[0]["arguments"]["from_identity"] == "cern"
+
+    # The probe reads the TENANT through the shipped seam, twice: held
+    # before the cancel, gone-unsent after it.
+    probes = [c["argv"] for c in spawn.calls
+              if len(c["argv"]) > 1 and c["argv"][1].endswith("rc-p08-status.py")]
+    assert len(probes) == 2
+    assert all(p[-3:] == ["cern", "AAMkAD-1", "<rc-p08@rc>"] for p in probes)
+    assert "draft_status" in (ctx.sandbox_home / "rc-p08-status.py").read_text()
+    assert [(m["lane"], m["event"], m["op"]) for m in _mints(ctx)] == [
+        ("prod", "schedule", "sched-p08"), ("prod", "cancel", "sched-p08")]
+
+
+def test_p08_fails_and_disarms_when_the_schedule_falls_back_to_launchd(
+        tmp_path, estate, monkeypatch):
+    """The silent graph→launchd fallback is a kept promise for a user and
+    a failed phase for the RC — and the failed phase must not leave a
+    real send pending on a one-hour fuse."""
+    _graph_identities(estate)
+    ctx = make_ctx(tmp_path, estate, dry_run=False)
+    monkeypatch.setattr(runner, "_spawn", ScriptedSpawn(
+        _session_route(_p08_respond(ctx, executor="launchd"))))
+    result = run_phase("P08", ctx)
+    assert result.status == runner.FAIL
+    assert any("fell back" in d for d in result.detail), result.detail
+    cancel = json.loads(
+        (ctx.sandbox_home / "rc-p08-cancel.calls.json").read_text())
+    assert cancel[0]["arguments"]["id"] == "sched-p08", \
+        "the fallback entry must be disarmed before the phase fails"
+
+
+@pytest.mark.parametrize("statuses, symptom", [
+    # /send raced past the deferred property: the tenant is not holding
+    (["sent", "sent"], "does not hold"),
+    # the cancel envelope said cancelled but Exchange still holds it
+    (["held", "held"], "not removed cleanly"),
+])
+def test_p08_fails_when_the_tenant_disagrees_with_the_envelopes(
+        tmp_path, estate, monkeypatch, statuses, symptom):
+    _graph_identities(estate)
+    ctx = make_ctx(tmp_path, estate, dry_run=False)
+    monkeypatch.setattr(runner, "_spawn", ScriptedSpawn(
+        _session_route(_p08_respond(ctx)), _p08_probe_route(statuses)))
+    result = run_phase("P08", ctx)
+    assert result.status == runner.FAIL
+    assert any(symptom in d for d in result.detail), result.detail
+    # Judged AFTER the cancel: even the failing paths leave nothing armed.
+    assert (ctx.sandbox_home / "rc-p08-cancel.calls.json").exists()
+
+
+def test_p08_fails_when_the_estate_has_no_graph_identity(
+        tmp_path, estate, monkeypatch):
+    (estate / "identities.toml").write_text(
+        'default = "main"\n\n[main]\nfrom_addr = "op@example.org"\n'
+        'driver = "pipe"\n')
+    ctx = make_ctx(tmp_path, estate, dry_run=False)
+    result = run_phase("P08", ctx)
+    assert result.status == runner.FAIL
+    assert any("Graph schedule lane needs one" in d for d in result.detail)
+
+
+# -- P09 ---------------------------------------------------------------- #
+
+
+def _p09_respond(ctx, *, executor="graph"):
+    def respond(tool, args, call):
+        assert tool == "schedule_email"
+        return {"ok": True, "id": "sched-p09", "send_at": args["send_at"],
+                "message_id": "<rc-p09@rc>", "executor": executor,
+                "graph_draft_id": "AAMkAD-9", "subject": args["subject"]}
+
+    return respond
+
+
+def test_p09_unattended_arms_nothing_and_stays_pending(tmp_path, estate):
+    """Scheduling a real deferred send with nobody at the lid would burn
+    the evidence window on every unattended pass — the body must record
+    PENDING without spawning anything (the autouse fence would raise)."""
+    _graph_identities(estate)
+    ctx = make_ctx(tmp_path, estate, dry_run=False, answer=None)
+    result = run_phase("P09", ctx)
+    assert result.status == runner.PENDING
+    assert _mints(ctx) == [], "nothing may be armed without an operator"
+
+
+def test_p09_attended_arms_the_send_and_the_prompt_carries_the_steps(
+        tmp_path, estate, monkeypatch):
+    _graph_identities(estate)
+    prompts = []
+
+    def answer(prompt):
+        prompts.append(prompt)
+        return "pass: delivered 03:12:00Z, lid down 03:02"
+
+    ctx = make_ctx(tmp_path, estate, dry_run=False, answer=answer)
+    monkeypatch.setattr(runner, "_spawn", ScriptedSpawn(
+        _session_route(_p09_respond(ctx))))
+    result = run_phase("P09", ctx)
+    assert result.status == runner.PASS, result.detail
+    assert any("delivered 03:12:00Z" in d for d in result.detail)
+
+    sched = json.loads(
+        (ctx.sandbox_home / "rc-p09-schedule.calls.json").read_text())
+    assert sched[0]["arguments"]["to"] == "operator@cern.ch", "self-only"
+    # The exact steps ride the manual prompt: the entry id, the lid, the
+    # send time the human must compare the Date header against.
+    assert len(prompts) == 1
+    assert "sched-p09" in prompts[0]
+    assert "CLOSE THE LID" in prompts[0]
+    assert "calibration 2026-07-29" in prompts[0]
+    assert [(m["lane"], m["event"], m["op"]) for m in _mints(ctx)] == [
+        ("prod", "schedule", "sched-p09")]
+
+
+def test_p09_fails_before_the_human_when_the_entry_falls_back(
+        tmp_path, estate, monkeypatch):
+    """A launchd entry cannot deliver with the lid closed — asking the
+    human to close it anyway would waste the window on a doomed run."""
+    _graph_identities(estate)
+    prompts = []
+    ctx = make_ctx(tmp_path, estate, dry_run=False,
+                   answer=lambda p: prompts.append(p) or "pass")
+    monkeypatch.setattr(runner, "_spawn", ScriptedSpawn(
+        _session_route(_p09_respond(ctx, executor="launchd"))))
+    result = run_phase("P09", ctx)
+    assert result.status == runner.FAIL
+    assert any("cannot deliver" in d for d in result.detail), result.detail
+    assert prompts == [], "the lid gate must not open for a doomed entry"
+
+
+# -- P14 ---------------------------------------------------------------- #
+
+
+def _p14_spawn(*, baseline_rc=0, revoked_rc=1,
+               revoked_out="FAIL mail_store: cannot read\n",
+               revoked_report=None, regrant_rc=0):
+    """Scripted doctor for the revoke round trip, answered in call order:
+    baseline (green), revoked (red + the JSON behind the fix check),
+    regranted (green again)."""
+    plain = iter([
+        _Proc(baseline_rc, "ok  mail_store: 42 messages\n"
+              if baseline_rc == 0 else "FAIL mail_store: dark\n"),
+        _Proc(revoked_rc, revoked_out),
+        _Proc(regrant_rc, "ok  mail_store: 42 messages\n"
+              if regrant_rc == 0 else "FAIL mail_store: still dark\n"),
+    ])
+    report = revoked_report if revoked_report is not None else {
+        "ok": False, "audit": {"ok": True},
+        "checks": {"mail_store": {
+            "ok": False, "detail": "cannot read the Envelope Index",
+            "fix": "System Settings → Privacy & Security → Full Disk "
+                   "Access, then restart it."}}}
+    return ScriptedSpawn(
+        (lambda a: a[-1] == "doctor", lambda c: next(plain)),
+        (lambda a: a[-1] == "--doctor",
+         lambda c: _Proc(1, json.dumps(report))),
+    )
+
+
+def test_p14_walks_the_revoke_regrant_round_trip(tmp_path, estate,
+                                                 monkeypatch):
+    answers = iter(["pass: toggled off", "pass: toggled back on"])
+    prompts = []
+
+    def answer(prompt):
+        prompts.append(prompt)
+        return next(answers)
+
+    ctx = make_ctx(tmp_path, estate, dry_run=False, answer=answer)
+    spawn = _p14_spawn()
+    monkeypatch.setattr(runner, "_spawn", spawn)
+    result = run_phase("P14", ctx)
+    assert result.status == runner.PASS, result.detail
+
+    # Two gates, each with the pane spelled out; doctor ran three times
+    # (baseline, revoked, regranted) plus the JSON read.
+    assert len(prompts) == 2
+    assert all("Full Disk Access" in p for p in prompts)
+    doctors = [c["argv"][-1] for c in spawn.calls]
+    assert doctors == ["doctor", "doctor", "--doctor", "doctor"]
+    assert any("Full Disk Access" in d for d in result.detail)
+
+
+def test_p14_requires_a_green_baseline_before_blaming_the_revoke(
+        tmp_path, estate, monkeypatch):
+    """A red estate before the revoke would let P14 blame Full Disk
+    Access for someone else's failure."""
+    ctx = make_ctx(tmp_path, estate, dry_run=False, answer=lambda p: "pass")
+    monkeypatch.setattr(runner, "_spawn", _p14_spawn(baseline_rc=1))
+    result = run_phase("P14", ctx)
+    assert result.status == runner.FAIL
+    assert any("before the revoke" in d for d in result.detail)
+
+
+@pytest.mark.parametrize("breakage, symptom", [
+    # doctor stayed green: the human toggled the wrong binary's grant
+    ({"revoked_rc": 0, "revoked_out": "ok\n"}, "did not bite"),
+    # a traceback is a crash, not a report (the acceptance's own words)
+    ({"revoked_out": "Traceback (most recent call last):\n  boom\n"},
+     "crashed instead of reporting"),
+    # the failure reports but names no remedy
+    ({"revoked_report": {"ok": False, "audit": {"ok": True},
+                         "checks": {"mail_store": {
+                             "ok": False, "detail": "cannot read"}}}},
+     "name no fix"),
+    # the regrant did not restore the estate
+    ({"regrant_rc": 1}, "not green after the regrant"),
+])
+def test_p14_fails_on_each_broken_side_of_the_round_trip(
+        tmp_path, estate, monkeypatch, breakage, symptom):
+    ctx = make_ctx(tmp_path, estate, dry_run=False, answer=lambda p: "pass")
+    monkeypatch.setattr(runner, "_spawn", _p14_spawn(**breakage))
+    result = run_phase("P14", ctx)
+    assert result.status == runner.FAIL
+    assert any(symptom in d for d in result.detail), result.detail
+
+
+def test_p14_stops_at_the_gate_when_the_operator_cannot_revoke(
+        tmp_path, estate, monkeypatch):
+    """A refused first gate must end the phase with the operator's word —
+    doctor's revoked side never runs against a still-granted estate."""
+    ctx = make_ctx(tmp_path, estate, dry_run=False,
+                   answer=lambda p: "fail: Settings pane is locked")
+    spawn = _p14_spawn()
+    monkeypatch.setattr(runner, "_spawn", spawn)
+    result = run_phase("P14", ctx)
+    assert result.status == runner.FAIL
+    assert any("Settings pane is locked" in d for d in result.detail)
+    assert [c["argv"][-1] for c in spawn.calls] == ["doctor"], \
+        "only the baseline may run before the revoke gate"
+
+
+# -- P17 ---------------------------------------------------------------- #
+
+
+def _prod_plists(fake_home, *labels):
+    agents = fake_home / "Library" / "LaunchAgents"
+    agents.mkdir(parents=True, exist_ok=True)
+    for label in labels:
+        (agents / f"{label}.plist").write_text(f"<plist>{label}</plist>")
+    return agents
+
+
+def _p17_spawn(*, runs="1", exit_code="0"):
+    return ScriptedSpawn(
+        (lambda a: a[:2] == ["launchctl", "bootout"], lambda c: _Proc(0)),
+        (lambda a: a[:2] == ["launchctl", "bootstrap"], lambda c: _Proc(0)),
+        (lambda a: a[:2] == ["launchctl", "print"],
+         lambda c: _Proc(0, "state = waiting\npath = /a/d.plist\n"
+                            f"\truns = {runs}\n"
+                            f"\tlast exit code = {exit_code}\n")),
+    )
+
+
+def test_p17_rebootstraps_the_existing_plists_and_sees_the_tick(
+        tmp_path, estate, fake_home, monkeypatch):
+    agents = _prod_plists(fake_home, "com.email-mcp.dispatcher",
+                          "com.email-mcp.fts")
+    monkeypatch.setattr(runner, "_P17_TICK_DEADLINE_S", 0.0)
+    ctx = make_ctx(tmp_path, estate, dry_run=False)
+    spawn = _p17_spawn()
+    monkeypatch.setattr(runner, "_spawn", spawn)
+    result = run_phase("P17", ctx)
+    assert result.status == runner.PASS, result.detail
+
+    launchctl = [c["argv"] for c in spawn.calls]
+    assert [a[1] for a in launchctl] == ["bootout", "bootstrap",
+                                         "bootout", "bootstrap", "print"], \
+        "bootout then bootstrap per agent, then the tick watch"
+    # The EXISTING plists, not a re-render: bootstrap names the files on
+    # disk, and the legacy v0.9 label is never touched.
+    boots = [a[-1] for a in launchctl if a[1] == "bootstrap"]
+    assert boots == [str(agents / "com.email-mcp.dispatcher.plist"),
+                     str(agents / "com.email-mcp.fts.plist")]
+    assert not any("com.paris" in " ".join(a) for a in launchctl)
+    assert any("ticked" in d for d in result.detail)
+
+
+def test_p17_fails_when_the_dispatcher_never_completes_a_run(
+        tmp_path, estate, fake_home, monkeypatch):
+    _prod_plists(fake_home, "com.email-mcp.dispatcher", "com.email-mcp.fts")
+    monkeypatch.setattr(runner, "_P17_TICK_DEADLINE_S", 0.0)
+    ctx = make_ctx(tmp_path, estate, dry_run=False)
+    monkeypatch.setattr(runner, "_spawn", _p17_spawn(runs="0"))
+    result = run_phase("P17", ctx)
+    assert result.status == runner.FAIL
+    assert any("no completed run within" in d for d in result.detail)
+
+
+def test_p17_fails_without_a_dispatcher_plist_but_tolerates_no_fts(
+        tmp_path, estate, fake_home, monkeypatch):
+    """The dispatcher is the phase's whole claim; the FTS agent is a
+    setup option an estate may legitimately lack."""
+    ctx = make_ctx(tmp_path, estate, dry_run=False)
+    result = run_phase("P17", ctx)
+    assert result.status == runner.FAIL
+    assert any("no prod dispatcher to re-bootstrap" in d
+               for d in result.detail)
+
+    _prod_plists(fake_home, "com.email-mcp.dispatcher")
+    monkeypatch.setattr(runner, "_P17_TICK_DEADLINE_S", 0.0)
+    ctx = make_ctx(tmp_path, estate, dry_run=False)
+    monkeypatch.setattr(runner, "_spawn", _p17_spawn())
+    result = run_phase("P17", ctx)
+    assert result.status == runner.PASS, result.detail
+    assert any("com.email-mcp.fts: not installed" in d
+               for d in result.detail)
+
+
+# -- P19 ---------------------------------------------------------------- #
+
+
+_P19_READBACK = {"is_draft": True, "internet_message_id": "<rc-p19@rc>",
+                 "in_drafts_folder": True,
+                 "text_parts": [["text/html", "base64"],
+                                ["text/plain", "base64"]]}
+
+
+def _p19_respond(ctx, *, refusal_code="draft_unsupported",
+                 refusal_ok=False):
+    def respond(tool, args, call):
+        assert tool == "create_draft"
+        if args["from_identity"] == "cern":
+            return {"ok": True, "draft_id": "AAMkAD-9",
+                    "message_id": "<rc-p19@rc>", "to": [args["to"]],
+                    "cc": [], "subject": args["subject"],
+                    "folder": "drafts", "account": "operator@cern.ch"}
+        if refusal_ok:
+            return {"ok": True, "draft_id": "leak",
+                    "message_id": "<leak@rc>", "to": [args["to"]],
+                    "cc": [], "subject": args["subject"],
+                    "folder": "drafts", "account": "x"}
+        return {"ok": False, "code": refusal_code,
+                "error": "create_draft is not available for identity "
+                         "[gmail]: drafts require drafts = \"graph\" ... "
+                         "~/.email-mcp/identities.toml."}
+
+    return respond
+
+
+def _p19_probe_route(readback):
+    return (lambda a: len(a) > 1 and a[1].endswith("rc-p19-readback.py"),
+            lambda c: _Proc(0, json.dumps(readback)))
+
+
+def test_p19_files_a_verified_base64_draft_and_hands_it_to_the_human(
+        tmp_path, estate, monkeypatch):
+    _graph_identities(estate)
+    prompts = []
+
+    def answer(prompt):
+        prompts.append(prompt)
+        return "pass: OWA round-trip clean, sent copy intact"
+
+    ctx = make_ctx(tmp_path, estate, dry_run=False, answer=answer)
+    spawn = ScriptedSpawn(_session_route(_p19_respond(ctx)),
+                          _p19_probe_route(_P19_READBACK))
+    monkeypatch.setattr(runner, "_spawn", spawn)
+    result = run_phase("P19", ctx)
+    assert result.status == runner.PASS, result.detail
+    assert any("OWA round-trip clean" in d for d in result.detail)
+
+    # Both halves went through one session: the filing under the drafts
+    # identity, the refusal probe under the lane-less one.
+    calls = json.loads(
+        (ctx.sandbox_home / "rc-p19-draft.calls.json").read_text())
+    assert [c["arguments"]["from_identity"] for c in calls] == ["cern",
+                                                                "gmail"]
+    assert all(c["arguments"]["to"] == "operator@cern.ch" for c in calls)
+    # The independent readback ran through the shipped seams.
+    probes = [c["argv"] for c in spawn.calls
+              if len(c["argv"]) > 1
+              and c["argv"][1].endswith("rc-p19-readback.py")]
+    assert len(probes) == 1 and probes[0][-2:] == ["cern", "AAMkAD-9"]
+    probe_text = (ctx.sandbox_home / "rc-p19-readback.py").read_text()
+    assert "draft_receipt" in probe_text and "$value" in probe_text
+    # The human half's prompt names the client editor, not this tool.
+    assert len(prompts) == 1 and "OWA" in prompts[0]
+    assert "rc-p19 draft" in prompts[0]
+
+
+def test_p19_unattended_still_proves_the_auto_half_but_stays_pending(
+        tmp_path, estate, monkeypatch):
+    """A draft never transmits, so the unattended pass may earn the
+    automated evidence — but the rendering verdict is the human's, and
+    without one the phase is PENDING, keeping the run INCOMPLETE."""
+    _graph_identities(estate)
+    ctx = make_ctx(tmp_path, estate, dry_run=False, answer=None)
+    monkeypatch.setattr(runner, "_spawn", ScriptedSpawn(
+        _session_route(_p19_respond(ctx)), _p19_probe_route(_P19_READBACK)))
+    result = run_phase("P19", ctx)
+    assert result.status == runner.PENDING
+    assert (ctx.sandbox_home / "rc-p19-draft.calls.json").exists()
+    assert any("base64 text parts" in d for d in result.detail)
+
+
+@pytest.mark.parametrize("readback, symptom", [
+    # a leg down: the draft is not in the Drafts folder
+    (dict(_P19_READBACK, in_drafts_folder=False), "three-legged readback"),
+    # a leg down: the stored message is not ours
+    (dict(_P19_READBACK, internet_message_id="<other@x>"),
+     "three-legged readback"),
+    # stored QP: exactly what OWA's editor mangles (round 1, 2026-08-02)
+    (dict(_P19_READBACK, text_parts=[["text/html", "base64"],
+                                     ["text/plain", "quoted-printable"]]),
+     "not base64"),
+])
+def test_p19_fails_when_the_tenant_readback_breaks_a_leg(
+        tmp_path, estate, monkeypatch, readback, symptom):
+    _graph_identities(estate)
+    ctx = make_ctx(tmp_path, estate, dry_run=False, answer=lambda p: "pass")
+    monkeypatch.setattr(runner, "_spawn", ScriptedSpawn(
+        _session_route(_p19_respond(ctx)), _p19_probe_route(readback)))
+    result = run_phase("P19", ctx)
+    assert result.status == runner.FAIL
+    assert any(symptom in d for d in result.detail), result.detail
+
+
+@pytest.mark.parametrize("breakage, symptom", [
+    # the lane-less identity filed a draft: the no-fallback rule broke
+    ({"refusal_ok": True}, "draft_unsupported"),
+    # refused, but with the wrong code
+    ({"refusal_code": "invalid_input"}, "draft_unsupported"),
+])
+def test_p19_fails_when_the_lane_less_identity_does_not_refuse(
+        tmp_path, estate, monkeypatch, breakage, symptom):
+    _graph_identities(estate)
+    ctx = make_ctx(tmp_path, estate, dry_run=False, answer=lambda p: "pass")
+    monkeypatch.setattr(runner, "_spawn", ScriptedSpawn(
+        _session_route(_p19_respond(ctx, **breakage)),
+        _p19_probe_route(_P19_READBACK)))
+    result = run_phase("P19", ctx)
+    assert result.status == runner.FAIL
+    assert any(symptom in d for d in result.detail), result.detail
+
+
+def test_p19_names_the_missing_identity_shape(tmp_path, estate):
+    """The refusal half needs a lane-less identity on the REAL estate;
+    an estate without one is a finding with a name, not a silent pass."""
+    _graph_identities(estate, bare=False)
+    ctx = make_ctx(tmp_path, estate, dry_run=False, answer=lambda p: "pass")
+    result = run_phase("P19", ctx)
+    assert result.status == runner.FAIL
+    assert any("refusal half needs one" in d for d in result.detail)
