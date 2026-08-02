@@ -86,8 +86,8 @@ PENDING rather than inventing a verdict).
 
 | # | Phase | Lane | Mode | Acceptance criterion |
 |---|---|---|---|---|
-| **P01** | wheel install | sandbox | auto | The built wheel installs into the sandbox `$HOME` and `email-mcp --version` reports the wheel's version — not the repo working tree's. |
-| **P02** | scripted setup | sandbox | auto | `email-mcp setup`, driven from a fixture answer file, leaves a 0700 tree with a 0600 `identities.toml`, never creates the FTS dir, writes no secret VALUE anywhere, and prints an MCP config whose entry point is absolute. |
+| **P01** | wheel install | sandbox | auto | The built wheel installs into the sandbox `$HOME` and `email-mcp version` reports the wheel's version — not the repo working tree's. |
+| **P02** | scripted setup | sandbox | auto | `email-mcp setup`, driven from a fixture answer file, leaves a 0700 tree with a 0600 `identities.toml`, leaves the FTS index unbuilt, writes no secret VALUE anywhere, and prints an MCP config whose entry point is absolute. |
 | **P03** | doctor | both | auto | Every check green in the sandbox. In prod, doctor reports the real estate healthy — and for anything it isn't, the failure names a concrete fix (a command or a Settings pane), per contract §2. |
 | **P04** | index | both | auto | Sandbox: `fts --build --limit N` completes and its documents are searchable. Prod: `fts --status` shows a full, non-stale index — the number the operator would actually get. |
 | **P05** | wire-level search/read | sandbox | auto | Driven through a real **MCP client subprocess** over stdio, not in-process: `search_emails` and `get_email` return contract envelopes, and no exception ever reaches the wire (contract §7). |
@@ -181,3 +181,14 @@ and the manual-step protocol, covered by `tests/test_rc_runner.py`. The
 18 phase bodies are R2; they attach with `@implements("P07")` and until
 they do, a phase reports `unimplemented` rather than passing silently —
 a live pass stops at the first hole in the life story.
+
+R2 attaches stage by stage. **S1** (2026-08-02) binds the sandbox core
+P01–P05: wheel install, scripted setup (fixture:
+`tests/fixtures/setup_answers.json`, rewritten for today's wizard incl.
+the two Exchange questions), doctor on both lanes, the bounded sandbox
+index build + round-trip search probe with the prod fullness check, and
+the wire-level search/read driven through a real MCP client subprocess.
+Two plan-text corrections rode along: the version verb is
+`email-mcp version` (the CLI has no `--version` flag), and setup's leaf
+materialization now creates an *empty* `fts/` dir by design — the P02
+claim is that the index stays unbuilt.

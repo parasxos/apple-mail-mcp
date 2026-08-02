@@ -4,11 +4,12 @@
 ``docs/w3-rc-plan.md`` is the plan this file executes: 18 phases across
 two lanes — a *sandbox* lane (a throwaway ``$HOME`` with the real Mail
 store attached read-only through ``EMAIL_MCP_MAIL_DIR``) and a *prod*
-lane (self-only sends on the real estate). This module is R1, the core
-only: Context, Report, Sentinel, the phase registry, the
+lane (self-only sends on the real estate). R1 shipped the core:
+Context, Report, Sentinel, the phase registry, the
 resume/--phase/--dry-run plumbing and the manual-step protocol. Phase
-bodies attach later through ``@implements``; a phase with no body is
-reported as ``unimplemented`` rather than silently passing.
+bodies attach through ``@implements`` (S1 binds the sandbox core,
+P01–P05, below); a phase with no body is reported as ``unimplemented``
+rather than silently passing.
 
 Two rules shape everything here.
 
@@ -162,7 +163,7 @@ class PhaseSpec:
 PLAN: tuple[PhaseSpec, ...] = (
     PhaseSpec("P01", "wheel install", SANDBOX,
               "the built wheel installs into the sandbox and `email-mcp "
-              "--version` reports the wheel's version"),
+              "version` reports the wheel's version"),
     PhaseSpec("P02", "scripted setup", SANDBOX,
               "`email-mcp setup` from a fixture answer file leaves a 0700 "
               "tree, 0600 identities.toml, and prints an absolute MCP entry"),
@@ -648,9 +649,19 @@ class Context:
             return
         guarded = str(self._resolve(self.sentinel.root))
         for arg in argv:
-            if guarded in arg:
-                raise UnsafeAction(
-                    f"sandbox-lane command names the real state root: {arg}")
+            # A hit must end on a path boundary: the runner's own
+            # ~/.email-mcp-rc (journals, the default sandbox home) shares
+            # the root's spelling as a prefix but is a sibling, not the
+            # estate — the first bound body found the naive substring
+            # match refusing its own venv path.
+            idx = arg.find(guarded)
+            while idx != -1:
+                end = idx + len(guarded)
+                if end == len(arg) or arg[end] == "/":
+                    raise UnsafeAction(
+                        f"sandbox-lane command names the real state root: "
+                        f"{arg}")
+                idx = arg.find(guarded, idx + 1)
 
     # -- files -------------------------------------------------------- #
 
@@ -983,6 +994,337 @@ def soak_report(state_dir: Path) -> str:
                      f"({'live' if raw.get('live') else 'dry'}) — "
                      f"{settled}/{len(raw.get('results', {}))} settled")
     return "\n".join(lines)
+
+
+# --------------------------------------------------------------------- #
+# phase bodies — R2, stage S1: the sandbox core (P01–P05)                #
+# --------------------------------------------------------------------- #
+#
+# Every body follows one shape: issue EVERY effect through ctx first (so
+# a dry run prints the complete plan of commands), then `return` on dry,
+# then assert the phase's acceptance criterion with ctx.require and leave
+# the evidence in ctx.note. Bodies never import email_mcp — the wheel
+# P01 installs is the thing under test, and it is driven by subprocess.
+
+
+def _venv_bin(ctx: Context, name: str) -> Path:
+    """The sandbox install P01 lays down and every later sandbox phase
+    drives. One spelling on purpose: if P02+ guessed a different path,
+    they would certify a different binary than the one P01 built."""
+    return ctx.sandbox_home / "venv" / "bin" / name
+
+
+@implements("P01")
+def _p01_wheel_install(ctx: Context) -> None:
+    venv = ctx.sandbox_home / "venv"
+    dist = ctx.sandbox_home / "dist"
+    ctx.sh([sys.executable, "-m", "venv", venv], timeout=300, check=True)
+    pip = venv / "bin" / "pip"
+    built = ctx.sh([pip, "wheel", "--no-deps", "-w", dist, ctx.repo_root],
+                   timeout=900, check=True)
+    if built.dry:
+        ctx.sh([pip, "install", dist / "email_mcp-<built>.whl"])
+        ctx.sh([_venv_bin(ctx, "email-mcp"), "version"])
+        return
+    wheels = sorted(dist.glob("email_mcp-*.whl"))
+    ctx.require(len(wheels) == 1,
+                f"expected exactly one built wheel under {dist}, "
+                f"found {len(wheels)}")
+    wheel = wheels[0]
+    expected = wheel.name.split("-")[1]
+    ctx.sh([pip, "install", wheel], timeout=900, check=True)
+    # cwd far from the checkout: the reported version must come from the
+    # installed wheel, unreachable by a repo-tree import.
+    ran = ctx.sh([_venv_bin(ctx, "email-mcp"), "version"],
+                 cwd=ctx.sandbox_home, timeout=120, check=True)
+    reported = ran.out.strip()
+    ctx.require(reported == expected,
+                f"`email-mcp version` reports {reported!r} but the wheel "
+                f"is {expected!r} — the wrong bytes answered")
+    ctx.note(f"wheel {wheel.name} installed into the sandbox; "
+             f"`email-mcp version` → {reported}")
+
+
+@implements("P02")
+def _p02_scripted_setup(ctx: Context) -> None:
+    # The fixture IS the wizard contract: prompts documented, answers fed
+    # one per stdin line in the order lifecycle.setup asks them. A stale
+    # fixture misfeeds every later answer, so the suite pins each prompt
+    # to the shipped wizard (test_rc_runner.py).
+    fixture = ctx.repo_root / "tests" / "fixtures" / "setup_answers.json"
+    answers = json.loads(fixture.read_text(encoding="utf-8"))["answers"]
+    ran = ctx.sh([_venv_bin(ctx, "email-mcp"), "setup"],
+                 stdin_text="".join(a["answer"] + "\n" for a in answers),
+                 timeout=300)
+    if ran.dry:
+        return
+    ctx.require(ran.ok, f"setup exited {ran.rc}: "
+                        f"{(ran.err or ran.out).strip()[:200]}")
+    root = ctx.sandbox_home / STATE_ROOT_NAME
+    loose = [str(d) for d in [root, *root.rglob("*")]
+             if d.is_dir() and d.stat().st_mode & 0o777 != 0o700]
+    ctx.require(not loose, "tree not 0700: " + ", ".join(loose))
+    ident = root / "identities.toml"
+    ctx.require(ident.is_file() and ident.stat().st_mode & 0o777 == 0o600,
+                "identities.toml is missing or not 0600")
+    # No secret VALUE anywhere: the tree may name secret references
+    # (a Keychain item), never hold one.
+    leaky = [str(f) for f in root.rglob("*") if f.is_file()
+             and "password" in f.read_text(encoding="utf-8",
+                                           errors="replace").lower()]
+    ctx.require(not leaky, "a secret value reached the tree: "
+                           + ", ".join(leaky))
+    ctx.require(not (root / "fts" / "fts.db").exists(),
+                "setup built the FTS index (the fixture defers it)")
+    command = next((line.split('"')[3] for line in ran.out.splitlines()
+                    if '"command"' in line), "")
+    ctx.require(command.startswith("/"),
+                f"printed MCP entry point is not absolute: {command!r}")
+    ctx.note(f"{len(answers)} scripted answers consumed; 0700 tree, "
+             f"0600 identities.toml, FTS unbuilt; MCP entry `{command}`")
+
+
+@implements("P03")
+def _p03_doctor(ctx: Context) -> None:
+    email_mcp = _venv_bin(ctx, "email-mcp")
+    # A BOTH phase runs its own comparison: the same verb on each lane,
+    # each with that lane's expectation (plan §1) — so the body sets the
+    # lane per half; run() restores it afterwards.
+    ctx.lane = SANDBOX
+    sandbox = ctx.sh([email_mcp, "doctor"], timeout=300)
+    ctx.lane = PROD
+    prod = ctx.sh([email_mcp, "doctor"], timeout=300)
+    # The JSON report backs the per-failure fix check; --doctor exits
+    # non-zero on a red estate by design, so its rc proves nothing here.
+    prod_json = ctx.sh([email_mcp, "--doctor"], timeout=300)
+    if ctx.dry_run:
+        return
+    fails = "; ".join(line for line in sandbox.out.splitlines()
+                      if line.startswith("FAIL"))
+    ctx.require(sandbox.ok, "sandbox doctor is not green: "
+                            + (fails or (sandbox.err or sandbox.out)
+                               .strip()[:200]))
+    ctx.note("sandbox doctor: every check green")
+    if prod.ok:
+        ctx.note("prod doctor: the real estate is healthy")
+        return
+    report = json.loads(prod_json.out)
+    red = {name: c
+           for name, c in {**report["checks"], "audit": report["audit"]}
+           .items() if not c["ok"]}
+    unfixed = sorted(name for name, c in red.items() if not c.get("fix"))
+    ctx.require(not unfixed, "prod doctor failure(s) name no fix: "
+                             + ", ".join(unfixed))
+    if not red:
+        # Red exit with green checks: the redness came from the checks
+        # registry, whose findings print with the one repair command.
+        ctx.require("doctor --fix" in prod.out,
+                    "prod doctor findings name no fix")
+    for name, c in sorted(red.items()):
+        ctx.note(f"prod {name}: {c['detail']} — fix: {c['fix']}")
+    ctx.note("prod doctor names a concrete fix for every failure")
+
+
+# One indexed document must round-trip through a MATCH query — the
+# definition of "searchable" that a row count cannot fake. Runs under the
+# installed wheel's interpreter so the query goes through the shipped
+# read seam (rowids_matching), not a re-implementation.
+_FTS_PROBE = '''\
+"""P04 probe: prove one indexed document comes back out of a MATCH."""
+import json
+import re
+
+from email_mcp import fts
+
+idx = fts.FtsIndex()
+out = {"rowid": None, "token": None, "hits": []}
+conn = idx._open_ro()
+try:
+    for row in conn.execute("SELECT rowid, body FROM body_fts LIMIT 25"):
+        tokens = re.findall(r"[A-Za-z0-9]{3,}", row["body"] or "")
+        if tokens:
+            out = {"rowid": row["rowid"], "token": tokens[0],
+                   "hits": idx.rowids_matching(tokens[0])}
+            break
+finally:
+    conn.close()
+print(json.dumps(out))
+'''
+
+
+@implements("P04")
+def _p04_index(ctx: Context) -> None:
+    email_mcp = _venv_bin(ctx, "email-mcp")
+    # Sandbox half: a bounded build (fullness is prod's claim, not this
+    # one), then the round-trip probe.
+    ctx.lane = SANDBOX
+    build = ctx.sh([email_mcp, "fts", "--build", "--limit", "200"],
+                   timeout=900)
+    probe = ctx.write(ctx.sandbox_home / "rc-p04-probe.py", _FTS_PROBE)
+    searched = ctx.sh([_venv_bin(ctx, "python"), probe], timeout=120)
+    # Prod half: the operator's real index, read-only.
+    ctx.lane = PROD
+    status = ctx.sh([email_mcp, "fts", "--status", "--json"], timeout=120)
+    if ctx.dry_run:
+        return
+    ctx.require(build.ok, f"sandbox fts --build exited {build.rc}: "
+                          f"{(build.err or build.out).strip()[:200]}")
+    ctx.require(searched.ok, f"fts probe exited {searched.rc}: "
+                             f"{(searched.err or searched.out).strip()[:200]}")
+    hit = json.loads(searched.out)
+    ctx.require(hit["rowid"] is not None,
+                "the sandbox index holds no indexed documents")
+    ctx.require(hit["rowid"] in hit["hits"],
+                f"indexed doc {hit['rowid']} not found by MATCH "
+                f"{hit['token']!r} — built but not searchable")
+    ctx.note(f"sandbox: built with --limit 200; MATCH {hit['token']!r} "
+             f"returned rowid {hit['rowid']} among {len(hit['hits'])} hit(s)")
+    st = json.loads(status.out)
+    ctx.require(st.get("state") == "ready",
+                f"prod index state is {st.get('state')!r}, not ready")
+    docs = st.get("docs", {})
+    ctx.require(docs.get("indexed", 0) > 0,
+                "prod index holds no indexed documents")
+    ctx.require(docs.get("missing", 0) == 0 and docs.get("error", 0) == 0,
+                f"prod index is not full: {docs}")
+    freshest = max(filter(None, (st.get("built_at"), st.get("last_sync_at"),
+                                 st.get("last_reconcile_at"))), default=None)
+    ctx.require(freshest is not None,
+                "prod index carries no build/sync timestamp")
+    # Two nightly agent cadences: one missed 03:30 sync is tolerated,
+    # a habitually-unsynced index is stale — not the number the operator
+    # would actually get.
+    age = datetime.now(timezone.utc) - datetime.fromisoformat(freshest)
+    ctx.require(age.total_seconds() < 48 * 3600,
+                f"prod index is stale: last touched {freshest}")
+    ctx.note(f"prod: ready, {docs.get('indexed')} indexed docs, "
+             f"freshest stamp {freshest}")
+
+
+# The test_mcp_wire.py discipline as a standalone program: newline-
+# delimited JSON-RPC on real pipes, every stdout byte kept, each response
+# awaited before the next send. It prints ONE JSON report; judging the
+# frames is the phase's job, not this client's — which is why a corrupt
+# line is kept as evidence rather than treated as an error here.
+_WIRE_CLIENT = '''\
+"""P05 wire client: a real MCP session over stdio, bytes preserved."""
+import json
+import subprocess
+import sys
+
+proc = subprocess.Popen([sys.argv[1]], stdin=subprocess.PIPE,
+                        stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                        text=True)
+lines = []
+
+
+def send(msg):
+    proc.stdin.write(json.dumps(msg) + "\\n")
+    proc.stdin.flush()
+
+
+def wait_for(rid):
+    while True:
+        line = proc.stdout.readline()
+        if not line:
+            return None  # EOF before the answer — the report will show it
+        lines.append(line.rstrip("\\n"))
+        try:
+            msg = json.loads(line)
+        except ValueError:
+            continue  # kept in lines; the phase judges purity
+        if msg.get("id") == rid:
+            return msg
+
+
+send({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {
+    "protocolVersion": "2025-06-18", "capabilities": {},
+    "clientInfo": {"name": "rc-runner-p05", "version": "0"}}})
+wait_for(1)
+send({"jsonrpc": "2.0", "method": "notifications/initialized"})
+send({"jsonrpc": "2.0", "id": 2, "method": "tools/call", "params": {
+    "name": "search_emails", "arguments": {"limit": 5}}})
+search = wait_for(2)
+
+target = "rc-p05-no-such-id"
+try:
+    envelope = json.loads(search["result"]["content"][0]["text"])
+    target = (envelope.get("results") or [{}])[0].get("id") or target
+except (TypeError, KeyError, ValueError, IndexError):
+    pass  # a malformed search answer still deserves the second call
+
+send({"jsonrpc": "2.0", "id": 3, "method": "tools/call", "params": {
+    "name": "get_email", "arguments": {"id": target}}})
+wait_for(3)
+proc.stdin.close()
+for line in proc.stdout:
+    lines.append(line.rstrip("\\n"))
+print(json.dumps({"lines": lines, "target": target,
+                  "server_exit": proc.wait(timeout=30)}))
+'''
+
+
+@implements("P05")
+def _p05_wire_search_read(ctx: Context) -> None:
+    client = ctx.write(ctx.sandbox_home / "rc-p05-client.py", _WIRE_CLIENT)
+    ran = ctx.sh([_venv_bin(ctx, "python"), client], timeout=300)
+    if ran.dry:
+        return
+    ctx.require(ran.ok, f"wire client exited {ran.rc}: "
+                        f"{(ran.err or ran.out).strip()[:200]}")
+    report = json.loads(ran.out)
+    ctx.require("Traceback" not in "\n".join(report["lines"]),
+                "a traceback crossed the wire")
+    by_id: dict = {}
+    for line in report["lines"]:
+        try:
+            msg = json.loads(line)
+        except ValueError:
+            raise PhaseFailure(
+                f"non-JSON-RPC bytes on the wire: {line[:120]!r}") from None
+        ctx.require(msg.get("jsonrpc") == "2.0",
+                    f"non-2.0 frame on the wire: {line[:120]!r}")
+        if "id" in msg:
+            by_id[msg["id"]] = msg
+    server = (by_id.get(1, {}).get("result", {})
+              .get("serverInfo", {}).get("name"))
+    ctx.require(server == "apple-mail",
+                f"initialize answered {server!r}, not the shipped server")
+    envelopes: dict[int, dict] = {}
+    for rid, tool in ((2, "search_emails"), (3, "get_email")):
+        msg = by_id.get(rid)
+        ctx.require(msg is not None, f"{tool}: no response on the wire")
+        ctx.require("error" not in msg,
+                    f"{tool}: a JSON-RPC error crossed the wire")
+        result = msg.get("result") or {}
+        ctx.require(result.get("isError") is not True,
+                    f"{tool}: isError — an exception reached the wire")
+        content = result.get("content") or [{}]
+        ctx.require(content[0].get("type") == "text",
+                    f"{tool}: no text content in the result")
+        envelope = json.loads(content[0]["text"])
+        ctx.require(isinstance(envelope.get("ok"), bool),
+                    f"{tool}: no ok key — not a contract envelope")
+        envelopes[rid] = envelope
+    search_env, read_env = envelopes[2], envelopes[3]
+    ctx.require(search_env["ok"] is True,
+                f"search_emails failed on the wire: "
+                f"{search_env.get('code')} {search_env.get('error')}")
+    if search_env.get("results"):
+        ctx.require(read_env["ok"] is True,
+                    f"get_email failed for a real id {report['target']!r}: "
+                    f"{read_env.get('code')} {read_env.get('error')}")
+    else:
+        # An empty store is still a wire claim: the miss must come back
+        # as a coded envelope, never as an exception.
+        ctx.require(read_env["ok"] is False and read_env.get("code"),
+                    "get_email on an empty store must yield a coded "
+                    "envelope")
+    ctx.require(report["server_exit"] == 0,
+                f"server exited {report['server_exit']} after the session")
+    ctx.note(f"{len(report['lines'])} clean JSON-RPC frame(s); "
+             f"search fts state {search_env.get('fts', {}).get('state')!r}; "
+             f"get_email target {report['target']!r}")
 
 
 # --------------------------------------------------------------------- #
