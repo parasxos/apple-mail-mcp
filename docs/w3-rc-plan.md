@@ -301,6 +301,12 @@ phase now has a body. What rode along:
   never-migrated pre-v0.8 install, file only: bootstrapping ANY
   dispatcher label from the sandbox reaches the shared per-user domain
   (§2), which also leaves the plist-drift re-render to P17's prod lane.
+  Retirement itself is not domain-free either — `doctor --fix` boots
+  the legacy label out, and that bootout reaches the shared domain
+  regardless of the sandbox HOME — so the phase opens with a read-only
+  `launchctl print` of the legacy label and refuses while it is loaded,
+  making the residual bootout provably its "No such process" goal
+  state.
 - **P16** proves both halves with the product's own verb: `uninstall
   --yes` removes a planted token cache and keeps the tree, `--purge`
   removes the tree and the sandbox logs — and it refuses to run at all

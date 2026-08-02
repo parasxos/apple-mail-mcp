@@ -3069,7 +3069,12 @@ def _legacy_plist(ctx: Context, worktree: Path) -> str:
     so this file reproduces the never-migrated install that the
     legacy_launchd check exists for. File only, never bootstrapped:
     loading ANY dispatcher label from the sandbox reaches the shared
-    per-user launchd domain (§2)."""
+    per-user launchd domain (§2). Retiring it is not domain-free
+    either — doctor --fix's legacy_launchd repair BOOTS the label OUT,
+    and that bootout reaches the same shared domain no matter whose
+    HOME is faked — hence the body's read-only pre-gate: proving the
+    label unloaded first makes the residual bootout "No such process",
+    its goal state."""
     python = _venv_bin(ctx, "python")
     return f"""<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -3107,6 +3112,20 @@ def _p15_upgrade_from_v09(ctx: Context) -> None:
     # sandbox estate.
     v09env = {"HOME": str(v09home), "PYTHONPATH": str(worktree)}
     cur = {"HOME": str(v09home)}
+
+    # The §2 gate for the retirement itself, BEFORE any verb (P16's
+    # shape): doctor --fix's legacy_launchd repair boots the legacy
+    # label OUT, and a bootout reaches the real per-user domain no
+    # matter whose HOME is faked. A loaded label here is an operator's
+    # live pre-v0.8 agent — refuse while it is, so the phase's one
+    # residual bootout is provably "No such process", its goal state.
+    loaded = ctx.sh(["launchctl", "print",
+                     f"gui/{os.getuid()}/{_LEGACY_LABEL}"], timeout=60)
+    ctx.require(loaded.dry or not loaded.ok,
+                f"{_LEGACY_LABEL} is loaded in the real per-user "
+                "launchd domain — doctor --fix from this phase would "
+                "boot the operator's live agent out. Retire it on the "
+                "prod estate first, then re-run P15.")
 
     present = ctx.sh(["git", "cat-file", "-e", _V09_REF],
                      cwd=ctx.repo_root, timeout=60)
@@ -3196,10 +3215,12 @@ def _p15_upgrade_from_v09(ctx: Context) -> None:
              "plan-text correction)")
     ctx.note("current wheel operated it: update stamped state_version "
              f"{meta['state_version']}, doctor --fix retired "
-             f"{_LEGACY_LABEL} (bootout of an unloaded label is its "
-             "goal state) and pulled v0.9's 0755 spool subdirs to 0700, "
-             f"and one dispatcher pass delivered {mid} from the "
-             "v0.9-frozen entry")
+             f"{_LEGACY_LABEL} (its residual bootout DOES reach the "
+             "shared per-user domain — the read-only pre-gate proved "
+             "the label unloaded there, making it a goal-state no-op) "
+             "and pulled v0.9's 0755 spool subdirs to 0700, and one "
+             f"dispatcher pass delivered {mid} from the v0.9-frozen "
+             "entry")
 
 
 @implements("P16")

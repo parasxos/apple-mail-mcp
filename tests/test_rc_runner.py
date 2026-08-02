@@ -2257,6 +2257,8 @@ def test_s4_dry_run_plans_the_failure_and_lifecycle_story(tmp_path, estate):
                    "p13-fm9: tools/call create_draft",
                    "p13-fm10: tools/call search_emails, triage_plan",
                    "p13-fm3: tools/call schedule_email",
+                   f"launchctl print gui/{os.getuid()}/"
+                   f"{runner._LEGACY_LABEL}",
                    "worktree add --detach", runner._V09_REF,
                    "rc-p15-v09-schedule.py", "email-mcp update",
                    "-m email_mcp.dispatcher",
@@ -2640,12 +2642,13 @@ def test_p13_fails_when_the_fuse_misses_the_build(
 # -- P15 ---------------------------------------------------------------- #
 
 
-def _p15_spawn(ctx, *, version="0.9.0", update_rc=0):
-    """Scripted v0.9 upgrade: the generator writes the old-shape spool
-    entry under the v0.9 home (asserting it ran with the worktree on
-    PYTHONPATH), update stamps meta, doctor --fix retires the legacy
-    plist and tightens v0.9's 0755 spool subdirs, the dispatcher
-    delivers the frozen entry."""
+def _p15_spawn(ctx, *, version="0.9.0", update_rc=0, legacy_loaded=False):
+    """Scripted v0.9 upgrade: the pre-gate reads the legacy label in
+    the real domain (loaded only when a test says so), the generator
+    writes the old-shape spool entry under the v0.9 home (asserting it
+    ran with the worktree on PYTHONPATH), update stamps meta, doctor
+    --fix retires the legacy plist and tightens v0.9's 0755 spool
+    subdirs, the dispatcher delivers the frozen entry."""
     v09home = ctx.sandbox_home / "rc-v09-home"
     v09root = v09home / ".email-mcp"
     worktree = ctx.sandbox_home / "rc-v09-src"
@@ -2700,6 +2703,9 @@ def _p15_spawn(ctx, *, version="0.9.0", update_rc=0):
         return _Proc(0, "{}")
 
     return ScriptedSpawn(
+        (lambda a: a[:2] == ["launchctl", "print"],
+         lambda c: _Proc(0, "state = running\n") if legacy_loaded
+         else _Proc(113, "", "Could not find service")),
         (lambda a: a[:3] == ["git", "cat-file", "-e"],
          lambda c: _Proc(0)),
         (lambda a: a[:3] == ["git", "worktree", "remove"],
@@ -2729,8 +2735,12 @@ def test_p15_lets_the_v09_bytes_write_and_the_wheel_migrate(
     add = next(c["argv"] for c in spawn.calls
                if c["argv"][:3] == ["git", "worktree", "add"])
     assert add[-1] == runner._V09_REF and "--detach" in add
-    assert not any(c["argv"][0] == "launchctl" for c in spawn.calls), \
-        "P15 must never load a dispatcher label from the sandbox"
+    launchctl = [c["argv"] for c in spawn.calls
+                 if c["argv"][0] == "launchctl"]
+    assert launchctl == [["launchctl", "print",
+                          f"gui/{os.getuid()}/{runner._LEGACY_LABEL}"]], \
+        "P15 may only READ the shared label space — the pre-gate — " \
+        "never load or unload it"
 
     # the v0.9 config the body wrote: pipe transport, self-only
     v09root = ctx.sandbox_home / "rc-v09-home" / ".email-mcp"
@@ -2775,6 +2785,27 @@ def test_p15_unregisters_the_worktree_even_when_the_upgrade_fails(
                      if c["argv"][-1] == "update")
     assert git_removes and git_removes[-1] > update_at, \
         "the worktree must be removed after the failing step"
+
+
+def test_p15_refuses_while_the_legacy_label_is_loaded(
+        tmp_path, estate, monkeypatch):
+    """doctor --fix's legacy_launchd repair boots the legacy label out
+    of the REAL per-user domain — launchd ignores the fake HOME — so a
+    loaded label is an operator's live pre-v0.8 agent. The gate must
+    stop the phase before any other effect (P16's shape: refuse before
+    the verb, don't witness the damage after), which makes the passing
+    run's residual bootout provably a no-op."""
+    ctx = make_ctx(tmp_path, estate, dry_run=False)
+    ctx.repo_root = _REPO
+    spawn = _p15_spawn(ctx, legacy_loaded=True)
+    monkeypatch.setattr(runner, "_spawn", spawn)
+    result = run_phase("P15", ctx)
+    assert result.status == runner.FAIL
+    assert any("loaded in the real per-user launchd domain" in d
+               for d in result.detail), result.detail
+    assert [c["argv"][:2] for c in spawn.calls] == [["launchctl",
+                                                     "print"]], \
+        "the refusal must precede every other effect"
 
 
 # -- P16 ---------------------------------------------------------------- #
