@@ -7,9 +7,10 @@ store attached read-only through ``EMAIL_MCP_MAIL_DIR``) and a *prod*
 lane (self-only sends on the real estate). R1 shipped the core:
 Context, Report, Sentinel, the phase registry, the
 resume/--phase/--dry-run plumbing and the manual-step protocol. Phase
-bodies attach through ``@implements`` (S1 binds the sandbox core,
-P01–P05, below); a phase with no body is reported as ``unimplemented``
-rather than silently passing.
+bodies attach through ``@implements`` (S1 bound the sandbox core
+P01–P05; S2 binds the mutation story P06–P07 and P10–P12, below); a
+phase with no body is reported as ``unimplemented`` rather than
+silently passing.
 
 Two rules shape everything here.
 
@@ -43,8 +44,9 @@ import os
 import sys
 import tempfile
 import time
+import tomllib
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Callable, Iterable, Sequence
 
@@ -1333,6 +1335,712 @@ def _p05_wire_search_read(ctx: Context) -> None:
     ctx.note(f"{len(report['lines'])} clean JSON-RPC frame(s); "
              f"search fts state {search_env.get('fts', {}).get('state')!r}; "
              f"get_email target {report['target']!r}")
+
+
+# --------------------------------------------------------------------- #
+# phase bodies — R2, stage S2: the mutation story (P06–P07, P10–P12)     #
+# --------------------------------------------------------------------- #
+#
+# The stage's one governing fact is §1's rule that the sandbox borrows
+# the real Mail store READ-ONLY. Everything below is shaped by it: a
+# sandbox send is fenced twice (the identity's own declared allowlist +
+# a file for a transport) so it cannot reach a real recipient even when
+# a phase is wrong; the triage phases prove plan + refusal instead of
+# applying against mail they may not touch; and P07 runs the shipped
+# dispatcher under an RC-owned launchd label so the operator's agents
+# are never displaced. Every mutation a phase performs is recorded into
+# one expectations file — the evidence P12 audits the ledger against.
+
+_RC_DISPATCHER_LABEL = "com.email-mcp.rc-dispatcher"
+
+# The ledger's mail-mutation families (contract §6). P12 counts THESE:
+# lifecycle/doctor_fix events belong to the estate story S1/S3 own and
+# are outside the one-event-per-mail-mutation claim.
+_LEDGER_FAMILIES = frozenset({
+    "send", "reply", "draft", "schedule", "deliver", "recover", "cancel",
+    "graph_adopt", "graph_flip", "graph_sent", "graph_cancelled_external",
+    "plan_create", "plan_finish", "mailbox_create", "mailbox_delete",
+})
+
+# Poll budgets, module-level so a test can shrink them to zero instead
+# of waiting out a live deadline.
+_P06_STORE_DEADLINE_S = 300.0   # send → Bcc-to-self round trip, real IMAP
+_P06_STORE_POLL_S = 10.0
+_P07_DELIVER_DEADLINE_S = 240.0  # RunAtLoad + two 60s ticks + slack
+_P07_POLL_S = 3.0
+
+
+def _poll(deadline_s: float, interval_s: float, probe):
+    """First probe immediately, judge the deadline before sleeping — a
+    zero deadline means exactly one probe, which is what the tests use
+    to exercise the timeout paths without waiting them out."""
+    end = time.monotonic() + deadline_s
+    while True:
+        got = probe()
+        if got is not None or time.monotonic() >= end:
+            return got
+        time.sleep(interval_s)
+
+
+# The P05 stdio discipline generalized: one real MCP session per run of
+# this client, the calls read from a JSON file so a phase can script any
+# tool sequence. It reports; judging the envelopes is the phase's job.
+_TOOL_CLIENT = '''\
+"""S2 tool client: one MCP session over stdio, one envelope per call."""
+import json
+import subprocess
+import sys
+
+calls = json.loads(open(sys.argv[2], encoding="utf-8").read())
+proc = subprocess.Popen([sys.argv[1]], stdin=subprocess.PIPE,
+                        stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                        text=True)
+
+
+def send(msg):
+    proc.stdin.write(json.dumps(msg) + "\\n")
+    proc.stdin.flush()
+
+
+def wait_for(rid):
+    while True:
+        line = proc.stdout.readline()
+        if not line:
+            return None  # EOF before the answer — reported, not judged
+        try:
+            msg = json.loads(line)
+        except ValueError:
+            continue  # frame purity is P05's claim, not this client's
+        if msg.get("id") == rid:
+            return msg
+
+
+send({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {
+    "protocolVersion": "2025-06-18", "capabilities": {},
+    "clientInfo": {"name": "rc-runner-s2", "version": "0"}}})
+wait_for(1)
+send({"jsonrpc": "2.0", "method": "notifications/initialized"})
+
+out = []
+for n, call in enumerate(calls, start=2):
+    send({"jsonrpc": "2.0", "id": n, "method": "tools/call", "params": {
+        "name": call["tool"], "arguments": call["arguments"]}})
+    msg = wait_for(n)
+    entry = {"tool": call["tool"], "envelope": None, "rpc_error": None,
+             "is_error": False}
+    if msg is None:
+        entry["rpc_error"] = "no response (EOF)"
+    elif "error" in msg:
+        entry["rpc_error"] = json.dumps(msg["error"])
+    else:
+        result = msg.get("result") or {}
+        entry["is_error"] = bool(result.get("isError"))
+        content = result.get("content") or [{}]
+        text = content[0].get("text") if content[0].get("type") == "text" \\
+            else None
+        if text is None:
+            entry["rpc_error"] = "no text content in the result"
+        else:
+            try:
+                entry["envelope"] = json.loads(text)
+            except ValueError:
+                entry["rpc_error"] = f"non-JSON content: {text[:120]!r}"
+    out.append(entry)
+proc.stdin.close()
+print(json.dumps({"calls": out, "server_exit": proc.wait(timeout=30)}))
+'''
+
+
+def _mcp_session(ctx: Context, tag: str, calls, *,
+                 extra_env: dict[str, str] | None = None,
+                 timeout: float = 600, note: bool = True) -> list[dict] | None:
+    """Run one MCP session and hand back one envelope per call (None on
+    dry). Transport-level failure — an rpc error, isError, a dirty exit —
+    is refused here because those are P05's already-proven claims
+    resurfacing; everything envelope-shaped goes back to the phase.
+    ``note=False`` is for sessions inside a poll loop, whose repetition
+    would flood the report with identical lines."""
+    if note:
+        ctx.note(f"{tag}: tools/call " + ", ".join(t for t, _ in calls))
+    client = ctx.write(ctx.sandbox_home / "rc-s2-client.py", _TOOL_CLIENT)
+    calls_file = ctx.write(
+        ctx.sandbox_home / f"rc-{tag}.calls.json",
+        json.dumps([{"tool": t, "arguments": a} for t, a in calls], indent=2))
+    ran = ctx.sh([_venv_bin(ctx, "python"), client,
+                  _venv_bin(ctx, "email-mcp"), calls_file],
+                 timeout=timeout, extra_env=extra_env)
+    if ran.dry:
+        return None
+    ctx.require(ran.ok, f"{tag}: tool client exited {ran.rc}: "
+                        f"{(ran.err or ran.out).strip()[:200]}")
+    report = json.loads(ran.out)
+    ctx.require(report["server_exit"] == 0,
+                f"{tag}: server exited {report['server_exit']}")
+    envelopes = []
+    for entry in report["calls"]:
+        ctx.require(entry["rpc_error"] is None and not entry["is_error"],
+                    f"{tag}: {entry['tool']} broke the wire: "
+                    f"{entry['rpc_error'] or 'isError'}")
+        envelope = entry["envelope"]
+        ctx.require(isinstance(envelope, dict)
+                    and isinstance(envelope.get("ok"), bool),
+                    f"{tag}: {entry['tool']} returned no contract envelope")
+        envelopes.append(envelope)
+    return envelopes
+
+
+def _record_mints(ctx: Context, records: list[dict], *,
+                  reset: bool = False) -> None:
+    """Append this phase's ledger-worthy mutations to the run's
+    expectations file — the evidence P12 audits against. P06, the run's
+    first mutation, resets the file so a fresh pass never inherits a
+    previous run's claims; a resumed pass skips settled phases, so the
+    records they earned survive untouched."""
+    path = ctx.sandbox_home / "rc-s2-mints.json"
+    existing = [] if reset or ctx.dry_run or not path.exists() \
+        else json.loads(path.read_text(encoding="utf-8"))
+    ctx.write(path, json.dumps(existing + records, indent=2))
+
+
+def _mint(started: str, lane: str, event: str, outcome: str, *,
+          op: str | None = None, message_id: str | None = None) -> dict:
+    # ts is the PHASE start, not the record time: the ledger stamps the
+    # event when the mutation lands, which is before the phase could
+    # write this record — a later stamp would push the event out of
+    # P12's since-window.
+    return {"ts": started, "lane": lane, "event": event, "outcome": outcome,
+            "op": op, "message_id": message_id}
+
+
+def _arm_sandbox_identity(ctx: Context) -> tuple[str, Path]:
+    """Fence the sandbox transport before anything can send.
+
+    Two independent fences, both the product's own mechanisms: the
+    identity DECLARES an allowlist of exactly its own address (sends are
+    open by default — declaring the guard arms it, so a foreign
+    recipient dies as `recipient_not_allowed` inside the sender), and
+    the pipe transport delivers into a file under the sandbox home —
+    the sandbox's delivery store. P02's wizard answers configured
+    `/usr/sbin/sendmail`, which could hand bytes to a real MTA; this
+    rewrite is what makes "a sandbox send can never reach a real
+    recipient" structural rather than hoped. Idempotent — P06 and P07
+    each call it so neither depends on the other having run."""
+    fixture = json.loads(
+        (ctx.repo_root / "tests" / "fixtures" / "setup_answers.json")
+        .read_text(encoding="utf-8"))["answers"]
+    addr = next(a["answer"] for a in fixture if "From: address" in a["prompt"])
+    store = ctx.sandbox_home / "rc-outbox" / "delivered.mbox"
+    sink = ctx.write(
+        ctx.sandbox_home / "rc-outbox" / "sink.sh",
+        "#!/bin/sh\n"
+        "# The sandbox's delivery store: bytes appended here provably left\n"
+        "# the sender, and a file cannot reach a real recipient.\n"
+        f'exec /bin/cat >> "{store}"\n',
+        mode=0o700)
+    ctx.write(
+        ctx.sandbox_home / STATE_ROOT_NAME / "identities.toml",
+        'default = "main"\n\n[main]\n'
+        f'from_addr = "{addr}"\n'
+        'from_name = "RC Sandbox"\n'
+        'driver = "pipe"\n'
+        f'command = "{sink}"\n'
+        f'allowlist = ["{addr}"]\n')
+    return addr, store
+
+
+def _prod_self_addr(ctx: Context) -> str:
+    """The prod lane's self-only recipient: the default identity's own
+    from_addr, read from the real identities file (a read, not an
+    effect — and the tree never holds secret values, P02's claim)."""
+    path = ctx.sentinel.root / "identities.toml"
+    ctx.require(path.is_file(),
+                f"no identities.toml under {ctx.sentinel.root} — the prod "
+                "send needs a configured identity")
+    data = tomllib.loads(path.read_text(encoding="utf-8"))
+    tables = {k: v for k, v in data.items() if isinstance(v, dict)}
+    name = data.get("default") or (next(iter(tables))
+                                   if len(tables) == 1 else None)
+    addr = str((tables.get(name) or {}).get("from_addr", "")).strip()
+    ctx.require(bool(addr),
+                f"cannot determine the default identity's own address "
+                f"from {path}")
+    return addr
+
+
+@implements("P06")
+def _p06_send(ctx: Context) -> None:
+    stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+    started = _now()
+    # Sandbox half: self-only against the armed fences. The foreign-
+    # recipient probe uses a reserved TLD so even a broken fence could
+    # not resolve a real mailbox — but the claim under test is that the
+    # product's own guard refuses it before any transport runs.
+    ctx.lane = SANDBOX
+    addr, store = _arm_sandbox_identity(ctx)
+    probe_to = "rc-p06-blocked@example.invalid"
+    sandbox = _mcp_session(ctx, "p06-sandbox", [
+        ("send_email", {"to": addr, "subject": f"rc-p06 sandbox {stamp}",
+                        "body": "RC P06 sandbox self-send."}),
+        ("send_email", {"to": probe_to, "subject": f"rc-p06 fence {stamp}",
+                        "body": "This must never leave the sender."}),
+    ])
+    ctx.lane = PROD
+    if ctx.dry_run:
+        _mcp_session(ctx, "p06-prod", [
+            ("send_email", {"to": "<the default identity's own address>",
+                            "subject": f"rc-p06 prod {stamp}",
+                            "body": "RC P06 prod self-send."})])
+        _mcp_session(ctx, "p06-prod-find", [
+            ("refresh_mail", {"wait_seconds": 5}),
+            ("search_emails", {"query": f"rc-p06 prod {stamp}",
+                               "limit": 10})])
+        return
+
+    sent, probe = sandbox
+    ctx.require(sent["ok"] is True,
+                f"sandbox send failed: {sent.get('code')} {sent.get('error')}")
+    ctx.require(sent.get("to") == [addr],
+                f"sandbox send was not self-only: to={sent.get('to')}")
+    mid = sent["message_id"]
+    ctx.require(probe["ok"] is False
+                and probe.get("code") == "recipient_not_allowed",
+                "the sandbox send fence is not armed: a foreign recipient "
+                f"got {probe.get('code') or 'ok=true'}, not "
+                "recipient_not_allowed")
+    delivered = store.read_text(encoding="utf-8")
+    ctx.require(mid in delivered,
+                f"{mid} is not in the sandbox delivery store — the send "
+                "reported ok but nothing arrived")
+    ctx.require(probe_to not in delivered,
+                "the refused recipient reached the delivery store")
+    ctx.note(f"sandbox: {mid} delivered to the sandbox store; foreign "
+             "recipient refused recipient_not_allowed")
+
+    # Prod half: the claim a fake store cannot make — a real self-only
+    # send whose Message-ID is read back out of the real Mail store.
+    self_addr = _prod_self_addr(ctx)
+    subject = f"rc-p06 prod {stamp}"
+    prod = _mcp_session(ctx, "p06-prod", [
+        ("send_email", {"to": self_addr, "subject": subject,
+                        "body": "RC P06 prod self-send."})])
+    psent = prod[0]
+    ctx.require(psent["ok"] is True,
+                f"prod send failed: {psent.get('code')} {psent.get('error')}")
+    pmid = psent["message_id"]
+
+    def in_store():
+        found = _mcp_session(ctx, "p06-prod-find", [
+            ("refresh_mail", {"wait_seconds": 5}),
+            ("search_emails", {"query": subject, "limit": 10})],
+            note=False)
+        hits = found[1].get("results") or [] if found[1]["ok"] else []
+        ids = [h["id"] for h in hits][:10]
+        if not ids:
+            return None
+        batch = _mcp_session(ctx, "p06-prod-read", [
+            ("get_emails_batch", {"ids": ids, "view": "metadata"})],
+            note=False)[0]
+        for email in batch.get("emails") or []:
+            headers = email.get("headers") or {}
+            for key, value in headers.items():
+                if key.lower() == "message-id" and value.strip() == pmid:
+                    return (email.get("ref") or {}).get("id") or True
+        return None
+
+    hit = _poll(_P06_STORE_DEADLINE_S, _P06_STORE_POLL_S, in_store)
+    ctx.require(hit is not None,
+                f"prod send {pmid} not found in the store within "
+                f"{_P06_STORE_DEADLINE_S:.0f}s")
+    _record_mints(ctx, [
+        _mint(started, SANDBOX, "send", "sent", message_id=mid),
+        _mint(started, SANDBOX, "send", "failed"),
+        _mint(started, PROD, "send", "sent", message_id=pmid),
+    ], reset=True)
+    ctx.note(f"prod: {pmid} sent self-only to {self_addr} and read back "
+             f"from the store (id {hit})")
+
+
+def _rc_dispatcher_plist(ctx: Context) -> str:
+    """The RC's own dispatcher agent — deliberately NOT the shipped
+    label. The per-user launchd domain is shared, so bootstrapping the
+    shipped label would displace the operator's real dispatcher (the §2
+    hazard); and the shipped plist pins no HOME, so launchd would hand
+    the agent the REAL estate. This plist pins the sandbox HOME: the
+    shipped dispatcher code, on the launchd cadence, over the sandbox
+    spool and nothing else."""
+    python = _venv_bin(ctx, "python")
+    log = ctx.sandbox_home / "rc-dispatcher.log"
+    path = os.environ.get("PATH", "/usr/bin:/bin:/usr/sbin:/sbin")
+    return f"""<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key><string>{_RC_DISPATCHER_LABEL}</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>{python}</string>
+        <string>-m</string>
+        <string>email_mcp.dispatcher</string>
+    </array>
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>HOME</key><string>{ctx.sandbox_home}</string>
+        <key>PATH</key><string>{path}</string>
+    </dict>
+    <key>StartInterval</key><integer>60</integer>
+    <key>RunAtLoad</key><true/>
+    <key>ProcessType</key><string>Background</string>
+    <key>StandardOutPath</key><string>{log}</string>
+    <key>StandardErrorPath</key><string>{log}</string>
+</dict>
+</plist>
+"""
+
+
+@implements("P07")
+def _p07_schedule_launchd(ctx: Context) -> None:
+    stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+    started = _now()
+    addr, store = _arm_sandbox_identity(ctx)
+    now = datetime.now(timezone.utc)
+    scheduled = _mcp_session(ctx, "p07-schedule", [
+        # Due immediately (inside the 120s past-tolerance): the agent's
+        # RunAtLoad pass can deliver it without waiting out a tick.
+        ("schedule_email", {"to": addr, "subject": f"rc-p07 deliver {stamp}",
+                            "body": "RC P07 dispatcher delivery.",
+                            "send_at": now.isoformat(timespec="seconds")}),
+        ("schedule_email", {"to": addr, "subject": f"rc-p07 cancel {stamp}",
+                            "body": "RC P07 cancel target.",
+                            "send_at": (now + timedelta(hours=1))
+                            .isoformat(timespec="seconds")}),
+    ])
+    plist = ctx.write(
+        ctx.sandbox_home / "Library" / "LaunchAgents"
+        / f"{_RC_DISPATCHER_LABEL}.plist",
+        _rc_dispatcher_plist(ctx))
+    uid = os.getuid()
+    target = f"gui/{uid}/{_RC_DISPATCHER_LABEL}"
+    if ctx.dry_run:
+        ctx.sh(["launchctl", "bootout", target])  # pre-clean a stale label
+        ctx.sh(["launchctl", "bootstrap", f"gui/{uid}", plist])
+        _mcp_session(ctx, "p07-cancel",
+                     [("cancel_scheduled", {"id": "<spool-id>"})])
+        ctx.sh(["launchctl", "bootout", target])
+        return
+
+    first, second = scheduled
+    for env in (first, second):
+        ctx.require(env["ok"] is True, f"schedule_email failed: "
+                                       f"{env.get('code')} {env.get('error')}")
+        ctx.require(env.get("executor") == "launchd",
+                    f"entry {env.get('id')} took executor "
+                    f"{env.get('executor')!r}, not the launchd spool")
+    id1, mid1 = first["id"], first["message_id"]
+    id2, mid2 = second["id"], second["message_id"]
+    spool = ctx.sandbox_home / STATE_ROOT_NAME / "spool"
+
+    # A crashed earlier pass leaves the agent loaded (kill -9 skips the
+    # bootout below); a stale agent double-ticking this spool would fake
+    # or break the delivery claim, so clear the label first.
+    ctx.sh(["launchctl", "bootout", target])
+    try:
+        ctx.sh(["launchctl", "bootstrap", f"gui/{uid}", plist], check=True)
+        delivered = _poll(
+            _P07_DELIVER_DEADLINE_S, _P07_POLL_S,
+            lambda: (spool / "sent" / f"{id1}.json").exists() or None)
+        ctx.require(delivered,
+                    f"the dispatcher agent did not deliver {id1} within "
+                    f"{_P07_DELIVER_DEADLINE_S:.0f}s")
+        manifest = json.loads(
+            (spool / "sent" / f"{id1}.json").read_text(encoding="utf-8"))
+        ctx.require(manifest.get("message_id") == mid1,
+                    f"sent manifest carries {manifest.get('message_id')!r}, "
+                    f"scheduled {mid1!r}")
+        ctx.require(mid1 in store.read_text(encoding="utf-8"),
+                    f"{mid1} never reached the sandbox delivery store")
+        cancel = _mcp_session(ctx, "p07-cancel",
+                              [("cancel_scheduled", {"id": id2})])[0]
+        ctx.require(cancel["ok"] is True
+                    and cancel.get("status") == "cancelled",
+                    f"cancel_scheduled answered {cancel.get('code') or cancel}")
+        cmanifest = spool / "cancelled" / f"{id2}.json"
+        ctx.require(cmanifest.exists(),
+                    f"{id2} did not land in cancelled/")
+        kept = json.loads(cmanifest.read_text(encoding="utf-8"))
+        ctx.require(kept.get("message_id") == mid2
+                    and kept.get("status") == "cancelled",
+                    f"cancelled manifest is not intact: {kept.get('id')} "
+                    f"{kept.get('status')!r} {kept.get('message_id')!r}")
+        ctx.require((spool / "cancelled" / f"{id2}.eml").exists(),
+                    "the cancelled entry lost its frozen .eml")
+    finally:
+        # Leave no loaded agent, pass or fail — a live label ticking a
+        # dead sandbox is exactly the stale state the pre-clean fears.
+        ctx.sh(["launchctl", "bootout", target])
+    armed = [p.name for state in ("pending", "sending")
+             for p in sorted((spool / state).glob("*.json"))]
+    ctx.require(not armed, "armed entries left behind: " + ", ".join(armed))
+    _record_mints(ctx, [
+        _mint(started, SANDBOX, "schedule", "scheduled", op=id1,
+              message_id=mid1),
+        _mint(started, SANDBOX, "schedule", "scheduled", op=id2,
+              message_id=mid2),
+        _mint(started, SANDBOX, "deliver", "sent", op=id1, message_id=mid1),
+        _mint(started, SANDBOX, "cancel", "cancelled", op=id2),
+    ])
+    ctx.note(f"{id1} delivered by the launchd agent ({_RC_DISPATCHER_LABEL}); "
+             f"{id2} cancelled with manifest + .eml intact; spool disarmed")
+
+
+def _trashish(name: str) -> bool:
+    low = name.lower()
+    return any(t in low for t in ("trash", "deleted", "junk", "bin"))
+
+
+def _triage_selection(ctx: Context, tag: str):
+    """Pick a real selection from the attached store: the busiest
+    non-trash mailbox, plus a same-account move target. Trash-adjacent
+    names are skipped because a delete plan's selection excludes Trash
+    by design — planning over it would read as an empty store."""
+    scan = _mcp_session(ctx, f"{tag}-scan", [("list_mailboxes", {})])
+    if scan is None:
+        return None
+    env = scan[0]
+    ctx.require(env["ok"] is True,
+                f"list_mailboxes failed: {env.get('code')} {env.get('error')}")
+    boxes = env.get("mailboxes") or []
+    populated = [b for b in boxes
+                 if b.get("local_count", 0) > 0 and not _trashish(b["name"])]
+    ctx.require(populated,
+                "the attached store serves no non-trash mailbox with local "
+                "rows — nothing to plan over")
+    source = max(populated, key=lambda b: b["local_count"])
+    targets = [b for b in boxes
+               if b["account"] == source["account"]
+               and b["name"] != source["name"] and not _trashish(b["name"])]
+    ctx.require(targets,
+                f"account {source['account']} has no second mailbox to "
+                "plan a move into")
+    return source["account"], source["name"], targets[0]["name"]
+
+
+def _refused_apply(ctx: Context, tag: str, plan_env: dict) -> dict:
+    """The shared back half of P10/P11: apply the frozen plan (TTL 0 has
+    already expired it), require the refusal BEFORE any mutation, verify
+    against the store that nothing moved, and require both ledger events
+    to carry the plan's summary — plan_finish is the line that must
+    outlive plan GC. Returns the audit envelope's events keyed by name."""
+    plan_id, summary = plan_env["plan_id"], plan_env["summary"]
+    planned = {m["id"]: m["mailbox"] for m in plan_env["messages"]}
+    refused, batch, ledger = _mcp_session(ctx, f"{tag}-refuse", [
+        ("triage_apply", {"plan_id": plan_id}),
+        ("get_emails_batch", {"ids": sorted(planned), "view": "minimal"}),
+        ("audit", {"plan_id": plan_id, "limit": 50}),
+    ])
+    ctx.require(refused["ok"] is False
+                and refused.get("code") == "plan_expired",
+                f"apply did not take the refusal path: "
+                f"{refused.get('code') or 'ok=true'}")
+    ctx.require(refused.get("operation_id") == plan_id,
+                "the refusal envelope does not thread to its plan id")
+    ctx.require(batch["ok"] is True and not batch.get("errors"),
+                f"store readback failed for the planned messages: "
+                f"{batch.get('errors') or batch.get('error')}")
+    now = {e["id"]: e.get("mailbox") for e in batch.get("emails") or []}
+    missing = sorted(set(planned) - set(now))
+    ctx.require(not missing,
+                "planned messages vanished from the store: "
+                + ", ".join(missing))
+    moved = sorted(i for i, box in planned.items() if now[i] != box)
+    ctx.require(not moved,
+                "the refused apply moved mail: " + ", ".join(moved))
+    ctx.require(ledger["ok"] is True, "the audit read failed")
+    events = ledger.get("events") or []
+    by_name = {e.get("event"): e for e in events}
+    ctx.require(len(events) == 2
+                and set(by_name) == {"plan_create", "plan_finish"},
+                f"expected exactly plan_create + plan_finish for {plan_id}, "
+                f"got {[e.get('event') for e in events]}")
+    ctx.require(by_name["plan_finish"].get("outcome") == "expired",
+                f"plan_finish outcome is "
+                f"{by_name['plan_finish'].get('outcome')!r}, not expired")
+    off = sorted(name for name, e in by_name.items()
+                 if e.get("op") != plan_id or e.get("summary") != summary)
+    ctx.require(not off, "event(s) missing the plan id as op or the "
+                         "summary line: " + ", ".join(off))
+    return by_name
+
+
+# TTL 0 expires the plan at the moment it freezes, so the later apply
+# refuses `plan_expired` BEFORE its Mail pre-flight — the coded refusal
+# is exercised with zero osascript and zero mutation. That is the plan +
+# refusal path §1's read-only store demands of the sandbox lane.
+_TTL_EXPIRED = {"EMAIL_MCP_TRIAGE_TTL": "0"}
+
+
+@implements("P10")
+def _p10_triage_plans(ctx: Context) -> None:
+    started = _now()
+    selection = _triage_selection(ctx, "p10")
+    if ctx.dry_run:
+        _mcp_session(ctx, "p10-plan", [
+            ("triage_plan", {"account": "<account>", "mailbox": "<mailbox>",
+                             "limit": 5,
+                             "actions": [{"action": "flag", "color": 1},
+                                         {"action": "move_to",
+                                          "mailbox": "<target>"}]})],
+            extra_env=_TTL_EXPIRED)
+        _mcp_session(ctx, "p10-refuse", [
+            ("triage_apply", {"plan_id": "<plan-id>"}),
+            ("get_emails_batch", {"ids": ["<planned>"], "view": "minimal"}),
+            ("audit", {"plan_id": "<plan-id>", "limit": 50})])
+        return
+    account, mailbox, target = selection
+    plan_env = _mcp_session(ctx, "p10-plan", [
+        ("triage_plan", {"account": account, "mailbox": mailbox, "limit": 5,
+                         "actions": [{"action": "flag", "color": 1},
+                                     {"action": "move_to",
+                                      "mailbox": target}]})],
+        extra_env=_TTL_EXPIRED)[0]
+    ctx.require(plan_env["ok"] is True,
+                f"triage_plan failed: {plan_env.get('code')} "
+                f"{plan_env.get('error')}")
+    verbs = sorted(a.get("action") for a in plan_env.get("actions") or [])
+    ctx.require(verbs == ["flag", "move_to"],
+                f"the plan froze {verbs}, not move + flag")
+    _refused_apply(ctx, "p10", plan_env)
+    _record_mints(ctx, [
+        _mint(started, SANDBOX, "plan_create", "created",
+              op=plan_env["plan_id"]),
+        _mint(started, SANDBOX, "plan_finish", "expired",
+              op=plan_env["plan_id"]),
+    ])
+    ctx.note(f"plan {plan_env['plan_id']}: move+flag over "
+             f"{plan_env['count']} message(s) in {mailbox} → {target}; "
+             f"apply refused plan_expired before any mutation; store "
+             f"verified unmoved; both ledger events carry the summary "
+             f"{plan_env['summary']!r}")
+
+
+@implements("P11")
+def _p11_trash_plan(ctx: Context) -> None:
+    started = _now()
+    selection = _triage_selection(ctx, "p11")
+    if ctx.dry_run:
+        _mcp_session(ctx, "p11-plan", [
+            ("triage_plan_delete", {"account": "<account>",
+                                    "mailbox": "<mailbox>", "limit": 3})],
+            extra_env=_TTL_EXPIRED)
+        _mcp_session(ctx, "p11-refuse", [
+            ("triage_apply", {"plan_id": "<plan-id>"}),
+            ("get_emails_batch", {"ids": ["<planned>"], "view": "minimal"}),
+            ("audit", {"plan_id": "<plan-id>", "limit": 50})])
+        return
+    account, mailbox, _target = selection
+    plan_env = _mcp_session(ctx, "p11-plan", [
+        ("triage_plan_delete", {"account": account, "mailbox": mailbox,
+                                "limit": 3})],
+        extra_env=_TTL_EXPIRED)[0]
+    ctx.require(plan_env["ok"] is True,
+                f"triage_plan_delete failed: {plan_env.get('code')} "
+                f"{plan_env.get('error')}")
+    # The delete selection excludes Trash by design — a planned message
+    # already sitting there would mean the exclusion failed.
+    trashed = sorted(m["id"] for m in plan_env["messages"]
+                     if _trashish(m["mailbox"]))
+    ctx.require(not trashed,
+                "the delete plan selected trash-resident messages: "
+                + ", ".join(trashed))
+    _refused_apply(ctx, "p11", plan_env)
+    _record_mints(ctx, [
+        _mint(started, SANDBOX, "plan_create", "created",
+              op=plan_env["plan_id"]),
+        _mint(started, SANDBOX, "plan_finish", "expired",
+              op=plan_env["plan_id"]),
+    ])
+    ctx.note(f"delete plan {plan_env['plan_id']}: {plan_env['count']} "
+             f"message(s) in {mailbox}, none Trash-resident; apply refused "
+             f"plan_expired; store verified — nothing landed in Trash; "
+             f"ledger carries the summary {plan_env['summary']!r}")
+
+
+@implements("P12")
+def _p12_audit_inspection(ctx: Context) -> None:
+    if ctx.dry_run:
+        ctx.lane = SANDBOX
+        _mcp_session(ctx, "p12-sandbox",
+                     [("audit", {"since": "<run-start>", "limit": 500})])
+        ctx.lane = PROD
+        _mcp_session(ctx, "p12-prod",
+                     [("audit", {"since": "<run-start>", "limit": 500})])
+        return
+    mints_path = ctx.sandbox_home / "rc-s2-mints.json"
+    ctx.require(mints_path.exists(),
+                "no mutation expectations recorded — P06–P11 write them; "
+                "run P12 after the phases whose ledger it audits")
+    mints = json.loads(mints_path.read_text(encoding="utf-8"))
+    ctx.require(bool(mints), "the expectations file is empty")
+    # ISO strings order lexicographically; +00:00 keeps the bound
+    # parseable by the server's fromisoformat.
+    since = min(r["ts"] for r in mints).replace("Z", "+00:00")
+
+    ctx.lane = SANDBOX
+    sandbox = _mcp_session(ctx, "p12-sandbox",
+                           [("audit", {"since": since, "limit": 500})])[0]
+    ctx.lane = PROD
+    prod = _mcp_session(ctx, "p12-prod",
+                        [("audit", {"since": since, "limit": 500})])[0]
+    for lane, env in ((SANDBOX, sandbox), (PROD, prod)):
+        ctx.require(env["ok"] is True, f"{lane} audit read failed: "
+                                       f"{env.get('code')} {env.get('error')}")
+
+    def matches(record: dict, events: list[dict]) -> list[dict]:
+        return [e for e in events
+                if e.get("event") == record["event"]
+                and e.get("outcome") == record["outcome"]
+                and (record["op"] is None or e.get("op") == record["op"])
+                and (record["message_id"] is None
+                     or e.get("message_id") == record["message_id"])]
+
+    # Sandbox: the estate was born this pass, so the claim is exact — a
+    # bijection between the mutations the phases recorded and the
+    # mail-mutation events on the ledger. One each, nothing else.
+    observed = [e for e in sandbox.get("events") or []
+                if e.get("event") in _LEDGER_FAMILIES]
+    expected = [r for r in mints if r["lane"] == SANDBOX]
+    for record in expected:
+        hits = matches(record, observed)
+        ctx.require(len(hits) == 1,
+                    f"sandbox {record['event']}/{record['outcome']} "
+                    f"(op {record['op']}, mid {record['message_id']}): "
+                    f"{len(hits)} event(s), want exactly 1")
+    ctx.require(len(observed) == len(expected),
+                f"sandbox ledger holds {len(observed)} mutation event(s) "
+                f"for {len(expected)} recorded mutation(s)")
+    unthreaded = [e.get("event") for e in observed if not e.get("op")]
+    ctx.require(not unthreaded, "event(s) carry no operation id: "
+                                + ", ".join(unthreaded))
+
+    # Prod: the estate is live — operator traffic during the window is
+    # not this run's claim. Ours must appear exactly once each; a second
+    # event for one of our mutations would be a double-emit.
+    prod_events = [e for e in prod.get("events") or []
+                   if e.get("event") in _LEDGER_FAMILIES]
+    ours = 0
+    for record in (r for r in mints if r["lane"] == PROD):
+        hits = matches(record, prod_events)
+        ctx.require(len(hits) == 1,
+                    f"prod {record['event']}/{record['outcome']} "
+                    f"(mid {record['message_id']}): {len(hits)} event(s), "
+                    f"want exactly 1")
+        ours += 1
+    unrelated = len(prod_events) - ours
+    ctx.note(f"sandbox: {len(expected)} mutation(s) ↔ {len(observed)} "
+             f"event(s), one each, every op threaded — one audit call")
+    ctx.note(f"prod: {ours} mutation(s) found exactly once in one audit "
+             f"call ({unrelated} unrelated live-estate event(s) outside "
+             f"this run's claim); spool ids and plan ids ride as op, "
+             f"Message-IDs on the send events")
 
 
 # --------------------------------------------------------------------- #

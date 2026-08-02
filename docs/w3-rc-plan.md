@@ -192,3 +192,43 @@ Two plan-text corrections rode along: the version verb is
 `email-mcp version` (the CLI has no `--version` flag), and setup's leaf
 materialization now creates an *empty* `fts/` dir by design — the P02
 claim is that the index stays unbuilt.
+
+**S2** (2026-08-02) binds the mutation story P06–P07 and P10–P12, every
+tool call driven through a real MCP client subprocess (the P05
+discipline, generalized). Four plan-text refinements rode along, each
+forced by §1's own rule that the sandbox's attached store is *only ever
+read*:
+
+- **P06** — the sandbox half fences itself with the product's own
+  mechanisms before anything can send: the sandbox identity *declares*
+  an allowlist of exactly its own address (sends are open by default;
+  declaring the guard arms it, so a foreign recipient must come back
+  `recipient_not_allowed`), and its pipe transport delivers into a file
+  under the sandbox home — the sandbox's delivery store, where the
+  Message-ID is then found. The prod half stays a real self-only send,
+  verified by Message-ID readback (metadata headers) from the real
+  store.
+- **P07** — the dispatcher runs under launchd via an RC-owned label
+  (`com.email-mcp.rc-dispatcher`) whose plist pins the sandbox HOME.
+  The shipped label would displace the operator's dispatcher (the §2
+  hazard), and the shipped plist pins no HOME, so launchd would aim the
+  agent at the real estate. The phase cancels its second entry, boots
+  its agent out pass or fail, and requires `pending/` + `sending/`
+  empty — no armed entry, no loaded agent, prod labels untouched.
+- **P10/P11** — apply cannot run against a read-only store, so both
+  phases prove the plan + refusal path instead of inventing a mutation:
+  the plan freezes with `EMAIL_MCP_TRIAGE_TTL=0`, `triage_apply`
+  refuses `plan_expired` *before* its Mail pre-flight (zero osascript),
+  the store is verified unmoved by readback, and the `plan_create` +
+  `plan_finish(expired)` events both carry the plan's summary — the
+  line that outlives GC.
+- **P12** — each lane's ledger is read through ONE `audit` tool call
+  bounded at the run's start, against the expectations file P06–P11
+  write (`rc-s2-mints.json` in the sandbox home). Sandbox: an exact
+  bijection — every recorded mutation ↔ exactly one mail-mutation
+  event, nothing else on the fresh estate. Prod: each of the run's
+  mutations exactly once; unrelated live-estate traffic is outside the
+  claim. Threading: spool ids and plan ids are their events' `op`,
+  Message-IDs ride the send events. Estate events (`lifecycle`,
+  `doctor_fix`) belong to the lifecycle story, not the mail-mutation
+  families, and are outside the count.

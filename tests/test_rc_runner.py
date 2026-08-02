@@ -587,8 +587,10 @@ def test_the_shipped_plan_is_the_eighteen_phases_of_the_w3_document():
     assert all(s.lane in (runner.SANDBOX, runner.PROD, runner.BOTH)
                for s in runner.PLAN)
     assert all(s.acceptance for s in runner.PLAN)
-    # R2 attaches bodies stage by stage; S1 bound the sandbox core.
-    assert set(runner.IMPLEMENTATIONS) == {"P01", "P02", "P03", "P04", "P05"}
+    # R2 attaches bodies stage by stage; S1 bound the sandbox core, S2
+    # the mutation story.
+    assert set(runner.IMPLEMENTATIONS) == {"P01", "P02", "P03", "P04", "P05",
+                                           "P06", "P07", "P10", "P11", "P12"}
 
 
 def test_the_runner_and_the_plan_document_agree():
@@ -1086,3 +1088,551 @@ def test_p05_fails_on_impure_stdout_or_a_wire_exception(
     result = run_phase("P05", ctx)
     assert result.status == runner.FAIL
     assert any(symptom in d for d in result.detail), result.detail
+
+
+# --------------------------------------------------------------------- #
+# 6. the S2 bodies — P06/P07, P10-P12, the mutation story                #
+# --------------------------------------------------------------------- #
+#
+# Same discipline as section 5: the dry run proves each body's complete
+# command plan, and the live paths run against a scripted _spawn. The S2
+# bodies speak MCP through one shared tool client, so most routes here
+# read the calls file the body wrote and answer per tool — which also
+# lets a test assert WHAT was asked (self-only recipients, TTL 0) and
+# WHERE (the env's HOME is the lane).
+
+_SB_ADDR = "rc-sandbox@example.org"  # the fixture's From: answer
+
+
+def _session_route(respond):
+    """Route the S2 tool client: read the calls file the body wrote and
+    answer each call through respond(tool, arguments, call)."""
+    def match(argv):
+        return len(argv) >= 4 and argv[1].endswith("rc-s2-client.py")
+
+    def reply(call):
+        calls = json.loads(Path(call["argv"][-1]).read_text())
+        out = [{"tool": c["tool"],
+                "envelope": respond(c["tool"], c["arguments"], call),
+                "rpc_error": None, "is_error": False}
+               for c in calls]
+        return _Proc(0, json.dumps({"calls": out, "server_exit": 0}))
+
+    return (match, reply)
+
+
+def _mints(ctx):
+    path = ctx.sandbox_home / "rc-s2-mints.json"
+    return json.loads(path.read_text()) if path.exists() else []
+
+
+def _fast_polls(monkeypatch):
+    """Timeout paths must not wait out live deadlines in a test."""
+    monkeypatch.setattr(runner, "_P06_STORE_DEADLINE_S", 0.0)
+    monkeypatch.setattr(runner, "_P07_DELIVER_DEADLINE_S", 0.0)
+
+
+def test_s2_dry_run_plans_the_whole_mutation_story(tmp_path, estate):
+    """A bare P06,P07,P10-P12 selection must print every planned effect
+    and spawn nothing (the autouse fence would raise): the tool sessions
+    with their call lists, the identity fence, the RC dispatcher plist,
+    and the launchd bootstrap/bootout pair."""
+    sink = io.StringIO()
+    code = runner.main(
+        ["--state-dir", str(tmp_path / "rcstate"), "--phase",
+         "P06,P07,P10-P12"],
+        sentinel=runner.Sentinel(estate, probe=_agents()), sink=sink)
+    text = sink.getvalue()
+
+    assert code == runner.EXIT_OK
+    for phase, title in (("P06", "send"),
+                         ("P07", "schedule via launchd, then cancel"),
+                         ("P10", "triage plans"), ("P11", "trash plan"),
+                         ("P12", "audit inspection")):
+        assert f"{phase} · {title}" in text and "dry-run" in text
+    for intent in ("rc-s2-client.py",
+                   "identities.toml", "sink.sh",
+                   f"{runner._RC_DISPATCHER_LABEL}.plist",
+                   "launchctl bootstrap", "launchctl bootout",
+                   "p06-sandbox: tools/call send_email, send_email",
+                   "p07-schedule: tools/call schedule_email, schedule_email",
+                   "p07-cancel: tools/call cancel_scheduled",
+                   "p10-plan: tools/call triage_plan",
+                   "p11-plan: tools/call triage_plan_delete",
+                   "p12-prod: tools/call audit"):
+        assert intent in text, f"the dry run never planned: {intent}"
+    assert "(0 phase(s) with no body yet)" in text, \
+        "every S2 phase must be bound"
+
+
+# -- P06 ---------------------------------------------------------------- #
+
+
+def _prod_identities(estate, addr="operator@example.com"):
+    (estate / "identities.toml").write_text(
+        f'default = "main"\n\n[main]\nfrom_addr = "{addr}"\n'
+        'driver = "pipe"\n')
+    return addr
+
+
+def _p06_respond(ctx, *, fence_armed=True, store_hit=True):
+    """Scripted lanes for P06: the sandbox self-send appends to the
+    delivery store, the fence probe refuses (or leaks, to test the
+    check), the prod half sends and is found via search + metadata."""
+    store = ctx.sandbox_home / "rc-outbox" / "delivered.mbox"
+
+    def respond(tool, args, call):
+        if tool == "send_email" and args["to"] == _SB_ADDR:
+            assert call["env"].get("HOME") == str(ctx.sandbox_home), \
+                "the sandbox send must run under the sandbox HOME"
+            store.parent.mkdir(parents=True, exist_ok=True)
+            with store.open("a") as fh:
+                fh.write("Message-ID: <rc-p06-sb@rc>\n\nbody\n")
+            return {"ok": True, "message_id": "<rc-p06-sb@rc>",
+                    "to": [args["to"]], "cc": [], "bcc": [],
+                    "subject": args["subject"], "attachments": [],
+                    "bootstrapped": False}
+        if tool == "send_email" and "blocked" in args["to"]:
+            if fence_armed:
+                return {"ok": False, "code": "recipient_not_allowed",
+                        "error": "refused: not on the allowlist"}
+            return {"ok": True, "message_id": "<leak@rc>",
+                    "to": [args["to"]], "cc": [], "bcc": [],
+                    "subject": args["subject"], "attachments": [],
+                    "bootstrapped": False}
+        if tool == "send_email":
+            assert call["env"].get("HOME") == os.environ["HOME"], \
+                "the prod send must run under the real HOME"
+            return {"ok": True, "message_id": "<rc-p06-prod@rc>",
+                    "to": [args["to"]], "cc": [], "bcc": [],
+                    "subject": args["subject"], "attachments": [],
+                    "bootstrapped": False}
+        if tool == "refresh_mail":
+            return {"ok": True, "new_messages": 1}
+        if tool == "search_emails":
+            return {"ok": True, "fts": {"state": "ready"},
+                    "results": [{"id": "42"}] if store_hit else []}
+        if tool == "get_emails_batch":
+            return {"ok": True, "view": "metadata", "errors": [],
+                    "emails": [{"ref": {"id": "42"},
+                                "headers": {"Message-Id":
+                                            "<rc-p06-prod@rc>"}}]}
+        raise AssertionError(f"unscripted tool: {tool}")
+
+    return respond
+
+
+def test_p06_sends_self_only_on_both_lanes_and_finds_the_message_id(
+        tmp_path, estate, monkeypatch):
+    addr = _prod_identities(estate)
+    ctx = make_ctx(tmp_path, estate, dry_run=False)
+    ctx.repo_root = _REPO
+    spawn = ScriptedSpawn(_session_route(_p06_respond(ctx)))
+    monkeypatch.setattr(runner, "_spawn", spawn)
+    result = run_phase("P06", ctx)
+    assert result.status == runner.PASS, result.detail
+
+    # The fence is the product's own declared guard plus a file store —
+    # written before anything could send.
+    ident = (ctx.sandbox_home / ".email-mcp" / "identities.toml").read_text()
+    assert f'allowlist = ["{_SB_ADDR}"]' in ident
+    assert "sink.sh" in ident, "delivery must be re-pointed at the sink"
+    sink = ctx.sandbox_home / "rc-outbox" / "sink.sh"
+    assert stat.S_IMODE(sink.stat().st_mode) == 0o700
+    assert str(ctx.sandbox_home / "rc-outbox" / "delivered.mbox") \
+        in sink.read_text()
+
+    # The prod recipient came from the real identities file: self-only.
+    prod_calls = json.loads(
+        (ctx.sandbox_home / "rc-p06-prod.calls.json").read_text())
+    assert prod_calls[0]["arguments"]["to"] == addr
+
+    mints = _mints(ctx)
+    assert [(m["lane"], m["event"], m["outcome"]) for m in mints] == [
+        ("sandbox", "send", "sent"), ("sandbox", "send", "failed"),
+        ("prod", "send", "sent")]
+    assert mints[0]["message_id"] == "<rc-p06-sb@rc>"
+    assert mints[2]["message_id"] == "<rc-p06-prod@rc>"
+
+
+def test_p06_fails_when_the_send_fence_is_not_armed(tmp_path, estate,
+                                                    monkeypatch):
+    """A foreign recipient that does NOT come back recipient_not_allowed
+    means a sandbox send could reach a real mailbox — the one outcome
+    this lane exists to make impossible."""
+    _prod_identities(estate)
+    ctx = make_ctx(tmp_path, estate, dry_run=False)
+    ctx.repo_root = _REPO
+    monkeypatch.setattr(runner, "_spawn", ScriptedSpawn(
+        _session_route(_p06_respond(ctx, fence_armed=False))))
+    result = run_phase("P06", ctx)
+    assert result.status == runner.FAIL
+    assert any("fence is not armed" in d for d in result.detail)
+
+
+def test_p06_fails_when_the_prod_store_never_shows_the_message_id(
+        tmp_path, estate, monkeypatch):
+    _prod_identities(estate)
+    _fast_polls(monkeypatch)
+    ctx = make_ctx(tmp_path, estate, dry_run=False)
+    ctx.repo_root = _REPO
+    monkeypatch.setattr(runner, "_spawn", ScriptedSpawn(
+        _session_route(_p06_respond(ctx, store_hit=False))))
+    result = run_phase("P06", ctx)
+    assert result.status == runner.FAIL
+    assert any("not found in the store" in d for d in result.detail)
+
+
+# -- P07 ---------------------------------------------------------------- #
+
+
+def _p07_spawn(ctx, *, deliver=True):
+    """Scripted schedule/cancel plus a launchd stand-in: bootstrap plays
+    the agent's RunAtLoad pass (pending → sent + bytes into the store),
+    cancel moves its entry to cancelled/ with both files."""
+    spool = ctx.sandbox_home / ".email-mcp" / "spool"
+    store = ctx.sandbox_home / "rc-outbox" / "delivered.mbox"
+
+    def respond(tool, args, call):
+        if tool == "schedule_email":
+            which = "deliver" if "deliver" in args["subject"] else "cancel"
+            sid, mid = f"sched-{which}", f"<rc-p07-{which}@rc>"
+            pending = spool / "pending"
+            pending.mkdir(parents=True, exist_ok=True)
+            (pending / f"{sid}.json").write_text(json.dumps(
+                {"id": sid, "status": "pending", "message_id": mid,
+                 "subject": args["subject"], "send_at": args["send_at"]}))
+            (pending / f"{sid}.eml").write_text(f"Message-ID: {mid}\n\nx\n")
+            return {"ok": True, "id": sid, "send_at": args["send_at"],
+                    "message_id": mid, "executor": "launchd",
+                    "subject": args["subject"]}
+        if tool == "cancel_scheduled":
+            sid = args["id"]
+            src, dst = spool / "pending", spool / "cancelled"
+            dst.mkdir(parents=True, exist_ok=True)
+            manifest = json.loads((src / f"{sid}.json").read_text())
+            manifest["status"] = "cancelled"
+            (dst / f"{sid}.json").write_text(json.dumps(manifest))
+            (src / f"{sid}.json").unlink()
+            (src / f"{sid}.eml").rename(dst / f"{sid}.eml")
+            return {"ok": True, "id": sid, "status": "cancelled",
+                    "subject": manifest["subject"],
+                    "was_due": manifest["send_at"]}
+        raise AssertionError(f"unscripted tool: {tool}")
+
+    def tick(call):
+        if deliver:
+            src, dst = spool / "pending", spool / "sent"
+            dst.mkdir(parents=True, exist_ok=True)
+            sid = "sched-deliver"
+            if (src / f"{sid}.json").exists():
+                manifest = json.loads((src / f"{sid}.json").read_text())
+                manifest["status"] = "sent"
+                (dst / f"{sid}.json").write_text(json.dumps(manifest))
+                (src / f"{sid}.json").unlink()
+                (src / f"{sid}.eml").rename(dst / f"{sid}.eml")
+                with store.open("a") as fh:
+                    fh.write(f"Message-ID: {manifest['message_id']}\n\nx\n")
+        return _Proc(0)
+
+    return ScriptedSpawn(
+        _session_route(respond),
+        (lambda a: a[:2] == ["launchctl", "bootstrap"], tick),
+        (lambda a: a[:2] == ["launchctl", "bootout"], lambda c: _Proc(0)),
+    )
+
+
+def test_p07_delivers_via_the_rc_agent_and_cancels_the_second_entry(
+        tmp_path, estate, monkeypatch):
+    ctx = make_ctx(tmp_path, estate, dry_run=False)
+    ctx.repo_root = _REPO
+    spawn = _p07_spawn(ctx)
+    monkeypatch.setattr(runner, "_spawn", spawn)
+    result = run_phase("P07", ctx)
+    assert result.status == runner.PASS, result.detail
+
+    # The agent is RC-owned and sandbox-pinned: the shipped label would
+    # displace the operator's dispatcher, and an unpinned HOME would aim
+    # the agent at the real estate.
+    plist = (ctx.sandbox_home / "Library" / "LaunchAgents"
+             / f"{runner._RC_DISPATCHER_LABEL}.plist").read_text()
+    assert runner._RC_DISPATCHER_LABEL in plist
+    assert "com.email-mcp.dispatcher<" not in plist
+    assert f"<key>HOME</key><string>{ctx.sandbox_home}</string>" in plist
+    assert "email_mcp.dispatcher" in plist
+
+    launchctl = [c["argv"] for c in spawn.calls
+                 if c["argv"][0] == "launchctl"]
+    assert [a[1] for a in launchctl] == ["bootout", "bootstrap", "bootout"], \
+        "pre-clean, bootstrap, and the final bootout — in that order"
+    assert all(runner._RC_DISPATCHER_LABEL in " ".join(a) or
+               str(ctx.sandbox_home) in " ".join(a) for a in launchctl), \
+        "launchd actions must never name a prod label"
+
+    spool = ctx.sandbox_home / ".email-mcp" / "spool"
+    assert not list((spool / "pending").glob("*.json")), "an entry is armed"
+    assert (spool / "cancelled" / "sched-cancel.eml").exists()
+    assert [(m["event"], m["op"]) for m in _mints(ctx)] == [
+        ("schedule", "sched-deliver"), ("schedule", "sched-cancel"),
+        ("deliver", "sched-deliver"), ("cancel", "sched-cancel")]
+
+
+def test_p07_times_out_loudly_and_still_boots_its_agent_out(
+        tmp_path, estate, monkeypatch):
+    """A dispatcher that never ticks is a failed phase — and the finally
+    must still unload the RC agent, or a dead sandbox keeps a live
+    launchd label ticking it."""
+    _fast_polls(monkeypatch)
+    ctx = make_ctx(tmp_path, estate, dry_run=False)
+    ctx.repo_root = _REPO
+    spawn = _p07_spawn(ctx, deliver=False)
+    monkeypatch.setattr(runner, "_spawn", spawn)
+    result = run_phase("P07", ctx)
+    assert result.status == runner.FAIL
+    assert any("did not deliver" in d for d in result.detail)
+    assert spawn.calls[-1]["argv"][:2] == ["launchctl", "bootout"], \
+        "the agent must be booted out even on failure"
+
+
+# -- P10 / P11 ---------------------------------------------------------- #
+
+
+_BOXES = [
+    {"account": "ACC", "name": "INBOX", "path": "u1", "total": 9,
+     "unread": 1, "local_count": 7},
+    {"account": "ACC", "name": "Archive", "path": "u2", "total": 3,
+     "unread": 0, "local_count": 2},
+    {"account": "ACC", "name": "Trash", "path": "u3", "total": 5,
+     "unread": 0, "local_count": 5},
+]
+
+
+def _plan_respond(ctx, *, plan_tool, planned_mailbox="INBOX",
+                  apply_env=None, batch_moved=False, finish_summary=True):
+    """One scripted triage store for P10 and P11: the plan freezes two
+    INBOX messages, apply refuses plan_expired, the batch readback shows
+    them unmoved (or moved, to test the check), and the ledger carries
+    plan_create + plan_finish(expired) with the summary."""
+    summary = "rc plan summary line"
+
+    def respond(tool, args, call):
+        if tool == "list_mailboxes":
+            return {"ok": True, "mailboxes": _BOXES}
+        if tool == plan_tool:
+            assert call["env"].get("EMAIL_MCP_TRIAGE_TTL") == "0", \
+                "the plan must freeze already-expired (TTL 0)"
+            assert args["account"] == "ACC" and args["mailbox"] == "INBOX"
+            actions = [{"action": "flag", "color": 1},
+                       {"action": "move_to", "mailbox": "Archive"}] \
+                if plan_tool == "triage_plan" \
+                else [{"action": "delete"}]
+            return {"ok": True, "plan_id": "tp-1", "count": 2,
+                    "expires_at": "2026-08-02T00:00:00+00:00",
+                    "summary": summary, "actions": actions,
+                    "messages": [
+                        {"id": "11", "subject": "a", "from_addr": "x",
+                         "date": "d", "mailbox": planned_mailbox,
+                         "unread": True},
+                        {"id": "12", "subject": "b", "from_addr": "y",
+                         "date": "d", "mailbox": planned_mailbox,
+                         "unread": False}]}
+        if tool == "triage_apply":
+            return apply_env or {
+                "ok": False, "code": "plan_expired",
+                "error": "plan tp-1 expired", "operation_id": "tp-1"}
+        if tool == "get_emails_batch":
+            assert args["ids"] == ["11", "12"]
+            return {"ok": True, "view": "minimal", "errors": [],
+                    "emails": [
+                        {"id": "11", "mailbox":
+                         "Archive" if batch_moved else planned_mailbox,
+                         "unread": True},
+                        {"id": "12", "mailbox": planned_mailbox,
+                         "unread": False}]}
+        if tool == "audit":
+            assert args["plan_id"] == "tp-1"
+            return {"ok": True, "files_scanned": 1, "skipped_lines": 0,
+                    "events": [
+                        {"event": "plan_finish", "outcome": "expired",
+                         "op": "tp-1",
+                         "summary": summary if finish_summary else "other"},
+                        {"event": "plan_create", "outcome": "created",
+                         "op": "tp-1", "summary": summary}]}
+        raise AssertionError(f"unscripted tool: {tool}")
+
+    return respond
+
+
+@pytest.mark.parametrize("pid, plan_tool", [
+    ("P10", "triage_plan"), ("P11", "triage_plan_delete")])
+def test_p10_p11_freeze_a_plan_and_prove_the_refusal_path(
+        tmp_path, estate, monkeypatch, pid, plan_tool):
+    ctx = make_ctx(tmp_path, estate, dry_run=False)
+    monkeypatch.setattr(runner, "_spawn", ScriptedSpawn(
+        _session_route(_plan_respond(ctx, plan_tool=plan_tool))))
+    result = run_phase(pid, ctx)
+    assert result.status == runner.PASS, result.detail
+    assert [(m["event"], m["outcome"], m["op"]) for m in _mints(ctx)] == [
+        ("plan_create", "created", "tp-1"),
+        ("plan_finish", "expired", "tp-1")]
+    assert any("summary" in d for d in result.detail)
+
+
+@pytest.mark.parametrize("breakage, symptom", [
+    # apply "succeeded": a mutation happened against a read-only store
+    ({"apply_env": {"ok": True, "status": "applied"}}, "refusal path"),
+    # apply refused with the wrong code
+    ({"apply_env": {"ok": False, "code": "plan_claimed", "error": "x",
+                    "operation_id": "tp-1"}}, "refusal path"),
+    # the store shows a planned message in the move target
+    ({"batch_moved": True}, "moved mail"),
+    # plan_finish lost the summary line that must outlive GC
+    ({"finish_summary": False}, "summary"),
+])
+def test_p10_fails_when_apply_mutates_or_the_ledger_drops_the_summary(
+        tmp_path, estate, monkeypatch, breakage, symptom):
+    ctx = make_ctx(tmp_path, estate, dry_run=False)
+    monkeypatch.setattr(runner, "_spawn", ScriptedSpawn(_session_route(
+        _plan_respond(ctx, plan_tool="triage_plan", **breakage))))
+    result = run_phase("P10", ctx)
+    assert result.status == runner.FAIL
+    assert any(symptom in d for d in result.detail), result.detail
+
+
+def test_p11_fails_when_the_delete_plan_selects_trash_residents(
+        tmp_path, estate, monkeypatch):
+    """The delete selection excludes Trash by design (a fumbled
+    parameter must never reach it) — a Trash-resident planned message
+    means that exclusion failed."""
+    ctx = make_ctx(tmp_path, estate, dry_run=False)
+    monkeypatch.setattr(runner, "_spawn", ScriptedSpawn(_session_route(
+        _plan_respond(ctx, plan_tool="triage_plan_delete",
+                      planned_mailbox="Trash"))))
+    result = run_phase("P11", ctx)
+    assert result.status == runner.FAIL
+    assert any("trash-resident" in d for d in result.detail), result.detail
+
+
+# -- P12 ---------------------------------------------------------------- #
+
+
+def _seed_mints(ctx, records):
+    ctx.sandbox_home.mkdir(parents=True, exist_ok=True)
+    (ctx.sandbox_home / "rc-s2-mints.json").write_text(json.dumps(records))
+
+
+def _mint(lane, event, outcome, op=None, message_id=None,
+          ts="2026-08-02T10:00:00Z"):
+    return {"ts": ts, "lane": lane, "event": event, "outcome": outcome,
+            "op": op, "message_id": message_id}
+
+
+_S2_MINTS = [
+    _mint("sandbox", "send", "sent", message_id="<sb@rc>"),
+    _mint("sandbox", "send", "failed"),
+    _mint("sandbox", "schedule", "scheduled", op="sched-1",
+          message_id="<s1@rc>"),
+    _mint("sandbox", "deliver", "sent", op="sched-1", message_id="<s1@rc>"),
+    _mint("sandbox", "cancel", "cancelled", op="sched-2"),
+    _mint("prod", "send", "sent", message_id="<pr@rc>"),
+]
+
+
+def _ledger_event(event, outcome, op="auto-op", message_id=None, **extra):
+    e = {"v": 1, "ts": "2026-08-02T10:01:00Z", "op": op, "src": "server",
+         "event": event, "outcome": outcome}
+    if message_id:
+        e["message_id"] = message_id
+    e.update(extra)
+    return e
+
+
+def _sandbox_ledger():
+    return [
+        _ledger_event("send", "sent", message_id="<sb@rc>"),
+        _ledger_event("send", "failed"),
+        _ledger_event("schedule", "scheduled", op="sched-1",
+                      message_id="<s1@rc>"),
+        _ledger_event("deliver", "sent", op="sched-1",
+                      message_id="<s1@rc>", src="dispatcher"),
+        _ledger_event("cancel", "cancelled", op="sched-2"),
+        # estate events are the lifecycle story, not a mail mutation —
+        # P12 must not count them against the bijection
+        _ledger_event("lifecycle", "setup"),
+    ]
+
+
+def _p12_respond(ctx, sandbox_events, prod_events, seen=None):
+    def respond(tool, args, call):
+        assert tool == "audit"
+        if seen is not None:
+            seen.append(args)
+        events = sandbox_events \
+            if call["env"].get("HOME") == str(ctx.sandbox_home) \
+            else prod_events
+        return {"ok": True, "events": events, "files_scanned": 1,
+                "skipped_lines": 0}
+
+    return respond
+
+
+def test_p12_proves_one_event_per_mutation_threaded_by_operation_id(
+        tmp_path, estate, monkeypatch):
+    ctx = make_ctx(tmp_path, estate, dry_run=False)
+    _seed_mints(ctx, _S2_MINTS)
+    prod = [
+        _ledger_event("send", "sent", message_id="<pr@rc>"),
+        # the live estate keeps living during the pass — not our claim
+        _ledger_event("send", "sent", message_id="<operator-noise@x>"),
+    ]
+    seen = []
+    monkeypatch.setattr(runner, "_spawn", ScriptedSpawn(_session_route(
+        _p12_respond(ctx, _sandbox_ledger(), prod, seen))))
+    result = run_phase("P12", ctx)
+    assert result.status == runner.PASS, result.detail
+    assert all(a == {"since": "2026-08-02T10:00:00+00:00", "limit": 500}
+               for a in seen), "one audit call per lane, run-start bounded"
+    assert len(seen) == 2
+    assert any("1 unrelated" in d for d in result.detail)
+
+
+@pytest.mark.parametrize("mutate, symptom", [
+    # the deliver event never made the ledger
+    (lambda sb, pr: sb.remove(sb[3]), "want exactly 1"),
+    # a second event for one mutation (double emit)
+    (lambda sb, pr: pr.append(_ledger_event("send", "sent",
+                                            message_id="<pr@rc>")),
+     "want exactly 1"),
+    # an extra mail-mutation event nobody performed
+    (lambda sb, pr: sb.append(_ledger_event("plan_create", "created",
+                                            op="ghost")),
+     "mutation event(s)"),
+    # an event that lost its operation id cannot be threaded (the
+    # failed send: its mint pins no op, so only this check can see it)
+    (lambda sb, pr: sb[1].update(op=""), "no operation id"),
+])
+def test_p12_fails_on_missing_extra_or_unthreaded_events(
+        tmp_path, estate, monkeypatch, mutate, symptom):
+    ctx = make_ctx(tmp_path, estate, dry_run=False)
+    _seed_mints(ctx, _S2_MINTS)
+    sandbox = _sandbox_ledger()
+    prod = [_ledger_event("send", "sent", message_id="<pr@rc>")]
+    mutate(sandbox, prod)
+    monkeypatch.setattr(runner, "_spawn", ScriptedSpawn(_session_route(
+        _p12_respond(ctx, sandbox, prod))))
+    result = run_phase("P12", ctx)
+    assert result.status == runner.FAIL
+    assert any(symptom in d for d in result.detail), result.detail
+
+
+def test_p12_refuses_to_pass_with_nothing_recorded(tmp_path, estate,
+                                                   monkeypatch):
+    """No expectations file means no earlier mutations — P12 must name
+    the ordering mistake, never bless an unexamined ledger."""
+    ctx = make_ctx(tmp_path, estate, dry_run=False)
+    monkeypatch.setattr(runner, "_spawn", ScriptedSpawn(_session_route(
+        _p12_respond(ctx, [], []))))
+    result = run_phase("P12", ctx)
+    assert result.status == runner.FAIL
+    assert any("no mutation expectations recorded" in d
+               for d in result.detail)
