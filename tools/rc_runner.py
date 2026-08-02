@@ -3190,6 +3190,25 @@ def _p13_failure_matrix(ctx: Context) -> None:
     mints += _fm3_at_most_once_window(ctx, addr, store, stamp, started,
                                       window_ms)
     _record_mints(ctx, mints)
+    # Leave the sandbox as found: the FM exhibits (FM4's torn pending
+    # pair, FM3's stranded sending claim) have banked their evidence in
+    # the report — left behind, they poison ANY later phase that sweeps
+    # pending/sending (a stale FM4 manifest failed P07's armed-entries
+    # check on a resumed pass, 2026-08-02). One sweep, P13's own tag
+    # only, after all sub-checks are done.
+    spool = _sandbox_spool(ctx)
+    debris: list[Path] = []
+    for st in ("pending", "sending"):
+        for manifest in sorted((spool / st).glob("*.json")):
+            eml = manifest.with_suffix(".eml")
+            if "rc-p13 " in (eml.read_text(encoding="utf-8", errors="replace")
+                             if eml.exists() else ""):
+                debris += [manifest, eml]
+    if debris:
+        ctx.sh(["rm", "-f", *[str(p) for p in debris]], check=True)
+        ctx.note(f"swept {len(debris) // 2} FM exhibit(s) out of "
+                 "pending/sending — evidence lives in this report, not "
+                 "the spool")
     ctx.note("FM1-FM10: every injection produced its coded surface and "
              "no mail was lost — FM3's delivery reached the store, "
              "FM2's delivered exactly once, FM4's sibling delivered, "
