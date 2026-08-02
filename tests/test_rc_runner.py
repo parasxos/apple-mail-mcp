@@ -690,6 +690,20 @@ def test_command_fence_stops_at_a_path_boundary(tmp_path, estate):
         "a sibling spelled <root>-rc is not the estate"
 
 
+def test_command_fence_refuses_dot_dot_reentry_into_the_estate(
+        tmp_path, estate):
+    """The boundary relaxation opened a hole the substring fence never
+    had: <root>-rc/../<root> ends the raw prefix match on '-', yet the
+    OS resolves it straight into the estate. The fence must judge the
+    normalized spelling too — while the honest sibling keeps passing."""
+    ctx = make_ctx(tmp_path, estate, dry_run=True, lane=runner.SANDBOX)
+    reentry = f"{estate}-rc/../{estate.name}/graph/work.token.json"
+    with pytest.raises(runner.UnsafeAction):
+        ctx.sh(["cat", reentry])
+    with pytest.raises(runner.UnsafeAction):
+        ctx.sh(["cat", f"--file={reentry}"])
+
+
 def test_s1_dry_run_plans_every_sandbox_core_command(tmp_path, estate):
     """A bare P01-P05 selection must print the complete command plan and
     spawn nothing (the autouse fence would raise): the venv, the wheel
@@ -1025,8 +1039,12 @@ def _wire_report(*, results=({"id": "m1"},), read_env=None, garbage=None,
 
 
 def _p05_spawn(report):
+    # The route demands the server command as the client's final arg —
+    # a client launched without it dies on sys.argv[1] before it can
+    # report, so an argv regression must surface as an unscripted spawn.
     return ScriptedSpawn(
-        (lambda a: a[-1].endswith("rc-p05-client.py"),
+        (lambda a: a[-2].endswith("rc-p05-client.py")
+         and a[-1].endswith("bin/email-mcp"),
          lambda c: _Proc(0, report)),
     )
 

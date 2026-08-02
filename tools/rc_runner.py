@@ -653,15 +653,19 @@ class Context:
             # ~/.email-mcp-rc (journals, the default sandbox home) shares
             # the root's spelling as a prefix but is a sibling, not the
             # estate — the first bound body found the naive substring
-            # match refusing its own venv path.
-            idx = arg.find(guarded)
-            while idx != -1:
-                end = idx + len(guarded)
-                if end == len(arg) or arg[end] == "/":
-                    raise UnsafeAction(
-                        f"sandbox-lane command names the real state root: "
-                        f"{arg}")
-                idx = arg.find(guarded, idx + 1)
+            # match refusing its own venv path. The scan also runs on the
+            # normalized spelling (mirroring _resolve), or a dot-dot
+            # re-entry like <root>-rc/../<root> — which the OS resolves
+            # to the estate — would sail through the boundary check.
+            for spelling in {arg, os.path.normpath(arg)}:
+                idx = spelling.find(guarded)
+                while idx != -1:
+                    end = idx + len(guarded)
+                    if end == len(spelling) or spelling[end] == "/":
+                        raise UnsafeAction(
+                            f"sandbox-lane command names the real state "
+                            f"root: {arg}")
+                    idx = spelling.find(guarded, idx + 1)
 
     # -- files -------------------------------------------------------- #
 
@@ -1267,7 +1271,11 @@ print(json.dumps({"lines": lines, "target": target,
 @implements("P05")
 def _p05_wire_search_read(ctx: Context) -> None:
     client = ctx.write(ctx.sandbox_home / "rc-p05-client.py", _WIRE_CLIENT)
-    ran = ctx.sh([_venv_bin(ctx, "python"), client], timeout=300)
+    # The client's argv[1] is the server it spawns: the bare console
+    # script P01 installed — the command a real client registers
+    # (contract §7, the test_mcp_wire.py _server_command discipline).
+    ran = ctx.sh([_venv_bin(ctx, "python"), client,
+                  _venv_bin(ctx, "email-mcp")], timeout=300)
     if ran.dry:
         return
     ctx.require(ran.ok, f"wire client exited {ran.rc}: "
