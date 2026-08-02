@@ -2174,15 +2174,31 @@ def _p08_schedule_graph(ctx: Context) -> None:
             "Exchange never took the schedule (check `python -m "
             "email_mcp.graph --status`)")
     draft_id = env.get("graph_draft_id")
-    ctx.require(bool(draft_id),
-                f"entry {sid} took the graph executor but carries no "
-                "graph_draft_id — nothing to verify against the tenant")
-    # The cancel is issued before the tenant evidence is judged: a probe
-    # failure must not leave an armed deferred draft behind.
-    held = ctx.sh([_venv_bin(ctx, "python"), probe, name, draft_id, mid],
-                  timeout=120)
-    cancel = _mcp_session(ctx, "p08-cancel",
-                          [("cancel_scheduled", {"id": sid})])[0]
+    # From here to the cancel, EVERY exit path must disarm: the missing-
+    # draft_id require and a probe-spawn exception both used to leave the
+    # real deferred self-send armed on its one-hour fuse (S3 gate
+    # finding). `cancelled` flips only once a cancel was actually issued.
+    cancelled = False
+    try:
+        ctx.require(bool(draft_id),
+                    f"entry {sid} took the graph executor but carries no "
+                    "graph_draft_id — nothing to verify against the tenant")
+        held = ctx.sh([_venv_bin(ctx, "python"), probe, name, draft_id, mid],
+                      timeout=120)
+        cancel = _mcp_session(ctx, "p08-cancel",
+                              [("cancel_scheduled", {"id": sid})])[0]
+        cancelled = True
+    finally:
+        if not cancelled:
+            try:
+                _mcp_session(ctx, "p08-cancel",
+                             [("cancel_scheduled", {"id": sid})])
+                ctx.note(f"disarmed {sid} after phase failure")
+            except Exception as e:  # noqa: BLE001 — never mask the real
+                # failure; but an armed fuse the disarm could not reach
+                # must be SHOUTED, not buried in a finally.
+                ctx.note(f"DISARM FAILED for {sid}: {e} — cancel it "
+                         f"yourself NOW: cancel_scheduled id={sid}")
     ctx.require(held.ok, f"tenant status probe exited {held.rc}: "
                          f"{(held.err or held.out).strip()[:200]}")
     held_status = json.loads(held.out)["status"]
