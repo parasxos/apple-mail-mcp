@@ -163,9 +163,20 @@ bound to paris.moschovakos@cern.ch). R1 DONE 2026-08-02: tool #21 with
 the three-legged readback, `drafts` identity capability, wizard
 Exchange step (tenant `organizations` — probed live, no GUID needed),
 `draft` audit event, call-graph invariant tests. R2 rode along
-(reference.md "Drafts", contract §1/§3/§6 rows). Next: R3 = Camilla's
-enable; manual acceptance (edit in OWA/phone, hand-send to Outlook,
-verify rendering) still owed for the RC record.*
+(reference.md "Drafts", contract §1/§3/§6 rows).*
+
+**Manual acceptance record.** Round 1 (2026-08-02, live draft, edited
+and hand-sent from OWA): **FAIL** — OWA's editor mangles the composer's
+quoted-printable soft breaks when loading a MIME-created draft
+("sent" → "se=t", "Paragraph" → "=aragraph", a literal `<=body>` in the
+text), and the damage was baked into the sent copy (Envelope Index
+1326812). Editing + hand-sending + the native Sent Items copy all worked
+mechanically. Fix, same day (3805c45): **draft parts are re-encoded
+base64** — no continuation semantics to fumble; the send/schedule paths
+keep QP (months in production, transmit-side clean). Round 2 (base64
+draft filed, awaiting one OWA glance). The kept-identity upgrade path
+(c34e343) lets a returning user gain the lane behind "reconfigure? → n";
+R3 enable instructions sent to the first user 2026-08-02.
 
 ## What is deliberately NOT here
 
