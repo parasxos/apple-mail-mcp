@@ -2909,3 +2909,69 @@ def test_p18_prompt_carries_the_walk_protocol_and_takes_the_verdict(
     for token in ("STOPWATCH", "pipx", "15 minutes", "archaeology",
                   "ONCE ever", "search_emails"):
         assert token in prompts[0], f"the protocol lost: {token}"
+
+
+# --------------------------------------------------------------------- #
+# 9. S5 — the programme end to end                                       #
+# --------------------------------------------------------------------- #
+#
+# S5 binds no body: it proves the assembled programme. The full dry run
+# must reach all nineteen phases and leave the machine untouched, and
+# the Sentinel — the thing every pass trusts first, pointed at the REAL
+# ~/.email-mcp — must witness the estate without writing a byte to it.
+
+
+def _fingerprint(root: Path) -> dict[str, tuple]:
+    """Every byte, mode and mtime under root, taken WITHOUT the Sentinel
+    — an instrument may not certify its own read-only claim."""
+    out = {}
+    for p in sorted(root.rglob("*")):
+        st = p.lstat()
+        out[str(p.relative_to(root))] = (
+            stat.S_IMODE(st.st_mode), st.st_size, st.st_mtime_ns,
+            p.read_bytes() if p.is_file() else b"")
+    return out
+
+
+def test_sentinel_witnesses_the_estate_without_modifying_it(estate):
+    """Read-only by construction: capture + verify (normal and strict)
+    change nothing under the witnessed root. The safety of aiming the
+    Sentinel at the operator's real state tree rests on exactly this,
+    so it is asserted against an independent fingerprint rather than
+    trusted from the code's shape."""
+    watcher = runner.Sentinel(estate, probe=_agents())
+    before = _fingerprint(estate)
+    baseline = watcher.capture()
+    assert watcher.verify(baseline).clean
+    assert watcher.verify(baseline, strict=True).clean
+    assert watcher.capture().files == baseline.files, \
+        "two reads of an untouched estate must manifest identically"
+    assert _fingerprint(estate) == before, \
+        "the witness wrote to the estate it only reads"
+
+
+def test_the_full_dry_run_reaches_every_phase_and_writes_nothing(
+        tmp_path, estate):
+    """The S5 gate: the shipped registry, all nineteen phases, one bare
+    invocation. Every phase must be reached (a FAIL stops the walk, so
+    nineteen sections IS the no-failure claim), none unbound, exit 0 —
+    and the machine untouched, --report included: the path takes effect
+    only under --execute."""
+    before = _fingerprint(estate)
+    report = tmp_path / "scratch" / "rc-dry.md"
+    sink = io.StringIO()
+    code = runner.main(
+        ["--state-dir", str(tmp_path / "rcstate"),
+         "--report", str(report)],
+        sentinel=runner.Sentinel(estate, probe=_agents()), sink=sink)
+    out = sink.getvalue()
+
+    assert code == runner.EXIT_OK
+    for spec in runner.PLAN:
+        assert f"### {spec.id} · {spec.title}" in out, \
+            f"{spec.id} was never reached"
+    assert "15 dry · 4 manual-pending" in out
+    assert "(0 phase(s) with no body yet)" in out
+    assert not report.exists(), "--report leaked into a dry run"
+    assert _fingerprint(estate) == before, \
+        "the dry run modified the estate the Sentinel witnesses"

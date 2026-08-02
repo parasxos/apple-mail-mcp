@@ -134,9 +134,31 @@ tools/rc_runner.py --execute --interactive   # answer MANUAL steps at the prompt
 tools/rc_runner.py --soak-report         # per-phase pass rate across all runs
 ```
 
-**Dry-run is the default.** Without `--execute` the runner spawns no
-process, writes no file, journals nothing, and renders the report to
-stdout instead of `docs/`. Effects require a human to type the flag.
+### How to run an RC pass
+
+1. **Dry-run first** — a bare `tools/rc_runner.py`. All nineteen phases
+   print their complete command-and-file plan and the pass exits 0 with
+   `15 dry · 4 manual-pending`; anything else is a bug to fix before
+   going live.
+2. **Then `--execute`, with a human at the machine** —
+   `tools/rc_runner.py --execute --interactive --mail-dir ~/Library/Mail`.
+   `--mail-dir` is what attaches the real Mail store read-only to the
+   sandbox lane (`EMAIL_MCP_MAIL_DIR`, §1); without it the sandbox
+   phases face an empty store. `--interactive` answers the four MANUAL
+   gates (P09, P14, P18, P19) at the prompt — unattended they record
+   PENDING and the run exits 5.
+3. **Phase selectors** narrow a pass without reordering it — `--phase
+   P05`, `--phase P03,P07`, `--phase P05-P09`; `--lane sandbox|prod`
+   keeps one lane's phases plus the `both` ones.
+4. **The report path** is `docs/rc-report-<date>.md` (override with
+   `--report <path>`) and takes effect only under `--execute` — a dry
+   run renders the same report to stdout and writes no file.
+
+**Dry-run is the default.** Without `--execute` the runner spawns none
+of the phases' processes, writes no file, journals nothing, and renders
+the report to stdout instead of `docs/`; the one thing that still runs
+is the Sentinel's read-only baseline — the `~/.email-mcp` manifest plus
+the launchctl label reads. Effects require a human to type the flag.
 
 **The report** is `docs/rc-report-<date>.md`, appended to as the pass
 goes so a crash keeps the evidence it earned. Each phase contributes a
@@ -320,3 +342,13 @@ phase now has a body. What rode along:
   by its own printed words only, first read under 15 minutes, no
   archaeology — and ends at its manual gate: the verdict is the
   human's, recorded once ever.
+
+**S5** (2026-08-02) binds no body: it proves the assembled programme.
+The full dry run reaches all nineteen phases against the real estate
+(15 dry · 4 manual-pending, exit 0, nothing written — the suite holds
+this as a gate), and the Sentinel's read-only-by-construction claim is
+asserted against an independent byte/mode/mtime fingerprint rather than
+trusted from the code's shape. §4 gained the "How to run an RC pass"
+steps that rode along: `--mail-dir` is what a live sandbox lane needs,
+and the dry-run wording now names the Sentinel baseline as the one
+thing a bare invocation still runs.
