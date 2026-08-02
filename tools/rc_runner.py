@@ -2607,20 +2607,31 @@ def _p19_drafts(ctx: Context) -> tuple[str, str]:
     name, addr = _prod_identity_where(
         ctx, lambda t: t.get("drafts") == "graph",
         'with drafts = "graph" — the drafts lane needs one')
-    bare, _bare_addr = _prod_identity_where(
-        ctx, lambda t: t.get("drafts", "none") != "graph",
-        "WITHOUT a drafts lane — the refusal half needs one")
     subject = f"rc-p19 draft {stamp}"
-    created, refused = _mcp_session(ctx, "p19-draft", [
+    created = _mcp_session(ctx, "p19-draft", [
         ("create_draft", {"to": addr, "subject": subject,
                           "body": body_text, "from_identity": name}),
-        ("create_draft", {"to": addr, "subject": f"rc-p19 refused {stamp}",
-                          "body": "This must never be filed.",
-                          "from_identity": bare}),
-    ])
+    ])[0]
     ctx.require(created["ok"] is True,
                 f"create_draft failed: {created.get('code')} "
                 f"{created.get('error')}")
+    # The refusal half must never demand the OPERATOR keep a lane-less
+    # identity on the real estate (live pass 2026-08-02: every prod
+    # identity had the lane and the phase refused to run). Prove it
+    # against the SAME live wheel with an ephemeral identities override —
+    # the real file is never named, never touched.
+    bare = "rc-p19-bare"
+    scratch = ctx.write(
+        ctx.sandbox_home / "rc-p19-identities.toml",
+        f'default = "{bare}"\n\n[{bare}]\n'
+        f'from_addr = "{addr}"\n'
+        'driver = "pipe"\ncommand = "/usr/bin/true"\n')
+    refused = _mcp_session(
+        ctx, "p19-refused",
+        [("create_draft", {"to": addr,
+                           "subject": f"rc-p19 refused {stamp}",
+                           "body": "This must never be filed."})],
+        extra_env={"EMAIL_MCP_IDENTITIES": str(scratch)})[0]
     draft_id, mid = created["draft_id"], created["message_id"]
     ctx.require(refused["ok"] is False
                 and refused.get("code") == "draft_unsupported",

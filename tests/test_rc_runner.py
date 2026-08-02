@@ -1733,7 +1733,7 @@ def test_s3_dry_run_plans_the_whole_prod_story(tmp_path, estate):
                    "bin/email-mcp doctor", "bin/email-mcp --doctor",
                    "launchctl bootout gui/", "launchctl bootstrap gui/",
                    "launchctl print gui/",
-                   "p19-draft: tools/call create_draft, create_draft",
+                   "p19-draft: tools/call create_draft",
                    "rc-p19-readback.py"):
         assert intent in text, f"the dry run never planned: {intent}"
     assert text.count("MANUAL — PENDING") == 3, \
@@ -2133,7 +2133,10 @@ def _p19_respond(ctx, *, refusal_code="draft_unsupported",
                  refusal_ok=False):
     def respond(tool, args, call):
         assert tool == "create_draft"
-        if args["from_identity"] == "cern":
+        # The refusal probe carries NO from_identity: it runs the same
+        # wheel under an ephemeral EMAIL_MCP_IDENTITIES override whose
+        # default identity has no drafts lane.
+        if args.get("from_identity") == "cern":
             return {"ok": True, "draft_id": "AAMkAD-9",
                     "message_id": "<rc-p19@rc>", "to": [args["to"]],
                     "cc": [], "subject": args["subject"],
@@ -2177,9 +2180,16 @@ def test_p19_files_a_verified_base64_draft_and_hands_it_to_the_human(
     # identity, the refusal probe under the lane-less one.
     calls = json.loads(
         (ctx.sandbox_home / "rc-p19-draft.calls.json").read_text())
-    assert [c["arguments"]["from_identity"] for c in calls] == ["cern",
-                                                                "gmail"]
-    assert all(c["arguments"]["to"] == "operator@cern.ch" for c in calls)
+    assert [c["arguments"].get("from_identity") for c in calls] == ["cern"]
+    refusal = json.loads(
+        (ctx.sandbox_home / "rc-p19-refused.calls.json").read_text())
+    assert [c["arguments"].get("from_identity") for c in refusal] == [None]
+    assert all(c["arguments"]["to"] == "operator@cern.ch"
+               for c in calls + refusal)
+    # The refusal identity is EPHEMERAL: written into the sandbox, never
+    # the operator's real file, and it declares no drafts lane.
+    scratch = (ctx.sandbox_home / "rc-p19-identities.toml").read_text()
+    assert "rc-p19-bare" in scratch and "drafts" not in scratch
     # The independent readback ran through the shipped seams.
     probes = [c["argv"] for c in spawn.calls
               if len(c["argv"]) > 1
@@ -2247,14 +2257,22 @@ def test_p19_fails_when_the_lane_less_identity_does_not_refuse(
     assert any(symptom in d for d in result.detail), result.detail
 
 
-def test_p19_names_the_missing_identity_shape(tmp_path, estate):
-    """The refusal half needs a lane-less identity on the REAL estate;
-    an estate without one is a finding with a name, not a silent pass."""
+def test_p19_needs_no_lane_less_identity_on_the_real_estate(
+        tmp_path, estate, monkeypatch):
+    """The inversion of the original pin, decided on the first live pass
+    (2026-08-02): an operator whose every identity has the drafts lane
+    must NOT be failed for it — the refusal half runs the same wheel
+    under an ephemeral EMAIL_MCP_IDENTITIES override, so the phase never
+    demands a crippled identity on the real estate."""
     _graph_identities(estate, bare=False)
-    ctx = make_ctx(tmp_path, estate, dry_run=False, answer=lambda p: "pass")
+    ctx = make_ctx(tmp_path, estate, dry_run=False,
+                   answer=lambda p: "pass: OWA round-trip clean")
+    spawn = ScriptedSpawn(_session_route(_p19_respond(ctx)),
+                          _p19_probe_route(_P19_READBACK))
+    monkeypatch.setattr(runner, "_spawn", spawn)
     result = run_phase("P19", ctx)
-    assert result.status == runner.FAIL
-    assert any("refusal half needs one" in d for d in result.detail)
+    assert result.status == runner.PASS, result.detail
+    assert (ctx.sandbox_home / "rc-p19-identities.toml").exists()
 
 
 # --------------------------------------------------------------------- #
