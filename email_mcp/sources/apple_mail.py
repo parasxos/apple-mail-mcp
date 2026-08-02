@@ -861,7 +861,22 @@ def _parse_emlx(path: Path, max_body: int) -> dict:
     raw = _read_emlx_bytes(path)
     msg = email.message_from_bytes(raw, policy=email.policy.default)
 
-    headers = {k: str(v) for k, v in msg.items()}
+    try:
+        headers = {k: str(v) for k, v in msg.items()}
+    except Exception:
+        # CPython's modern header parser can itself crash on hostile
+        # values — measured: a truncated, never-closed Message-ID
+        # ("<[54f4c5ade…", no ">") raises IndexError inside get_msg_id
+        # (8 live messages, found by RC P04 2026-08-02). Rebuild
+        # per-header, serving the RAW value for whatever the stdlib
+        # cannot parse: a message's body must never be unreadable
+        # because one header is malformed.
+        headers = {}
+        for k, raw_v in msg.raw_items():
+            try:
+                headers[k] = str(msg[k])
+            except Exception:
+                headers[k] = " ".join(str(raw_v).split())
 
     body_text_parts: list[str] = []
     body_html_parts: list[str] = []

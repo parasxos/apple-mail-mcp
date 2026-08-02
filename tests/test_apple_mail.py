@@ -292,3 +292,26 @@ def test_mail_dir_tcc_denial_names_full_disk_access(monkeypatch, tmp_path):
         mail.chmod(0o755)
     assert "Full Disk Access" in str(e.value)
     assert str(mail) in str(e.value)
+
+
+def test_parse_emlx_survives_a_header_that_crashes_cpython(tmp_path):
+    """CPython's header parser ITSELF can raise on hostile values — a
+    truncated never-closed Message-ID ("<[54f4…", no ">") IndexErrors in
+    get_msg_id. Found on 8 live messages by RC P04 (2026-08-02): the fts
+    index marked them permanently `error` and get_email crashed to the
+    belt. The body must never be hostage to one malformed header."""
+    from email_mcp.sources.apple_mail import _parse_emlx
+
+    rfc822 = (b"From: a@example.org\r\n"
+              b"To: b@example.org\r\n"
+              b"Subject: hostile message-id\r\n"
+              b"Message-ID: <[54f4c5ade13347b4ab85403832aac1ce-TRUNCATED\r\n"
+              b"Content-Type: text/plain; charset=utf-8\r\n"
+              b"\r\n"
+              b"The body still matters.\r\n")
+    emlx = tmp_path / "1.emlx"
+    emlx.write_bytes(str(len(rfc822)).encode() + b"\n" + rfc822)
+    parsed = _parse_emlx(emlx, 512 * 1024)
+    assert "The body still matters." in parsed["body_text"]
+    assert parsed["headers"]["Subject"] == "hostile message-id"
+    assert "54f4c5ade" in parsed["headers"]["Message-ID"]  # raw, served
