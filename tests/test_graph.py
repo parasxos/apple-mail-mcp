@@ -13,6 +13,8 @@ machine.
 from __future__ import annotations
 
 import base64
+import email
+import email.policy
 import json
 import os
 import stat
@@ -724,6 +726,30 @@ def test_schedule_graph_two_phase_manifest_write(monkeypatch, tmp_path):
     raw = spool.read_eml("pending", entry.id)
     assert entry.message_id.encode() in raw       # frozen recovery key
     assert inner.calls[0][2] == base64.b64encode(raw)  # Exchange got the SAME bytes
+
+
+def test_schedule_graph_freezes_base64_text_parts(monkeypatch, tmp_path):
+    """The deferred-send sibling of the drafts pin: Exchange's MIME
+    importer garbles QP soft breaks ("prepared" → "prepar=d", measured
+    2026-08-03 on a deferred-draft readback), so the graph lane freezes
+    text parts as base64 and the body round-trips verbatim."""
+    _write_graph_toml(tmp_path, monkeypatch)
+    _seed_token()
+    _fake(monkeypatch, (201, {"id": "D1"}), (200, {}), (202, {}))
+    body = ("Two quick questions before tomorrow: would it help if I "
+            "prepared the calibration summary in advance? "
+            "SNOW Ref=INC4471902 stays open until then — à demain.")
+    entry = sender.schedule_email(
+        to="someone@example.org", subject="s", body=body,
+        send_at=_future(30), from_identity="cern",
+    )
+    assert entry.executor == "graph"
+    wire = email.message_from_bytes(spool.read_eml("pending", entry.id),
+                                    policy=email.policy.default)
+    for part in wire.walk():
+        if part.get_content_type() in ("text/plain", "text/html"):
+            assert part["Content-Transfer-Encoding"] == "base64"
+    assert body in wire.get_body(("plain",)).get_content()
 
 
 def test_schedule_graph_error_falls_back_to_launchd(monkeypatch, tmp_path):

@@ -587,6 +587,21 @@ def send_email(
     )
 
 
+def _reencode_text_base64(msg: EmailMessage) -> None:
+    """Re-encode text parts as base64 on ANY MIME handed to Graph.
+
+    Quoted-printable is fine on the transports (months in production),
+    but Exchange's MIME importer mangles QP soft breaks: "sent" arrived
+    as "se=t" in a draft (measured 2026-08-02, first acceptance run) and
+    "prepared" as "prepar=d" in a deferred-send readback (measured
+    2026-08-03). Base64 has no continuation semantics to fumble."""
+    for part in msg.walk():
+        if part.get_content_type() in ("text/plain", "text/html"):
+            part.set_content(part.get_content(),
+                             subtype=part.get_content_subtype(),
+                             charset="utf-8", cte="base64")
+
+
 def create_draft(
     *,
     to: str | list[str],
@@ -627,17 +642,7 @@ def create_draft(
 
     msg = compose(to=to_l, subject=subject, body=body, cc=cc_l, bcc=[],
                   in_reply_to=in_reply_to, identity=ident)
-    # Drafts re-encode as base64. Quoted-printable is fine on the SEND
-    # path (months in production), but Exchange/OWA loading a MIME-
-    # created draft into its EDITOR mangles QP soft breaks — measured
-    # 2026-08-02 on the first acceptance run: "sent" arrived as "se=t",
-    # "Paragraph" as "=aragraph", a literal <=body> in the text. Base64
-    # has no continuation semantics to fumble.
-    for part in msg.walk():
-        if part.get_content_type() in ("text/plain", "text/html"):
-            part.set_content(part.get_content(),
-                             subtype=part.get_content_subtype(),
-                             charset="utf-8", cte="base64")
+    _reencode_text_base64(msg)
 
     from . import graph
 
@@ -749,6 +754,12 @@ def schedule_email(
         message_id=msg["Message-ID"],
         identity=ident.name,
     )
+    if ident.executor == "graph":
+        # Exchange imports this MIME to arm the deferred draft, and its
+        # importer garbles QP (see _reencode_text_base64). Re-encode
+        # BEFORE freezing: the launchd fallback must deliver the same
+        # bytes Exchange was shown.
+        _reencode_text_base64(msg)
     raw = msg.as_bytes()
     if ident.executor != "graph":
         spool.save(raw, entry)
