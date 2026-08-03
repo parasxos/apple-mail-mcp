@@ -139,6 +139,25 @@ def test_mail_store_unreadable_maps_to_fda_fix(monkeypatch, tmp_path):
     assert "Full Disk Access" in check["fix"]
 
 
+def test_failing_agent_reddens_dispatcher_and_fts_checks(monkeypatch):
+    """An agent whose last run exited nonzero is a real fault even while
+    everything it manages still serves — the nightly fts sync failed
+    every run (no FDA on its python) under a green doctor until RC P04
+    caught it from the index side (live, 2026-08-03)."""
+    monkeypatch.setattr(doctor, "_agent_last_exit", lambda label: 1)
+    for check in (doctor.check_dispatcher(), doctor.check_fts()):
+        assert check["ok"] is False
+        assert "exited 1" in check["detail"]
+        assert "Full Disk Access" in check["fix"]
+
+
+def test_never_ran_agent_is_not_a_fault(monkeypatch):
+    """Fresh bootstrap ('never exited') and absent launchctl (CI) both
+    read as None — silence is not failure."""
+    monkeypatch.setattr(doctor, "_agent_last_exit", lambda label: None)
+    assert doctor.check_dispatcher()["ok"] is True
+
+
 def test_mail_store_tcc_denial_maps_to_fda_fix_not_crash(monkeypatch):
     """The TCC case: the Mail dir exists but macOS refuses the read, so
     config.mail_dir raises PermissionError, not FileNotFoundError.

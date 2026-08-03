@@ -259,6 +259,16 @@ def mail_fixture(tmp_path: Path) -> Path:
 
 
 @pytest.fixture(autouse=True)
+def no_host_launchd(monkeypatch):
+    """Doctor consults launchctl for the agents' last exit codes; unit
+    tests must never read the host's real agents (the dev Mac's fts
+    agent can be legitimately red). Tests exercising the check override
+    this stub explicitly."""
+    monkeypatch.setattr(
+        "email_mcp.doctor._agent_last_exit", lambda label: None)
+
+
+@pytest.fixture(autouse=True)
 def state_dir_guard(tmp_path_factory, monkeypatch) -> Path:
     """Pin the managed state tree (spool/plans/graph/fts/audit) to a fresh
     per-test root for EVERY test — nothing in the suite may ever resolve,

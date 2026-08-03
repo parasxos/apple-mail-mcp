@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import sqlite3
 import subprocess
 import time
@@ -244,6 +245,29 @@ def check_transports() -> dict:
     return out
 
 
+def _agent_last_exit(label: str) -> int | None:
+    """Last exit code of a launchd agent; None when the agent is absent,
+    has never exited, or launchctl is unavailable (non-macOS CI). The
+    doctor called an estate healthy while its nightly agent failed every
+    run — RC P04's root cause sat invisible for a day (2026-08-03)."""
+    try:
+        r = subprocess.run(
+            ["launchctl", "print", f"gui/{os.getuid()}/{label}"],
+            capture_output=True, text=True, timeout=10)
+    except Exception:
+        return None
+    if r.returncode != 0:
+        return None
+    m = re.search(r"last exit code = (-?\d+)", r.stdout)
+    return int(m.group(1)) if m else None
+
+
+_AGENT_EXIT_FIX = (
+    "read {log}; a PermissionError there means the agent's python needs "
+    "Full Disk Access (System Settings → Privacy & Security → Full Disk "
+    "Access)")
+
+
 def check_dispatcher() -> dict:
     """Scheduled-send dispatcher: plist installed under the current label,
     stray legacy com.paris.* plists flagged, log freshness, pending count."""
@@ -277,9 +301,13 @@ def check_dispatcher() -> dict:
         bits.append(f"legacy plist(s): {', '.join(legacy)}")
         fixes.append("boot out the legacy agent(s): launchctl bootout "
                      "gui/$UID ~/Library/LaunchAgents/<legacy>.plist")
+    last_exit = _agent_last_exit(LAUNCHD_LABEL)
+    if last_exit not in (None, 0):
+        bits.append(f"last run exited {last_exit}")
+        fixes.append(_AGENT_EXIT_FIX.format(log=log))
     out: dict = {
         # Not installed only bites once something is waiting to send.
-        "ok": installed or pending == 0,
+        "ok": (installed or pending == 0) and last_exit in (None, 0),
         "detail": "; ".join(bits),
         "installed": installed,
         "label": LAUNCHD_LABEL,
@@ -362,6 +390,16 @@ def check_fts() -> dict:
         st = fts.status()
     except Exception as e:  # soft by contract: never let fts crash doctor
         return {"ok": True, "detail": f"index status unavailable: {e}"}
+    # The nightly agent is estate machinery, not index state: a sync that
+    # dies every run must redden the doctor even while the index still
+    # serves — it silently failed every night until RC P04 caught it
+    # (FDA missing on the agent's python, live 2026-08-03).
+    last_exit = _agent_last_exit(fts.LAUNCHD_LABEL)
+    if last_exit not in (None, 0):
+        return {"ok": False,
+                "detail": f"nightly sync agent last exited {last_exit}",
+                "fix": _AGENT_EXIT_FIX.format(log=fts._log_path()),
+                "status": st}
     state = st.get("state")
     if state == "absent":
         return {"ok": True, "detail": "not built",
