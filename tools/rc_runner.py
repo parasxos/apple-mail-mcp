@@ -1081,6 +1081,11 @@ def _venv_bin(ctx: Context, name: str) -> Path:
 def _p01_wheel_install(ctx: Context) -> None:
     venv = ctx.sandbox_home / "venv"
     dist = ctx.sandbox_home / "dist"
+    # FROM SCRATCH, always: a version bump leaves the previous release's
+    # wheel behind, and the exactly-one guard below trips on it (found
+    # live 2026-08-03: 0.12.0 beside 1.0.0rc1). An empty dist is what
+    # makes "the one wheel found" provably the wheel THIS run built.
+    ctx.rm_tree(dist)
     ctx.sh([sys.executable, "-m", "venv", venv], timeout=300, check=True)
     pip = venv / "bin" / "pip"
     built = ctx.sh([pip, "wheel", "--no-deps", "-w", dist, ctx.repo_root],
@@ -3511,9 +3516,22 @@ def _default_mail_dir(explicit: str | None) -> Path | None:
     P03 failed on "Library/Mail does not exist" inside the sandbox
     HOME). Resolution failure is not fatal here: the phases that need a
     store say so themselves.
+
+    An explicit path may be either the versioned store root (V10) or
+    the ~/Library/Mail above it — the plan's own §4 example passes the
+    latter, while every consumer appends MailData/Envelope Index to
+    this value verbatim (found live 2026-08-03: P03's sandbox doctor
+    read ~/Library/Mail/MailData). Same pick as config.mail_dir():
+    highest V<N> wins.
     """
     if explicit:
-        return Path(explicit).expanduser()
+        root = Path(explicit).expanduser()
+        if not (root / "MailData" / "Envelope Index").exists():
+            versioned = [p for p in root.glob("V*")
+                         if p.is_dir() and re.fullmatch(r"V\d+", p.name)]
+            if versioned:
+                return max(versioned, key=lambda p: int(p.name[1:]))
+        return root
     try:
         sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
         from email_mcp.config import mail_dir

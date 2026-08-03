@@ -3053,6 +3053,25 @@ def test_sandbox_borrows_the_real_mail_store_by_default(monkeypatch, tmp_path):
         tmp_path / "other"
 
 
+def test_explicit_mail_dir_accepts_either_store_spelling(tmp_path):
+    """--mail-dir may name the versioned root OR the ~/Library/Mail
+    above it (the plan's §4 example does the latter): the runner
+    descends to the highest V<N>, numerically — V10 beats V9 despite
+    sorting before it lexicographically. A versioned root that already
+    holds the Envelope Index is taken verbatim (found live 2026-08-03:
+    P03's sandbox doctor read ~/Library/Mail/MailData)."""
+    mail = tmp_path / "Mail"
+    for v in ("V9", "V10"):
+        (mail / v).mkdir(parents=True)
+    (mail / "Vault").mkdir()  # non-V<N> sibling never picked
+    assert runner._default_mail_dir(str(mail)) == mail / "V10"
+
+    index = mail / "V10" / "MailData" / "Envelope Index"
+    index.parent.mkdir()
+    index.write_bytes(b"")
+    assert runner._default_mail_dir(str(mail / "V10")) == mail / "V10"
+
+
 def test_missing_mail_store_is_not_fatal_to_the_runner(monkeypatch):
     """No store on this Mac -> None, and the phases that need one say so
     themselves; the runner does not refuse to start."""
