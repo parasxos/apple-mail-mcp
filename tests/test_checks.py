@@ -267,6 +267,45 @@ def test_current_plist_is_not_drift(home, writer):
     assert _finding(checks.PLIST_DRIFT) is None
 
 
+def test_another_seats_plist_is_not_drift(home, writer):
+    """Doctor runs from several seats (operator shell, MCP server, the
+    RC's wheel venv) whose renders spell the same install differently.
+    A plist whose interpreter is a live sibling spelling and whose PATH
+    was baked by another shell is NOT drift — byte-comparing made P14's
+    precondition unsatisfiable (live, 2026-08-03)."""
+    import plistlib
+    import sys
+    from email_mcp import dispatcher
+
+    doc = plistlib.loads(dispatcher._plist_content().encode())
+    sibling = Path(sys.executable).parent / "python3"
+    assert sibling.exists()  # every venv carries this spelling
+    doc["ProgramArguments"][0] = str(sibling)
+    doc["EnvironmentVariables"]["PATH"] = "/some/other/shells:/path"
+    dispatcher._plist_path().write_bytes(plistlib.dumps(doc))
+    assert _finding(checks.PLIST_DRIFT) is None
+
+
+def test_dead_interpreter_and_drifted_schedule_are_drift(home, writer):
+    """The teeth the seat-tolerance must not lose: an interpreter path
+    that no longer exists (the moved-venv case the check was born for),
+    and any change outside the exempt fields (args, schedule), are
+    still stale."""
+    import plistlib
+    from email_mcp import dispatcher
+
+    plist = dispatcher._plist_path()
+    doc = plistlib.loads(dispatcher._plist_content().encode())
+    doc["ProgramArguments"][0] = str(home / "gone" / "bin" / "python")
+    plist.write_bytes(plistlib.dumps(doc))
+    assert _finding(checks.PLIST_DRIFT) is not None
+
+    doc = plistlib.loads(dispatcher._plist_content().encode())
+    doc["ProgramArguments"][-1] = "--someone-elses-flag"
+    plist.write_bytes(plistlib.dumps(doc))
+    assert _finding(checks.PLIST_DRIFT) is not None
+
+
 def test_uninstalled_agents_are_not_drift(home, writer):
     assert _finding(checks.PLIST_DRIFT) is None
 

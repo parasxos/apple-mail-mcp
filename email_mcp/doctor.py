@@ -90,7 +90,11 @@ def check_mail_store() -> dict:
     setup or (far more often) missing Full Disk Access."""
     try:
         base = config.mail_dir()
-    except FileNotFoundError as e:
+    except (FileNotFoundError, PermissionError) as e:
+        # PermissionError is the TCC case (config.py documents it): the
+        # directory exists but macOS refuses the read. Uncaught it became
+        # "check crashed" with no structured fix — RC P14's revoked-side
+        # check refused exactly that (live, 2026-08-03).
         return {"ok": False, "detail": str(e), "fix": _FDA_FIX}
     index = base / "MailData" / "Envelope Index"
     if not index.exists():

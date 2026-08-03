@@ -139,6 +139,21 @@ def test_mail_store_unreadable_maps_to_fda_fix(monkeypatch, tmp_path):
     assert "Full Disk Access" in check["fix"]
 
 
+def test_mail_store_tcc_denial_maps_to_fda_fix_not_crash(monkeypatch):
+    """The TCC case: the Mail dir exists but macOS refuses the read, so
+    config.mail_dir raises PermissionError, not FileNotFoundError.
+    Uncaught it became "check crashed" with no structured fix — the RC's
+    revoked-side P14 check refused exactly that (live, 2026-08-03)."""
+    def _tcc_denied():
+        raise PermissionError("cannot be read — grant Full Disk Access")
+
+    monkeypatch.setattr(doctor.config, "mail_dir", _tcc_denied)
+    check = doctor.check_mail_store()
+    assert check["ok"] is False
+    assert "crashed" not in check["detail"]
+    assert "Full Disk Access" in check["fix"]
+
+
 # --------------------------------------------------------------------- #
 # identities + transports                                               #
 # --------------------------------------------------------------------- #

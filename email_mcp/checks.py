@@ -24,7 +24,9 @@ from __future__ import annotations
 
 import json
 import os
+import plistlib
 import stat
+import sys
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable
@@ -221,6 +223,38 @@ def _repair_legacy_launchd(writer: StateWriter, f: Finding) -> list[plan.Action]
     return rows
 
 
+def _plist_equivalent(installed: str, rendered: str) -> bool:
+    """Seat-stable plist equality. The render bakes the probing process's
+    own interpreter and PATH, but doctor legitimately runs from several
+    seats — the operator's shell, the MCP server, the RC's wheel venv —
+    that spell the same install differently (a byte-compare made P14's
+    precondition unsatisfiable, found live 2026-08-03). Exempt exactly
+    those two fields: the interpreter must be a live python that carries
+    this package (an `email-mcp` sibling, or this very interpreter by
+    realpath); PATH is whatever shell installed it. Everything else —
+    args, schedule, label, ProcessType — must still match the render."""
+    try:
+        a = plistlib.loads(installed.encode("utf-8"))
+        b = plistlib.loads(rendered.encode("utf-8"))
+    except Exception:
+        return False
+    if not isinstance(a, dict) or not isinstance(b, dict):
+        return False  # parseable but empty/scalar — not an agent plist
+    pa = list(a.pop("ProgramArguments", None) or [])
+    pb = list(b.pop("ProgramArguments", None) or [])
+    if not pa or pa[1:] != pb[1:]:
+        return False
+    interp = Path(pa[0])
+    if not (interp.is_file() and os.access(interp, os.X_OK)):
+        return False
+    if not ((interp.parent / "email-mcp").exists()
+            or os.path.realpath(interp) == os.path.realpath(sys.executable)):
+        return False
+    (a.get("EnvironmentVariables") or {}).pop("PATH", None)
+    (b.get("EnvironmentVariables") or {}).pop("PATH", None)
+    return a == b
+
+
 def _probe_plist_drift(reader: StateReader) -> Finding | None:
     stale = []
     for label, plist, content in _agents():
@@ -228,13 +262,13 @@ def _probe_plist_drift(reader: StateReader) -> Finding | None:
             current = plist.read_text(encoding="utf-8")
         except OSError:
             continue  # not installed — nothing to be stale
-        if current != content():
+        if not _plist_equivalent(current, content()):
             stale.append(plist)
     if not stale:
         return None
     return Finding(PLIST_DRIFT,
-                   f"{len(stale)} installed launchd plist(s) differ from "
-                   f"the current render (moved interpreter, changed PATH): "
+                   f"{len(stale)} installed launchd plist(s) stale — dead "
+                   f"interpreter, or drifted args/schedule: "
                    f"{', '.join(p.name for p in stale)}",
                    tuple(stale))
 
