@@ -99,7 +99,13 @@ RC_DIRNAME = ".email-mcp-rc"
 # Everything else — identities.toml, meta.json, an unknown new file at
 # the root — is material drift.
 EXPECTED_CHANGE = ("audit/*", "spool/*", "fts/*", "plans/*",
-                   "graph/*.token.json", "dispatcher.log")
+                   "graph/*.token.json", "dispatcher.log",
+                   # The fts agent appends to its own log whenever it
+                   # runs — same estate machinery as the dispatcher's.
+                   # Once the agent actually worked (FDA granted
+                   # 2026-08-03), a tick during a pass flagged MATERIAL
+                   # DRIFT on nothing but its success output.
+                   "fts.log")
 # Removal is judged separately and more harshly: a vanished token cache
 # is always reported, even though rewriting one is routine.
 EXPECTED_REMOVAL = ("spool/*", "plans/*", "fts/*")

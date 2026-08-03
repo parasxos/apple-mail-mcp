@@ -239,11 +239,16 @@ def test_sentinel_separates_expected_churn_from_credential_loss(estate):
     (estate / "audit" / "2026-07.jsonl").write_text('{"tool":"send"}\n{"x":1}\n')
     (estate / "spool" / "pending" / "s1.json").unlink()
     (estate / "graph" / "work.token.json").write_text('{"refresh":"BBB"}')
+    # Both agents append to their own logs whenever they run — estate
+    # machinery, not drift (a working fts agent's tick mid-pass flagged
+    # MATERIAL DRIFT on nothing but its success output, 2026-08-03).
+    (estate / "fts.log").write_text('{"scanned": 4}\n')
 
     diff = watcher.verify(baseline)
     assert diff.clean, diff.render()
     assert "audit/2026-07.jsonl" in diff.expected
     assert "spool/pending/s1.json" in diff.expected
+    assert "fts.log" in diff.expected
 
     (estate / "graph" / "work.token.json").unlink()
     gone = watcher.verify(baseline)
