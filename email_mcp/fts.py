@@ -504,9 +504,14 @@ class FtsIndex:
             # docs were never re-attempted — 8 one-shot verdicts sat
             # permanent on a live estate until RC P04 refused the index
             # (2026-08-02). Same backoff, same attempt cap.
+            # Longest-waiting first, NOT ascending rowid: under a budget
+            # deadline, rowid order let ~95k storeless Exchange docs
+            # permanently starve any late-materializing recent message
+            # (RC P04, live 2026-08-03 — a body that arrived on disk 21h
+            # after its last retry was still unindexed).
             "SELECT rowid, attempts, last_attempt FROM docs "
             "WHERE status IN ('missing', 'error') AND attempts < ? "
-            "ORDER BY rowid",
+            "ORDER BY last_attempt, rowid",
             (_MAX_ATTEMPTS,),
         ).fetchall()
         due = [

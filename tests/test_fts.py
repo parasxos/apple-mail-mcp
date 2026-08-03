@@ -211,6 +211,31 @@ def test_miss_retry_respects_backoff_and_attempt_cap(mail_fixture):
     assert _doc_statuses()[200] == "missing"
 
 
+def test_retry_serves_longest_waiting_doc_first(mail_fixture):
+    """Under a quota, retries go to the doc that has waited longest since
+    its last attempt — NOT ascending rowid, which let ~95k storeless
+    low-rowid docs permanently starve a recent message whose body
+    materialised late (RC P04, live 2026-08-03)."""
+    idx = FtsIndex(mail_base=mail_fixture)
+    idx.build()
+    conn = _fts_db()
+    conn.execute("UPDATE docs SET status='missing', attempts=1, "
+                 "last_attempt=1000 WHERE rowid = 100")
+    conn.execute("UPDATE docs SET status='missing', attempts=1, "
+                 "last_attempt=0 WHERE rowid = 200")
+    conn.commit()
+    conn.close()
+
+    out = idx.incremental(max_docs=1)  # quota for exactly one retry
+    assert out["retried"] == 1
+    conn = _fts_db()
+    la = dict(conn.execute(
+        "SELECT rowid, last_attempt FROM docs WHERE rowid IN (100, 200)"))
+    conn.close()
+    assert la[200] > 1000   # the longest-waiting doc was re-statted…
+    assert la[100] == 1000  # …the fresher one stayed queued behind it
+
+
 def test_incremental_skips_on_busy_writer(mail_fixture, monkeypatch):
     monkeypatch.setattr(fts, "_BUSY_TIMEOUT_MS", 100)
     idx = FtsIndex(mail_base=mail_fixture)
