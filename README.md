@@ -25,9 +25,13 @@ Grant the host app **Full Disk Access** *before* running `setup`
 app) — reading happens through Mail's local store, and the optional index
 build and closing smoke test need to see it.
 
-`setup` adopts `~/.email-mcp`, offers a sending identity and the launchd
-agents, prints the MCP client config to register, and ends with a doctor
-smoke test:
+`setup` adopts `~/.email-mcp`, offers a sending identity and the two
+background helpers in plain words (bare Enter says yes to both), builds
+the body-search index, then verifies the nightly refresh actually runs —
+if macOS blocks it, setup opens the Full Disk Access pane, reveals the
+exact program to drag in, and re-checks until a real run survives (there
+is no API or pop-up for FDA; the toggle is Apple's). It prints the MCP
+client config to register and ends with a doctor smoke test:
 
 ```json
 {

@@ -1049,8 +1049,10 @@ def _build_mcp_server():
         and the audit ledger (reported as the top-level `audit` section).
         Returns {ok, read_only, checks, audit} where each check is
         {ok, detail} plus a concrete `fix` (a command or a Settings pane)
-        when something is off. Read-only and side-effect free — call it
-        first when any other tool misbehaves."""
+        when something is off. Checks marked `advisory: true` (an optional
+        extra's permission, e.g. Accessibility) warn without flipping the
+        top-level `ok`. Read-only and side-effect free — call it first
+        when any other tool misbehaves."""
         return tool_doctor()
 
     @mcp.tool()

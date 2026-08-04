@@ -132,6 +132,41 @@ def test_accessibility_not_trusted_names_the_fallback(fake_osa):
     assert "Accessibility" in check["fix"]
 
 
+def test_accessibility_denial_is_advisory_not_a_red_doctor(fake_osa):
+    """The first-user finding (2026-08-04): a machine where everything
+    the user touches works read '=> NOT ready' off the one permission
+    that only backs mailbox_delete's UI fallback. A denial warns —
+    advisory, fix visible — without flipping the report's ok."""
+    fake_osa.accessibility = subprocess.CompletedProcess([], 0, "false\n", "")
+    report = doctor.run()
+    check = report["checks"]["accessibility"]
+    assert check["ok"] is False
+    assert check["advisory"] is True
+    assert report["ok"] is True                      # not gated
+    lines = doctor.render(report)
+    (acc_line,) = [ln for ln in lines if "accessibility:" in ln]
+    assert acc_line.startswith("warn")
+    assert not any(ln.startswith("FAIL") for ln in lines)
+    (fix_line,) = [ln for ln in lines if "Accessibility" in ln
+                   and "fix:" in ln]
+    assert fix_line                                   # remedy stays visible
+
+
+def test_non_advisory_failure_still_reddens_through_the_advisory_gate(
+    fake_osa,
+):
+    fake_osa.automation = subprocess.CompletedProcess(
+        [], 1, "",
+        "execution error: Not authorized to send Apple events to Mail. (-1743)",
+    )
+    fake_osa.accessibility = subprocess.CompletedProcess([], 0, "false\n", "")
+    report = doctor.run()
+    assert report["ok"] is False
+    lines = doctor.render(report)
+    assert any(ln.startswith("FAIL automation") for ln in lines)
+    assert any(ln.startswith("warn accessibility") for ln in lines)
+
+
 def test_mail_store_unreadable_maps_to_fda_fix(monkeypatch, tmp_path):
     monkeypatch.setenv("EMAIL_MCP_MAIL_DIR", str(tmp_path / "no-such-V10"))
     check = doctor.check_mail_store()

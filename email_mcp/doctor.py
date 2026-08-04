@@ -2,9 +2,10 @@
 needs, checked in one pass with remediation hints.
 
 `run()` returns {ok, read_only, checks: {name: {ok, detail, fix?, ...}},
-audit} — `ok` is the AND of every check (the audit ledger check included);
-`fix` appears only when there is a concrete next step (a Settings pane or
-a command). The v0.10 ledger check reports as the top-level `audit`
+audit} — `ok` is the AND of every non-advisory check (the audit ledger
+check included); checks carrying `advisory: true` (accessibility) warn
+without gating `ok`. `fix` appears only when there is a concrete next
+step (a Settings pane or a command). The v0.10 ledger check reports as the top-level `audit`
 section, NOT a tenth member of `checks`: that mapping's membership is the
 v0.9 doctor surface, pinned by its shape tests, and v0.10 does not touch
 existing success shapes (docs/v1-contract.md §8) — folding it into
@@ -151,21 +152,23 @@ def check_automation() -> dict:
 
 
 def check_accessibility() -> dict:
-    """Is UI scripting (System Events) available? Advisory in practice —
-    it is only needed for mailbox_delete's UI fallback."""
+    """Is UI scripting (System Events) available? ADVISORY: it is only
+    needed for mailbox_delete's UI fallback, so a denial warns without
+    flipping the doctor's overall ok — a first user with every feature
+    they use working read "NOT ready" off this line (2026-08-04)."""
     probe = 'tell application "System Events" to get UI elements enabled'
     try:
         proc = _osascript(probe)
     except FileNotFoundError:
-        return {"ok": False,
+        return {"ok": False, "advisory": True,
                 "detail": "osascript not found — this MCP is macOS-only."}
     except subprocess.TimeoutExpired:
-        return {"ok": False,
+        return {"ok": False, "advisory": True,
                 "detail": f"System Events probe timed out after "
                           f"{_OSA_TIMEOUT:g}s ({_ACCESSIBILITY_NOTE})."}
     if proc.returncode != 0:
         code = _osa_error_code(proc.stderr)
-        out = {"ok": False,
+        out = {"ok": False, "advisory": True,
                "detail": f"System Events not scriptable "
                          f"({(proc.stderr or '').strip()[:150]}; "
                          f"{_ACCESSIBILITY_NOTE}).",
@@ -180,7 +183,7 @@ def check_accessibility() -> dict:
     if (proc.stdout or "").strip().lower() == "true":
         return {"ok": True,
                 "detail": f"UI scripting enabled ({_ACCESSIBILITY_NOTE})."}
-    return {"ok": False,
+    return {"ok": False, "advisory": True,
             "detail": f"UI scripting not authorised for this process "
                       f"({_ACCESSIBILITY_NOTE}).",
             "fix": _ACCESSIBILITY_FIX}
@@ -266,6 +269,9 @@ _AGENT_EXIT_FIX = (
     "read {log}; a PermissionError there means the agent's python needs "
     "Full Disk Access (System Settings → Privacy & Security → Full Disk "
     "Access)")
+_FTS_AGENT_EXIT_FIX = (
+    "run `email-mcp setup` — it verifies the nightly refresh and walks "
+    "the Full Disk Access grant hands-on; the log is {log}")
 
 
 def check_dispatcher() -> dict:
@@ -398,7 +404,7 @@ def check_fts() -> dict:
     if last_exit not in (None, 0):
         return {"ok": False,
                 "detail": f"nightly sync agent last exited {last_exit}",
-                "fix": _AGENT_EXIT_FIX.format(log=fts._log_path()),
+                "fix": _FTS_AGENT_EXIT_FIX.format(log=fts._log_path()),
                 "status": st}
     state = st.get("state")
     if state == "absent":
@@ -582,11 +588,12 @@ def render(report: dict, *, indent: str = "") -> list[str]:
     """The one text form of a doctor report. Every surface that prints one
     (the CLI verb, setup's smoke test) asks here — two hand-written
     renderings kept equal by care is the drift this module exists to
-    prevent in others."""
+    prevent in others. Advisory failures render `warn`, never FAIL: the
+    fix stays visible, the alarm does not."""
     lines = []
     for name, c in {**report["checks"], "audit": report["audit"]}.items():
-        lines.append(f"{indent}{'ok  ' if c['ok'] else 'FAIL'} "
-                     f"{name}: {c['detail']}")
+        tag = "ok  " if c["ok"] else ("warn" if c.get("advisory") else "FAIL")
+        lines.append(f"{indent}{tag} {name}: {c['detail']}")
         if not c["ok"] and c.get("fix"):
             lines.append(f"{indent}     fix: {c['fix']}")
     return lines
@@ -596,11 +603,15 @@ def run() -> dict:
     """Run every check. Returns {ok, read_only, checks, audit} — the
     ledger check rides beside `checks` (see the module docstring for why
     its membership stays at the v0.9 nine) but still gates `ok`: a ledger
-    that silently drops events is a red doctor."""
+    that silently drops events is a red doctor. Advisory failures
+    (accessibility — an optional fallback's permission) do NOT gate `ok`:
+    `ok` answers "does everything you use work", not "is every optional
+    extra enabled"."""
     checks = {name: _guarded(name, fn) for name, fn in _CHECKS}
     audit_check = _guarded("audit", check_audit)
     return {
-        "ok": all(c["ok"] for c in checks.values()) and audit_check["ok"],
+        "ok": (all(c["ok"] or c.get("advisory") for c in checks.values())
+               and audit_check["ok"]),
         "read_only": config.read_only(),
         "checks": checks,
         "audit": audit_check,

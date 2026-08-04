@@ -156,8 +156,9 @@ def test_overridden_log_file_is_print_only(home, installed, monkeypatch):
 def test_preview_is_render_of_the_list_execute_consumes(
     home, installed, launchctl, monkeypatch, capsys,
 ):
-    """THE anti-divergence acceptance: the preview text is render() of
-    the SAME list object execute() then consumes."""
+    """THE anti-divergence acceptance: the preview text shown before the
+    typed confirmation is render() of the SAME list object execute()
+    then consumes."""
     rendered, executed = [], []
     real_render, real_execute = plan.render, plan.execute
 
@@ -171,11 +172,27 @@ def test_preview_is_render_of_the_list_execute_consumes(
 
     monkeypatch.setattr(plan, "render", spy_render)
     monkeypatch.setattr(plan, "execute", spy_execute)
+    _script(monkeypatch, ["uninstall"])
     rows = lifecycle.plan_uninstall()
-    assert lifecycle.confirm_and_run(rows, verb="uninstall", yes=True) == 0
+    assert lifecycle.confirm_and_run(rows, verb="uninstall") == 0
     assert rendered[0] is executed[0] is rows
     out = capsys.readouterr().out
     assert real_render(rows) in out
+
+
+def test_yes_skips_the_preview_but_reports_results(
+    home, installed, launchctl, monkeypatch, capsys,
+):
+    """Under --yes the results ARE the report: each row prints once with
+    its outcome, never twice (preview + result stuttered every line in
+    the first-user transcript, 2026-08-04)."""
+    _no_input(monkeypatch)
+    rows = lifecycle.plan_uninstall()
+    assert lifecycle.confirm_and_run(rows, verb="uninstall", yes=True) == 0
+    out = capsys.readouterr().out
+    line = f"remove file {installed / 'graph' / 'main.token.json'}"
+    assert out.count(line) == 1
+    assert f"ok: {line}" in out
 
 
 def test_dry_run_provably_touches_nothing(home, installed, monkeypatch,
@@ -433,15 +450,153 @@ def test_setup_installs_the_agents_when_asked(home, smoke, launchctl,
                                               monkeypatch):
     _script(monkeypatch, [
         "",     # From: address -> skip identity
-        "y",    # dispatcher agent
-        "y",    # fts agent
-        "n",    # fts build
+        "y",    # background sender
+        "y",    # nightly index refresh
+        "n",    # body-search index build
     ])
     assert lifecycle.setup() == 0
     assert dispatcher._plist_path().read_text() == \
         dispatcher._plist_content()
     assert fts._plist_path().read_text() == fts._plist_content()
     assert [c[0] for c in launchctl].count("bootstrap") == 2
+
+
+def test_setup_defaults_drive_to_yes(home, smoke, launchctl, monkeypatch):
+    """Bare Enter on every optional question must land the user in the
+    good state: both agents installed, index built. The first user
+    answered 'n' to prompts she could not evaluate and lost body search
+    without knowing it existed (2026-08-04)."""
+    built = []
+    monkeypatch.setattr("email_mcp.fts.FtsIndex.build",
+                        lambda self: built.append(True) or {"scanned": 0})
+    _script(monkeypatch, ["", "", "", ""])  # identity skip + 3 bare Enters
+    assert lifecycle.setup() == 0
+    assert dispatcher._plist_path().exists()
+    assert fts._plist_path().exists()
+    assert built == [True]
+
+
+def test_setup_keeps_installed_agents_without_asking(home, smoke, launchctl,
+                                                     monkeypatch, capsys):
+    """A returning user must not be re-asked about agents that are
+    already there — and 'n' never silently meant 'remove'."""
+    agents = home / "Library" / "LaunchAgents"
+    (agents / f"{dispatcher.LAUNCHD_LABEL}.plist").write_text(
+        dispatcher._plist_content())
+    (agents / f"{fts.LAUNCHD_LABEL}.plist").write_text(fts._plist_content())
+    _script(monkeypatch, [
+        "",     # From: address -> skip identity
+        "n",    # body-search index build (agents never asked)
+    ])
+    assert lifecycle.setup() == 0
+    out = capsys.readouterr().out
+    assert "background sender already installed" in out
+    assert "nightly index refresh already installed" in out
+    assert "install the" not in out
+
+
+def test_setup_skips_the_build_prompt_when_the_index_is_ready(
+    home, smoke, monkeypatch, capsys,
+):
+    monkeypatch.setattr("email_mcp.fts.status", lambda: {"state": "ready"})
+    _script(monkeypatch, [
+        "",     # From: address -> skip identity
+        "n",    # background sender
+        "n",    # nightly index refresh
+    ])
+    assert lifecycle.setup() == 0
+    assert "already built — kept" in capsys.readouterr().out
+
+
+# ---------------------------------------------------------------------- #
+# setup — nightly-refresh aftercare (FDA walk + verify)                    #
+# ---------------------------------------------------------------------- #
+
+
+class SeqLaunchctl:
+    """plan._launchctl stand-in: kickstart always succeeds; each `print`
+    pops the next canned service dump."""
+
+    def __init__(self, dumps: list[str]):
+        self.dumps = list(dumps)
+        self.calls: list[tuple] = []
+
+    def __call__(self, *args):
+        self.calls.append(args)
+        out = ""
+        if args[0] == "print":
+            out = self.dumps.pop(0) if self.dumps else ""
+        return subprocess.CompletedProcess(args, 0, stdout=out, stderr="")
+
+
+EXIT0 = "state = not running\nlast exit code = 0\n"
+EXIT1 = "state = not running\nlast exit code = 1\n"
+RUNNING = "state = running\n"
+
+
+@pytest.fixture
+def no_sleep(monkeypatch):
+    monkeypatch.setattr("time.sleep", lambda s: None)
+
+
+def test_aftercare_is_a_noop_without_the_agent(home, monkeypatch):
+    _no_input(monkeypatch)
+    lifecycle._fts_agent_aftercare()  # no plist — returns silently
+
+
+def test_aftercare_verifies_a_green_agent_and_asks_nothing(
+    home, monkeypatch, capsys, no_sleep,
+):
+    fts._plist_path().write_text("<plist/>")
+    monkeypatch.setattr(plan, "_launchctl", SeqLaunchctl([EXIT0, EXIT0]))
+    _no_input(monkeypatch)
+    lifecycle._fts_agent_aftercare()
+    assert "verified" in capsys.readouterr().out
+
+
+def test_aftercare_walks_the_fda_grant_until_the_agent_runs(
+    home, monkeypatch, capsys, no_sleep,
+):
+    """The first-user machine (2026-08-04): agent installed three days
+    earlier, dying with PermissionError every night. Aftercare kicks it,
+    sees the death, opens the FDA pane + reveals the python binary,
+    waits for the human, re-verifies — green only when a real run
+    survives."""
+    fts._plist_path().write_text("<plist/>")
+    fake = SeqLaunchctl([EXIT1, EXIT1,                       # verify 1: died
+                         RUNNING, RUNNING, RUNNING, RUNNING])  # verify 2
+    monkeypatch.setattr(plan, "_launchctl", fake)
+    opened = []
+    monkeypatch.setattr(
+        lifecycle, "_open_in_macos",
+        lambda target, reveal=False: opened.append((target, reveal)))
+    _script(monkeypatch, [""])                # Enter after granting
+    lifecycle._fts_agent_aftercare()
+    out = capsys.readouterr().out
+    assert "Full Disk Access" in out
+    assert "verified" in out
+    assert any("Privacy_AllFiles" in t for t, _ in opened)   # the pane
+    assert any(reveal for _, reveal in opened)               # the binary
+    assert [c[0] for c in fake.calls].count("kickstart") == 2
+
+
+def test_aftercare_skip_removes_the_agent_instead_of_leaving_it_red(
+    home, monkeypatch, capsys, no_sleep,
+):
+    """The wizard's way out must land green: a user who cannot grant FDA
+    right now removes the agent (re-added any time) rather than keeping
+    a nightly failure the doctor reddens forever."""
+    fts._plist_path().write_text("<plist/>")
+    monkeypatch.setattr(plan, "_launchctl", SeqLaunchctl([EXIT1, EXIT1]))
+    monkeypatch.setattr(lifecycle, "_open_in_macos", lambda *a, **k: None)
+    removed = []
+    monkeypatch.setattr(
+        fts, "uninstall_launchd",
+        lambda: (removed.append(True), f"removed {fts.LAUNCHD_LABEL}")[1])
+    _script(monkeypatch, ["skip"])
+    lifecycle._fts_agent_aftercare()
+    assert removed == [True]
+    assert "removed" in capsys.readouterr().out
 
 
 def test_setup_reconfigure_is_backup_first(home, smoke, monkeypatch):

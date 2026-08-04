@@ -92,8 +92,11 @@ Rules:
   `errors[]` (get_emails_batch) and `pending[]` (triage_apply) ride inside
   `ok: true` envelopes. `ok: false` means the *operation* did not happen.
 - **Documented exceptions**: `doctor`'s top-level `ok` reports environment
-  health (a failed check, not a failed tool call); `refresh_mail`'s `ok`
-  reports the nudge outcome. Both are total functions and never crash.
+  health (a failed check, not a failed tool call) — checks carrying
+  `advisory: true` (an optional extra's permission, e.g. Accessibility)
+  warn without gating it (additive key, 2026-08-04); `refresh_mail`'s
+  `ok` reports the nudge outcome. Both are total functions and never
+  crash.
 - **Consumers must tolerate unknown keys** — the envelope grows additively
   (§8).
 

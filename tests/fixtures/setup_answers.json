@@ -1,5 +1,5 @@
 {
-  "about": "Scripted answers for P02 of the RC (tools/rc_runner.py): `email-mcp setup` driven over stdin, one line per entry, in the EXACT order today's wizard asks (email_mcp/lifecycle.py: identity, Exchange extras, launchd agents, FTS build). Each `prompt` is a distinctive substring of the real prompt and is pinned to the shipped wizard by tests/test_rc_runner.py — update BOTH together when the wizard changes. Rewritten 2026-08-02: the old fixture modeled a pre-lifecycle wizard (read_only/identity_action/fts_choice keys) that no longer exists, and the wizard gained the two Exchange questions — answered y then n so both prompts are exercised without a browser sign-in. The pipe driver keeps the sandbox transport healthcheck green without any credential; agents and the index build are deferred to the phases that own them (P07, P04).",
+  "about": "Scripted answers for P02 of the RC (tools/rc_runner.py): `email-mcp setup` driven over stdin, one line per entry, in the EXACT order today's wizard asks (email_mcp/lifecycle.py: identity, Exchange extras, launchd agents, FTS build). Each `prompt` is a distinctive substring of the real prompt and is pinned to the shipped wizard by tests/test_rc_runner.py — update BOTH together when the wizard changes. Rewritten 2026-08-02: the old fixture modeled a pre-lifecycle wizard (read_only/identity_action/fts_choice keys) that no longer exists, and the wizard gained the two Exchange questions — answered y then n so both prompts are exercised without a browser sign-in. The pipe driver keeps the sandbox transport healthcheck green without any credential; agents and the index build are deferred to the phases that own them (P07, P04). Prompts re-pinned 2026-08-04: the wizard now speaks plain language (background sender / nightly index refresh / body-search index) with yes defaults.",
   "answers": [
     {"prompt": "From: address", "answer": "rc-sandbox@example.org"},
     {"prompt": "display name", "answer": "RC Sandbox"},
@@ -7,8 +7,8 @@
     {"prompt": "delivery command (RFC822 on stdin)", "answer": "/usr/sbin/sendmail -t -i"},
     {"prompt": "Is rc-sandbox@example.org a Microsoft/Exchange mailbox", "answer": "y"},
     {"prompt": "Enable them now (one browser sign-in)?", "answer": "n"},
-    {"prompt": "install the scheduled-send dispatcher (every 60s) launchd agent?", "answer": "n"},
-    {"prompt": "install the nightly FTS sync (03:30) launchd agent?", "answer": "n"},
-    {"prompt": "build the FTS body index now (first crawl can take a while)?", "answer": "n"}
+    {"prompt": "install the background sender", "answer": "n"},
+    {"prompt": "install the nightly index refresh", "answer": "n"},
+    {"prompt": "build the body-search index now", "answer": "n"}
   ]
 }

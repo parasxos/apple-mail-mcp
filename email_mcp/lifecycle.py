@@ -14,7 +14,10 @@ from __future__ import annotations
 
 import json
 import os
+import re
+import subprocess
 import sys
+import time
 from pathlib import Path
 
 from . import checks, config, plan, state
@@ -28,15 +31,20 @@ def confirm_and_run(rows: list[plan.Row], *, verb: str, yes: bool = False,
     there (render is pure, so a dry run provably touches nothing); a plan
     with no Action rows has nothing to confirm; otherwise the typed verb
     (or --yes) releases execute, and the exit code is a fold over the same
-    results the report renders from."""
-    print(plan.render(rows))
+    results the report renders from. The preview prints only when someone
+    will act on it — before a typed confirmation or as the dry run; under
+    --yes the results ARE the report, and printing both stuttered every
+    row twice (first-user transcript, 2026-08-04)."""
     if dry_run:
+        print(plan.render(rows))
         return 0
     actions = [r for r in rows if isinstance(r, plan.Action)]
     if not actions:
+        print(plan.render(rows))
         print("nothing to do.")
         return 0
     if not yes:
+        print(plan.render(rows))
         answer = input(f"type '{verb}' to proceed ({len(actions)} "
                        f"action(s)): ")
         if answer.strip() != verb:
@@ -311,20 +319,142 @@ def _upgrade_rows(path) -> list[plan.Row]:
 
 
 def _agent_rows() -> list[plan.Row]:
+    """The two background helpers, offered in the user's words with the
+    right answer as the default. A question phrased in launchd jargon
+    with a safe-looking "N" is a question the first user answers wrong
+    and never benefits from (2026-08-04). Already-installed agents are
+    kept silently — setup re-renders drift via the checks registry, and
+    removal belongs to `email-mcp uninstall`."""
     from . import dispatcher, fts
 
     rows: list[plan.Row] = []
-    for label, plist, content, what, default in (
+    for label, plist, content, what, why in (
         (dispatcher.LAUNCHD_LABEL, dispatcher._plist_path(),
-         dispatcher._plist_content,
-         "scheduled-send dispatcher (every 60s)", True),
+         dispatcher._plist_content, "background sender",
+         "scheduled emails go out even after you close this terminal"),
         (fts.LAUNCHD_LABEL, fts._plist_path(), fts._plist_content,
-         "nightly FTS sync (03:30)", False),
+         "nightly index refresh",
+         "search inside message bodies stays current, hands-off"),
     ):
-        if _yn(f"install the {what} launchd agent?", default=default):
+        if plist.exists():
+            rows.append(plan.Kept(plist, f"{what} already installed"))
+            continue
+        if _yn(f"install the {what} ({why})?", default=True):
             rows += [plan.WriteFile(plist, content(), mode=0o644),
                      plan.BootstrapAgent(label, plist)]
     return rows
+
+
+# ---------------------------------------------------------------------- #
+# the nightly refresh needs Full Disk Access for ITS python — walk + verify
+# ---------------------------------------------------------------------- #
+
+# macOS offers NO API or permission pop-up for Full Disk Access (unlike
+# Accessibility/Automation): TCC requires the human to flip the toggle.
+# The closest legal thing to "just do it" is opening System Settings on
+# the exact pane and revealing the exact binary to drag in — then
+# verifying with a real run, because a probe spawned from this terminal
+# inherits the terminal's TCC identity and proves nothing about launchd.
+_FDA_PANE = ("x-apple.systempreferences:com.apple.preference.security"
+             "?Privacy_AllFiles")
+
+_VERIFY_POLL = 2.0     # seconds between launchctl looks
+_VERIFY_GRACE = 8.0    # running this long ⇒ crawling, not crashing
+_VERIFY_TIMEOUT = 45.0
+
+
+def _open_in_macos(target: str, reveal: bool = False) -> None:
+    """Best-effort `open` — a failed open never derails setup."""
+    try:
+        subprocess.run(["open", "-R", target] if reveal
+                       else ["open", target],
+                       capture_output=True, timeout=10)
+    except Exception:  # noqa: BLE001 — cosmetic helper
+        pass
+
+
+def _verify_fts_agent() -> bool | None:
+    """Ground truth on the nightly refresh: kick it once and watch it via
+    launchctl. True = it ran (exit 0) or is visibly crawling (an FDA
+    denial dies in under a second, so surviving the grace period proves
+    disk access). False = it died. None = cannot judge here (launchctl
+    unavailable or agent not loaded)."""
+    from . import fts
+
+    tgt = f"gui/{os.getuid()}/{fts.LAUNCHD_LABEL}"
+    try:
+        if plan._launchctl("kickstart", "-k", tgt).returncode != 0:
+            return None
+    except Exception:  # noqa: BLE001 — non-macOS CI
+        return None
+    ran = 0.0
+    stale_guard = False  # first exit-code sighting may predate the kick
+    deadline = time.monotonic() + _VERIFY_TIMEOUT
+    while time.monotonic() < deadline:
+        try:
+            r = plan._launchctl("print", tgt)
+        except Exception:  # noqa: BLE001
+            return None
+        if r.returncode != 0 or "state = " not in (r.stdout or ""):
+            return None  # not a service dump — nothing to judge
+        if "state = running" in r.stdout:
+            ran += _VERIFY_POLL
+            if ran >= _VERIFY_GRACE:
+                return True
+        else:
+            m = re.search(r"last exit code = (-?\d+)", r.stdout)
+            if m and (ran or stale_guard):
+                return int(m.group(1)) == 0
+            stale_guard = True
+        time.sleep(_VERIFY_POLL)
+    return None
+
+
+def _fts_agent_aftercare() -> None:
+    """Setup must never end with a nightly refresh that silently dies
+    every night (first user: agent installed 2026-08-01, PermissionError
+    at every 03:30 since). Verify with a real run; on failure, guide the
+    Full Disk Access grant hands-on and re-verify until it works — or
+    remove the agent, so the machine is green either way."""
+    from . import fts
+
+    if not fts._plist_path().exists():
+        return
+    attempt = 0
+    while True:
+        print("\nchecking the nightly index refresh actually runs "
+              "(takes a few seconds)...")
+        verdict = _verify_fts_agent()
+        if verdict is None:
+            print("could not verify from here — `email-mcp doctor` will "
+                  "flag it if it misbehaves.")
+            return
+        if verdict:
+            print("nightly refresh verified — it runs with disk access.")
+            return
+        attempt += 1
+        py = Path(sys.executable).resolve()
+        print("the refresh died on its first run — almost always because "
+              "macOS blocks background programs from reading Mail until "
+              "you grant Full Disk Access to this exact program:")
+        print(f"  {py}")
+        print("there is no pop-up for this one; it is a one-time toggle:")
+        print("  1) a Finder window opens with the program selected")
+        print("  2) System Settings opens on Privacy & Security -> Full "
+              "Disk Access")
+        print("  3) drag the program from Finder into that list and "
+              "switch it ON")
+        if attempt > 1:
+            print(f"  still failing — the log may say more: "
+                  f"{fts._log_path()}")
+        _open_in_macos(str(py), reveal=True)
+        _open_in_macos(_FDA_PANE)
+        ans = input("press Enter here once granted, and I re-check "
+                    "(or type 'skip' to remove the nightly refresh — "
+                    "re-add it any time with `email-mcp setup`): ")
+        if ans.strip().lower() in {"s", "skip"}:
+            print(fts.uninstall_launchd())
+            return
 
 
 def _print_client_config() -> None:
@@ -342,16 +472,24 @@ def _smoke() -> None:
     report = doctor.run()
     for line in doctor.render(report, indent="  "):
         print(line)
-    print("  => ready" if report["ok"]
-          else "  => NOT ready — fix the FAIL lines and re-run doctor")
+    if not report["ok"]:
+        print("  => NOT ready — fix the FAIL lines and re-run doctor")
+        return
+    warns = sum(1 for c in {**report["checks"],
+                            "audit": report["audit"]}.values()
+                if not c["ok"] and c.get("advisory"))
+    print(f"  => ready ({warns} optional warning(s) — everything you "
+          f"use works)" if warns else "  => ready")
 
 
 def setup(*, yes: bool = False) -> int:
     """First run: adopt the state root, run the create-checks forward
     (meta stamp rides there), prompt the optional pieces (identity,
-    launchd agents, FTS build), print the MCP client config, smoke-test.
-    Non-interactive (--yes) takes no answers, so it skips every optional
-    piece and just adopts + stamps + repairs."""
+    launchd agents, FTS build) in plain words with the right answer as
+    the default, verify the nightly refresh actually runs (guiding the
+    Full Disk Access grant when it does not), print the MCP client
+    config, smoke-test. Non-interactive (--yes) takes no answers, so it
+    skips every optional piece and just adopts + stamps + repairs."""
     r = state.State.resolve()
     if isinstance(r, state.Refused):
         print(f"cannot set up: {r.reason}")
@@ -370,22 +508,32 @@ def setup(*, yes: bool = False) -> int:
         rows += _identity_rows()
         rows += _agent_rows()
     code = confirm_and_run(rows, verb="setup", yes=True)
-    if not yes and _yn("build the FTS body index now (first crawl can "
-                       "take a while)?"):
+    if not yes:
         from . import fts
 
-        try:
-            print(f"fts build: {fts.FtsIndex().build()}")
-        except Exception as e:
-            # The build is OPTIONAL; its failure is a finding, not the end
-            # of setup. Unguarded, it took the client config and the smoke
-            # test down with it — the two things that would have named the
-            # actual problem in plain words (first user, 2026-08-01: no
-            # Full Disk Access → raw PermissionError traceback, half-
-            # configured machine, zero diagnosis).
-            print(f"fts build FAILED: {e}")
-            print("  setup continues — build later with: "
-                  "python -m email_mcp.fts --build")
+        index_state = fts.status().get("state")
+        if index_state == "ready":
+            print("body-search index already built — kept.")
+        elif index_state == "error":
+            print("body-search index is damaged — rebuild with: "
+                  "python -m email_mcp.fts --rebuild")
+        elif _yn("build the body-search index now (lets Claude search "
+                 "inside message bodies; the first crawl can take a "
+                 "while and resumes if interrupted)?", default=True):
+            try:
+                print(f"fts build: {fts.FtsIndex().build()}")
+            except Exception as e:
+                # The build is OPTIONAL; its failure is a finding, not the
+                # end of setup. Unguarded, it took the client config and
+                # the smoke test down with it — the two things that would
+                # have named the actual problem in plain words (first
+                # user, 2026-08-01: no Full Disk Access → raw
+                # PermissionError traceback, half-configured machine,
+                # zero diagnosis).
+                print(f"fts build FAILED: {e}")
+                print("  setup continues — build later with: "
+                      "python -m email_mcp.fts --build")
+        _fts_agent_aftercare()
     _print_client_config()
     _smoke()
     return code
