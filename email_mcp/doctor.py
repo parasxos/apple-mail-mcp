@@ -3,9 +3,10 @@ needs, checked in one pass with remediation hints.
 
 `run()` returns {ok, read_only, checks: {name: {ok, detail, fix?, ...}},
 audit} — `ok` is the AND of every non-advisory check (the audit ledger
-check included); checks carrying `advisory: true` (accessibility) warn
-without gating `ok`. `fix` appears only when there is a concrete next
-step (a Settings pane or a command). The v0.10 ledger check reports as the top-level `audit`
+check included); checks carrying `advisory: true` (accessibility; a
+transports check whose only failures self-heal, e.g. a cold SSH socket)
+warn without gating `ok`. `fix` appears only when there is a concrete
+next step (a Settings pane or a command). The v0.10 ledger check reports as the top-level `audit`
 section, NOT a tenth member of `checks`: that mapping's membership is the
 v0.9 doctor surface, pinned by its shape tests, and v0.10 does not touch
 existing success shapes (docs/v1-contract.md §8) — folding it into
@@ -238,21 +239,31 @@ def check_transports() -> dict:
         # carried no fix, found by the first live RC pass (P03,
         # 2026-08-02). The remedy comes from the DRIVER that knows its
         # own lane (healthcheck's `fix`); doctor only aggregates, so a
-        # new driver's remedy needs no edit here.
+        # new driver's remedy needs no edit here. The same deference
+        # covers severity: a driver that marks its failure `advisory`
+        # (a cold SSH socket the next send re-bootstraps) makes the
+        # whole check a warn — unless another lane is hard-broken.
         parts = [f"{n}: {r['fix']}" for n, r in sorted(report.items())
                  if not r.get("ok") and r.get("fix")]
         bad = sorted(n for n, r in report.items() if not r.get("ok"))
         out["fix"] = ("; ".join(parts) if parts else
                       f"unhealthy: {', '.join(bad)} — see each identity's "
                       "error above")
+        if all(r.get("ok") or r.get("advisory") for r in report.values()):
+            out["advisory"] = True
     return out
 
 
 def _agent_last_exit(label: str) -> int | None:
     """Last exit code of a launchd agent; None when the agent is absent,
-    has never exited, or launchctl is unavailable (non-macOS CI). The
-    doctor called an estate healthy while its nightly agent failed every
-    run — RC P04's root cause sat invisible for a day (2026-08-03)."""
+    has never exited, is running RIGHT NOW, or launchctl is unavailable
+    (non-macOS CI). The doctor called an estate healthy while its nightly
+    agent failed every run — RC P04's root cause sat invisible for a day
+    (2026-08-03). The running guard is the mirror image: a mid-run agent's
+    recorded exit code belongs to a PREVIOUS run — setup's smoke test read
+    the pre-grant exit 1 while the freshly-verified sync was still in
+    flight and called a healthy machine NOT ready (first user,
+    2026-08-05)."""
     try:
         r = subprocess.run(
             ["launchctl", "print", f"gui/{os.getuid()}/{label}"],
@@ -261,6 +272,8 @@ def _agent_last_exit(label: str) -> int | None:
         return None
     if r.returncode != 0:
         return None
+    if "state = running" in r.stdout:
+        return None  # mid-run: only a finished run can be judged
     m = re.search(r"last exit code = (-?\d+)", r.stdout)
     return int(m.group(1)) if m else None
 
@@ -604,8 +617,9 @@ def run() -> dict:
     ledger check rides beside `checks` (see the module docstring for why
     its membership stays at the v0.9 nine) but still gates `ok`: a ledger
     that silently drops events is a red doctor. Advisory failures
-    (accessibility — an optional fallback's permission) do NOT gate `ok`:
-    `ok` answers "does everything you use work", not "is every optional
+    (accessibility — an optional fallback's permission; a transports
+    check whose only failures self-heal) do NOT gate `ok`: `ok` answers
+    "does anything need your hand before use", not "is every optional
     extra enabled"."""
     checks = {name: _guarded(name, fn) for name, fn in _CHECKS}
     audit_check = _guarded("audit", check_audit)

@@ -478,8 +478,8 @@ def _smoke() -> None:
     warns = sum(1 for c in {**report["checks"],
                             "audit": report["audit"]}.values()
                 if not c["ok"] and c.get("advisory"))
-    print(f"  => ready ({warns} optional warning(s) — everything you "
-          f"use works)" if warns else "  => ready")
+    print(f"  => ready ({warns} warning(s) — none block use)"
+          if warns else "  => ready")
 
 
 def setup(*, yes: bool = False) -> int:

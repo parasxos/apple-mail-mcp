@@ -19,6 +19,10 @@ CHECK_NAMES = {
     "transports", "dispatcher", "spool_plans", "fts", "graph",
 }
 
+# Captured at import time, BEFORE conftest's no_host_launchd stub patches
+# the module attribute — for the tests that exercise the real parser.
+_REAL_AGENT_LAST_EXIT = doctor._agent_last_exit
+
 
 @pytest.fixture(autouse=True)
 def _env(monkeypatch, tmp_path, mail_fixture):
@@ -193,6 +197,27 @@ def test_never_ran_agent_is_not_a_fault(monkeypatch):
     assert doctor.check_dispatcher()["ok"] is True
 
 
+def test_running_agent_is_not_judged_by_the_previous_exit(monkeypatch):
+    """The first-user finding (2026-08-05): setup's aftercare verified
+    the freshly-granted sync by watching it RUN, then the smoke doctor
+    seconds later read `last exit code = 1` — the pre-grant run's — and
+    called the machine NOT ready. A mid-run agent's recorded exit code
+    belongs to a previous run; only a finished run can be judged."""
+    def fake_run(cmd, **kw):
+        return subprocess.CompletedProcess(
+            cmd, 0, "\tstate = running\n\tlast exit code = 1\n", "")
+
+    monkeypatch.setattr(doctor.subprocess, "run", fake_run)
+    assert _REAL_AGENT_LAST_EXIT("com.email-mcp.fts") is None
+
+    def fake_run_done(cmd, **kw):
+        return subprocess.CompletedProcess(
+            cmd, 0, "\tstate = not running\n\tlast exit code = 1\n", "")
+
+    monkeypatch.setattr(doctor.subprocess, "run", fake_run_done)
+    assert _REAL_AGENT_LAST_EXIT("com.email-mcp.fts") == 1
+
+
 def test_mail_store_tcc_denial_maps_to_fda_fix_not_crash(monkeypatch):
     """The TCC case: the Mail dir exists but macOS refuses the read, so
     config.mail_dir raises PermissionError, not FileNotFoundError.
@@ -226,6 +251,54 @@ def test_malformed_identities_toml_is_verbatim_red(tmp_path):
     assert report["checks"]["transports"]["ok"] is False
     assert "identities unreadable" in report["checks"]["transports"]["detail"]
     assert report["checks"]["graph"]["ok"] is True
+
+
+def test_cold_ssh_socket_warns_without_reddening_the_doctor(monkeypatch):
+    """The driver owns severity as it owns the remedy: a healthcheck
+    marked advisory (cold socket, bootstrap configured — the next send
+    re-establishes it headlessly) makes the transports check a warn, and
+    the doctor stays ready. Second first-user round, 2026-08-05: her
+    only FAILs were this and a mid-run agent — a fully working machine
+    read NOT ready twice."""
+
+    class ColdButSelfHealing:
+        def healthcheck(self):
+            return {"ok": False, "advisory": True,
+                    "fix": "run ssh -fN lxplus to re-establish — the "
+                           "next send bootstraps it headlessly."}
+
+    monkeypatch.setattr(doctor, "get_transport",
+                        lambda ident: ColdButSelfHealing())
+    check = doctor.check_transports()
+    assert check["ok"] is False
+    assert check["advisory"] is True
+    assert "bootstraps it headlessly" in check["fix"]
+    report = doctor.run()
+    assert report["ok"] is True
+    lines = doctor.render(report)
+    assert any(ln.startswith("warn transports") for ln in lines)
+
+
+def test_hard_broken_lane_overrides_an_advisory_one(monkeypatch, tmp_path):
+    (tmp_path / "identities.toml").write_text(
+        'default = "a"\n'
+        '[a]\nfrom_addr = "a@x.org"\ndriver = "pipe"\ncommand = "cat"\n'
+        '[b]\nfrom_addr = "b@x.org"\ndriver = "pipe"\ncommand = "cat"\n'
+    )
+
+    def factory(ident):
+        class T:
+            def healthcheck(self):
+                if ident.name == "a":
+                    return {"ok": False, "advisory": True, "fix": "cold"}
+                return {"ok": False, "fix": "dead credentials"}
+
+        return T()
+
+    monkeypatch.setattr(doctor, "get_transport", factory)
+    check = doctor.check_transports()
+    assert check["ok"] is False
+    assert "advisory" not in check
 
 
 def test_transports_mirrors_mocked_healthchecks(monkeypatch, tmp_path):

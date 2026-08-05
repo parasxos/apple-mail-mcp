@@ -200,6 +200,27 @@ def test_ssh_healthcheck_only_checks_never_mutates(monkeypatch):
     assert calls[0][:3] == ["ssh", "-O", "check"]
 
 
+def test_ssh_healthcheck_cold_socket_severity_follows_the_bootstrap(
+    monkeypatch,
+):
+    """A cold socket the next send re-bootstraps is advisory (a state,
+    not damage — 2026-08-05 first-user finding); without a bootstrap
+    command the human must act, so it stays a hard failure."""
+    monkeypatch.setattr(
+        ssh_mod.subprocess, "run",
+        lambda cmd, **kw: _FakeProc(returncode=1, stderr=b"no master"),
+    )
+    hc = _ssh(bootstrap="ssh -fN lxplus_vscode").healthcheck()
+    assert hc["ok"] is False
+    assert hc["advisory"] is True
+    assert "bootstraps it headlessly" in hc["fix"]
+
+    hc = _ssh().healthcheck()
+    assert hc["ok"] is False
+    assert "advisory" not in hc
+    assert "2FA" in hc["fix"]
+
+
 # --------------------------------------------------------------------- #
 # smtp                                                                  #
 # --------------------------------------------------------------------- #

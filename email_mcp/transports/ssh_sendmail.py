@@ -217,6 +217,11 @@ class SshSendmailTransport:
             ) + " — a cold socket is a state, not damage: the next send "
             if self.bootstrap:
                 out["fix"] += "bootstraps it headlessly."
+                # Self-healing by the driver's own claim: degradation the
+                # next send repairs must warn, never redden the doctor —
+                # a first user on holiday read "NOT ready" off a lane
+                # that needed no hand at all (2026-08-05).
+                out["advisory"] = True
             else:
                 out["fix"] += "will report it until the session exists."
         return out
