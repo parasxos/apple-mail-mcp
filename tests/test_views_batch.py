@@ -270,3 +270,67 @@ def test_normal_and_unknown_mailboxes_carry_no_note(src):
     # Populated scoped list_recent: no note.
     out = tool_list_recent(mailbox="Inbox")
     assert out["messages"] and out["note"] is None
+
+
+# --------------------------------------------------------------------- #
+# body-gap fix (2026-08-06): backfilled bodies with declared provenance #
+# --------------------------------------------------------------------- #
+
+
+def _seed_backfilled_body(rowid: int, text: str) -> None:
+    """Hand-write a v2 fts db holding a graph-sourced body for `rowid` —
+    the state the nightly backfill leaves behind."""
+    import sqlite3
+
+    from email_mcp import state
+
+    path = state.State.resolve().adopt().fts / "fts.db"
+    conn = sqlite3.connect(path)
+    conn.executescript(
+        "CREATE TABLE IF NOT EXISTS meta("
+        "  key TEXT PRIMARY KEY, value TEXT NOT NULL);"
+        "CREATE TABLE IF NOT EXISTS docs("
+        "  rowid INTEGER PRIMARY KEY, status TEXT NOT NULL,"
+        "  attempts INTEGER NOT NULL DEFAULT 0,"
+        "  last_attempt REAL NOT NULL DEFAULT 0,"
+        "  bytes INTEGER NOT NULL DEFAULT 0,"
+        "  source TEXT NOT NULL DEFAULT 'local');"
+        "CREATE VIRTUAL TABLE IF NOT EXISTS body_fts USING fts5("
+        "  body, tokenize = 'unicode61 remove_diacritics 2');"
+        "INSERT INTO meta VALUES('schema_version', '2');")
+    conn.execute("INSERT INTO docs(rowid, status, source) "
+                 "VALUES (?, 'indexed', 'graph')", (rowid,))
+    conn.execute("INSERT INTO body_fts(rowid, body) VALUES (?, ?)",
+                 (rowid, text))
+    conn.commit()
+    conn.close()
+
+
+def test_full_view_serves_backfilled_body_with_provenance(src):
+    """Rowid 200 has NO .emlx (Mail never downloaded it): today's read
+    surfaces only the Envelope snippet. With a backfilled server copy in
+    the index, the source serves the real body instead — and SAYS so via
+    body_source, never silently."""
+    before = tool_get_email("200", view="full")["email"]
+    assert before["body_text"] == "Routine ops digest"  # snippet fallback
+    assert before["body_source"] is None
+
+    _seed_backfilled_body(200, "the server copy of the body")
+    out = tool_get_email("200", view="full")["email"]
+    assert out["body_text"] == "the server copy of the body"
+    assert out["body_source"] == "server_backfill"
+
+    # Batch full view inherits the same fold.
+    batch = tool_get_emails_batch(["200"], view="full")["emails"][0]
+    assert batch["body_source"] == "server_backfill"
+
+    # Views without bodies carry no provenance claim either way.
+    meta = tool_get_email("200", view="metadata")["email"]
+    assert "body_source" not in meta
+
+
+def test_local_bodies_never_carry_a_backfill_claim(src):
+    _seed_backfilled_body(100, "must never be served")
+    out = tool_get_email("100", view="full")["email"]
+    assert "retracted" in out["body_text"]       # the live .emlx body
+    assert out["body_source"] is None

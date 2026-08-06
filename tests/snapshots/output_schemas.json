@@ -51,6 +51,7 @@
             }
           ],
           "body_html": "str",
+          "body_source": "str|null",
           "body_text": "str",
           "flags": "dict",
           "headers": "dict",
@@ -129,6 +130,7 @@
               }
             ],
             "body_html": "str",
+            "body_source": "str|null",
             "body_text": "str",
             "flags": "dict",
             "headers": "dict",

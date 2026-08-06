@@ -604,6 +604,79 @@ def create_deferred_draft(ident, raw: bytes, when: datetime) -> str:
     return draft_id
 
 
+def fetch_body_by_message_id(ident, message_id: str) -> dict | None:
+    """The mailbox's own copy of a message body, located by RFC
+    Message-ID across every folder. Returns {"contentType", "content"}
+    verbatim from the wire (usually contentType "html") — text
+    extraction is the index's business, not the transport's. None on a
+    CONFIRMED empty result (this mailbox does not hold the message);
+    lookup failures raise GraphError — absence of evidence must never
+    read as evidence of absence (the backfill would stamp a permanent
+    graph_miss off a transient 503)."""
+    quoted = message_id.replace("'", "''")
+    query = urllib.parse.urlencode({
+        "$filter": f"internetMessageId eq '{quoted}'",
+        "$select": "body",
+    })
+    status, body = _graph("GET", f"/me/messages?{query}", ident)
+    if status != 200:
+        raise GraphError(
+            f"[{_name(ident)}/graph] message lookup by internetMessageId "
+            f"failed (HTTP {status}): {_graph_reason(body)}"
+        )
+    value = body.get("value") or []
+    if not value:
+        return None
+    b = value[0].get("body") or {}
+    return {"contentType": str(b.get("contentType") or "text"),
+            "content": str(b.get("content") or "")}
+
+
+def translate_ews_ids(ident, ews_ids: list[str]) -> dict[str, str]:
+    """EWS ItemIds (Mail.app's messages.remote_id) → Graph REST ids, in
+    one call. Purely an id-format conversion: a translated id says
+    nothing about the message still existing — existence is decided by
+    the body GET (404). Returns {ews_id: rest_id} for every id Graph
+    could convert; omitted ids simply are not in the mapping. Raises
+    GraphError on a failed call."""
+    if not ews_ids:
+        return {}
+    status, body = _graph(
+        "POST", "/me/translateExchangeIds", ident,
+        body={"inputIds": ews_ids, "sourceIdType": "ewsId",
+              "targetIdType": "restId"})
+    if status != 200:
+        raise GraphError(
+            f"[{_name(ident)}/graph] translateExchangeIds failed "
+            f"(HTTP {status}): {_graph_reason(body)}"
+        )
+    out: dict[str, str] = {}
+    for row in body.get("value") or []:
+        src, tgt = row.get("sourceId"), row.get("targetId")
+        if src and tgt:
+            out[str(src)] = str(tgt)
+    return out
+
+
+def fetch_body_by_graph_id(ident, rest_id: str) -> dict | None:
+    """One message's body by Graph REST id. None on a CONFIRMED 404 —
+    the mailbox no longer holds it; anything else non-200 raises
+    (absence of evidence must never read as evidence of absence)."""
+    quoted = urllib.parse.quote(rest_id, safe="")
+    status, body = _graph(
+        "GET", f"/me/messages/{quoted}?$select=body", ident)
+    if status == 404:
+        return None
+    if status != 200:
+        raise GraphError(
+            f"[{_name(ident)}/graph] message body fetch failed "
+            f"(HTTP {status}): {_graph_reason(body)}"
+        )
+    b = body.get("body") or {}
+    return {"contentType": str(b.get("contentType") or "text"),
+            "content": str(b.get("content") or "")}
+
+
 def _find_by_message_id(ident, folder: str, message_id: str) -> str | None:
     """First message id in `folder` whose internetMessageId matches, or
     None on a CONFIRMED empty result. Lookup failures raise GraphError —

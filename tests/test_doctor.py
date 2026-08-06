@@ -477,3 +477,40 @@ def test_spool_plans_check_survives_mode_000_and_names_chmod(monkeypatch,
     assert f"chmod 700 {plans_dir}" in out["fix"]
     assert ("unreadable" in out["detail"]          # 3.11: glob raised
             or "mode 0" in out["detail"])          # 3.14: named anyway
+
+
+def test_fts_body_gap_warns_with_the_mail_side_lever(monkeypatch):
+    """Phase 3(a) of the body-gap fix (2026-08-06): partial + missing is
+    mail whose body Mail.app never downloaded — search silently cannot
+    see it. Big gaps warn (advisory — nothing is broken) and the remedy
+    names the Mail-side lever, not a rebuild that cannot help."""
+    monkeypatch.setattr("email_mcp.fts.status", lambda: {
+        "state": "ready",
+        "docs": {"indexed": 500, "partial": 400, "missing": 200,
+                 "error": 0, "total": 1100, "backfilled": 25}})
+    check = doctor.check_fts()
+    assert check["ok"] is False
+    assert check["advisory"] is True
+    assert "600 of 1100 bodies" in check["detail"]
+    assert "25 backfilled" in check["detail"]
+    assert "download all messages" in check["fix"]
+    assert "graph identity backfill themselves nightly" in check["fix"]
+    report = doctor.run()
+    assert report["ok"] is True                      # warn, not a red
+
+
+def test_fts_small_or_young_body_gaps_stay_quiet(monkeypatch):
+    # Young index: huge ratio but too few docs to mean anything.
+    monkeypatch.setattr("email_mcp.fts.status", lambda: {
+        "state": "ready",
+        "docs": {"indexed": 10, "partial": 400, "missing": 0,
+                 "error": 0, "total": 410, "backfilled": 0}})
+    assert doctor.check_fts()["ok"] is True
+    # Mature index, small gap: normal traffic, not a coverage ceiling.
+    monkeypatch.setattr("email_mcp.fts.status", lambda: {
+        "state": "ready",
+        "docs": {"indexed": 9500, "partial": 300, "missing": 200,
+                 "error": 0, "total": 10000, "backfilled": 0}})
+    check = doctor.check_fts()
+    assert check["ok"] is True
+    assert "advisory" not in check

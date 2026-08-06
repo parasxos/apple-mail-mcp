@@ -195,6 +195,8 @@ class AppleMailSource:
             "state": "disabled",
             "indexed": 0,
             "missing": 0,
+            "partial": 0,
+            "backfilled": 0,
             "backlog": 0,
             "hits": len(rowids),
             "hits_capped": capped,
@@ -212,6 +214,13 @@ class AppleMailSource:
             return out
         out["indexed"] = st["docs"]["indexed"]
         out["missing"] = st["docs"]["missing"]
+        # Bodies Mail never downloaded (headers-only partials) are a
+        # coverage hole exactly like missing files — reporting only
+        # `missing` let a 15k-doc gap read as full coverage (first-user
+        # body-gap report, 2026-08-06). `backfilled` counts the docs the
+        # Graph lane has already recovered into that coverage.
+        out["partial"] = st["docs"]["partial"]
+        out["backfilled"] = st["docs"].get("backfilled", 0)
         out["backlog"] = self._fts_backlog(st["last_rowid"])
         if out["backlog"] > 0:
             out["remedy"] = "python -m email_mcp.fts --sync"
@@ -595,6 +604,7 @@ class AppleMailSource:
 
         body_text = ""
         body_html = ""
+        body_source: str | None = None
         headers: dict[str, str] = {}
         attachments: list[AttachmentRef] = []
 
@@ -605,13 +615,21 @@ class AppleMailSource:
             body_html = parsed["body_html"]
             attachments = parsed["attachments"]
         else:
-            # IMAP-only mailbox without a local copy. Surface what we can.
             headers = {
                 "Subject": ref.subject,
                 "From": ref.from_addr,
                 "Date": ref.date.isoformat(),
             }
             body_text = ref.snippet
+            idx = self._fts()
+            if idx is not None:
+                try:
+                    filled = idx.backfilled_text(rowid)
+                except Exception:  # index trouble must not break reads
+                    filled = None
+                if filled:
+                    body_text = filled
+                    body_source = "server_backfill"
 
         flags = {"read": not ref.unread, "flagged": flagged}
         return Email(
@@ -621,6 +639,7 @@ class AppleMailSource:
             body_html=body_html,
             attachments=attachments,
             flags=flags,
+            body_source=body_source,
         )
 
     def attachment(self, id: str, attachment_id: str) -> AttachmentBlob:

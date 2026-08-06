@@ -1510,3 +1510,39 @@ def test_ssl_context_prefers_certifi_and_caches(monkeypatch):
     assert isinstance(ctx1, _ssl.SSLContext)
     # certifi present in this venv -> the context must have CA certs loaded
     assert ctx1.cert_store_stats()["x509_ca"] > 0
+
+
+def test_fetch_body_by_message_id_shapes(monkeypatch):
+    """Hit → verbatim wire body; confirmed empty → None; lookup failure
+    → GraphError (a transient 503 must never stamp a permanent miss)."""
+    from email_mcp import graph
+
+    class Ident:
+        name = "main"
+        from_addr = "a@cern.ch"
+        graph = {"tenant": "organizations", "client_id": "x"}
+
+    calls = []
+
+    def fake_graph(method, path, ident, body=None, ctype=None):
+        calls.append(path)
+        return 200, {"value": [{"body": {"contentType": "html",
+                                         "content": "<p>hi</p>"}}]}
+
+    monkeypatch.setattr(graph, "_graph", fake_graph)
+    out = graph.fetch_body_by_message_id(Ident(), "<x'y@cern.ch>")
+    assert out == {"contentType": "html", "content": "<p>hi</p>"}
+    import urllib.parse as _up
+
+    assert "%24filter=internetMessageId" in calls[0] \
+        or "$filter" in calls[0]
+    assert "''" in _up.unquote(calls[0])             # quote escaped
+
+    monkeypatch.setattr(graph, "_graph",
+                        lambda *a, **k: (200, {"value": []}))
+    assert graph.fetch_body_by_message_id(Ident(), "<m@x>") is None
+
+    monkeypatch.setattr(graph, "_graph",
+                        lambda *a, **k: (503, {"error": {"message": "down"}}))
+    with pytest.raises(graph.GraphError):
+        graph.fetch_body_by_message_id(Ident(), "<m@x>")

@@ -130,6 +130,9 @@ EXPECTED_SKIPS = frozenset({
     "list_mailboxes.mailboxes[].local_count",
     "list_recent.note",
     "search_emails.note",
+    # body-gap fix (2026-08-06): declared provenance on backfilled bodies
+    "get_email.email.body_source",
+    "get_emails_batch.emails[].body_source",
 })
 
 # oracle keys whose ABSENCE from the derived shape is expected (see above)
@@ -141,6 +144,10 @@ _WAIVED_ADDED = frozenset({
     "list_mailboxes.mailboxes[].local_count",
     "list_recent.note",
     "search_emails.note",
+    # body-gap fix (2026-08-06): backfilled bodies carry declared
+    # provenance — additive on the full view only
+    "get_email.email.body_source",
+    "get_emails_batch.emails[].body_source",
 })
 
 

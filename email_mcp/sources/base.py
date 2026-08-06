@@ -47,13 +47,20 @@ class EmailRef:
 
 @dataclass(frozen=True)
 class Email:
-    """Full email body returned by get_email."""
+    """Full email body returned by get_email.
+
+    body_source is None for the normal case (bodies read live from the
+    mail store). "server_backfill" marks the one exception: the local
+    .emlx holds no body (Mail never downloaded it) and body_text is the
+    server copy the FTS backfill fetched — provenance declared, never
+    implied (body-gap fix, 2026-08-06)."""
     ref: EmailRef
     headers: dict[str, str]
     body_text: str
     body_html: str
     attachments: list[AttachmentRef]
     flags: dict[str, bool]  # {"flagged": bool, "read": bool, ...}
+    body_source: str | None = None
 
 
 @dataclass(frozen=True)

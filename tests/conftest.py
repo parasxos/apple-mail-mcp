@@ -47,7 +47,8 @@ def _build_envelope_index(db_path: Path) -> None:
             deleted INTEGER NOT NULL DEFAULT 0,
             conversation_id INTEGER NOT NULL DEFAULT 0,
             global_message_id INTEGER,
-            flag_color INTEGER
+            flag_color INTEGER,
+            remote_id TEXT
         );
         CREATE TABLE message_global_data (
             ROWID INTEGER PRIMARY KEY,

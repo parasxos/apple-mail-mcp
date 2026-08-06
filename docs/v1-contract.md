@@ -422,6 +422,15 @@ gains an `audit` check (dir exists, perms, writability).
     `note` — set when an empty page was scoped to such a server-side-only
     mailbox, so the emptiness explains itself instead of reading as tool
     failure.
+  - *Additive growth 2026-08-06* (snapshot regenerated deliberately —
+    the body-gap fix): `get_email`/`get_emails_batch` full-view emails
+    gain `body_source` — null for the normal live-store read;
+    `"server_backfill"` when the local store holds no body (Mail never
+    downloaded it) and `body_text` is the mailbox's own server copy the
+    FTS backfill fetched via Graph. Provenance is declared, never
+    implied. `search_emails.fts` gains `partial` (headers-only local
+    files — the same coverage hole `missing` always reported) and
+    `backfilled` (docs recovered by the Graph lane).
 - **Audit schema**: `v` is bumped only for breaking changes to the event
   envelope; adding optional fields does not bump it. Readers must ignore
   unknown fields and tolerate mixed `v` within one file month.

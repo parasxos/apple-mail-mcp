@@ -6,12 +6,17 @@ misses message bodies. This module maintains a private SQLite database
 
   meta      key/value: schema_version, last_rowid high-water mark, timestamps
   docs      per-message ledger: status indexed|partial|missing|error,
-            attempts, last_attempt, bytes
+            attempts, last_attempt, bytes, source local|graph|graph_miss
   body_fts  plain FTS5 over extracted body text, rowid == messages.ROWID
 
 Design points (docs/v0.8-concept.md, movement 1):
-  * Apple's store is never written; bodies are always SERVED from .emlx —
-    the index only routes rowids into search.
+  * Apple's store is never written. Bodies come from .emlx first; where
+    Mail never downloaded one (a .partial.emlx ceiling the crawler
+    cannot raise — first-user body-gap report, 2026-08-06), backfill()
+    fetches the mailbox's own server copy via Graph and records
+    source='graph', so provenance is never ambiguous. get_email may
+    serve that text with a declared body_source; search covers it like
+    any other doc.
   * ROWIDs are AUTOINCREMENT (never reused), so "new mail" is exactly
     "ROWID > last_rowid" and deletions are absent rowids (reconcile).
   * Crawls read the Envelope Index through fresh short-lived read-only
@@ -25,9 +30,10 @@ Design points (docs/v0.8-concept.md, movement 1):
 
 CLI:
   python -m email_mcp.fts --build              # initial crawl (resumable)
-  python -m email_mcp.fts --sync               # catch up + retries (+ weekly reconcile)
+  python -m email_mcp.fts --sync               # catch up + retries (+ weekly reconcile + backfill)
+  python -m email_mcp.fts --backfill           # server-side bodies for local holes
   python -m email_mcp.fts --reconcile          # full rowid-set diff
-  python -m email_mcp.fts --rebuild            # drop the db, build from scratch
+  python -m email_mcp.fts --rebuild            # fresh build; server-fetched bodies carried over
   python -m email_mcp.fts --status [--json]
   python -m email_mcp.fts --install-launchd    # com.email-mcp.fts, 03:30 daily --sync
   python -m email_mcp.fts --uninstall-launchd
@@ -50,13 +56,14 @@ from . import config, state
 from .log import get_logger
 from .sources.apple_mail_paths import find_emlx_path, mailbox_data_dir
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2  # v2: docs.source (local | graph | graph_miss)
 LAUNCHD_LABEL = "com.email-mcp.fts"
 
 _DB_NAME = "fts.db"
 _BUSY_TIMEOUT_MS = 5000
 _BATCH_SIZE = 2000
 _MAX_ATTEMPTS = 6
+_TRANSLATE_CHUNK = 100  # EWS ids per translateExchangeIds call
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS meta (
@@ -68,7 +75,8 @@ CREATE TABLE IF NOT EXISTS docs (
     status       TEXT NOT NULL,
     attempts     INTEGER NOT NULL DEFAULT 0,
     last_attempt REAL NOT NULL DEFAULT 0,
-    bytes        INTEGER NOT NULL DEFAULT 0
+    bytes        INTEGER NOT NULL DEFAULT 0,
+    source       TEXT NOT NULL DEFAULT 'local'
 );
 CREATE INDEX IF NOT EXISTS docs_status ON docs(status);
 CREATE VIRTUAL TABLE IF NOT EXISTS body_fts USING fts5(
@@ -149,10 +157,11 @@ class FtsIndex:
             "schema_version": None,
             "last_rowid": 0,
             "docs": {"indexed": 0, "partial": 0, "missing": 0, "error": 0,
-                     "total": 0},
+                     "total": 0, "backfilled": 0},
             "built_at": None,
             "last_sync_at": None,
             "last_reconcile_at": None,
+            "last_backfill_at": None,
         }
         if not path.exists():
             out["remedy"] = "python -m email_mcp.fts --build"
@@ -173,6 +182,12 @@ class FtsIndex:
             for key in ("indexed", "partial", "missing", "error"):
                 out["docs"][key] = counts.get(key, 0)
             out["docs"]["total"] = sum(counts.values())
+            try:
+                out["docs"]["backfilled"] = int(conn.execute(
+                    "SELECT COUNT(*) AS n FROM docs WHERE source = 'graph'"
+                ).fetchone()["n"])
+            except sqlite3.OperationalError:  # pre-v2 db: no source column
+                out["docs"]["backfilled"] = 0
             out["state"] = "ready"
             out["db_bytes"] = path.stat().st_size
             raw_version = self._meta_get(conn, "schema_version")
@@ -181,6 +196,7 @@ class FtsIndex:
             out["built_at"] = self._meta_get(conn, "built_at")
             out["last_sync_at"] = self._meta_get(conn, "last_sync_at")
             out["last_reconcile_at"] = self._meta_get(conn, "last_reconcile_at")
+            out["last_backfill_at"] = self._meta_get(conn, "last_backfill_at")
         except sqlite3.Error as e:
             out["state"] = "error"
             out["error"] = str(e)
@@ -228,6 +244,13 @@ class FtsIndex:
         where it stopped. `limit` bounds the number of documents (CLI
         --limit; smoke runs)."""
         t0 = time.monotonic()
+        # A full crawl must never trust cached absence: a mailbox with no
+        # local store when this instance last looked may have one now
+        # (rebuild-after-backfill hit exactly this, 2026-08-07).
+        self._data_dir_cache = {
+            url: d for url, d in self._data_dir_cache.items()
+            if d is not None
+        }
         conn = self._open_rw()
         try:
             stats = self._crawl(conn, max_docs=limit, deadline=None)
@@ -305,12 +328,309 @@ class FtsIndex:
             "elapsed": round(time.monotonic() - t0, 3),
         }
 
+    def backfill(self, max_docs: int | None = None,
+                 deadline: float | None = None) -> dict:
+        """Fill index holes from the mailbox's own server copy.
+
+        Mail.app's local store has a ceiling no crawling raises
+        (first-user body-gap report, 2026-08-06): bodies it never
+        downloaded exist as headers-only .partial.emlx files — or, for
+        EWS accounts, as Envelope rows with NO file at all (97% of a
+        live CERN account). Both classes are recovered from Exchange
+        via a graph-enabled identity:
+
+          partial  — keyed by the RFC Message-ID read from the partial
+                     file's OWN headers (the Envelope Index stores only
+                     a hash);
+          missing  — keyed by the Envelope row's EWS remote_id,
+                     translated to a Graph REST id in bulk
+                     (translateExchangeIds), then fetched directly.
+
+        Hits are indexed with source='graph'. A miss CONFIRMED by every
+        graph identity (empty lookup / 404 / untranslatable id) is
+        stamped source='graph_miss' and never re-asked; any GraphError
+        (throttle, outage) aborts the pass untouched — the next run
+        resumes exactly where this one stopped. Network calls happen
+        OUTSIDE write transactions: Graph latency must never hold the
+        index lock a search is waiting on."""
+        t0 = time.monotonic()
+        stats = {"candidates": 0, "backfilled": 0, "misses": 0,
+                 "no_message_id": 0, "no_remote_id": 0,
+                 "skipped_non_exchange": 0}
+        idents = self._graph_identities()
+        if not idents:
+            stats["skipped"] = "no_graph_identity"
+            return stats
+        conn = self._open_rw()
+        try:
+            try:
+                classes = {
+                    status: [int(r["rowid"]) for r in conn.execute(
+                        "SELECT rowid FROM docs WHERE status = ? "
+                        "AND source = 'local' ORDER BY rowid DESC",
+                        (status,))]
+                    for status in ("partial", "missing")
+                }
+            except sqlite3.OperationalError:  # pre-v2 db mid-migration
+                stats["skipped"] = "schema_not_migrated"
+                return stats
+            meta = self._envelope_backfill_meta(
+                classes["partial"] + classes["missing"])
+            p_todo: list[tuple[int, str]] = []       # (rowid, mailbox url)
+            m_todo: list[tuple[int, str]] = []       # (rowid, ews id)
+            for rid in classes["partial"]:
+                url, _ = meta.get(rid, ("", None))
+                if not url.startswith("ews://"):
+                    stats["skipped_non_exchange"] += 1
+                else:
+                    p_todo.append((rid, url))
+            for rid in classes["missing"]:
+                url, remote_id = meta.get(rid, ("", None))
+                if not url.startswith("ews://"):
+                    stats["skipped_non_exchange"] += 1
+                elif not remote_id:
+                    stats["no_remote_id"] += 1
+                else:
+                    m_todo.append((rid, remote_id))
+            if max_docs is not None:
+                budget = max(0, max_docs)
+                p_todo = p_todo[:budget]
+                m_todo = m_todo[: budget - len(p_todo)]
+            stats["candidates"] = len(p_todo) + len(m_todo)
+
+            def _out_of_time() -> bool:
+                return (deadline is not None
+                        and time.monotonic() >= deadline)
+
+            def _store_hit(rid: int, body: dict) -> bool:
+                text = self._remote_text(body)
+                if not self._begin_immediate(conn):
+                    stats["skipped"] = "busy"
+                    return False
+                cur = conn.cursor()
+                cur.execute("DELETE FROM body_fts WHERE rowid = ?", (rid,))
+                cur.execute(
+                    "INSERT INTO body_fts(rowid, body) VALUES (?, ?)",
+                    (rid, text))
+                self._record(cur, rid, "indexed", time.time(),
+                             len(text.encode("utf-8", "replace")),
+                             source="graph")
+                conn.commit()
+                stats["backfilled"] += 1
+                if stats["backfilled"] % 500 == 0:
+                    get_logger().info(
+                        "fts backfill: %s bodies fetched, %s to go",
+                        stats["backfilled"],
+                        stats["candidates"] - stats["backfilled"]
+                        - stats["misses"] - stats["no_message_id"])
+                return True
+
+            def _stamp_miss(rid: int, counter: str) -> bool:
+                if not self._stamp_source(conn, rid, "graph_miss"):
+                    stats["skipped"] = "busy"
+                    return False
+                stats[counter] += 1
+                return True
+
+            # class 1: partials — Message-ID from the file's own headers
+            for rid, url in p_todo:
+                if _out_of_time():
+                    break
+                mid = self._message_id_from_partial(rid, url)
+                if mid is None:
+                    if not _stamp_miss(rid, "no_message_id"):
+                        break
+                    continue
+                body = None
+                try:
+                    for ident in idents:
+                        body = self._fetch_remote_body(ident, mid)
+                        if body is not None:
+                            break
+                except Exception as e:  # GraphError: defer, never guess
+                    get_logger().info(
+                        "fts backfill: pass aborted at rowid %s: %s",
+                        rid, e)
+                    stats["aborted"] = str(e)
+                    break
+                if body is None:
+                    if not _stamp_miss(rid, "misses"):
+                        break
+                    continue
+                if not _store_hit(rid, body):
+                    break
+
+            # class 2: storeless — remote_id → REST id → body
+            for i in range(0, len(m_todo), _TRANSLATE_CHUNK):
+                if _out_of_time() or "aborted" in stats \
+                        or "skipped" in stats:
+                    break
+                chunk = m_todo[i:i + _TRANSLATE_CHUNK]
+                mapping: dict[str, str] = {}
+                try:
+                    for ident in idents:
+                        left = [e for _, e in chunk if e not in mapping]
+                        if not left:
+                            break
+                        mapping.update(
+                            self._translate_ews_ids(ident, left))
+                except Exception as e:
+                    get_logger().info(
+                        "fts backfill: translate aborted the pass: %s", e)
+                    stats["aborted"] = str(e)
+                    break
+                for rid, ews_id in chunk:
+                    if _out_of_time():
+                        break
+                    rest = mapping.get(ews_id)
+                    if rest is None:  # unaddressable by every identity
+                        if not _stamp_miss(rid, "misses"):
+                            break
+                        continue
+                    body = None
+                    try:
+                        for ident in idents:
+                            body = self._fetch_remote_body_by_id(
+                                ident, rest)
+                            if body is not None:
+                                break
+                    except Exception as e:
+                        get_logger().info(
+                            "fts backfill: pass aborted at rowid %s: %s",
+                            rid, e)
+                        stats["aborted"] = str(e)
+                        break
+                    if body is None:
+                        if not _stamp_miss(rid, "misses"):
+                            break
+                        continue
+                    if not _store_hit(rid, body):
+                        break
+                if "aborted" in stats or "skipped" in stats:
+                    break
+
+            if stats["backfilled"] or stats["misses"] \
+                    or stats["no_message_id"]:
+                self._stamp(conn, "last_backfill_at")
+        finally:
+            conn.close()
+        stats["elapsed"] = round(time.monotonic() - t0, 3)
+        return stats
+
+    def backfilled_text(self, rowid: int) -> str | None:
+        """Server-fetched body text for a doc whose local .emlx has none
+        — the ONE read get_email may serve, with declared provenance
+        (body_source). None for local-sourced docs, absent rowids, or a
+        pre-v2 index."""
+        if not self.available():
+            return None
+        conn = self._open_ro()
+        try:
+            try:
+                row = conn.execute(
+                    "SELECT f.body AS body FROM docs d "
+                    "JOIN body_fts f ON f.rowid = d.rowid "
+                    "WHERE d.rowid = ? AND d.source = 'graph'",
+                    (rowid,)).fetchone()
+            except sqlite3.OperationalError:  # pre-v2 db: no source column
+                return None
+            return str(row["body"]) if row and row["body"] else None
+        finally:
+            conn.close()
+
     def rebuild(self, limit: int | None = None) -> dict:
-        """Drop the index files and build from scratch."""
+        """Drop the index files and build from scratch — REUSING the
+        server-fetched bodies the old index held.
+
+        Graph-sourced rows are not derived state: the local store never
+        had those bodies, and re-fetching ~95k of them is an overnight
+        of Graph traffic. So the old db is set aside, the fresh build
+        runs from disk, and every graph body (and graph_miss stamp) the
+        new build could not produce locally is carried over. A corrupt
+        old db — the usual reason to rebuild — skips the salvage and
+        rebuilds clean, exactly as before."""
         base = db_path()
-        for suffix in ("", "-wal", "-shm"):
+        old: Path | None = None
+        if base.exists():
+            old = base.with_name(base.name + ".pre-rebuild")
+            try:  # fold the WAL in so the set-aside file is complete
+                conn = sqlite3.connect(base)
+                conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+                conn.close()
+            except sqlite3.Error:
+                pass
+            os.replace(base, old)
+        for suffix in ("-wal", "-shm"):
             Path(f"{base}{suffix}").unlink(missing_ok=True)
-        return self.build(limit=limit)
+        out = self.build(limit=limit)
+        if old is not None:
+            try:
+                out["salvaged"] = self._salvage_graph_rows(old)
+                old.unlink(missing_ok=True)
+            except Exception as e:  # corrupt old db: rebuild stays clean
+                get_logger().warning("fts rebuild: salvage skipped: %s", e)
+                out["salvage_skipped"] = str(e)
+                out["salvage_db"] = str(old)
+        return out
+
+    def _salvage_graph_rows(self, old: Path) -> int:
+        """Carry graph bodies and graph_miss stamps from the set-aside db
+        into the fresh one — set-based, never through Python memory. A
+        rowid the new build indexed from a full local file keeps the
+        local text (local truth wins); everything the old db knew from
+        the server and the new build could not read from disk is
+        reinstated."""
+        conn = self._open_rw()
+        try:
+            conn.execute("ATTACH DATABASE ? AS old", (str(old),))
+            if not self._begin_immediate(conn):
+                raise sqlite3.OperationalError("index writer busy")
+            cur = conn.cursor()
+            cur.execute(
+                """
+                CREATE TEMP TABLE salv AS
+                SELECT o.rowid AS rowid, o.attempts AS attempts,
+                       o.last_attempt AS last_attempt, o.bytes AS bytes
+                  FROM old.docs o
+                  LEFT JOIN main.docs n ON n.rowid = o.rowid
+                 WHERE o.source = 'graph'
+                   AND COALESCE(n.status, '') != 'indexed'
+                """)
+            cur.execute("DELETE FROM body_fts WHERE rowid IN "
+                        "(SELECT rowid FROM salv)")
+            cur.execute(
+                """
+                INSERT INTO body_fts(rowid, body)
+                SELECT s.rowid, ob.body
+                  FROM salv s JOIN old.body_fts ob ON ob.rowid = s.rowid
+                """)
+            cur.execute(
+                """
+                INSERT INTO docs(rowid, status, attempts, last_attempt,
+                                 bytes, source)
+                SELECT rowid, 'indexed', attempts, last_attempt, bytes,
+                       'graph'
+                  FROM salv
+                 WHERE 1  -- disambiguates ON CONFLICT from a join clause
+                ON CONFLICT(rowid) DO UPDATE SET
+                    status = 'indexed', bytes = excluded.bytes,
+                    source = 'graph'
+                """)
+            cur.execute(
+                """
+                UPDATE docs SET source = 'graph_miss'
+                 WHERE source = 'local' AND status IN ('partial', 'missing')
+                   AND rowid IN (SELECT rowid FROM old.docs
+                                  WHERE source = 'graph_miss')
+                """)
+            salvaged = int(cur.execute(
+                "SELECT COUNT(*) FROM salv").fetchone()[0])
+            cur.execute("DROP TABLE salv")
+            conn.commit()
+            conn.execute("DETACH DATABASE old")
+            return salvaged
+        finally:
+            conn.close()
 
     # ------------------------------------------------------------------ #
     # internals: our db                                                  #
@@ -333,6 +653,17 @@ class FtsIndex:
         conn.execute(f"PRAGMA busy_timeout={_BUSY_TIMEOUT_MS}")
         conn.execute("PRAGMA journal_mode=WAL")
         conn.executescript(_SCHEMA)
+        # v1 → v2 in place: docs gains `source` (ADD COLUMN backfills
+        # 'local' onto every existing row — exactly right, they all came
+        # from .emlx). CREATE IF NOT EXISTS above leaves a v1 table
+        # untouched, so the column check is the actual migration gate.
+        cols = {r[1] for r in conn.execute("PRAGMA table_info(docs)")}
+        if "source" not in cols and self._begin_immediate(conn):
+            conn.execute("ALTER TABLE docs ADD COLUMN source TEXT "
+                         "NOT NULL DEFAULT 'local'")
+            self._meta_set(conn.cursor(), "schema_version",
+                           str(SCHEMA_VERSION))
+            conn.commit()
         if self._meta_get(conn, "schema_version") is None:
             if self._begin_immediate(conn):
                 self._meta_set(conn.cursor(), "schema_version",
@@ -549,19 +880,37 @@ class FtsIndex:
 
     def _index_one(self, cur: sqlite3.Cursor, rowid: int, url: str) -> str:
         """Index a single message; returns its docs.status. Caller holds
-        the write transaction."""
+        the write transaction.
+
+        Local truth wins, but never regresses: a full .emlx always
+        overwrites (source back to 'local'); a partial file, a vanished
+        file or a parse failure never clobbers a graph-sourced body —
+        headers-only text replacing a real server-fetched body would be
+        the index un-learning what it already knows."""
         now = time.time()
         data_dir = self._data_dir(url)
         path = find_emlx_path(data_dir, rowid) if data_dir else None
         if path is None:
+            src = self._source_of(cur, rowid)
+            if src == "graph":
+                return "indexed"  # remote body still serves this rowid
+            if src == "graph_miss":
+                return "missing"  # stamped: a re-stat must not un-stamp
             return self._record(cur, rowid, "missing", now, 0)
         try:
             text = self._extract_text(path)
         except Exception as e:  # any parse failure — never abort a crawl
+            src = self._source_of(cur, rowid)
+            if src == "graph":
+                return "indexed"
+            if src == "graph_miss":
+                return "error"
             get_logger().warning("fts: cannot index rowid %s (%s): %s",
                                  rowid, path, e)
             return self._record(cur, rowid, "error", now, 0)
         status = "partial" if path.name.endswith(".partial.emlx") else "indexed"
+        if status == "partial" and self._source_of(cur, rowid) == "graph":
+            return "indexed"
         cur.execute("DELETE FROM body_fts WHERE rowid = ?", (rowid,))
         cur.execute("INSERT INTO body_fts(rowid, body) VALUES (?, ?)",
                     (rowid, text))
@@ -569,21 +918,29 @@ class FtsIndex:
                             len(text.encode("utf-8", "replace")))
 
     @staticmethod
+    def _source_of(cur: sqlite3.Cursor, rowid: int) -> str | None:
+        row = cur.execute("SELECT source FROM docs WHERE rowid = ?",
+                          (rowid,)).fetchone()
+        return str(row["source"]) if row else None
+
+    @staticmethod
     def _record(cur: sqlite3.Cursor, rowid: int, status: str,
-                now: float, nbytes: int) -> str:
+                now: float, nbytes: int, source: str = "local") -> str:
         if status in ("missing", "error"):
             cur.execute("DELETE FROM body_fts WHERE rowid = ?", (rowid,))
         cur.execute(
             """
-            INSERT INTO docs(rowid, status, attempts, last_attempt, bytes)
-            VALUES (?, ?, 1, ?, ?)
+            INSERT INTO docs(rowid, status, attempts, last_attempt, bytes,
+                             source)
+            VALUES (?, ?, 1, ?, ?, ?)
             ON CONFLICT(rowid) DO UPDATE SET
                 status = excluded.status,
                 attempts = docs.attempts + 1,
                 last_attempt = excluded.last_attempt,
-                bytes = excluded.bytes
+                bytes = excluded.bytes,
+                source = excluded.source
             """,
-            (rowid, status, now, nbytes),
+            (rowid, status, now, nbytes, source),
         )
         return status
 
@@ -604,6 +961,123 @@ class FtsIndex:
 
         parsed = _parse_emlx(path, config.fts_doc_cap_bytes())
         return parsed["body_text"]
+
+    # ------------------------------------------------------------------ #
+    # internals: backfill (server-side bodies for local holes)           #
+    # ------------------------------------------------------------------ #
+
+    def _graph_identities(self) -> list:
+        """Graph-enabled identities, default first — the mailboxes a
+        backfill may ask. Unreadable identities read as none: backfill
+        silently skips rather than crashing the nightly sync."""
+        from . import identities as ident_mod
+
+        try:
+            idents, default = ident_mod.load()
+        except Exception:  # noqa: BLE001 — soft by contract, like status()
+            return []
+        names = sorted(idents, key=lambda n: (n != default, n))
+        return [idents[n] for n in names
+                if getattr(idents[n], "executor", "launchd") == "graph"
+                or getattr(idents[n], "drafts", "none") == "graph"]
+
+    def _fetch_remote_body(self, ident, message_id: str) -> dict | None:
+        """Network seam (partial class): tests monkeypatch this symbol."""
+        from . import graph
+
+        return graph.fetch_body_by_message_id(ident, message_id)
+
+    def _translate_ews_ids(self, ident, ews_ids: list[str]) -> dict[str, str]:
+        """Network seam (storeless class): bulk id translation."""
+        from . import graph
+
+        return graph.translate_ews_ids(ident, ews_ids)
+
+    def _fetch_remote_body_by_id(self, ident, rest_id: str) -> dict | None:
+        """Network seam (storeless class): body by Graph REST id."""
+        from . import graph
+
+        return graph.fetch_body_by_graph_id(ident, rest_id)
+
+    def _envelope_backfill_meta(
+        self, rowids: list[int],
+    ) -> dict[int, tuple[str, str | None]]:
+        """{rowid: (mailbox url, EWS remote_id)} — remote_id is None when
+        the Envelope Index generation has no such column."""
+        out: dict[int, tuple[str, str | None]] = {}
+        if not rowids:
+            return out
+        conn = self._envelope_conn()
+        try:
+            cols = {r[1] for r in conn.execute("PRAGMA table_info(messages)")}
+            rid_col = "m.remote_id" if "remote_id" in cols else "NULL"
+            for i in range(0, len(rowids), 500):
+                chunk = rowids[i:i + 500]
+                marks = ",".join("?" * len(chunk))
+                rows = conn.execute(
+                    f"""
+                    SELECT m.ROWID AS rowid, mb.url AS url,
+                           {rid_col} AS remote_id
+                      FROM messages m
+                      JOIN mailboxes mb ON mb.ROWID = m.mailbox
+                     WHERE m.ROWID IN ({marks})
+                       {self._deleted_filter(conn)}
+                    """,
+                    chunk,
+                ).fetchall()
+                for r in rows:
+                    remote = r["remote_id"]
+                    out[int(r["rowid"])] = (
+                        r["url"] or "",
+                        str(remote) if remote else None,
+                    )
+        finally:
+            conn.close()
+        return out
+
+    def _message_id_from_partial(self, rowid: int, url: str) -> str | None:
+        """RFC Message-ID read from the partial file's own headers — the
+        only place it exists locally (the Envelope Index keeps a hash)."""
+        import email as email_mod
+
+        from .sources.apple_mail import _read_emlx_bytes
+
+        data_dir = self._data_dir(url)
+        path = find_emlx_path(data_dir, rowid) if data_dir else None
+        if path is None:
+            return None
+        try:
+            raw = _read_emlx_bytes(path)
+            msg = email_mod.message_from_bytes(raw)
+            mid = (msg.get("Message-ID") or "").strip()
+        except Exception:  # noqa: BLE001 — a hostile header is a miss
+            return None
+        return mid or None
+
+    @staticmethod
+    def _remote_text(body: dict) -> str:
+        """Graph body → index text, same shape as the emlx path: HTML is
+        stripped by the ONE stripper, and the same doc cap applies."""
+        content = str(body.get("content") or "")
+        if str(body.get("contentType") or "").lower() == "html":
+            from .sources.apple_mail import _html_to_text
+
+            content = _html_to_text(content)
+        cap = config.fts_doc_cap_bytes()
+        if cap and len(content) > cap:
+            content = content[:cap] + "\n[…body truncated…]"
+        return content
+
+    def _stamp_source(self, conn: sqlite3.Connection, rowid: int,
+                      source: str) -> bool:
+        """Short own-transaction source stamp; False when the writer is
+        busy (caller stops the pass, next nightly resumes)."""
+        if not self._begin_immediate(conn):
+            return False
+        conn.execute("UPDATE docs SET source = ?, last_attempt = ? "
+                     "WHERE rowid = ?", (source, time.time(), rowid))
+        conn.commit()
+        return True
 
 
 # ---------------------------------------------------------------------- #
@@ -693,12 +1167,16 @@ def _reconcile_due(idx: FtsIndex) -> bool:
     return age.days >= config.fts_reconcile_days()
 
 
+_BACKFILL_CAP = 500  # per-sync ceiling: polite to Graph, resumes nightly
+
+
 def _sync(idx: FtsIndex, limit: int | None) -> dict:
     out = idx.incremental(max_docs=limit)
     if out.get("skipped") == "busy":
         return out
     if _reconcile_due(idx):
         out["reconcile"] = idx.reconcile()
+    out["backfill"] = idx.backfill(max_docs=_BACKFILL_CAP)
     return out
 
 
@@ -722,7 +1200,8 @@ def _print_status(st: dict, as_json: bool) -> None:
           f"{d['missing']} missing, {d['error']} error "
           f"(hwm rowid {st['last_rowid']})")
     print(f"built: {st['built_at'] or '-'}  synced: {st['last_sync_at'] or '-'}  "
-          f"reconciled: {st['last_reconcile_at'] or '-'}")
+          f"reconciled: {st['last_reconcile_at'] or '-'}  "
+          f"backfilled: {st.get('last_backfill_at') or '-'}")
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -737,6 +1216,10 @@ def main(argv: list[str] | None = None) -> int:
                              "(+ weekly reconcile)")
     parser.add_argument("--reconcile", action="store_true",
                         help="full rowid-set diff against the Envelope Index")
+    parser.add_argument("--backfill", action="store_true",
+                        help="fetch bodies Mail never downloaded from the "
+                             "server (Exchange accounts with a graph "
+                             "identity)")
     parser.add_argument("--rebuild", action="store_true",
                         help="drop the index and build from scratch")
     parser.add_argument("--status", action="store_true")
@@ -767,6 +1250,8 @@ def main(argv: list[str] | None = None) -> int:
             out = idx.rebuild(limit=args.limit)
         elif args.reconcile:
             out = idx.reconcile()
+        elif args.backfill:
+            out = idx.backfill(max_docs=args.limit)
         elif args.sync:
             out = _sync(idx, args.limit)
         else:

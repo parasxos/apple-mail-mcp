@@ -282,6 +282,11 @@ _AGENT_EXIT_FIX = (
     "read {log}; a PermissionError there means the agent's python needs "
     "Full Disk Access (System Settings → Privacy & Security → Full Disk "
     "Access)")
+
+# Body-gap warning knobs: below _GAP_MIN_TOTAL docs the index is too
+# young for a ratio to mean anything (fresh installs mid-build).
+_GAP_MIN_TOTAL = 1000
+_GAP_WARN_RATIO = 0.15
 _FTS_AGENT_EXIT_FIX = (
     "run `email-mcp setup` — it verifies the nightly refresh and walks "
     "the Full Disk Access grant hands-on; the log is {log}")
@@ -427,12 +432,27 @@ def check_fts() -> dict:
         return {"ok": False, "detail": f"index error: {st.get('error')}",
                 "fix": "python -m email_mcp.fts --rebuild", "status": st}
     d = st.get("docs", {})
-    return {"ok": True,
-            "detail": f"ready: {d.get('indexed', 0)} indexed, "
-                      f"{d.get('partial', 0)} partial, "
-                      f"{d.get('missing', 0)} missing, "
-                      f"{d.get('error', 0)} error",
-            "status": st}
+    detail = (f"ready: {d.get('indexed', 0)} indexed, "
+              f"{d.get('partial', 0)} partial, "
+              f"{d.get('missing', 0)} missing, "
+              f"{d.get('error', 0)} error"
+              + (f", {d['backfilled']} backfilled"
+                 if d.get("backfilled") else ""))
+    total = d.get("total", 0)
+    gap = d.get("partial", 0) + d.get("missing", 0)
+    if total > _GAP_MIN_TOTAL and gap / total > _GAP_WARN_RATIO:
+        return {"ok": False, "advisory": True,
+                "detail": detail + f" — {gap} of {total} bodies are not "
+                          "in Mail's local store, so body search cannot "
+                          "see them",
+                "fix": "in Mail ▸ Settings ▸ Accounts, set the account "
+                       "to download all messages (and disable 'Optimize "
+                       "Mac Storage' where offered) — bodies index "
+                       "automatically as they arrive; Exchange accounts "
+                       "with a graph identity backfill themselves "
+                       "nightly",
+                "status": st}
+    return {"ok": True, "detail": detail, "status": st}
 
 
 def check_audit() -> dict:
