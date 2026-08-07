@@ -116,7 +116,7 @@ installation anytime with `email-mcp doctor`.
 
 > 💡 *New to the terminal?* Three things that look wrong and aren't:
 > `brew install pipx` wants a typed `y` (Enter alone is rejected);
-> `pipx ensurepath` may print a ⚠️ — the "pixp is ready to go!" line after it
+> `pipx ensurepath` may print a ⚠️ — the "pipx is ready to go!" line after it
 > is the verdict; and after `ensurepath`, close and reopen the terminal once
 > so `email-mcp` is found.
 
