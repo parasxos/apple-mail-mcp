@@ -278,6 +278,21 @@ def _agent_last_exit(label: str) -> int | None:
     return int(m.group(1)) if m else None
 
 
+def _agent_loaded(label: str) -> bool | None:
+    """Is the agent loaded in the gui domain? A plist on disk says what
+    WOULD run; only launchd says whether anything will. None when
+    launchctl is unavailable (non-macOS CI) — unknowable, never guessed.
+    An installed-but-unloaded agent runs nothing until the next login,
+    while every file-level probe reads healthy (2026-08-07)."""
+    try:
+        r = subprocess.run(
+            ["launchctl", "print", f"gui/{os.getuid()}/{label}"],
+            capture_output=True, text=True, timeout=10)
+    except Exception:
+        return None
+    return r.returncode == 0
+
+
 _AGENT_EXIT_FIX = (
     "read {log}; a PermissionError there means the agent's python needs "
     "Full Disk Access (System Settings → Privacy & Security → Full Disk "
@@ -321,6 +336,15 @@ def check_dispatcher() -> dict:
     fixes: list[str] = []
     if not installed:
         fixes.append("python -m email_mcp.dispatcher --install-launchd")
+    # Installed is the plist; SCHEDULED is launchd. An unloaded agent
+    # (bootstrap failed at setup, or booted out) delivers nothing until
+    # the next login while every file probe reads healthy.
+    loaded = _agent_loaded(LAUNCHD_LABEL) if installed else None
+    if loaded is False:
+        bits.append("installed but NOT loaded — scheduled sends will not "
+                    "fire")
+        fixes.append("email-mcp doctor --fix   # re-bootstraps installed "
+                     "agents")
     if legacy:
         bits.append(f"legacy plist(s): {', '.join(legacy)}")
         fixes.append("boot out the legacy agent(s): launchctl bootout "
@@ -331,9 +355,11 @@ def check_dispatcher() -> dict:
         fixes.append(_AGENT_EXIT_FIX.format(log=log))
     out: dict = {
         # Not installed only bites once something is waiting to send.
-        "ok": (installed or pending == 0) and last_exit in (None, 0),
+        "ok": ((installed and loaded is not False) or pending == 0)
+        and last_exit in (None, 0),
         "detail": "; ".join(bits),
         "installed": installed,
+        "loaded": loaded,
         "label": LAUNCHD_LABEL,
         "legacy_plists": legacy,
         "pending": pending,
@@ -417,7 +443,16 @@ def check_fts() -> dict:
     # The nightly agent is estate machinery, not index state: a sync that
     # dies every run must redden the doctor even while the index still
     # serves — it silently failed every night until RC P04 caught it
-    # (FDA missing on the agent's python, live 2026-08-03).
+    # (FDA missing on the agent's python, live 2026-08-03). Same for an
+    # installed-but-unloaded agent: it runs nothing at all.
+    if fts._plist_path().exists() \
+            and _agent_loaded(fts.LAUNCHD_LABEL) is False:
+        return {"ok": False,
+                "detail": "nightly sync agent installed but NOT loaded — "
+                          "it will not run",
+                "fix": "email-mcp doctor --fix   # re-bootstraps "
+                       "installed agents",
+                "status": st}
     last_exit = _agent_last_exit(fts.LAUNCHD_LABEL)
     if last_exit not in (None, 0):
         return {"ok": False,
@@ -431,6 +466,17 @@ def check_fts() -> dict:
     if state == "error":
         return {"ok": False, "detail": f"index error: {st.get('error')}",
                 "fix": "python -m email_mcp.fts --rebuild", "status": st}
+    # The backfill records its identity trouble as state (meta), exactly
+    # so a lane that silently does nothing every night is visible here
+    # instead of only in a log nobody reads.
+    backfill_err = st.get("last_backfill_error")
+    if backfill_err:
+        return {"ok": False, "advisory": True,
+                "detail": f"server backfill in trouble: {backfill_err}",
+                "fix": "re-login the named identity (python -m "
+                       "email_mcp.graph --login <name>), then "
+                       "python -m email_mcp.fts --backfill",
+                "status": st}
     d = st.get("docs", {})
     detail = (f"ready: {d.get('indexed', 0)} indexed, "
               f"{d.get('partial', 0)} partial, "
@@ -450,7 +496,8 @@ def check_fts() -> dict:
                        "Mac Storage' where offered) — bodies index "
                        "automatically as they arrive; Exchange accounts "
                        "with a graph identity backfill themselves "
-                       "nightly",
+                       "nightly (500/night), or in one pass with: "
+                       "python -m email_mcp.fts --backfill",
                 "status": st}
     return {"ok": True, "detail": detail, "status": st}
 
@@ -607,14 +654,27 @@ _CHECKS = (
 )
 
 
+# Advisory is a property of the CHECK, not of one outcome: accessibility
+# guards an optional extra (mailbox_delete's UI fallback), so EVERY way
+# it can fail — a crash included — warns without gating doctor's ok. An
+# advisory check that reddens the report only when its probe crashes
+# resurrects the exact first-user bug the flag exists to prevent
+# (2026-08-04: "NOT ready" on a machine where every used feature worked).
+_ADVISORY_CHECKS = frozenset({"accessibility"})
+
+
 def _guarded(name: str, fn) -> dict:
     """Doctor must work precisely when everything else is broken — a check
-    that blows up becomes a red entry, never a crashed tool."""
+    that blows up becomes a red entry, never a crashed tool. The entry
+    inherits the check's declared advisory nature."""
     try:
         return fn()
     except Exception as e:
         _log.exception("doctor check %s crashed", name)
-        return {"ok": False, "detail": f"check crashed: {e!r}"}
+        out: dict = {"ok": False, "detail": f"check crashed: {e!r}"}
+        if name in _ADVISORY_CHECKS:
+            out["advisory"] = True
+        return out
 
 
 def render(report: dict, *, indent: str = "") -> list[str]:

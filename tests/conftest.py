@@ -267,6 +267,38 @@ def no_host_launchd(monkeypatch):
     this stub explicitly."""
     monkeypatch.setattr(
         "email_mcp.doctor._agent_last_exit", lambda label: None)
+    monkeypatch.setattr(
+        "email_mcp.doctor._agent_loaded", lambda label: None)
+
+
+@pytest.fixture(autouse=True)
+def home_guard(tmp_path_factory, monkeypatch) -> Path:
+    """Pin HOME to a fresh per-test directory. Path.home() decides where
+    launchd plists and log files live, so an unpinned suite reads — and
+    on the wizard paths WRITES — the developer's real LaunchAgents (a
+    setup test rewrote the real fts agent's plist mid-suite, 2026-08-07).
+    The Library skeleton the lifecycle verbs expect is materialized up
+    front."""
+    home = tmp_path_factory.mktemp("home")
+    (home / "Library" / "LaunchAgents").mkdir(parents=True)
+    (home / "Library" / "Logs").mkdir()
+    monkeypatch.setenv("HOME", str(home))
+    return home
+
+
+@pytest.fixture(autouse=True)
+def no_host_launchctl(monkeypatch):
+    """plan._launchctl is THE launchctl seam; the suite must never drive
+    the host's real launchd. The neutral stand-in succeeds with an empty
+    dump: bootstraps 'work', and run-verification honestly reports
+    'cannot judge' instead of reading host state. Tests exercising
+    launchctl behavior override this stub explicitly."""
+    import subprocess
+
+    monkeypatch.setattr(
+        "email_mcp.plan._launchctl",
+        lambda *args: subprocess.CompletedProcess(
+            ["launchctl", *args], 0, stdout="", stderr=""))
 
 
 @pytest.fixture(autouse=True)

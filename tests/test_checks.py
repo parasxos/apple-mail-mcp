@@ -315,6 +315,43 @@ def test_uninstalled_agents_are_not_drift(home, writer):
 # ---------------------------------------------------------------------- #
 
 
+def test_unloaded_agent_found_and_bootstrapped(home, writer, monkeypatch):
+    """A plist on disk with nothing loaded behind it runs NOTHING until
+    the next login — and no file-level probe can see it: the content
+    matches its render exactly, so plist_drift stays quiet. The registry
+    asks launchd itself; the repair is the re-bootstrap."""
+    from email_mcp import dispatcher
+
+    plist = dispatcher._plist_path()
+    plist.parent.mkdir(parents=True, exist_ok=True)
+    plist.write_text(dispatcher._plist_content())
+    calls: list[tuple] = []
+
+    def fake(*args):
+        calls.append(args)
+        rc = 3 if args[0] == "print" else 0    # not loaded; bootstrap ok
+        return subprocess.CompletedProcess(args, rc, stdout="", stderr="")
+
+    monkeypatch.setattr(plan, "_launchctl", fake)
+    f = _finding(checks.AGENT_UNLOADED)
+    assert f is not None and "not loaded" in f.detail
+    assert f.paths == (plist,)
+    results = _fix(checks.AGENT_UNLOADED)
+    assert all(r.ok for r in results)
+    assert ("bootstrap", f"gui/{os.getuid()}", str(plist)) in calls
+
+
+def test_loaded_agent_is_not_an_unloaded_finding(home, writer, launchctl):
+    """The neutral launchctl (print succeeds) reads as loaded — no
+    finding, nothing to repair."""
+    from email_mcp import dispatcher
+
+    plist = dispatcher._plist_path()
+    plist.parent.mkdir(parents=True, exist_ok=True)
+    plist.write_text(dispatcher._plist_content())
+    assert _finding(checks.AGENT_UNLOADED) is None
+
+
 def test_plan_fix_only_restricts_to_the_named_checks(home, writer):
     os.chmod(writer.plans, 0o755)  # a tree_modes finding AND meta pending
     rows = checks.plan_fix(only=frozenset({checks.META_VERSION}))

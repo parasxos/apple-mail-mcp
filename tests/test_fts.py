@@ -11,6 +11,8 @@ import sqlite3
 import textwrap
 from pathlib import Path
 
+import pytest
+
 from email_mcp import fts
 from email_mcp.fts import FtsIndex, match_expr
 from email_mcp.sources.apple_mail_paths import emlx_relpath_for_rowid
@@ -491,12 +493,13 @@ def test_backfill_confirmed_miss_is_never_asked_again(mail_fixture,
     assert len(calls) == 1
 
 
-def test_backfill_skips_non_exchange_and_headerless_partials(
+def test_backfill_stamps_unaskable_docs_once(
     mail_fixture, monkeypatch,
 ):
     """Gmail partials are not Graph's to answer, and a partial with no
-    Message-ID has no join key ever — both must shrink the pass instead
-    of erroring or looping."""
+    Message-ID has no join key ever — both are stamped 'graph_none'
+    ONCE (local evidence, independent of identities), so no later pass
+    re-walks the estate to re-conclude it."""
     _add_ews_mailbox(mail_fixture)
     _add_envelope_row_in(mail_fixture, 502, EWS_MBOX_ROWID)
     _write_ews_partial(mail_fixture, 502, None)      # no Message-ID
@@ -520,8 +523,12 @@ def test_backfill_skips_non_exchange_and_headerless_partials(
     # doc (200), now also weighed by the storeless class.
     assert out["skipped_non_exchange"] == 2
     assert out["no_message_id"] == 1
-    assert _doc_sources()[502] == "graph_miss"
-    assert _doc_sources()[503] == "local"            # untouched
+    assert _doc_sources()[502] == "graph_none"
+    assert _doc_sources()[503] == "graph_none"
+    # Concluded once: the next pass derives no work from them.
+    out = idx.backfill()
+    assert out["skipped_non_exchange"] == 0
+    assert out["no_message_id"] == 0
 
 
 def test_backfill_without_graph_identity_is_a_soft_skip(mail_fixture,
@@ -532,6 +539,7 @@ def test_backfill_without_graph_identity_is_a_soft_skip(mail_fixture,
                               "misses": 0, "no_message_id": 0,
                               "no_remote_id": 0,
                               "skipped_non_exchange": 0,
+                              "deferred": 0,
                               "skipped": "no_graph_identity"}
 
 
@@ -629,10 +637,12 @@ def test_retry_missing_never_unstamps_a_graph_miss(mail_fixture,
     assert _doc_statuses()[514] == "missing"
 
 
-def test_backfill_aborts_the_pass_on_graph_trouble(mail_fixture,
-                                                   monkeypatch):
-    """Throttle or outage: defer, never guess — the stamped state is
-    untouched so the next nightly resumes exactly here."""
+def test_backfill_graph_trouble_defers_never_stamps(mail_fixture,
+                                                    monkeypatch):
+    """Throttle or outage: the doc is DEFERRED untouched — absence of
+    evidence must never read as evidence of absence — and the trouble
+    becomes visible state (meta last_backfill_error), not a log line.
+    A later clean pass clears the note."""
     _add_ews_mailbox(mail_fixture)
     _add_envelope_row_in(mail_fixture, 504, EWS_MBOX_ROWID)
     _write_ews_partial(mail_fixture, 504, "<t-504@cern.ch>")
@@ -646,9 +656,227 @@ def test_backfill_aborts_the_pass_on_graph_trouble(mail_fixture,
 
     monkeypatch.setattr(FtsIndex, "_fetch_remote_body", boom)
     out = idx.backfill()
-    assert "aborted" in out
+    assert out["deferred"] == 1
     assert out["backfilled"] == 0
+    assert out["identity_errors"] == {"main": 1}
     assert _doc_sources()[504] == "local"            # still a candidate
+    assert "429" in idx.status()["last_backfill_error"]
+
+    monkeypatch.setattr(
+        FtsIndex, "_fetch_remote_body",
+        lambda self, ident, mid: {"contentType": "text",
+                                  "content": "late but here"})
+    out = idx.backfill()
+    assert out["backfilled"] == 1
+    assert idx.status()["last_backfill_error"] is None
+
+
+def test_backfill_retires_a_dead_identity_and_aborts(mail_fixture,
+                                                     monkeypatch):
+    """An identity that keeps erroring and has answered NOTHING is dead
+    for the pass after _IDENT_FAIL_FAST sightings (revoked token, not a
+    poisoned doc); with no identity left the pass aborts — every doc
+    still unstamped, nothing burned on a hopeless night."""
+    _add_ews_mailbox(mail_fixture)
+    for rid in range(530, 535):
+        _add_envelope_row_in(mail_fixture, rid, EWS_MBOX_ROWID)
+        _write_ews_partial(mail_fixture, rid, f"<t-{rid}@cern.ch>")
+    idx = FtsIndex(mail_base=mail_fixture)
+    idx.build()
+    monkeypatch.setattr(FtsIndex, "_graph_identities",
+                        lambda self: [_Ident()])
+    calls = []
+
+    def boom(self, ident, mid):
+        calls.append(mid)
+        raise RuntimeError("invalid_grant: token revoked")
+
+    monkeypatch.setattr(FtsIndex, "_fetch_remote_body", boom)
+    out = idx.backfill()
+    assert out["aborted"].startswith("every graph identity failing")
+    assert len(calls) == fts._IDENT_FAIL_FAST        # not one per doc
+    assert out["deferred"] == fts._IDENT_FAIL_FAST
+    assert all(_doc_sources()[rid] == "local" for rid in range(530, 535))
+
+
+def _mk_ident(name: str) -> _Ident:
+    i = _Ident()
+    i.name = name
+    return i
+
+
+def test_backfill_second_identity_serves_when_the_first_fails(
+    mail_fixture, monkeypatch,
+):
+    """One broken identity must not hide the others (the transports-check
+    rule, applied to backfill): the healthy mailbox still answers, and
+    the broken one's trouble is recorded."""
+    _add_ews_mailbox(mail_fixture)
+    _add_envelope_row_in(mail_fixture, 535, EWS_MBOX_ROWID)
+    _write_ews_partial(mail_fixture, 535, "<t-535@cern.ch>")
+    idx = FtsIndex(mail_base=mail_fixture)
+    idx.build()
+    monkeypatch.setattr(FtsIndex, "_graph_identities",
+                        lambda self: [_mk_ident("broken"), _mk_ident("ok")])
+
+    def fetch(self, ident, mid):
+        if ident.name == "broken":
+            raise RuntimeError("invalid_grant: token revoked")
+        return {"contentType": "text", "content": "second lane answers"}
+
+    monkeypatch.setattr(FtsIndex, "_fetch_remote_body", fetch)
+    out = idx.backfill()
+    assert out["backfilled"] == 1
+    assert out["identity_errors"] == {"broken": 1}
+    assert "aborted" not in out
+    assert _doc_sources()[535] == "graph"
+
+
+def test_backfill_miss_needs_every_identity_to_answer(
+    mail_fixture, monkeypatch,
+):
+    """A graph_miss stamp requires EVERY identity to have answered: when
+    one errored, 'the others did not have it' is absence of evidence,
+    not evidence of absence — the doc defers."""
+    _add_ews_mailbox(mail_fixture)
+    _add_envelope_row_in(mail_fixture, 536, EWS_MBOX_ROWID)
+    _write_ews_partial(mail_fixture, 536, "<t-536@cern.ch>")
+    idx = FtsIndex(mail_base=mail_fixture)
+    idx.build()
+    monkeypatch.setattr(FtsIndex, "_graph_identities",
+                        lambda self: [_mk_ident("broken"), _mk_ident("ok")])
+
+    def fetch(self, ident, mid):
+        if ident.name == "broken":
+            raise RuntimeError("HTTP 503")
+        return None                                  # confirmed empty here
+
+    monkeypatch.setattr(FtsIndex, "_fetch_remote_body", fetch)
+    out = idx.backfill()
+    assert out["misses"] == 0
+    assert out["deferred"] == 1
+    assert _doc_sources()[536] == "local"
+
+
+def test_changing_the_identity_set_revokes_graph_miss_stamps(
+    mail_fixture, monkeypatch,
+):
+    """A graph_miss means 'absent from every mailbox ASKED' — it is
+    scoped to the identity set. A second Exchange account added later
+    must get its question, or its bodies are lost forever."""
+    _add_ews_mailbox(mail_fixture)
+    _add_envelope_row_in(mail_fixture, 537, EWS_MBOX_ROWID)
+    _write_ews_partial(mail_fixture, 537, "<t-537@cern.ch>")
+    idx = FtsIndex(mail_base=mail_fixture)
+    idx.build()
+    monkeypatch.setattr(FtsIndex, "_graph_identities",
+                        lambda self: [_mk_ident("work")])
+    monkeypatch.setattr(FtsIndex, "_fetch_remote_body",
+                        lambda self, ident, mid: None)   # work: not mine
+    assert idx.backfill()["misses"] == 1
+    assert _doc_sources()[537] == "graph_miss"
+
+    monkeypatch.setattr(
+        FtsIndex, "_graph_identities",
+        lambda self: [_mk_ident("work"), _mk_ident("personal")])
+    monkeypatch.setattr(
+        FtsIndex, "_fetch_remote_body",
+        lambda self, ident, mid: (
+            {"contentType": "text", "content": "the personal mailbox has it"}
+            if ident.name == "personal" else None))
+    out = idx.backfill()
+    assert out["backfilled"] == 1
+    assert _doc_sources()[537] == "graph"
+
+
+def test_backfill_reads_a_raw_8bit_or_folded_message_id(
+    mail_fixture, monkeypatch,
+):
+    """An unencoded 8-bit byte makes stdlib hand back a Header object
+    (not str), and folding can leave whitespace inside the angle-addr:
+    both must still yield the join key. Stamping such a doc graph_miss
+    would lose a recoverable body forever without asking Graph."""
+    _add_ews_mailbox(mail_fixture)
+    _add_envelope_row_in(mail_fixture, 538, EWS_MBOX_ROWID)
+    rfc = (b"From: a@cern.ch\nTo: b@cern.ch\nSubject: p 538\n"
+           b"Message-ID: <weird-\xe9-538@\n cern.ch>\n"
+           b"Content-Type: text/plain; charset=utf-8\n\n")
+    rel = emlx_relpath_for_rowid(538).with_name("538.partial.emlx")
+    path = mail_fixture / EWS_ACCT / "Inbox.mbox" / EWS_INNER / "Data" / rel
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(_make_emlx(rfc))
+    idx = FtsIndex(mail_base=mail_fixture)
+    idx.build()
+    asked = []
+    monkeypatch.setattr(FtsIndex, "_graph_identities",
+                        lambda self: [_Ident()])
+
+    def fetch(self, ident, mid):
+        asked.append(mid)
+        return {"contentType": "text", "content": "recovered after all"}
+
+    monkeypatch.setattr(FtsIndex, "_fetch_remote_body", fetch)
+    out = idx.backfill()
+    assert out["no_message_id"] == 0
+    assert out["backfilled"] == 1
+    assert len(asked) == 1
+    assert asked[0].startswith("<weird-") and asked[0].endswith("@cern.ch>")
+    assert not any(c.isspace() for c in asked[0])
+
+
+def test_unreadable_partial_defers_instead_of_stamping(
+    mail_fixture, monkeypatch,
+):
+    """A partial file that cannot be read right now (Mail rewriting it,
+    momentary TCC denial) is absence of evidence: defer, never stamp."""
+    _add_ews_mailbox(mail_fixture)
+    _add_envelope_row_in(mail_fixture, 539, EWS_MBOX_ROWID)
+    _write_ews_partial(mail_fixture, 539, "<t-539@cern.ch>")
+    idx = FtsIndex(mail_base=mail_fixture)
+    idx.build()
+    monkeypatch.setattr(FtsIndex, "_graph_identities",
+                        lambda self: [_Ident()])
+    monkeypatch.setattr(
+        FtsIndex, "_fetch_remote_body",
+        lambda self, ident, mid: pytest.fail("unreadable file, no lookup"))
+    monkeypatch.setattr(
+        "email_mcp.fts.FtsIndex._message_id_from_partial",
+        lambda self, rid, url: (_ for _ in ()).throw(OSError("mid-write")))
+    out = idx.backfill()
+    assert out["deferred"] == 1
+    assert out["no_message_id"] == 0
+    assert _doc_sources()[539] == "local"            # still a candidate
+
+
+def test_stamped_docs_age_out_of_the_retry_queue(mail_fixture, monkeypatch):
+    """A stamped doc's re-stat RECORDS the attempt: frozen bookkeeping
+    kept stamped docs permanently 'due' at the HEAD of the retry queue,
+    starving every genuinely late-materializing body (P04, again)."""
+    _add_ews_mailbox(mail_fixture)
+    _add_envelope_row_in(mail_fixture, 545, EWS_MBOX_ROWID,
+                         remote_id="AAMkAD-545")
+    idx = FtsIndex(mail_base=mail_fixture)
+    idx.build()
+    monkeypatch.setattr(FtsIndex, "_graph_identities",
+                        lambda self: [_Ident()])
+    monkeypatch.setattr(FtsIndex, "_translate_ews_ids",
+                        lambda self, ident, ids: {})
+    idx.backfill()
+    assert _doc_sources()[545] == "graph_miss"
+
+    conn = _fts_db()
+    conn.execute("UPDATE docs SET last_attempt = 0, attempts = 1 "
+                 "WHERE rowid = 545")
+    conn.commit()
+    conn.close()
+    idx.incremental()                          # runs _retry_missing
+    conn = _fts_db()
+    row = conn.execute("SELECT attempts, last_attempt, source FROM docs "
+                       "WHERE rowid = 545").fetchone()
+    conn.close()
+    assert row["source"] == "graph_miss"       # the stamp survived
+    assert row["attempts"] == 2                # ...and the attempt counted
+    assert row["last_attempt"] > 0
 
 
 def test_partial_recrawl_never_clobbers_a_graph_body(mail_fixture,
@@ -733,8 +961,7 @@ def test_sync_folds_a_backfill_pass(mail_fixture, monkeypatch):
     idx = FtsIndex(mail_base=mail_fixture)
     monkeypatch.setattr(
         FtsIndex, "backfill",
-        lambda self, max_docs=None, deadline=None:
-            {"skipped": "no_graph_identity"})
+        lambda self, max_docs=None: {"skipped": "no_graph_identity"})
     out = fts._sync(idx, None)
     assert out["backfill"] == {"skipped": "no_graph_identity"}
 
@@ -775,7 +1002,7 @@ def test_rebuild_carries_graph_bodies_across(mail_fixture, monkeypatch):
     assert idx.rowids_matching("salvage") == [520]
     assert idx.backfilled_text(520) == "salvage me"
     assert not fts.db_path().with_name(
-        fts.db_path().name + ".pre-rebuild").exists()
+        fts.db_path().name + ".rebuild").exists()
 
 
 def test_rebuild_prefers_a_fresh_local_body_over_the_old_graph_one(
@@ -824,3 +1051,57 @@ def test_rebuild_of_a_corrupt_db_skips_salvage_and_stays_clean(
     assert "salvage_skipped" in out
     assert out["indexed"] == 3                   # the rebuild itself worked
     assert idx.status()["state"] == "ready"
+
+
+def test_interrupted_rebuild_leaves_the_live_index_untouched(
+    mail_fixture, monkeypatch,
+):
+    """The live db is never the casualty: a rebuild that dies at ANY
+    point leaves it serving — and the NEXT rebuild still salvages every
+    graph body (an interrupted-then-retried rebuild used to clobber its
+    own salvage source and destroy them all)."""
+    idx = _backfill_one(mail_fixture, monkeypatch, 523, "survives crashes")
+    real_build = FtsIndex.build
+    armed = {"on": True}
+
+    def dying_build(self, limit=None):
+        out = real_build(self, limit=limit)
+        if armed["on"]:
+            armed["on"] = False
+            raise RuntimeError("power cut")
+        return out
+
+    monkeypatch.setattr(FtsIndex, "build", dying_build)
+    with pytest.raises(RuntimeError):
+        idx.rebuild()
+    assert idx.backfilled_text(523) == "survives crashes"   # live intact
+    assert idx.rowids_matching("survives") == [523]
+
+    out = idx.rebuild()
+    assert out["salvaged"] == 1
+    assert idx.backfilled_text(523) == "survives crashes"
+    assert not fts.db_path().with_name(
+        fts.db_path().name + ".rebuild").exists()
+
+
+def test_rebuild_promote_defers_to_a_busy_writer(mail_fixture, monkeypatch):
+    """A writer mid-commit must not have its transaction swapped out
+    from under it: the promote treats busy exactly like every other
+    writer here — skip, report, leave the live index untouched."""
+    idx = _backfill_one(mail_fixture, monkeypatch, 524, "busy text")
+    monkeypatch.setattr(fts, "_BUSY_TIMEOUT_MS", 50)
+    blocker = sqlite3.connect(fts.db_path())
+    blocker.isolation_level = None
+    blocker.execute("BEGIN IMMEDIATE")
+    try:
+        out = idx.rebuild()
+    finally:
+        blocker.rollback()
+        blocker.close()
+    assert out["skipped"] == "busy"
+    assert idx.backfilled_text(524) == "busy text"          # live intact
+
+    out = idx.rebuild()                        # writer gone: promote lands
+    assert "skipped" not in out
+    assert out["salvaged"] == 1
+    assert idx.backfilled_text(524) == "busy text"

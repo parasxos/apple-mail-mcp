@@ -383,6 +383,75 @@ def test_crashed_check_becomes_red_entry_not_exception(monkeypatch):
     assert "crashed" in report["checks"]["mail_store"]["detail"]
 
 
+def test_advisory_check_crash_stays_advisory():
+    """Advisory is a property of the CHECK, not of one outcome: a crash
+    in the accessibility probe (a PermissionError spawning osascript on
+    an MDM-hardened Mac) warns exactly like its ordinary failures — it
+    must never redden a machine where everything the user touches
+    works."""
+    def boom():
+        raise PermissionError("osascript blocked by MDM policy")
+
+    out = doctor._guarded("accessibility", boom)
+    assert out["ok"] is False
+    assert out.get("advisory") is True
+    out = doctor._guarded("mail_store", boom)
+    assert "advisory" not in out               # core checks still gate
+
+
+def test_installed_but_unloaded_fts_agent_reddens(monkeypatch):
+    """A plist on disk says what WOULD run; only launchd says whether
+    anything will. Installed-but-unloaded ran NOTHING while every file
+    probe read healthy — doctor now asks launchd."""
+    from email_mcp import fts as fts_mod
+
+    plist = fts_mod._plist_path()
+    plist.parent.mkdir(parents=True, exist_ok=True)
+    plist.write_text("<plist/>")
+    monkeypatch.setattr(doctor, "_agent_loaded", lambda label: False)
+    check = doctor.check_fts()
+    assert check["ok"] is False
+    assert "NOT loaded" in check["detail"]
+    assert "doctor --fix" in check["fix"]
+
+
+def test_unloaded_dispatcher_bites_once_something_is_pending(monkeypatch):
+    """Same gating as not-installed: informational while the spool is
+    empty, red the moment a scheduled send is waiting on it."""
+    from email_mcp import dispatcher
+
+    plist = dispatcher._plist_path()
+    plist.parent.mkdir(parents=True, exist_ok=True)
+    plist.write_text("<plist/>")
+    monkeypatch.setattr(doctor, "_agent_loaded", lambda label: False)
+    check = doctor.check_dispatcher()
+    assert check["ok"] is True and check["loaded"] is False
+    monkeypatch.setattr("email_mcp.spool.entries",
+                        lambda s: ["e"] if s == "pending" else [])
+    check = doctor.check_dispatcher()
+    assert check["ok"] is False
+    assert "doctor --fix" in check["fix"]
+
+
+def test_backfill_trouble_is_an_advisory_warning(monkeypatch):
+    """The backfill records identity trouble as state exactly so doctor
+    can surface a lane that silently does nothing every night."""
+    import email_mcp.fts as fts_mod
+
+    st = {"state": "ready",
+          "docs": {"indexed": 5, "partial": 0, "missing": 0, "error": 0,
+                   "total": 5, "backfilled": 0},
+          "last_rowid": 5,
+          "last_backfill_error":
+              "identity 'main': 3 error(s), last: HTTP 401"}
+    monkeypatch.setattr(fts_mod, "status", lambda: st)
+    check = doctor.check_fts()
+    assert check["ok"] is False
+    assert check["advisory"] is True
+    assert "--backfill" in check["fix"]
+    assert "HTTP 401" in check["detail"]
+
+
 def test_check_audit_flags_file_where_dir_belongs(monkeypatch, tmp_path):
     """Red-team S3 finding (left for ownership reasons): a regular FILE at
     the audit path must read as a fault, not a fresh install."""

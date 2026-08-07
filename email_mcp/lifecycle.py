@@ -373,49 +373,111 @@ def _open_in_macos(target: str, reveal: bool = False) -> None:
         pass
 
 
+def _service_dump(tgt: str) -> str | None:
+    """One launchctl print, or None when there is nothing to judge
+    (launchctl unavailable, agent not loaded, not a service dump)."""
+    try:
+        r = plan._launchctl("print", tgt)
+    except Exception:  # noqa: BLE001 — non-macOS CI
+        return None
+    if r.returncode != 0 or "state = " not in (r.stdout or ""):
+        return None
+    return r.stdout
+
+
+def _dump_int(dump: str, pattern: str) -> int | None:
+    m = re.search(pattern, dump)
+    return int(m.group(1)) if m else None
+
+
 def _verify_fts_agent() -> bool | None:
-    """Ground truth on the nightly refresh: kick it once and watch it via
-    launchctl. True = it ran (exit 0) or is visibly crawling (an FDA
-    denial dies in under a second, so surviving the grace period proves
-    disk access). False = it died. None = cannot judge here (launchctl
-    unavailable or agent not loaded)."""
+    """Ground truth on the nightly refresh: kick it once and judge ONLY
+    fresh evidence. Freshness is either watching the run happen or
+    launchd's `runs` counter advancing past its pre-kick value — a
+    `last exit code` read without one of those belongs to a PREVIOUS
+    run (a loaded machine's slow spawn once got last night's exit 0
+    presented as today's verdict). True = the kicked run exited 0 or is
+    visibly crawling (an FDA denial dies in under a second, so
+    surviving the grace period proves disk access). False = the kicked
+    run died. None = cannot judge here — never guessed."""
     from . import fts
 
     tgt = f"gui/{os.getuid()}/{fts.LAUNCHD_LABEL}"
+    before = _service_dump(tgt)
+    if before is None:
+        return None
+    runs0 = _dump_int(before, r"\bruns = (\d+)")
     try:
         if plan._launchctl("kickstart", "-k", tgt).returncode != 0:
             return None
     except Exception:  # noqa: BLE001 — non-macOS CI
         return None
     ran = 0.0
-    stale_guard = False  # first exit-code sighting may predate the kick
     deadline = time.monotonic() + _VERIFY_TIMEOUT
     while time.monotonic() < deadline:
-        try:
-            r = plan._launchctl("print", tgt)
-        except Exception:  # noqa: BLE001
+        dump = _service_dump(tgt)
+        if dump is None:
             return None
-        if r.returncode != 0 or "state = " not in (r.stdout or ""):
-            return None  # not a service dump — nothing to judge
-        if "state = running" in r.stdout:
+        if "state = running" in dump:
             ran += _VERIFY_POLL
             if ran >= _VERIFY_GRACE:
                 return True
         else:
-            m = re.search(r"last exit code = (-?\d+)", r.stdout)
-            if m and (ran or stale_guard):
-                return int(m.group(1)) == 0
-            stale_guard = True
+            runs = _dump_int(dump, r"\bruns = (\d+)")
+            code = _dump_int(dump, r"last exit code = (-?\d+)")
+            fresh = ran > 0 or (runs is not None and runs0 is not None
+                                and runs > runs0)
+            if fresh and code is not None:
+                return code == 0
         time.sleep(_VERIFY_POLL)
     return None
+
+
+# The dead run's own log is the diagnosis — never an assumption. The
+# markers mirror what the failing lanes actually print: TCC denials
+# raise PermissionError / "Operation not permitted"; a damaged index
+# raises out of sqlite3.
+_FDA_MARKERS = ("PermissionError", "Operation not permitted")
+_INDEX_MARKERS = ("sqlite3.", "database disk image is malformed",
+                  "file is not a database")
+
+
+def _log_tail(log: Path, size: int = 4096) -> str:
+    try:
+        with open(log, "rb") as f:
+            f.seek(0, os.SEEK_END)
+            end = f.tell()
+            f.seek(max(0, end - size))
+            return f.read().decode("utf-8", "replace")
+    except OSError:
+        return ""
+
+
+def _diagnose_fts_failure(log: Path) -> str:
+    """'fda' | 'index' | 'unknown', judged by the LAST marker in the
+    log's tail — the log accumulates runs, and an already-granted FDA
+    denial from last week must not outvote today's sqlite error."""
+    tail = _log_tail(log)
+
+    def last(markers: tuple[str, ...]) -> int:
+        return max((tail.rfind(m) for m in markers), default=-1)
+
+    fda, index = last(_FDA_MARKERS), last(_INDEX_MARKERS)
+    if fda < 0 and index < 0:
+        return "unknown"
+    return "fda" if fda >= index else "index"
 
 
 def _fts_agent_aftercare() -> None:
     """Setup must never end with a nightly refresh that silently dies
     every night (first user: agent installed 2026-08-01, PermissionError
-    at every 03:30 since). Verify with a real run; on failure, guide the
-    Full Disk Access grant hands-on and re-verify until it works — or
-    remove the agent, so the machine is green either way."""
+    at every 03:30 since). Verify with a real run; on failure the dead
+    run's own log names the cause: a TCC denial gets the hands-on Full
+    Disk Access walk and a re-verify; a damaged index gets the rebuild
+    remedy; anything else gets its log — the FDA walk is never
+    prescribed for a failure that is not an FDA failure (it used to
+    loop a damaged-index machine through System Settings until the only
+    green exit was uninstalling a perfectly healthy agent)."""
     from . import fts
 
     if not fts._plist_path().exists():
@@ -432,11 +494,26 @@ def _fts_agent_aftercare() -> None:
         if verdict:
             print("nightly refresh verified — it runs with disk access.")
             return
+        log = fts._log_path()
+        cause = _diagnose_fts_failure(log)
+        if cause == "index":
+            print("the refresh died on a damaged body-search index — not "
+                  "a permissions problem. Rebuild it with:")
+            print("  python -m email_mcp.fts --rebuild")
+            print("the nightly agent stays installed and will succeed "
+                  "once the index is rebuilt.")
+            return
+        if cause == "unknown":
+            print("the refresh died; its log has the details:")
+            print(f"  {log}")
+            print("the agent stays installed — `email-mcp doctor` keeps "
+                  "flagging it until the cause is fixed.")
+            return
         attempt += 1
         py = Path(sys.executable).resolve()
-        print("the refresh died on its first run — almost always because "
-              "macOS blocks background programs from reading Mail until "
-              "you grant Full Disk Access to this exact program:")
+        print("the refresh died on its first run — its log shows macOS "
+              "blocking background programs from reading Mail until you "
+              "grant Full Disk Access to this exact program:")
         print(f"  {py}")
         print("there is no pop-up for this one; it is a one-time toggle:")
         print("  1) a Finder window opens with the program selected")
@@ -445,8 +522,7 @@ def _fts_agent_aftercare() -> None:
         print("  3) drag the program from Finder into that list and "
               "switch it ON")
         if attempt > 1:
-            print(f"  still failing — the log may say more: "
-                  f"{fts._log_path()}")
+            print(f"  still failing — the log may say more: {log}")
         _open_in_macos(str(py), reveal=True)
         _open_in_macos(_FDA_PANE)
         ans = input("press Enter here once granted, and I re-check "

@@ -6,8 +6,22 @@ misses message bodies. This module maintains a private SQLite database
 
   meta      key/value: schema_version, last_rowid high-water mark, timestamps
   docs      per-message ledger: status indexed|partial|missing|error,
-            attempts, last_attempt, bytes, source local|graph|graph_miss
+            attempts, last_attempt, bytes,
+            source local|graph|graph_miss|graph_none
   body_fts  plain FTS5 over extracted body text, rowid == messages.ROWID
+
+Source is the evidence ledger of the Graph backfill lane:
+  local       the doc is (or may yet be) served from Mail's own store
+  graph       body fetched from the mailbox's server copy
+  graph_miss  every configured graph identity answered and none holds it
+              — CONFIRMED absent, relative to the identity set that was
+              asked; changing that set revokes every graph_miss stamp
+  graph_none  the doc can never be asked (non-Exchange mailbox, or a
+              partial file with no Message-ID header) — local evidence,
+              independent of identities
+A stamp is only ever placed on confirmed evidence. Errors, unreadable
+files and unanswered identities DEFER a doc — absence of evidence must
+never read as evidence of absence.
 
 Design points (docs/v0.8-concept.md, movement 1):
   * Apple's store is never written. Bodies come from .emlx first; where
@@ -56,7 +70,7 @@ from . import config, state
 from .log import get_logger
 from .sources.apple_mail_paths import find_emlx_path, mailbox_data_dir
 
-SCHEMA_VERSION = 2  # v2: docs.source (local | graph | graph_miss)
+SCHEMA_VERSION = 2  # v2: docs.source (local | graph | graph_miss | graph_none)
 LAUNCHD_LABEL = "com.email-mcp.fts"
 
 _DB_NAME = "fts.db"
@@ -64,6 +78,12 @@ _BUSY_TIMEOUT_MS = 5000
 _BATCH_SIZE = 2000
 _MAX_ATTEMPTS = 6
 _TRANSLATE_CHUNK = 100  # EWS ids per translateExchangeIds call
+# Per-pass identity health (backfill): an identity that keeps erroring
+# and has answered NOTHING is dead for the pass (revoked token, outage);
+# one that answered before is given more rope (a poisoned doc or chunk
+# is the doc's problem, not the identity's) but still caps out.
+_IDENT_FAIL_FAST = 3
+_IDENT_ERROR_CAP = 25
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS meta (
@@ -134,10 +154,14 @@ class FtsIndex:
     available() before invoking any of them.
     """
 
-    def __init__(self, mail_base: Path | None = None) -> None:
+    def __init__(self, mail_base: Path | None = None,
+                 db: Path | None = None) -> None:
         # Resolved lazily: status()/rowids_matching() must work (and --status
         # must print) on a machine where config.mail_dir() would raise.
         self._mail_base = mail_base
+        # An index instance addresses ONE db file — the canonical one by
+        # default; rebuild()'s scratch instance overrides the path.
+        self._db = db
         self._data_dir_cache: dict[str, Path | None] = {}
         self._envelope_deleted: bool | None = None
 
@@ -146,7 +170,7 @@ class FtsIndex:
     # ------------------------------------------------------------------ #
 
     def available(self) -> bool:
-        return db_path().exists()
+        return (self._db or db_path()).exists()
 
     def status(self) -> dict:
         path = db_path()
@@ -162,6 +186,7 @@ class FtsIndex:
             "last_sync_at": None,
             "last_reconcile_at": None,
             "last_backfill_at": None,
+            "last_backfill_error": None,
         }
         if not path.exists():
             out["remedy"] = "python -m email_mcp.fts --build"
@@ -197,6 +222,8 @@ class FtsIndex:
             out["last_sync_at"] = self._meta_get(conn, "last_sync_at")
             out["last_reconcile_at"] = self._meta_get(conn, "last_reconcile_at")
             out["last_backfill_at"] = self._meta_get(conn, "last_backfill_at")
+            out["last_backfill_error"] = self._meta_get(
+                conn, "last_backfill_error")
         except sqlite3.Error as e:
             out["state"] = "error"
             out["error"] = str(e)
@@ -328,8 +355,7 @@ class FtsIndex:
             "elapsed": round(time.monotonic() - t0, 3),
         }
 
-    def backfill(self, max_docs: int | None = None,
-                 deadline: float | None = None) -> dict:
+    def backfill(self, max_docs: int | None = None) -> dict:
         """Fill index holes from the mailbox's own server copy.
 
         Mail.app's local store has a ceiling no crawling raises
@@ -346,23 +372,46 @@ class FtsIndex:
                      translated to a Graph REST id in bulk
                      (translateExchangeIds), then fetched directly.
 
-        Hits are indexed with source='graph'. A miss CONFIRMED by every
-        graph identity (empty lookup / 404 / untranslatable id) is
-        stamped source='graph_miss' and never re-asked; any GraphError
-        (throttle, outage) aborts the pass untouched — the next run
-        resumes exactly where this one stopped. Network calls happen
-        OUTSIDE write transactions: Graph latency must never hold the
-        index lock a search is waiting on."""
+        Hits are indexed with source='graph'. Verdicts follow the
+        evidence rules of the module docstring: a miss is stamped
+        source='graph_miss' only when EVERY configured identity answered
+        without error and none holds the message (empty lookup / 404 /
+        untranslatable id) — and the stamp is scoped to that identity
+        set: when the set changes, every graph_miss is revoked and
+        re-asked. Docs no server can ever answer for (non-Exchange
+        mailbox, no Message-ID header) are stamped source='graph_none'
+        once, so no later pass re-walks the estate to re-conclude it.
+        Everything else — a GraphError, an unreadable partial file, an
+        identity that could not be asked — DEFERS the doc untouched; an
+        identity that keeps erroring and answers nothing is retired for
+        the pass, and its trouble is recorded in meta
+        last_backfill_error so status() and doctor can surface it.
+        Network calls happen OUTSIDE write transactions: Graph latency
+        must never hold the index lock a search is waiting on."""
         t0 = time.monotonic()
         stats = {"candidates": 0, "backfilled": 0, "misses": 0,
                  "no_message_id": 0, "no_remote_id": 0,
-                 "skipped_non_exchange": 0}
+                 "skipped_non_exchange": 0, "deferred": 0}
         idents = self._graph_identities()
         if not idents:
             stats["skipped"] = "no_graph_identity"
             return stats
         conn = self._open_rw()
         try:
+            fingerprint = ",".join(
+                sorted(str(getattr(i, "name", "")) for i in idents))
+            if self._meta_get(conn, "backfill_identities") != fingerprint:
+                # A graph_miss means "absent from every mailbox asked".
+                # A different identity set can answer differently —
+                # revoke the confirmations so the new set gets asked.
+                if not self._begin_immediate(conn):
+                    stats["skipped"] = "busy"
+                    return stats
+                cur = conn.cursor()
+                cur.execute("UPDATE docs SET source = 'local' "
+                            "WHERE source = 'graph_miss'")
+                self._meta_set(cur, "backfill_identities", fingerprint)
+                conn.commit()
             try:
                 classes = {
                     status: [int(r["rowid"]) for r in conn.execute(
@@ -378,29 +427,89 @@ class FtsIndex:
                 classes["partial"] + classes["missing"])
             p_todo: list[tuple[int, str]] = []       # (rowid, mailbox url)
             m_todo: list[tuple[int, str]] = []       # (rowid, ews id)
+            non_exchange: list[int] = []
             for rid in classes["partial"]:
                 url, _ = meta.get(rid, ("", None))
                 if not url.startswith("ews://"):
-                    stats["skipped_non_exchange"] += 1
+                    non_exchange.append(rid)
                 else:
                     p_todo.append((rid, url))
             for rid in classes["missing"]:
                 url, remote_id = meta.get(rid, ("", None))
                 if not url.startswith("ews://"):
-                    stats["skipped_non_exchange"] += 1
+                    non_exchange.append(rid)
                 elif not remote_id:
                     stats["no_remote_id"] += 1
                 else:
                     m_todo.append((rid, remote_id))
+            stats["skipped_non_exchange"] = len(non_exchange)
+            if non_exchange:
+                # Not Graph's to answer, and a rowid's mailbox URL never
+                # changes: stamp once (one set-based txn), so no later
+                # pass re-derives the whole estate to re-conclude it.
+                if not self._begin_immediate(conn):
+                    stats["skipped"] = "busy"
+                    return stats
+                cur = conn.cursor()
+                for i in range(0, len(non_exchange), 500):
+                    chunk = non_exchange[i:i + 500]
+                    marks = ",".join("?" * len(chunk))
+                    cur.execute(f"UPDATE docs SET source = 'graph_none' "
+                                f"WHERE rowid IN ({marks})", chunk)
+                conn.commit()
             if max_docs is not None:
                 budget = max(0, max_docs)
                 p_todo = p_todo[:budget]
                 m_todo = m_todo[: budget - len(p_todo)]
             stats["candidates"] = len(p_todo) + len(m_todo)
 
-            def _out_of_time() -> bool:
-                return (deadline is not None
-                        and time.monotonic() >= deadline)
+            # Per-pass identity health: evidence accumulates, verdicts
+            # follow it (constants _IDENT_FAIL_FAST / _IDENT_ERROR_CAP).
+            errors: dict[str, int] = {}
+            successes: dict[str, int] = {}
+            last_error: dict[str, str] = {}
+
+            def _name(ident) -> str:
+                return str(getattr(ident, "name", ""))
+
+            def _dead(ident) -> bool:
+                n = _name(ident)
+                e = errors.get(n, 0)
+                return (e >= _IDENT_ERROR_CAP
+                        or (e >= _IDENT_FAIL_FAST
+                            and not successes.get(n, 0)))
+
+            def _any_live() -> bool:
+                return any(not _dead(i) for i in idents)
+
+            def _count_error(ident, what: str, e: Exception) -> None:
+                n = _name(ident)
+                errors[n] = errors.get(n, 0) + 1
+                last_error[n] = str(e)
+                get_logger().warning(
+                    "fts backfill: identity %r %s failed: %s", n, what, e)
+
+            def _fetch_confirmed(fetch) -> tuple[dict | None, bool]:
+                """Ask every identity. (body, confirmed): body on a hit;
+                confirmed only when EVERY identity answered without
+                error and none had it — the sole evidence that
+                justifies a graph_miss stamp."""
+                confirmed = True
+                for ident in idents:
+                    if _dead(ident):
+                        confirmed = False
+                        continue
+                    try:
+                        body = fetch(ident)
+                    except Exception as e:  # GraphError: no evidence
+                        _count_error(ident, "lookup", e)
+                        confirmed = False
+                        continue
+                    successes[_name(ident)] = \
+                        successes.get(_name(ident), 0) + 1
+                    if body is not None:
+                        return body, True
+                return None, confirmed
 
             def _store_hit(rid: int, body: dict) -> bool:
                 text = self._remote_text(body)
@@ -425,8 +534,8 @@ class FtsIndex:
                         - stats["misses"] - stats["no_message_id"])
                 return True
 
-            def _stamp_miss(rid: int, counter: str) -> bool:
-                if not self._stamp_source(conn, rid, "graph_miss"):
+            def _stamp_doc(rid: int, source: str, counter: str) -> bool:
+                if not self._stamp_source(conn, rid, source):
                     stats["skipped"] = "busy"
                     return False
                 stats[counter] += 1
@@ -434,81 +543,86 @@ class FtsIndex:
 
             # class 1: partials — Message-ID from the file's own headers
             for rid, url in p_todo:
-                if _out_of_time():
+                if not _any_live() or "skipped" in stats:
                     break
-                mid = self._message_id_from_partial(rid, url)
-                if mid is None:
-                    if not _stamp_miss(rid, "no_message_id"):
-                        break
-                    continue
-                body = None
                 try:
-                    for ident in idents:
-                        body = self._fetch_remote_body(ident, mid)
-                        if body is not None:
-                            break
-                except Exception as e:  # GraphError: defer, never guess
+                    mid = self._message_id_from_partial(rid, url)
+                except Exception as e:  # unreadable now ≠ unaskable
                     get_logger().info(
-                        "fts backfill: pass aborted at rowid %s: %s",
-                        rid, e)
-                    stats["aborted"] = str(e)
-                    break
-                if body is None:
-                    if not _stamp_miss(rid, "misses"):
+                        "fts backfill: cannot read partial %s (%s) — "
+                        "deferred", rid, e)
+                    stats["deferred"] += 1
+                    continue
+                if mid is None:  # the file itself says: no join key, ever
+                    if not _stamp_doc(rid, "graph_none", "no_message_id"):
                         break
                     continue
-                if not _store_hit(rid, body):
-                    break
+                body, confirmed = _fetch_confirmed(
+                    lambda i, mid=mid: self._fetch_remote_body(i, mid))
+                if body is not None:
+                    if not _store_hit(rid, body):
+                        break
+                elif confirmed:
+                    if not _stamp_doc(rid, "graph_miss", "misses"):
+                        break
+                else:
+                    stats["deferred"] += 1
 
             # class 2: storeless — remote_id → REST id → body
             for i in range(0, len(m_todo), _TRANSLATE_CHUNK):
-                if _out_of_time() or "aborted" in stats \
-                        or "skipped" in stats:
+                if not _any_live() or "skipped" in stats:
                     break
                 chunk = m_todo[i:i + _TRANSLATE_CHUNK]
                 mapping: dict[str, str] = {}
-                try:
-                    for ident in idents:
-                        left = [e for _, e in chunk if e not in mapping]
-                        if not left:
-                            break
-                        mapping.update(
-                            self._translate_ews_ids(ident, left))
-                except Exception as e:
-                    get_logger().info(
-                        "fts backfill: translate aborted the pass: %s", e)
-                    stats["aborted"] = str(e)
-                    break
+                translated_by_all = True
+                for ident in idents:
+                    if _dead(ident):
+                        translated_by_all = False
+                        continue
+                    left = [e for _, e in chunk if e not in mapping]
+                    if not left:
+                        break
+                    try:
+                        mapping.update(self._translate_ews_ids(ident, left))
+                    except Exception as e:  # chunk deferred, not the pass
+                        _count_error(ident, "translate", e)
+                        translated_by_all = False
+                        continue
+                    successes[_name(ident)] = \
+                        successes.get(_name(ident), 0) + 1
                 for rid, ews_id in chunk:
-                    if _out_of_time():
+                    if "skipped" in stats:
                         break
                     rest = mapping.get(ews_id)
-                    if rest is None:  # unaddressable by every identity
-                        if not _stamp_miss(rid, "misses"):
-                            break
-                        continue
-                    body = None
-                    try:
-                        for ident in idents:
-                            body = self._fetch_remote_body_by_id(
-                                ident, rest)
-                            if body is not None:
+                    if rest is None:
+                        if translated_by_all:  # unaddressable by every one
+                            if not _stamp_doc(rid, "graph_miss", "misses"):
                                 break
-                    except Exception as e:
-                        get_logger().info(
-                            "fts backfill: pass aborted at rowid %s: %s",
-                            rid, e)
-                        stats["aborted"] = str(e)
-                        break
-                    if body is None:
-                        if not _stamp_miss(rid, "misses"):
-                            break
+                        else:
+                            stats["deferred"] += 1
                         continue
-                    if not _store_hit(rid, body):
-                        break
-                if "aborted" in stats or "skipped" in stats:
-                    break
+                    body, confirmed = _fetch_confirmed(
+                        lambda i, rest=rest:
+                        self._fetch_remote_body_by_id(i, rest))
+                    if body is not None:
+                        if not _store_hit(rid, body):
+                            break
+                    elif confirmed:
+                        if not _stamp_doc(rid, "graph_miss", "misses"):
+                            break
+                    else:
+                        stats["deferred"] += 1
 
+            if errors:
+                stats["identity_errors"] = dict(errors)
+                if not _any_live():
+                    stats["aborted"] = "every graph identity failing: " \
+                        + "; ".join(f"{n}: {m}"
+                                    for n, m in sorted(last_error.items()))
+            summary = "; ".join(
+                f"identity {n!r}: {errors[n]} error(s), last: {last_error[n]}"
+                for n in sorted(errors)) or None
+            self._note_backfill_health(conn, summary)
             if stats["backfilled"] or stats["misses"] \
                     or stats["no_message_id"]:
                 self._stamp(conn, "last_backfill_at")
@@ -516,6 +630,20 @@ class FtsIndex:
             conn.close()
         stats["elapsed"] = round(time.monotonic() - t0, 3)
         return stats
+
+    def _note_backfill_health(self, conn: sqlite3.Connection,
+                              summary: str | None) -> None:
+        """Record (or clear) the pass's identity trouble in meta — the
+        one place status() and doctor read, so a backfill that silently
+        does nothing every night is a visible state, not a log line."""
+        if not self._begin_immediate(conn):
+            return
+        cur = conn.cursor()
+        if summary is None:
+            cur.execute("DELETE FROM meta WHERE key = 'last_backfill_error'")
+        else:
+            self._meta_set(cur, "last_backfill_error", summary)
+        conn.commit()
 
     def backfilled_text(self, rowid: int) -> str | None:
         """Server-fetched body text for a doc whose local .emlx has none
@@ -539,47 +667,68 @@ class FtsIndex:
             conn.close()
 
     def rebuild(self, limit: int | None = None) -> dict:
-        """Drop the index files and build from scratch — REUSING the
-        server-fetched bodies the old index held.
+        """Fresh build BESIDE the live index, then one atomic promote —
+        REUSING the server-fetched bodies the live index holds.
 
         Graph-sourced rows are not derived state: the local store never
         had those bodies, and re-fetching ~95k of them is an overnight
-        of Graph traffic. So the old db is set aside, the fresh build
-        runs from disk, and every graph body (and graph_miss stamp) the
-        new build could not produce locally is carried over. A corrupt
-        old db — the usual reason to rebuild — skips the salvage and
-        rebuilds clean, exactly as before."""
+        of Graph traffic. So the fresh build runs at <db>.rebuild,
+        salvages every graph body (and stamp) straight from the LIVE db
+        — read through SQLite, so WAL-resident rows are included — and
+        only then replaces it, under the live writer lock so no
+        concurrent commit is swapped out mid-flight. The live index is
+        never the casualty: interruption at ANY point leaves it exactly
+        as it was, plus a scratch file the next attempt overwrites. A
+        corrupt live db — the usual reason to rebuild — fails the
+        salvage, and the fresh build is promoted clean, exactly as
+        before."""
         base = db_path()
-        old: Path | None = None
-        if base.exists():
-            old = base.with_name(base.name + ".pre-rebuild")
-            try:  # fold the WAL in so the set-aside file is complete
-                conn = sqlite3.connect(base)
-                conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
-                conn.close()
-            except sqlite3.Error:
-                pass
-            os.replace(base, old)
-        for suffix in ("-wal", "-shm"):
-            Path(f"{base}{suffix}").unlink(missing_ok=True)
-        out = self.build(limit=limit)
-        if old is not None:
+        if not base.exists():
+            return self.build(limit=limit)
+        scratch = base.with_name(base.name + ".rebuild")
+        for suffix in ("", "-wal", "-shm"):  # void any interrupted attempt
+            Path(f"{scratch}{suffix}").unlink(missing_ok=True)
+        fresh = FtsIndex(mail_base=self._mail_base, db=scratch)
+        out = fresh.build(limit=limit)
+        try:
+            out["salvaged"] = fresh._salvage_graph_rows(base)
+        except Exception as e:  # corrupt live db: rebuild stays clean
+            get_logger().warning("fts rebuild: salvage skipped: %s", e)
+            out["salvage_skipped"] = str(e)
+        conn = sqlite3.connect(scratch)
+        try:  # fold the scratch WAL so ONE complete file is promoted
+            conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+        finally:
+            conn.close()
+        live = sqlite3.connect(base)
+        try:
+            live.execute(f"PRAGMA busy_timeout={_BUSY_TIMEOUT_MS}")
             try:
-                out["salvaged"] = self._salvage_graph_rows(old)
-                old.unlink(missing_ok=True)
-            except Exception as e:  # corrupt old db: rebuild stays clean
-                get_logger().warning("fts rebuild: salvage skipped: %s", e)
-                out["salvage_skipped"] = str(e)
-                out["salvage_db"] = str(old)
+                locked = self._begin_immediate(live)
+            except sqlite3.Error:  # not a database — nothing to lock
+                locked = True
+            if not locked:
+                # A writer would not survive the swap; every writer here
+                # treats busy as skip, so the promote does too — the
+                # fresh build waits at .rebuild for the next attempt.
+                out["skipped"] = "busy"
+                return out
+            os.replace(scratch, base)
+        finally:
+            live.close()
+        for suffix in ("-wal", "-shm"):  # dead names once the file swapped
+            Path(f"{base}{suffix}").unlink(missing_ok=True)
         return out
 
     def _salvage_graph_rows(self, old: Path) -> int:
-        """Carry graph bodies and graph_miss stamps from the set-aside db
-        into the fresh one — set-based, never through Python memory. A
-        rowid the new build indexed from a full local file keeps the
-        local text (local truth wins); everything the old db knew from
-        the server and the new build could not read from disk is
-        reinstated."""
+        """Carry graph bodies and graph_miss/graph_none stamps from the
+        live db into the fresh one — set-based, never through Python
+        memory. A rowid the new build indexed from a full local file
+        keeps the local text (local truth wins); everything the old db
+        knew from the server and the new build could not read from disk
+        is reinstated. The identity fingerprint the stamps are scoped to
+        rides along — carried stamps must stay revocable by the same
+        rule that placed them."""
         conn = self._open_rw()
         try:
             conn.execute("ATTACH DATABASE ? AS old", (str(old),))
@@ -618,10 +767,20 @@ class FtsIndex:
                 """)
             cur.execute(
                 """
-                UPDATE docs SET source = 'graph_miss'
+                UPDATE docs SET source = (
+                        SELECT o.source FROM old.docs o
+                         WHERE o.rowid = docs.rowid)
                  WHERE source = 'local' AND status IN ('partial', 'missing')
                    AND rowid IN (SELECT rowid FROM old.docs
-                                  WHERE source = 'graph_miss')
+                                  WHERE source IN ('graph_miss',
+                                                   'graph_none'))
+                """)
+            cur.execute(
+                """
+                INSERT INTO meta(key, value)
+                SELECT key, value FROM old.meta
+                 WHERE key = 'backfill_identities'
+                ON CONFLICT(key) DO UPDATE SET value = excluded.value
                 """)
             salvaged = int(cur.execute(
                 "SELECT COUNT(*) FROM salv").fetchone()[0])
@@ -637,7 +796,8 @@ class FtsIndex:
     # ------------------------------------------------------------------ #
 
     def _open_ro(self) -> sqlite3.Connection:
-        uri = "file:" + urllib.parse.quote(str(db_path())) + "?mode=ro"
+        uri = ("file:" + urllib.parse.quote(str(self._db or db_path()))
+               + "?mode=ro")
         conn = sqlite3.connect(uri, uri=True)
         conn.row_factory = sqlite3.Row
         conn.execute(f"PRAGMA busy_timeout={_BUSY_TIMEOUT_MS}")
@@ -645,8 +805,10 @@ class FtsIndex:
 
     def _open_rw(self) -> sqlite3.Connection:
         """Open (creating on first use) the index db. The ONLY fts write
-        seam: the directory comes from state adoption (the one door)."""
-        path = state.State.resolve().adopt().fts / _DB_NAME
+        seam: the directory comes from state adoption (the one door); a
+        rebuild's scratch instance overrides the file name only — same
+        directory, promoted atomically."""
+        path = self._db or (state.State.resolve().adopt().fts / _DB_NAME)
         conn = sqlite3.connect(path)
         conn.row_factory = sqlite3.Row
         conn.isolation_level = None  # explicit BEGIN IMMEDIATE / COMMIT
@@ -663,6 +825,17 @@ class FtsIndex:
                          "NOT NULL DEFAULT 'local'")
             self._meta_set(conn.cursor(), "schema_version",
                            str(SCHEMA_VERSION))
+            conn.commit()
+        # Not in _SCHEMA: on a v1 db the column above must land first.
+        # status() counts backfilled docs by source on every search — a
+        # 300k-row scan per call without this index. Busy writer: skip,
+        # the next write-open creates it.
+        have_idx = conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type = 'index' "
+            "AND name = 'docs_source'").fetchone()
+        if not have_idx and self._begin_immediate(conn):
+            conn.execute("CREATE INDEX IF NOT EXISTS docs_source "
+                         "ON docs(source)")
             conn.commit()
         if self._meta_get(conn, "schema_version") is None:
             if self._begin_immediate(conn):
@@ -890,24 +1063,28 @@ class FtsIndex:
         now = time.time()
         data_dir = self._data_dir(url)
         path = find_emlx_path(data_dir, rowid) if data_dir else None
+        stamps = ("graph_miss", "graph_none")
         if path is None:
             src = self._source_of(cur, rowid)
             if src == "graph":
                 return "indexed"  # remote body still serves this rowid
-            if src == "graph_miss":
-                return "missing"  # stamped: a re-stat must not un-stamp
-            return self._record(cur, rowid, "missing", now, 0)
+            # A stamped doc keeps its stamp — but the attempt is RECORDED:
+            # frozen attempts/last_attempt held stamped docs permanently
+            # 'due' at the head of the retry queue, starving every
+            # genuinely late-materializing body (the P04 starvation,
+            # re-introduced by the stamp early-returns, 2026-08-07).
+            return self._record(cur, rowid, "missing", now, 0,
+                                source=src if src in stamps else "local")
         try:
             text = self._extract_text(path)
         except Exception as e:  # any parse failure — never abort a crawl
             src = self._source_of(cur, rowid)
             if src == "graph":
                 return "indexed"
-            if src == "graph_miss":
-                return "error"
             get_logger().warning("fts: cannot index rowid %s (%s): %s",
                                  rowid, path, e)
-            return self._record(cur, rowid, "error", now, 0)
+            return self._record(cur, rowid, "error", now, 0,
+                                source=src if src in stamps else "local")
         status = "partial" if path.name.endswith(".partial.emlx") else "indexed"
         if status == "partial" and self._source_of(cur, rowid) == "graph":
             return "indexed"
@@ -1037,7 +1214,11 @@ class FtsIndex:
 
     def _message_id_from_partial(self, rowid: int, url: str) -> str | None:
         """RFC Message-ID read from the partial file's own headers — the
-        only place it exists locally (the Envelope Index keeps a hash)."""
+        only place it exists locally (the Envelope Index keeps a hash).
+        None means the file parses and simply HAS no Message-ID header
+        (a doc that can never be asked); read and parse failures RAISE —
+        an unreadable file is absence of evidence, and the caller defers
+        the doc instead of stamping it."""
         import email as email_mod
 
         from .sources.apple_mail import _read_emlx_bytes
@@ -1045,13 +1226,14 @@ class FtsIndex:
         data_dir = self._data_dir(url)
         path = find_emlx_path(data_dir, rowid) if data_dir else None
         if path is None:
-            return None
-        try:
-            raw = _read_emlx_bytes(path)
-            msg = email_mod.message_from_bytes(raw)
-            mid = (msg.get("Message-ID") or "").strip()
-        except Exception:  # noqa: BLE001 — a hostile header is a miss
-            return None
+            raise FileNotFoundError(f"no partial file for rowid {rowid}")
+        raw = _read_emlx_bytes(path)
+        msg = email_mod.message_from_bytes(raw)
+        # str() first: an unencoded 8-bit value arrives as
+        # email.header.Header, not str. Then collapse ALL whitespace:
+        # folding can leave '\r\n ' inside the angle-addr, Graph rejects
+        # a $filter containing it, and no real Message-ID holds spaces.
+        mid = re.sub(r"\s+", "", str(msg.get("Message-ID") or ""))
         return mid or None
 
     @staticmethod
@@ -1202,6 +1384,8 @@ def _print_status(st: dict, as_json: bool) -> None:
     print(f"built: {st['built_at'] or '-'}  synced: {st['last_sync_at'] or '-'}  "
           f"reconciled: {st['last_reconcile_at'] or '-'}  "
           f"backfilled: {st.get('last_backfill_at') or '-'}")
+    if st.get("last_backfill_error"):
+        print(f"backfill trouble: {st['last_backfill_error']}")
 
 
 def main(argv: list[str] | None = None) -> int:

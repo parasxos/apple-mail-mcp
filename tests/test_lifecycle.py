@@ -529,14 +529,23 @@ class SeqLaunchctl:
         return subprocess.CompletedProcess(args, 0, stdout=out, stderr="")
 
 
-EXIT0 = "state = not running\nlast exit code = 0\n"
-EXIT1 = "state = not running\nlast exit code = 1\n"
-RUNNING = "state = running\n"
+def DUMP(runs: int, code: int) -> str:
+    return (f"state = not running\nruns = {runs}\n"
+            f"last exit code = {code}\n")
+
+
+RUNNING = "state = running\nruns = 1\n"
 
 
 @pytest.fixture
 def no_sleep(monkeypatch):
     monkeypatch.setattr("time.sleep", lambda s: None)
+
+
+def _write_agent_log(text: str) -> None:
+    log = fts._log_path()
+    log.parent.mkdir(parents=True, exist_ok=True)
+    log.write_text(text)
 
 
 def test_aftercare_is_a_noop_without_the_agent(home, monkeypatch):
@@ -548,10 +557,24 @@ def test_aftercare_verifies_a_green_agent_and_asks_nothing(
     home, monkeypatch, capsys, no_sleep,
 ):
     fts._plist_path().write_text("<plist/>")
-    monkeypatch.setattr(plan, "_launchctl", SeqLaunchctl([EXIT0, EXIT0]))
+    # baseline runs=4; post-kick runs=5 exit 0 — a FRESH verdict
+    monkeypatch.setattr(plan, "_launchctl",
+                        SeqLaunchctl([DUMP(4, 0), DUMP(5, 0)]))
     _no_input(monkeypatch)
     lifecycle._fts_agent_aftercare()
     assert "verified" in capsys.readouterr().out
+
+
+def test_verify_never_trusts_a_stale_exit_code(home, monkeypatch, no_sleep):
+    """The loaded-machine trap: launchd has not spawned the kicked run
+    yet, so every dump still shows LAST NIGHT's exit 0 with an
+    unchanged runs counter. That is not evidence about the kicked run —
+    the verdict must be 'cannot judge', never 'verified'."""
+    fts._plist_path().write_text("<plist/>")
+    monkeypatch.setattr(
+        plan, "_launchctl",
+        SeqLaunchctl([DUMP(3, 0), DUMP(3, 0), DUMP(3, 0)]))
+    assert lifecycle._verify_fts_agent() is None
 
 
 def test_aftercare_walks_the_fda_grant_until_the_agent_runs(
@@ -559,11 +582,14 @@ def test_aftercare_walks_the_fda_grant_until_the_agent_runs(
 ):
     """The first-user machine (2026-08-04): agent installed three days
     earlier, dying with PermissionError every night. Aftercare kicks it,
-    sees the death, opens the FDA pane + reveals the python binary,
-    waits for the human, re-verifies — green only when a real run
-    survives."""
+    sees the death, reads the CAUSE off the agent's own log, opens the
+    FDA pane + reveals the python binary, waits for the human,
+    re-verifies — green only when a real run survives."""
     fts._plist_path().write_text("<plist/>")
-    fake = SeqLaunchctl([EXIT1, EXIT1,                       # verify 1: died
+    _write_agent_log("PermissionError: [Errno 1] Operation not permitted: "
+                     "'/Users/u/Library/Mail'\n")
+    fake = SeqLaunchctl([DUMP(1, 1), DUMP(2, 1),             # verify 1: died
+                         DUMP(2, 1),                          # baseline 2
                          RUNNING, RUNNING, RUNNING, RUNNING])  # verify 2
     monkeypatch.setattr(plan, "_launchctl", fake)
     opened = []
@@ -587,7 +613,9 @@ def test_aftercare_skip_removes_the_agent_instead_of_leaving_it_red(
     right now removes the agent (re-added any time) rather than keeping
     a nightly failure the doctor reddens forever."""
     fts._plist_path().write_text("<plist/>")
-    monkeypatch.setattr(plan, "_launchctl", SeqLaunchctl([EXIT1, EXIT1]))
+    _write_agent_log("PermissionError: Operation not permitted\n")
+    monkeypatch.setattr(plan, "_launchctl",
+                        SeqLaunchctl([DUMP(1, 1), DUMP(2, 1)]))
     monkeypatch.setattr(lifecycle, "_open_in_macos", lambda *a, **k: None)
     removed = []
     monkeypatch.setattr(
@@ -597,6 +625,55 @@ def test_aftercare_skip_removes_the_agent_instead_of_leaving_it_red(
     lifecycle._fts_agent_aftercare()
     assert removed == [True]
     assert "removed" in capsys.readouterr().out
+
+
+def test_aftercare_names_the_rebuild_for_a_damaged_index(
+    home, monkeypatch, capsys, no_sleep,
+):
+    """A damaged index is not a permissions problem: the FDA walk must
+    never be prescribed for it (it used to loop such a machine through
+    System Settings until the only green exit uninstalled a healthy
+    agent). The log names the cause; the remedy is the rebuild, and the
+    agent stays."""
+    fts._plist_path().write_text("<plist/>")
+    _write_agent_log("sqlite3.DatabaseError: database disk image is "
+                     "malformed\n")
+    monkeypatch.setattr(plan, "_launchctl",
+                        SeqLaunchctl([DUMP(1, 1), DUMP(2, 1)]))
+    opened = []
+    monkeypatch.setattr(
+        lifecycle, "_open_in_macos",
+        lambda target, reveal=False: opened.append(target))
+    _no_input(monkeypatch)                     # asks NOTHING
+    removed = []
+    monkeypatch.setattr(fts, "uninstall_launchd",
+                        lambda: removed.append(True) or "removed")
+    lifecycle._fts_agent_aftercare()
+    out = capsys.readouterr().out
+    assert "--rebuild" in out
+    assert "Full Disk Access" not in out
+    assert opened == [] and removed == []
+
+
+def test_aftercare_unknown_failure_names_the_log_and_keeps_the_agent(
+    home, monkeypatch, capsys, no_sleep,
+):
+    """No marker in the log: aftercare refuses to guess — it names the
+    log, keeps the agent, and leaves the flagging to doctor (which now
+    sees unloaded and failing agents alike)."""
+    fts._plist_path().write_text("<plist/>")
+    monkeypatch.setattr(plan, "_launchctl",
+                        SeqLaunchctl([DUMP(1, 1), DUMP(2, 1)]))
+    opened = []
+    monkeypatch.setattr(
+        lifecycle, "_open_in_macos",
+        lambda target, reveal=False: opened.append(target))
+    _no_input(monkeypatch)
+    lifecycle._fts_agent_aftercare()
+    out = capsys.readouterr().out
+    assert str(fts._log_path()) in out
+    assert "Full Disk Access" not in out
+    assert opened == []
 
 
 def test_setup_reconfigure_is_backup_first(home, smoke, monkeypatch):

@@ -44,6 +44,7 @@ AUDIT_SQUAT = "audit_squat"
 META_VERSION = "meta_version"
 LEGACY_LAUNCHD = "legacy_launchd"
 PLIST_DRIFT = "plist_drift"
+AGENT_UNLOADED = "agent_unloaded"
 
 
 @dataclass(frozen=True)
@@ -282,6 +283,39 @@ def _repair_plist_drift(writer: StateWriter, f: Finding) -> list[plan.Action]:
     return rows
 
 
+def _agent_loaded(label: str) -> bool | None:
+    """Is the agent loaded in the gui domain (launchctl print, through
+    THE seam)? None = unknowable (non-macOS CI) — never guessed."""
+    try:
+        r = plan._launchctl("print", f"gui/{os.getuid()}/{label}")
+    except Exception:  # noqa: BLE001 — no launchctl here
+        return None
+    return r.returncode == 0
+
+
+def _probe_agent_unloaded(reader: StateReader) -> Finding | None:
+    """A plist on disk says what WOULD run; only launchd says whether
+    anything will. An installed agent that is not loaded (bootstrap
+    failed at setup, or booted out by hand) runs NOTHING until the next
+    login — and no file-level probe can see it: the plist content
+    matches its render exactly, so PLIST_DRIFT stays quiet."""
+    stale = [plist for label, plist, _content in _agents()
+             if plist.exists() and _agent_loaded(label) is False]
+    if not stale:
+        return None
+    return Finding(AGENT_UNLOADED,
+                   f"{len(stale)} installed launchd agent(s) not loaded — "
+                   f"nothing scheduled will run: "
+                   f"{', '.join(p.name for p in stale)}",
+                   tuple(stale))
+
+
+def _repair_agent_unloaded(writer: StateWriter,
+                           f: Finding) -> list[plan.Action]:
+    return [plan.BootstrapAgent(label, plist)
+            for label, plist, _content in _agents() if plist in f.paths]
+
+
 REGISTRY: tuple[Check, ...] = (
     Check(TREE_MODES, _probe_tree_modes, _repair_tree_modes),
     Check(SECRET_MODES, _probe_secret_modes, _repair_secret_modes),
@@ -289,6 +323,7 @@ REGISTRY: tuple[Check, ...] = (
     Check(META_VERSION, _probe_meta_version, _repair_meta_version),
     Check(LEGACY_LAUNCHD, _probe_legacy_launchd, _repair_legacy_launchd),
     Check(PLIST_DRIFT, _probe_plist_drift, _repair_plist_drift),
+    Check(AGENT_UNLOADED, _probe_agent_unloaded, _repair_agent_unloaded),
 )
 
 
