@@ -1,6 +1,11 @@
 # email-mcp — full operational reference
 
-Local MCP server that gives Claude Code access to Apple Mail.app on this Mac: **read** every message from Mail's own SQLite envelope database + `.emlx` files (no network, no creds, no new index), and **send** mail through the server's own delivery path. Sending is off by default for everyone but you — see [Sending mail](#sending-mail-send_email--reply_email).
+Local-first MCP server for Apple Mail on macOS. It reads Mail's own envelope
+database and `.emlx` files directly, maintains an optional full-body search
+index, and can backfill bodies from your own Exchange or IMAP provider when
+Mail has not downloaded them. Sending, drafts and scheduling use explicitly
+configured identities; without an identity, every sending tool stays
+unavailable while reading continues to work.
 
 ## Install
 
@@ -27,19 +32,24 @@ Add to `~/.claude.json` (merge with whatever is already there) — point at the 
 }
 ```
 
-Restart Claude Code. Run `/mcp` — `apple-mail` should appear with nineteen tools: `search_emails`, `get_email`, `get_emails_batch`, `get_thread`, `list_mailboxes`, `list_recent`, `get_attachment`, `refresh_mail`, `list_scheduled`, `doctor`, `send_email`, `reply_email`, `schedule_email`, `cancel_scheduled`, `triage_plan`, `triage_plan_delete`, `triage_apply`, `mailbox_create`, `mailbox_delete`. (With `EMAIL_MCP_READ_ONLY=1` only the first ten — the read-side surface — register.)
+Restart Claude Code and run `/mcp`. `apple-mail` should appear with 21 tools
+across search, sending, scheduling, triage and diagnostics; the complete list
+is in [Tool reference](#tool-reference). With `EMAIL_MCP_READ_ONLY=1`, only
+the 11 non-mutating mail tools register.
 
-To disable the self-only send guard (after you've trusted it — see [Sending mail](#sending-mail-send_email--reply_email)), add the flag to that server's `env` block:
+For a cautious first run, restrict an environment-configured identity to its
+own address by adding this flag to the server's `env` block:
 
 ```json
     "apple-mail": {
       "type": "stdio",
       "command": "/path/to/email-mcp/.venv/bin/email-mcp",
-      "env": { "EMAIL_MCP_SEND_ALLOW_ALL": "1" }
+      "env": { "EMAIL_MCP_SEND_ALLOW_ALL": "0" }
     }
 ```
 
-`~/.claude.json` is machine-local and untracked (it holds per-server secrets) — this snippet is the reproducible record of that setting.
+`~/.claude.json` is machine-local and untracked. The flag is a safety policy,
+not a secret; SMTP credentials belong in Keychain or 1Password, never here.
 
 ## macOS Full-Disk-Access
 
@@ -97,14 +107,15 @@ CERN-flavoured example (sources a secrets file, generates a TOTP). With no
 bootstrap configured (the default), a cold socket is reported as a clear
 transport error instead of being repaired.
 
-End-to-end send test (real delivery, defaults to the safe self-only guard):
+End-to-end send test (real delivery — use one of your own addresses first):
 
 ```bash
-python3 -m email_mcp.server --send-test you@example.org
+email-mcp --send-test you@example.org
 ```
 
-Prints `{ok, message_id, to, cc, bcc, ...}`; a non-self address prints the
-guard refusal instead of sending.
+Prints `{ok, message_id, to, cc, bcc, ...}`. A non-self address is refused
+only when the selected identity declares an allowlist or
+`allow_all = false`.
 
 ## Identities & transports
 
@@ -113,9 +124,10 @@ decides the transport. `~/.email-mcp/identities.toml` (override:
 `EMAIL_MCP_IDENTITIES`) maps identity names to a From address, a transport
 driver, and that driver's parameters; `send_email` / `reply_email` /
 `schedule_email` take an optional `from_identity` to pick one (omit for the
-file's `default`). Each identity carries its **own allowlist** — the
-self-only guard is per-identity, so each identity's "self" is its own
-address — plus its own Bcc-to-self target and Message-ID domain.
+file's `default`). Each identity can declare its **own allowlist**. When that
+guard is enabled, the identity's own address is always allowed; identities
+also keep separate Bcc-to-self targets, provider capabilities and Message-ID
+domains.
 
 **No file needed for one identity:** with `identities.toml` absent, a single
 identity named `default` is synthesized from the environment. The minimal
@@ -131,7 +143,7 @@ Three drivers ship, all stdlib:
 | Driver | What it is |
 |---|---|
 | `ssh_sendmail` | the original production path: `sendmail` over an SSH `ControlMaster` session |
-| `smtp` | `smtplib`, STARTTLS (or implicit TLS on port 465); password read from the macOS Keychain |
+| `smtp` | `smtplib`, STARTTLS (or implicit TLS on port 465); password read from macOS Keychain or 1Password |
 | `pipe` | pipe the raw message to a local command (`/usr/sbin/sendmail -t -i`, msmtp, …) |
 
 Picking between the first two: corporate submission hosts are often
@@ -186,7 +198,7 @@ security add-generic-password -s email-mcp-gmail -a you@gmail.com -w 'your-app-p
 Check every configured lane in one shot (part of the full diagnostic run):
 
 ```bash
-python3 -m email_mcp.server --doctor
+email-mcp doctor
 ```
 
 The `transports` check reports `{default, identities: {name: {ok, ...,
@@ -196,13 +208,13 @@ a cold socket). `--transport-check` survives as a deprecated alias that
 prints exactly that one check. To exercise a specific lane end-to-end:
 
 ```bash
-python3 -m email_mcp.server --send-test you@gmail.com --from-identity gmail
+email-mcp --send-test you@gmail.com --from-identity gmail
 ```
 
 ## Smoke test
 
 ```bash
-python3 -m email_mcp.server --selftest
+email-mcp --selftest
 ```
 
 Prints a small JSON summary (number of mailboxes, newest subject/from/date). If this works, the MCP server will work.
@@ -210,7 +222,7 @@ Prints a small JSON summary (number of mailboxes, newest subject/from/date). If 
 To exercise `refresh_mail` end-to-end against the live Mail.app:
 
 ```bash
-python3 -m email_mcp.server --refresh-test --refresh-wait 5
+email-mcp --refresh-test --refresh-wait 5
 ```
 
 Prints `{ok, applescript_duration_ms, before, after, new_messages, ...}`. Exit code is non-zero on failure (permission denied, Mail.app missing, timeout).
@@ -229,19 +241,18 @@ The tests build a fake `~/Library/Mail/V10` tree in `tmp_path` — they don't re
 | Var | Default | Effect |
 |---|---|---|
 | `EMAIL_MCP_MAIL_DIR` | newest `~/Library/Mail/V*` | Override Mail.app base directory. |
-| `EMAIL_MCP_SOURCE` | `apple` | Source adapter to load (Phase 2: gmail, imap, …). |
-| `EMAIL_MCP_READ_ONLY` | `0` | `1` registers only the ten read-side tools — the widest trust envelope for demos, reviews and new users. |
+| `EMAIL_MCP_SOURCE` | `apple` | Source adapter to load. Apple Mail is the built-in source. |
+| `EMAIL_MCP_READ_ONLY` | `0` | `1` registers only the 11 non-mutating mail tools. Local search indexing and requested attachment materialisation can still write local files. |
+| `EMAIL_MCP_STATE_DIR` | `~/.email-mcp` | One managed private root for scheduled mail, plans, Graph tokens, the body index and audit data. |
 | `EMAIL_MCP_MAX_BODY_BYTES` | `2000000` | Cap on body returned per `get_email`. |
 | `EMAIL_MCP_ATTACH_DIR` | `$TMPDIR/email-mcp` | Where `get_attachment` writes blobs. |
 | `EMAIL_MCP_FROM_ADDR` | *(empty)* | From: address for outgoing mail. Required for env-only sending (with `identities.toml` absent). |
 | `EMAIL_MCP_FROM_NAME` | *(empty)* | From: display name. |
 | `EMAIL_MCP_SEND_ALLOW_ALL` | `1` | `0` engages the env identity's guard (allowlist + own address only). Setting `EMAIL_MCP_SEND_ALLOWLIST` engages it too. |
-| `EMAIL_MCP_SEND_ALLOWLIST` | (From: addr) | Comma-separated addresses sending may reach while the guard is on. |
+| `EMAIL_MCP_SEND_ALLOWLIST` | (From: addr) | Comma-separated addresses sending may reach while the guard is on; declaring this variable enables the guard. |
 | `EMAIL_MCP_BCC_SELF` | `1` | Bcc the From: address on every send for a record. |
 | `EMAIL_MCP_MAX_ATTACH_MB` | `20` | Total attachment budget per outgoing message (file bytes, pre-base64). |
-| `EMAIL_MCP_SPOOL_DIR` | `~/.email-mcp/spool` | Scheduled-send spool root (created 0700). |
 | `EMAIL_MCP_SEND_RETRIES` | `5` | Delivery attempts per scheduled message before parking in `failed/`. |
-| `EMAIL_MCP_PLANS_DIR` | `~/.email-mcp/plans` | Triage plan store (created 0700). |
 | `EMAIL_MCP_TRIAGE_MAX` | `200` | Message cap per triage plan (bigger selections rejected). |
 | `EMAIL_MCP_TRIAGE_DELETE_MAX` | `50` | Tighter cap per delete plan (`triage_plan_delete`). |
 | `EMAIL_MCP_TRIAGE_TTL` | `600` | Seconds a draft plan stays applicable. |
@@ -253,7 +264,6 @@ The tests build a fake `~/Library/Mail/V10` tree in `tmp_path` — they don't re
 | `EMAIL_MCP_DELIVERY_CMD` | `/usr/sbin/sendmail` | Remote delivery command. |
 | `EMAIL_MCP_SSH_BOOTSTRAP` | *(empty)* | Optional command that re-establishes a cold socket headlessly (`tools/lxplus_mail_master.sh` is a documented example). |
 | `EMAIL_MCP_IDENTITIES` | `~/.email-mcp/identities.toml` | Identity routing file (see [Identities & transports](#identities--transports)); absent → one identity synthesized from the env vars above (needs `EMAIL_MCP_FROM_ADDR`). |
-| `EMAIL_MCP_FTS_DIR` | `~/.email-mcp/fts` | FTS body-index directory (created 0700 by build paths only). |
 | `EMAIL_MCP_FTS_ENABLED` | `1` | `0` disables FTS body hits in `search_emails` (snippet-only search). |
 | `EMAIL_MCP_FTS_MAX_HITS` | `2000` | Cap on FTS rowid hits folded into one search (newest kept). |
 | `EMAIL_MCP_FTS_INLINE_BATCH` | `500` | Max documents the inline (search-time) incremental pass indexes. |
@@ -263,28 +273,45 @@ The tests build a fake `~/Library/Mail/V10` tree in `tmp_path` — they don't re
 | `EMAIL_MCP_LOG_FILE` | `~/Library/Logs/email-mcp.log` | Debug log path; `off` disables file logging. |
 | `EMAIL_MCP_LOG_LEVEL` | `INFO` | Log verbosity. |
 
+The old per-component overrides (`EMAIL_MCP_SPOOL_DIR`,
+`EMAIL_MCP_PLANS_DIR`, `EMAIL_MCP_GRAPH_DIR`, `EMAIL_MCP_FTS_DIR` and
+`EMAIL_MCP_AUDIT_DIR`) are retired. If one is still set, email-mcp refuses
+the state configuration and tells you to replace it with
+`EMAIL_MCP_STATE_DIR`; it never silently writes to two state trees.
+
 ## Tool reference
 
-The seven read tools are **read-only on disk**. `refresh_mail` nudges Mail.app via AppleScript but writes nothing to `~/Library/Mail` itself. `send_email` / `reply_email` are the only tools that leave the machine, gated by the self-only guard above. All return JSON-friendly objects.
+All 21 tools return JSON-friendly objects. email-mcp never opens Mail's own
+database writable: mailbox changes go through Mail.app. “Read-only mode” is
+about mail mutation, not absolute filesystem purity—`search_emails` may
+incrementally maintain the private FTS index, `get_attachment` materialises a
+requested file, and `refresh_mail` asks Mail.app to sync. Provider-backed body
+backfill, drafts and server-side scheduling contact only the configured mail
+provider.
 
 | Tool | Purpose |
 |---|---|
 | `search_emails(query, from_addr?, to_addr?, mailbox?, account?, before?, after?, has_attachment?, unread_only?, limit?, offset?)` | Full-text search over subject + sender + snippet, plus AND filters. |
 | `get_email(id)` | Full headers, plain-text and HTML body, attachment list for one message. |
+| `get_emails_batch(ids, view?)` | Full or metadata views for several message ids in one bounded call, with per-item errors. |
 | `get_thread(thread_id)` | All messages in the conversation, oldest first. |
 | `list_mailboxes()` | Every mailbox across every account, with counts. |
 | `list_recent(mailbox?, account?, limit?)` | Newest messages first. |
 | `get_attachment(id, attachment_id)` | Materialises the attachment to a tmp file; returns the path. |
 | `refresh_mail(wait_seconds=5, timeout_seconds=30)` | Asks Mail.app to fetch new mail, waits, returns before/after snapshot + delta count. Launches Mail.app if it isn't running. Needs Automation permission (see above). |
-| `send_email(to, subject, body, cc?, bcc?, attachments?, from_identity?)` | Compose and send. Comma-separated address strings. `attachments` = list of local file paths (each entry ONE path), attached with guessed MIME types; total capped at `EMAIL_MCP_MAX_ATTACH_MB` (default 20). `from_identity` picks the sending identity (see [Identities & transports](#identities--transports)). Auto Bcc-to-self. Self-only guard applies per identity. Returns `{ok, message_id, to, cc, bcc, subject, attachments}` or `{ok: false, error}`. |
-| `schedule_email(to, subject, body, send_at, cc?, bcc?, attachments?, from_identity?)` | Compose + freeze now, deliver at `send_at` via the launchd dispatcher on the recorded identity's transport. Returns `{ok, id, send_at, message_id, ...}`. |
-| `list_scheduled(state?, limit?)` | The "Send Later mailbox": pending / sending / sent / failed / cancelled, with errors and delivery stamps. |
+| `send_email(to, subject, body, cc?, bcc?, attachments?, from_identity?)` | Compose and send. Comma-separated address strings. `attachments` = list of local file paths (each entry ONE path), attached with guessed MIME types; total capped at `EMAIL_MCP_MAX_ATTACH_MB` (default 20). `from_identity` picks the sending identity (see [Identities & transports](#identities--transports)). Auto Bcc-to-self. A declared allowlist applies per identity. Returns `{ok, message_id, to, cc, bcc, subject, attachments}` or `{ok: false, error}`. |
+| `reply_email(id, body, reply_all?, cc?, bcc?, include_history?, attachments?, from_identity?)` | Reply with correct `In-Reply-To` / `References`, optional reply-all, quoted history and attachments. |
+| `create_draft(to, subject, body, cc?, in_reply_to?, from_identity?)` | Create and verify a draft in a Graph-enabled identity's real Exchange Drafts folder; never sends it. |
+| `schedule_email(to, subject, body, send_at, cc?, bcc?, attachments?, from_identity?)` | Compose and durably freeze now. Exchange identities can schedule server-side; other identities use the local background dispatcher. Returns `{ok, id, send_at, message_id, ...}`. |
+| `list_scheduled(state?, limit?)` | The "Send Later mailbox": pending / sending / sent / failed / cancelled. If an on-disk record is corrupt or incomplete, returns healthy records plus `{ok: false, code: "spool_integrity", integrity: ...}` instead of a false empty list. |
 | `cancel_scheduled(id)` | Cancel a pending scheduled message (sent/mid-flight cannot be recalled). |
 | `triage_plan(filters..., actions)` | Stage a mailbox operation: same filters as `search_emails` + a list of dispositions. Mutates nothing; returns `{plan_id, count, summary, messages}` for review. |
+| `triage_plan_delete(filters...)` | Stage a Trash move through the separate destructive door and tighter 50-message cap; still mutates nothing until apply. |
 | `triage_apply(plan_id)` | Execute a staged plan (one batched AppleScript, by-ROWID addressing) + verify against the index. Per-message failures are data. |
 | `mailbox_create(account, path)` | Create a (nested) mailbox; idempotent. |
 | `mailbox_delete(account, path)` | Delete an EMPTY mailbox; idempotent. Outcome decided by live re-probe (Mail's delete verb lies); escalates to UI scripting when the verb has no effect (needs Accessibility permission). |
-| `reply_email(id, body, reply_all?, cc?, bcc?, include_history?, attachments?, from_identity?)` | Reply to message `id`, threading via In-Reply-To / References / `Re:` subject. Quotes the original below the reply (attribution + `>` block, HTML blockquote) like a normal client; `include_history=False` for a bare reply. Defaults to the original sender only; `reply_all=True` also Ccs the original To+Cc minus your own address. `attachments` as in `send_email`. |
+| `doctor()` | Full installation, permission, transport, queue and index diagnostics with concrete fixes. |
+| `audit(filters...)` | Query the local best-effort activity ledger; skipped torn/corrupt lines are counted explicitly. |
 
 ## Drafts (`create_draft`)
 
@@ -317,25 +344,42 @@ has no automation API; verified against Mail.sdef), without touching Mail's
 database:
 
 - `schedule_email(..., send_at)` composes and **freezes** the full RFC-822
-  now — recipients validated, allowlist enforced, attachments embedded,
+  now — recipients validated, any declared allowlist enforced, attachments
+  embedded,
   Bcc-to-self added — into `~/.email-mcp/spool/pending/` (mode 0700).
   Naive `send_at` means local time; explicit offsets respected.
-- A **launchd agent** (`com.email-mcp.dispatcher`, every 60 s +
+- Manifest creates and updates use a same-directory temporary file, flush the
+  file, atomically replace the live record, and flush the directory. An
+  interrupted update therefore leaves the previous valid manifest intact.
+  `list_scheduled`, `email-mcp dispatcher --status`, and `email-mcp doctor`
+  report corrupt JSON, missing `.eml`/manifest pairs and interrupted temp
+  files; healthy siblings are still listed and dispatched.
+- For local transports, a **launchd agent**
+  (`com.email-mcp.dispatcher`, every 60 s +
   RunAtLoad) delivers what is due over the same SSH path, bootstrapping the
   ControlMaster if cold. Worst-case delivery lag is ~two ticks (~2 min) past
-  send_at — measured 81 s in fleet testing. Mac asleep at send time → the message goes out on
-  the first pass after wake, like Mail.app's "send when opened".
+  `send_at` — measured 81 s in fleet testing. Mac asleep at send time → the
+  message goes out on the first pass after wake, like Mail.app's "send when
+  opened". A Graph-enabled Exchange identity hands the schedule to Exchange,
+  so it can fire while the Mac is offline.
 - Failures retry with backoff (2/5/15/45/120 min, `EMAIL_MCP_SEND_RETRIES`
   attempts, default 5), then park in `failed/` with the error + a macOS
-  notification. Overlapping dispatcher runs are double-send-safe (atomic
-  manifest rename claims ownership).
+  notification. Atomic claim renames prevent overlapping dispatcher runs from
+  owning the same record concurrently.
+- Local scheduled delivery is **at-least-once across the transport handoff**.
+  If the process dies after the provider accepts the message but before the
+  record moves from `sending/` to `sent/`, recovery cannot know the outcome
+  and may deliver it again after 10 minutes. The frozen `Message-ID` is the
+  deduplication key. Graph schedules reconcile against Exchange Drafts/Sent.
 - Authorization happens at **schedule time** (inside the MCP server, where
   your config lives); the dispatcher deliberately does not re-check — it
-  runs under launchd's bare environment where the self-only default would
-  block everything.
-- Install once: `python -m email_mcp.dispatcher --install-launchd`
-  (also `--uninstall-launchd`, `--status`; log at
-  `~/.email-mcp/dispatcher.log`). Install and uninstall also boot out and
+  runs under launchd's bare environment where identity policy is not loaded.
+- `email-mcp setup` installs the background sender. Its direct operational
+  commands are `email-mcp dispatcher --status`,
+  `email-mcp dispatcher --install-launchd` and
+  `email-mcp dispatcher --uninstall-launchd`; the log is at
+  `~/.email-mcp/dispatcher.log`.
+  Install and uninstall also boot out and
   remove any pre-v0.8 agent (`com.paris.email-mcp-dispatcher`), so
   upgrading never leaves two dispatchers ticking over the same spool.
 
@@ -370,11 +414,15 @@ index verifies the mutations landed (write-through ≤2 s).
   Envelope Index itself is **never opened writable** — all mutations go
   through Mail.app, which owns server sync.
 
-## Phase-2 hooks (not implemented yet)
+## Extension points
 
 - **More sources**: implement `EmailSource` in `email_mcp/sources/`, register in `email_mcp/sources/__init__.py::_REGISTRY`, select via `EMAIL_MCP_SOURCE`.
-- ~~**FTS5 sidecar**~~ shipped in v0.8.0: `python -m email_mcp.fts --build` indexes `.emlx` bodies into a local FTS5 db; `search_emails` folds body hits in transparently (see the `EMAIL_MCP_FTS_*` vars above).
-- **More write tools** (mark-read, move): future. `send_email` / `reply_email` shipped in v0.2.0; reply history-quoting in v0.3.0; outgoing attachments in v0.4.0; scheduled send in v0.5.0; triage (mailbox management) in v0.6.0; identity transports in v0.7.0.
+- **Body indexing** is already built in: `email-mcp fts --build` indexes
+  local `.emlx` bodies, and `search_emails` folds those hits in
+  transparently.
+- Additional providers and write capabilities should extend the source,
+  transport and identity seams rather than bypassing the state and audit
+  boundaries.
 
 ## Safety notes
 
@@ -382,5 +430,12 @@ index verifies the mutations landed (write-through ≤2 s).
 - Never writes to `~/Library/Mail`. Sending never touches the Mail store.
 - Triage mutations go through Mail.app's AppleScript interface; the Envelope Index is never opened writable.
 - `get_attachment` writes only to the configurable `EMAIL_MCP_ATTACH_DIR`.
-- Body and attachment size are capped by `EMAIL_MCP_MAX_BODY_BYTES`.
-- Sending is the only outward action: gated by the client's per-send permission prompt (plus the opt-in allowlist guard for trials), a mandatory non-empty `to`/`subject`/`body`, and Bcc-to-self for an audit trail.
+- Returned bodies are capped by `EMAIL_MCP_MAX_BODY_BYTES`; outgoing
+  attachments have the separate `EMAIL_MCP_MAX_ATTACH_MB` budget.
+- Outward provider access is limited to configured delivery plus optional
+  Exchange/IMAP body backfill, Graph drafts and server-side scheduling.
+- SMTP secrets stay in Keychain/1Password. Graph access and refresh tokens
+  are stored locally in 0600 files below the managed 0700 state root.
+- The audit ledger is best-effort by design: an unwritable ledger never
+  blocks a mail operation. Reconcile using the scheduled record, frozen
+  Message-ID, Bcc-to-self copy or provider Sent Items.

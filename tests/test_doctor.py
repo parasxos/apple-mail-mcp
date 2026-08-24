@@ -418,7 +418,7 @@ def test_installed_but_unloaded_fts_agent_reddens(monkeypatch):
 def test_unloaded_dispatcher_bites_once_something_is_pending(monkeypatch):
     """Same gating as not-installed: informational while the spool is
     empty, red the moment a scheduled send is waiting on it."""
-    from email_mcp import dispatcher
+    from email_mcp import dispatcher, spool
 
     plist = dispatcher._plist_path()
     plist.parent.mkdir(parents=True, exist_ok=True)
@@ -426,8 +426,11 @@ def test_unloaded_dispatcher_bites_once_something_is_pending(monkeypatch):
     monkeypatch.setattr(doctor, "_agent_loaded", lambda label: False)
     check = doctor.check_dispatcher()
     assert check["ok"] is True and check["loaded"] is False
-    monkeypatch.setattr("email_mcp.spool.entries",
-                        lambda s: ["e"] if s == "pending" else [])
+    monkeypatch.setattr(
+        "email_mcp.spool.scan",
+        lambda s: spool.Scan(s, manifest_files=1, eml_files=1)
+        if s == "pending" else spool.Scan(s),
+    )
     check = doctor.check_dispatcher()
     assert check["ok"] is False
     assert "doctor --fix" in check["fix"]

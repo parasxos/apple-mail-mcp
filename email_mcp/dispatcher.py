@@ -17,10 +17,10 @@ send armed at schedule time) and never enter the local claim/deliver path;
 each pass reconciles their outcome instead — see _reconcile_graph.
 
 CLI:
-  python -m email_mcp.dispatcher              # one pass (what launchd runs)
-  python -m email_mcp.dispatcher --status     # spool overview
-  python -m email_mcp.dispatcher --install-launchd
-  python -m email_mcp.dispatcher --uninstall-launchd
+  email-mcp dispatcher                        # one pass (what launchd runs)
+  email-mcp dispatcher --status               # spool overview
+  email-mcp dispatcher --install-launchd
+  email-mcp dispatcher --uninstall-launchd
 """
 from __future__ import annotations
 
@@ -373,7 +373,12 @@ def run_once(now: datetime | None = None) -> dict:
            if e.executor != "graph" and _due(e, now)]
     results: dict[str, str] = _reconcile_graph(now)
     if not due:
-        return {"checked_at": spool.iso(now), "due": 0, "results": results}
+        summary = {"checked_at": spool.iso(now), "due": 0,
+                   "results": results}
+        integrity = spool.integrity(spool.scan_all())
+        if not integrity["ok"]:
+            summary["integrity"] = integrity
+        return summary
 
     # Per-run memo: ensure each identity's transport once, however many
     # messages ride it. An unknown identity at fire time is retried with
@@ -405,8 +410,10 @@ def run_once(now: datetime | None = None) -> dict:
             continue
         try:
             raw = spool.read_eml("sending", entry.id)
-        except FileNotFoundError:
-            entry.last_error = "spool .eml missing"
+        except OSError as e:
+            entry.last_error = ("spool .eml missing" if
+                                isinstance(e, FileNotFoundError) else
+                                f"spool .eml unreadable: {e}")
             spool.move(entry.id, "sending", "failed", entry)
             # Bypasses the _fail_or_retry funnel (no retry can help a
             # vanished .eml) — so it records its own deliver event.
@@ -440,7 +447,12 @@ def run_once(now: datetime | None = None) -> dict:
                    subject=entry.subject)
         results[entry.id] = "sent"
 
-    return {"checked_at": spool.iso(now), "due": len(due), "results": results}
+    summary = {"checked_at": spool.iso(now), "due": len(due),
+               "results": results}
+    integrity = spool.integrity(spool.scan_all())
+    if not integrity["ok"]:
+        summary["integrity"] = integrity
+    return summary
 
 
 # --------------------------------------------------------------------- #
@@ -533,19 +545,26 @@ def uninstall_launchd() -> str:
 
 
 def status() -> dict:
-    return {
+    scans = spool.scan_all()
+    integrity = spool.integrity(scans)
+    pending = next(result for result in scans if result.state == "pending")
+    out = {
+        "ok": integrity["ok"],
         "spool": str(config.spool_dir()),
         "launchd_plist": str(_plist_path()),
         "launchd_installed": _plist_path().exists(),
-        "counts": {s: len(spool.entries(s)) for s in spool.STATES},
+        "counts": integrity["counts"],
         "pending": [
             {"id": e.id, "send_at": e.send_at, "to": e.to,
              "subject": e.subject, "attempts": e.attempts,
              "next_attempt_at": e.next_attempt_at, "last_error": e.last_error,
              "executor": e.executor}
-            for e in spool.entries("pending")
+            for e in pending.entries
         ],
     }
+    if not integrity["ok"]:
+        out["integrity"] = integrity
+    return out
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -556,9 +575,10 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--uninstall-launchd", action="store_true")
     args = parser.parse_args(argv)
     if args.status:
-        json.dump(status(), sys.stdout, indent=2)
+        report = status()
+        json.dump(report, sys.stdout, indent=2)
         sys.stdout.write("\n")
-        return 0
+        return 0 if report["ok"] else 1
     if args.install_launchd:
         print(install_launchd())
         return 0
@@ -571,7 +591,10 @@ def main(argv: list[str] | None = None) -> int:
     if summary["due"] or summary["results"]:
         json.dump(summary, sys.stdout)
         sys.stdout.write("\n")
-    return 0
+    elif "integrity" in summary:
+        json.dump(summary, sys.stdout)
+        sys.stdout.write("\n")
+    return 1 if "integrity" in summary else 0
 
 
 if __name__ == "__main__":

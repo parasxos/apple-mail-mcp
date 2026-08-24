@@ -327,7 +327,9 @@ def check_dispatcher() -> dict:
     if log.exists():
         log_mtime = datetime.fromtimestamp(
             log.stat().st_mtime, tz=timezone.utc).isoformat(timespec="seconds")
-    pending = len(spool.entries("pending"))
+    pending_scan = spool.scan("pending")
+    pending = pending_scan.manifest_files
+    pending_integrity = spool.integrity([pending_scan])
 
     bits = [f"label {LAUNCHD_LABEL}: "
             f"{'installed' if installed else 'NOT installed'}",
@@ -335,7 +337,7 @@ def check_dispatcher() -> dict:
             f"log mtime {log_mtime or 'never'}"]
     fixes: list[str] = []
     if not installed:
-        fixes.append("python -m email_mcp.dispatcher --install-launchd")
+        fixes.append("email-mcp dispatcher --install-launchd")
     # Installed is the plist; SCHEDULED is launchd. An unloaded agent
     # (bootstrap failed at setup, or booted out) delivers nothing until
     # the next login while every file probe reads healthy.
@@ -353,10 +355,16 @@ def check_dispatcher() -> dict:
     if last_exit not in (None, 0):
         bits.append(f"last run exited {last_exit}")
         fixes.append(_AGENT_EXIT_FIX.format(log=log))
+    if not pending_integrity["ok"]:
+        bits.append(f"{len(pending_integrity['issues'])} pending-spool "
+                    "integrity issue(s)")
+        fixes.append("scheduled records need attention — run `email-mcp "
+                     "dispatcher --status` and reconcile every named file")
     out: dict = {
         # Not installed only bites once something is waiting to send.
-        "ok": ((installed and loaded is not False) or pending == 0)
-        and last_exit in (None, 0),
+        "ok": (((installed and loaded is not False) or pending == 0)
+               and last_exit in (None, 0)
+               and pending_integrity["ok"]),
         "detail": "; ".join(bits),
         "installed": installed,
         "loaded": loaded,
@@ -365,6 +373,8 @@ def check_dispatcher() -> dict:
         "pending": pending,
         "log_mtime": log_mtime,
     }
+    if not pending_integrity["ok"]:
+        out["integrity"] = pending_integrity
     if fixes:
         out["fix"] = "; ".join(fixes)
     return out
@@ -389,30 +399,33 @@ def check_spool_plans() -> dict:
             problems.append(f"{label} dir {d} is mode {mode:o} (want 700)")
             fixes.append(f"chmod 700 {d}")
 
+    scans = spool.scan_all()
+    integrity = spool.integrity(scans)
+    counts = integrity["counts"]
     stranded: list[str] = []
-    try:
-        counts = {s: len(spool.entries(s)) for s in spool.STATES}
-        now = spool.utcnow()
-        for e in spool.entries("sending"):
-            try:
-                ref = datetime.fromisoformat(e.next_attempt_at or e.send_at)
-            except ValueError:
-                stranded.append(e.id)
-                continue
-            if (now - ref).total_seconds() / 60 >= STALE_SENDING_MINUTES:
-                stranded.append(e.id)
-    except OSError as e:
-        # Doctor must REPORT the fault it exists to diagnose, never die
-        # of it: a mode-000 spool made the counts scan raise out of the
-        # whole check while the chmod remedy above went unread (RC P13
-        # FM8, 2026-08-02). The modes loop has already named the fix.
-        counts = {}
-        problems.append(f"spool unreadable ({e.strerror or e}) — "
-                        "counts unavailable")
+    now = spool.utcnow()
+    sending = next(result for result in scans if result.state == "sending")
+    for e in sending.entries:
+        try:
+            ref = datetime.fromisoformat(e.next_attempt_at or e.send_at)
+        except ValueError:
+            stranded.append(e.id)
+            continue
+        if (now - ref).total_seconds() / 60 >= STALE_SENDING_MINUTES:
+            stranded.append(e.id)
+    if not integrity["ok"]:
+        problems.append(
+            f"{len(integrity['issues'])} scheduled-record integrity "
+            "issue(s); raw file counts are shown, readable counts are "
+            "reported separately"
+        )
+        fixes.append("scheduled records need attention — run `email-mcp "
+                     "dispatcher --status`; keep each named .eml until "
+                     "you have reconciled or rescheduled it")
     if stranded:
         problems.append(f"{len(stranded)} stranded claim(s) in sending/: "
                         f"{', '.join(sorted(stranded))}")
-        fixes.append("python -m email_mcp.dispatcher   # one pass recovers "
+        fixes.append("email-mcp dispatcher   # one pass recovers "
                      "stranded claims")
 
     counts_txt = ", ".join(f"{s} {n}" for s, n in counts.items())
@@ -423,6 +436,9 @@ def check_spool_plans() -> dict:
         "counts": counts,
         "stranded_sending": sorted(stranded),
     }
+    if not integrity["ok"]:
+        out["readable_counts"] = integrity["readable_counts"]
+        out["integrity"] = integrity
     if fixes:
         out["fix"] = "; ".join(fixes)
     return out

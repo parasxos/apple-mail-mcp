@@ -14,6 +14,7 @@ Groups mirror the contract:
                    ("ok" marks success internally; failures[].code is
                    always ITEM_CODES minus "ok")
   BELT_CODES       v0.10 wire-safety belts on previously-crashing paths
+  SPOOL_CODES      scheduled-store integrity/delivery artifact failures
   SEND_CODES_V011  target codes frozen on paper for today's prose-only
                    SendError failures; wired to the wire at v0.11
   OSA_CODE_MAP     osascript numeric error -> namespace code
@@ -95,6 +96,12 @@ BELT_CODES = frozenset({INTERNAL_ERROR, NOT_FOUND, INVALID_INPUT,
 # Dispatcher/ledger-level code, not on any tool's wire: a claimed spool
 # manifest whose frozen .eml is gone — the deliver event's failure code.
 SPOOL_EML_MISSING = "spool_eml_missing"
+
+# list_scheduled's partial-but-not-trustworthy result: healthy records are
+# returned, while corrupt/incomplete sibling artifacts are named explicitly.
+SPOOL_INTEGRITY = "spool_integrity"
+
+SPOOL_CODES = frozenset({SPOOL_EML_MISSING, SPOOL_INTEGRITY})
 
 # --------------------------------------------------------------------- #
 # Send codes (contract §3.4) — v0.11 targets, frozen on paper at v0.10  #

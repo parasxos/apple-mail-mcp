@@ -1,9 +1,10 @@
 # email-mcp security posture — the destructive surface, stated plainly
 
-*Written for v0.11.0 (branch `v0.11`), 2026-07-31. Companion to
-`docs/v1-contract.md`, which says what the tools promise on the wire. This
-document says what the tool can BREAK, what stops it, what does not, and
-where the guards stop being meaningful at all.*
+*Started as the v0.11.0 security review journal on 2026-07-31 and retained
+as a dated record of findings. Current user behavior and guarantees are
+defined by `README.md`, `docs/reference.md` and `docs/v1-contract.md`; “now”
+inside a historical audit entry refers to the commit reviewed in that entry
+unless the behavior is restated in those current documents.*
 
 This tool reads your mail, sends mail as you, deletes mailboxes, installs
 launchd agents, and — behind `email-mcp uninstall --purge` — deletes a
@@ -168,9 +169,13 @@ Additionally, `from_addr` / `from_name` are refused if they contain
 CR/LF/NUL, because a header value with a control character would make
 every send from that identity fail the compose fence.
 
-Secrets themselves live in the macOS Keychain or 1Password and are read by
-the driver at send time. `uninstall` never deletes them — it prints the
-exact `security delete-generic-password` commands for you to run.
+SMTP passwords live in the macOS Keychain or 1Password and are read by the
+driver at send time. Microsoft Graph is different: OAuth access and refresh
+tokens are stored locally in 0600 cache files under the managed 0700
+`~/.email-mcp/graph/` directory so background refresh and server-side
+scheduling can work without an interactive prompt. Token values are excluded
+from config, tool output, audit events and logs. `uninstall` removes local
+Graph token caches but never deletes Keychain or 1Password items.
 
 *Proven by mutation* — `test_wizard_rejects_control_chars_in_header_values`,
 `test_identity_name_fence_rejects_hostile_names`,
@@ -993,14 +998,14 @@ sibling — so this round fixed the shape, not just the instances.
   but not an unreadable manifest or month file.** The previous round had
   taught `dispatcher --status` and `doctor` both halves and the tools only
   one.
-- **THE STRUCTURAL FIX: `email_mcp/health.py`.** There is now ONE
-  definition of "is a report about our own state trustworthy", and every
-  surface that reports counts, lists or an `ok` about state this tool owns
-  merges it. A surface can no longer pick up half of it, and the helper
-  performs its own scan rather than trusting the caller to have scanned
-  first — the implicit ordering that made a too-early call return a silent
-  `{}`. Caveat keys are **conditional**: a healthy install returns exactly
-  the frozen v0.10/v0.11 shape, so the output surface does not move.
+- **THE STRUCTURAL FIX (current v1.3): `spool.scan()` +
+  `spool.integrity()`.** There is one definition of whether scheduled-mail
+  counts and lists are trustworthy. `list_scheduled`, dispatcher run/status,
+  doctor, and purge preview all consume it. The scanner enumerates raw files
+  before parsing, keeps corrupt records visible, checks `.json`/`.eml` pairs,
+  and names interrupted temp writes; healthy siblings remain actionable.
+  Audit ledger reads use their own line-oriented equivalent and report
+  `skipped_lines`.
 - **MINOR — `uninstall` named the DEFAULT root while the CONFIGURED one was
   refused**, answering about the wrong directory.
 - **MINOR — configuration silently re-moded a pre-existing tree.**

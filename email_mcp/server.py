@@ -641,11 +641,28 @@ def tool_list_scheduled(state: str | None = None, limit: int = 50) -> dict:
     # is `[0:]` — the WHOLE spool, the opposite of "give me nothing".
     _check_page(limit)
     states = [state] if state else list(spool.STATES)
-    return {
+    scans = spool.scan_all(states)
+    integrity = spool.integrity(scans)
+    out = {
         "dispatcher_installed": _plist_path().exists(),
         "dispatcher_label": LAUNCHD_LABEL,
-        **{s: spool.entries(s)[-limit:] for s in states},
+        **{result.state: result.entries[-limit:] for result in scans},
     }
+    if not integrity["ok"]:
+        out.update({
+            "ok": False,
+            "code": codes.SPOOL_INTEGRITY,
+            "error": (
+                f"scheduled-mail storage has {len(integrity['issues'])} "
+                "integrity issue(s); readable records are included below "
+                "and damaged records were left untouched"
+            ),
+            "fix": ("run `email-mcp dispatcher --status`, then reconcile "
+                    "every path in integrity.issues before deleting or "
+                    "rescheduling mail"),
+            "integrity": integrity,
+        })
+    return out
 
 
 def _plan_receipt(plan) -> PlanReceipt:
@@ -1042,7 +1059,9 @@ def _build_mcp_server():
         delivers it (Mac must be awake at/after send_at); "graph" means
         Exchange holds an armed deferred draft (`graph_draft_id`) and sends
         it server-side even with the Mac off — such entries stay pending
-        until a dispatcher pass confirms the outcome."""
+        until a dispatcher pass confirms the outcome. If any stored record
+        is corrupt or incomplete, healthy entries are still returned but the
+        result is `ok: false`, code `spool_integrity`, with named issues."""
         return tool_list_scheduled(state=state, limit=limit)
 
     @mcp.tool()
@@ -1247,13 +1266,13 @@ def _build_mcp_server():
 
             `from_identity` selects the sending identity from
             ~/.email-mcp/identities.toml (omit for the default). Each identity
-            carries its own From: address, transport (ssh_sendmail / smtp /
-            pipe) and allowlist; the manifest records the identity so the
-            dispatcher delivers on that identity's transport at fire time.
+            carries its own From: address and transport (ssh_sendmail / smtp /
+            pipe), plus an optional allowlist; the manifest records the
+            identity so the dispatcher uses the same transport at fire time.
 
             Returns {ok, id, send_at (UTC), message_id, ...}. If the result
             warns the dispatcher is not installed, run:
-            python -m email_mcp.dispatcher --install-launchd
+            email-mcp dispatcher --install-launchd
             """
             res = tool_schedule_email(
                 to=to, subject=subject, body=body, send_at=send_at,
@@ -1265,7 +1284,7 @@ def _build_mcp_server():
                 if not _plist_path().exists():
                     res["warning"] = (
                         "dispatcher launchd agent NOT installed — nothing will "
-                        "send. Run: python -m email_mcp.dispatcher --install-launchd"
+                        "send. Run: email-mcp dispatcher --install-launchd"
                     )
             return res
 

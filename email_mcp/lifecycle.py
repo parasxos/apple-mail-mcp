@@ -96,6 +96,24 @@ def plan_uninstall(purge: bool = False) -> list[plan.Row]:
             f"state root is overridden to {r.root} ({state.ENV_VAR}) — "
             f"not touched; remove it yourself"))
     elif purge:
+        from . import spool
+
+        scans = spool.scan_all(["pending", "sending"])
+        integrity = spool.integrity(scans)
+        queued = {record_id for result in scans
+                  for record_id in result.artifact_ids}
+        if queued:
+            condition = ("; some are unreadable or incomplete"
+                         if not integrity["ok"] else "")
+            rows.append(plan.PrintOnly(
+                f"WARNING: purge will permanently remove {len(queued)} "
+                f"undelivered scheduled email record(s){condition}"
+            ))
+        elif not integrity["ok"]:
+            rows.append(plan.PrintOnly(
+                "WARNING: scheduled-mail storage cannot be fully read; "
+                "purge may remove an unknown number of undelivered records"
+            ))
         rows.append(plan.RemoveTree.state_root())
     else:
         reader = r.reader()

@@ -4,10 +4,10 @@
 
 ### Your Apple Mail, fully agent-operable.
 
-Connect Claude to Mail.app on your Mac and your mailbox stops being a chore
-and starts being something you can **ask** and **delegate to** — find anything
-in seconds, file hundreds of messages safely, send polished mail as any of
-your addresses, and schedule delivery that fires even while the laptop sleeps.
+Connect your MCP client to Mail.app and your mailbox becomes something you can
+**ask, search and delegate to** — find anything in seconds, file hundreds of
+messages through a reviewed plan, send polished mail as the right identity,
+and let Exchange deliver scheduled messages even while your Mac is asleep.
 
 ![ci](https://github.com/parasxos/email-mcp/actions/workflows/ci.yml/badge.svg)
 ![tools](https://img.shields.io/badge/MCP%20tools-21-brightgreen)
@@ -37,10 +37,9 @@ from scratch as clean, standards-correct email that renders everywhere,
 Outlook is the reason this project exists).
 
 ⏰ **Schedule like "Send Later", but scriptable.** A scheduled message is
-frozen in full — attachments, identity, exact text — and delivered within
-seconds of due time. On Exchange, delivery is handed to the server itself:
-calibrated live, a message left on a sleeping Mac went out at the deferred
-time **to the second, lid closed**.
+frozen in full — attachments, identity, exact text. Exchange can execute it
+server-side at the requested time, lid closed; other providers use a local
+background sender and deliver on its next pass (or just after the Mac wakes).
 
 🗂️ **Triage at scale, without fear.** *"File these 40 newsletters"* becomes a
 reviewable plan: nothing moves until it is approved, every message is
@@ -60,7 +59,7 @@ This one doesn't — and it shows:
 | 🔍 Search 300k messages | seconds-to-timeout | **milliseconds** |
 | 🎯 Address one message in a 72k mailbox | **85.6 s** (measured) | **0.16 s** — 535× faster |
 | ✉️ Send mail | body renders **blank in Outlook** | renders everywhere, plain+HTML |
-| ⏰ Schedule mail | — | survives sleep, reboot, even a closed lid |
+| ⏰ Schedule mail | — | server-side on Exchange; reliable local queue everywhere else |
 | 🗂️ Bulk triage | one call per message, fire-and-forget | one reviewed plan, one apply, **verified** |
 
 Every number above was measured on a live 305,000-message mailbox.
@@ -72,16 +71,25 @@ Every number above was measured on a live 305,000-message mailbox.
   Mail's own store afterward — never assumed.
 - 🗑️ **Nothing is ever erased.** "Delete" files into Mail's Trash, and
   destructive plans have their own separate, capped door.
-- 👓 **Read-only mode.** Set `EMAIL_MCP_READ_ONLY=1` and only the 11 tools
-  that can move no mail even exist in the session.
-- 🧾 **A local audit ledger.** Every send, schedule, cancellation and triage
-  run is recorded — your mail history has a paper trail, on your disk only.
-- 🔒 **Nothing leaves your Mac** except the mail you send. No cloud service in
-  between — the only server ever contacted is your own mail provider — and
-  secrets stay in the macOS Keychain or 1Password, never in a config file.
+- 👓 **Read-only mail mode.** Set `EMAIL_MCP_READ_ONLY=1` and only the 11
+  non-mutating mail tools exist in the session. Search may still maintain its
+  local body index, and attachment retrieval writes the requested file to the
+  configured temporary directory.
+- 💾 **A crash-safe scheduled queue.** Manifest updates are flushed and
+  atomically replaced, so an interrupted rewrite keeps the last valid record.
+  If a file is damaged independently, diagnostics name it instead of claiming
+  the queue is empty, while healthy scheduled messages keep moving.
+- 🧾 **A local, best-effort activity ledger.** Sends, schedules,
+  cancellations and triage runs are recorded without making an unwritable log
+  block mail. For reconciliation, the message itself, its Message-ID and its
+  scheduled record remain authoritative.
+- 🔒 **No third-party mail relay.** Mail content stays local except for mail
+  you send and optional access to your own provider for Exchange/IMAP body
+  backfill, drafts and server-side scheduling. SMTP passwords stay in the
+  macOS Keychain or 1Password; Microsoft OAuth tokens live in a private 0600
+  cache under `~/.email-mcp/graph/`.
 - 📜 **A written contract.** Since v1.0 every tool's shapes, error codes and
-  caps are frozen — additive changes only, held in place by 771 automated
-  tests.
+  caps evolve additively, held in place by 795+ automated tests.
 - 🩺 **Self-diagnosing.** `email-mcp doctor` checks every permission,
   identity and transport lane and tells you the exact fix for anything red.
 
@@ -161,7 +169,7 @@ needs no sending configuration at all.
 
 <div align="center">
 
-**v1.2** · 21 tools · 771 tests · wire contract frozen since v1.0
+**v1.3** · 21 tools · 795+ tests · additive wire contract since v1.0
 Live-calibrated end-to-end on a 305k-message store.
 
 Built for one Mac — and for anyone else whose Mac runs Mail.app.

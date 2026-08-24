@@ -120,6 +120,21 @@ def test_uninstall_plan_purge_adds_tree_and_logs(home, installed):
     assert logs == {"email-mcp.log", "email-mcp.log.1"}
 
 
+def test_purge_preview_counts_corrupt_undelivered_records(home, installed):
+    """A purge warning counts files, not only manifests that still parse."""
+    pending = installed / "spool" / "pending"
+    pending.mkdir(parents=True)
+    (pending / "good.json").write_text("{}")
+    (pending / "good.eml").write_text("message")
+    (pending / "torn.json").write_text('{"id":')
+
+    rows = lifecycle.plan_uninstall(purge=True)
+    notes = [r.text for r in rows if isinstance(r, plan.PrintOnly)]
+
+    assert any("2 undelivered scheduled email record(s)" in n for n in notes)
+    assert any("unreadable or incomplete" in n for n in notes)
+
+
 def test_overridden_state_root_is_print_only(home, installed, monkeypatch,
                                              tmp_path):
     other = tmp_path / "elsewhere"

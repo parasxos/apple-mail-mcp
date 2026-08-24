@@ -229,10 +229,16 @@ the log file and returns `fix: "run doctor"`:
 | `invalid_input` | a caller-supplied value could not be parsed/used (bad ISO datetime in `before`/`after`, malformed argument) |
 | `mail_unavailable` | the Mail store is not readable — Mail not configured, or Full Disk Access missing |
 
-One additional code lives at the dispatcher/ledger level, not on any tool's
-wire: **`spool_eml_missing`** — a claimed manifest whose frozen `.eml` is
-gone (the entry parks in `failed/`); it appears as the `deliver` event's
-failure code in the audit ledger (§6).
+Two spool codes are additive to the original belt namespace:
+
+- **`spool_integrity`** is returned by `list_scheduled` when one or more
+  scheduled-mail artifacts are corrupt, incomplete or unreadable. The result
+  includes every healthy record plus an `integrity` report with raw counts,
+  readable counts and named issues; it never converts damaged mail into an
+  empty success.
+- **`spool_eml_missing`** lives at the dispatcher/ledger level, not on a
+  tool's wire. A claimed manifest whose frozen `.eml` is gone parks in
+  `failed/`; the code appears on the `deliver` audit event.
 
 ## 4. Idempotency and retry — every mutating tool
 
@@ -246,7 +252,7 @@ message_id before retrying — never blind-resend.
 |------|-------------|------------|
 | `send_email` | **No** — every call composes a fresh Message-ID | `{ok: false}` before transport handoff (validation, allowlist, attachments, preflight) touched nothing: fix and retry freely. After an ambiguous transport outcome (timeout, crash): check for the returned/logged `message_id` (Bcc-to-self copy, audit `send` event) before resending |
 | `reply_email` | **No** — same as send_email | same as send_email |
-| `schedule_email` | **No per call** (fresh spool id + Message-ID each time), but the scheduled delivery itself is exactly-once: the dispatcher's atomic manifest rename means one claim wins, and a graph entry is never locally delivered while Exchange may still hold or have sent the draft | `{ok: false}` scheduled nothing — retry freely. `{ok: true}` means the frozen .eml is durably spooled; do NOT re-schedule, use `list_scheduled`/`cancel_scheduled`. Dedupe key: the manifest's frozen `message_id` |
+| `schedule_email` | **No per call** (fresh spool id + Message-ID each time). Atomic claim rename gives one concurrent owner, but a local delivery is **at-least-once** across the provider-handoff → `sent/` commit window: recovery may redeliver after a crash with an unknown outcome. Graph entries reconcile against Exchange and are never locally delivered while Exchange may still hold or have sent the draft | `{ok: false}` scheduled nothing — retry freely. `{ok: true}` means the frozen `.eml` and manifest were flushed and durably published; do NOT re-schedule, use `list_scheduled`/`cancel_scheduled`. Dedupe key: the manifest's frozen `message_id` |
 | `cancel_scheduled` | **Effectively** — the pending→cancelled transition happens at most once (atomic rename fence); repeats and races return `{ok: false}` explaining the current state, mutating nothing | safe to retry until a terminal answer; graph revoke failures leave the entry pending with instructions (Exchange keeps the job until the revoke is CONFIRMED) |
 | `triage_plan` | Each call freezes a NEW plan file (durable artifact, zero mail mutation) | retry freely; superseded plans expire on their own (TTL 600 s) and are GC'd (7 d) |
 | `triage_plan_delete` | same as triage_plan | same |
@@ -257,12 +263,23 @@ message_id before retrying — never blind-resend.
 Scheduled-delivery retry (dispatcher-side, not caller-visible): 5 attempts
 per message with 2/5/15/45/120-minute backoff, then park in `failed/` with
 `last_error` + a macOS notification. A dispatcher that dies mid-delivery is
-recovered after 10 minutes (attempt consumed — the outcome was unknown).
+recovered after 10 minutes (attempt consumed). If the provider had already
+accepted the bytes, that recovery can deliver the same frozen Message-ID
+again; callers must reconcile instead of assuming exactly-once delivery.
+
+Spool create/update durability: write a unique temp file in the target
+directory, set mode 0600, write fully, fsync the file, atomically replace the
+canonical path, then fsync the directory. The manifest is published after the
+frozen `.eml`, so it is the commit record. Scans count canonical files before
+parsing and report invalid JSON, mismatched ids, broken `.json`/`.eml` pairs,
+unexpected files and interrupted temp writes. Healthy siblings continue to
+dispatch; doctor/status/list/purge never infer “nothing queued” from a parse
+failure.
 
 ## 5. Caps and TTLs (live config defaults)
 
-Caps REJECT, never truncate. Values below are the defaults of
-`email_mcp/config.py` at v0.10; env overrides in parentheses.
+Caps REJECT, never truncate. Values below are the v1.3 defaults from
+`email_mcp/config.py`; env overrides are shown where available.
 
 | Limit | Default | Knob |
 |-------|---------|------|
@@ -371,7 +388,7 @@ recorded", never as proof the mutation did not happen.
 (filters: `since`/`until`/`tool`/`event`/`plan_id`/`operation_id`/`limit`)
 returns `{ok: true, events (newest-first), files_scanned, skipped_lines}` —
 torn or corrupt lines are skipped and counted, never fatal. CLI:
-`python -m email_mcp.audit --tail/--since/…` (JSONL on stdout). `doctor`
+`email-mcp audit --tail/--since/…` (JSONL on stdout). `doctor`
 gains an `audit` check (dir exists, perms, writability).
 
 ## 7. Wire safety
