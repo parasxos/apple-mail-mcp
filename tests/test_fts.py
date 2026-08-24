@@ -385,6 +385,32 @@ class _Ident:
     from_addr = "someone@cern.ch"
 
 
+class _ImapIdent:
+    name = "gmail"
+    executor = "launchd"
+    drafts = "none"
+    from_addr = "someone@gmail.com"
+    imap = {"host": "imap.example.test", "keychain": "k"}
+
+
+IMAP_ACCT = "BBBBBBBB-0000-0000-0000-000000000002"
+IMAP_INNER = "CCCCCCCC-0000-0000-0000-000000000003"
+
+
+def _write_imap_partial(mail_dir: Path, rowid: int,
+                        message_id: str | None) -> None:
+    """A headers-only .partial.emlx in the fixture's Gmail-style imap
+    account tree (mailbox rowid 2 — [Gmail]/All Mail)."""
+    mid = f"Message-ID: {message_id}\n" if message_id else ""
+    rfc = (f"From: a@gmail.com\nTo: b@gmail.com\nSubject: g {rowid}\n{mid}"
+           f"Content-Type: text/plain; charset=utf-8\n\n").encode()
+    rel = emlx_relpath_for_rowid(rowid).with_name(f"{rowid}.partial.emlx")
+    path = (mail_dir / IMAP_ACCT / "[Gmail].mbox" / "All Mail.mbox"
+            / IMAP_INNER / "Data" / rel)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(_make_emlx(rfc))
+
+
 def _add_ews_mailbox(mail_dir: Path) -> None:
     conn = sqlite3.connect(mail_dir / "MailData" / "Envelope Index")
     conn.execute(
@@ -519,28 +545,141 @@ def test_backfill_stamps_unaskable_docs_once(
         FtsIndex, "_fetch_remote_body",
         lambda self, ident, mid: pytest.fail("no fetch for these"))
     out = idx.backfill()
-    # 2 = the imap partial (503) + the fixture's local-mailbox missing
-    # doc (200), now also weighed by the storeless class.
-    assert out["skipped_non_exchange"] == 2
+    # 2 = the imap partial (503, no imap identity configured) + the
+    # fixture's local-mailbox missing doc (200), now also weighed by
+    # the storeless class.
+    assert out["no_lane"] == 2
     assert out["no_message_id"] == 1
     assert _doc_sources()[502] == "graph_none"
     assert _doc_sources()[503] == "graph_none"
     # Concluded once: the next pass derives no work from them.
     out = idx.backfill()
-    assert out["skipped_non_exchange"] == 0
+    assert out["no_lane"] == 0
     assert out["no_message_id"] == 0
 
 
-def test_backfill_without_graph_identity_is_a_soft_skip(mail_fixture,
-                                                        monkeypatch):
+def test_backfill_imap_lane_fetches_gmail_bodies(mail_fixture, monkeypatch):
+    """The Gmail 15k-partials case (2026-08-24): an imap:// partial is
+    recovered through a declared [name.imap] identity, keyed by the
+    same Message-ID, indexed with source='imap', and served by
+    backfilled_text exactly like a graph hit."""
+    _add_envelope_row_in(mail_fixture, 520, 2)       # [Gmail]/All Mail
+    _write_imap_partial(mail_fixture, 520, "<gm-520@mail.gmail.com>")
+    idx = FtsIndex(mail_base=mail_fixture)
+    idx.build()
+    assert _doc_statuses()[520] == "partial"
+
+    asked = []
+
+    def fake_fetch(self, ident, message_id):
+        asked.append((ident.name, message_id))
+        return {"contentType": "html", "content": "<p>gmail&nbsp;truth</p>"}
+
+    monkeypatch.setattr(FtsIndex, "_graph_identities", lambda self: [])
+    monkeypatch.setattr(FtsIndex, "_imap_identities",
+                        lambda self: [_ImapIdent()])
+    monkeypatch.setattr(FtsIndex, "_fetch_imap_body", fake_fetch)
+    out = idx.backfill()
+    assert out["backfilled"] == 1
+    assert asked == [("gmail", "<gm-520@mail.gmail.com>")]
+    assert _doc_statuses()[520] == "indexed"
+    assert _doc_sources()[520] == "imap"
+    assert idx.rowids_matching("gmail truth") == [520]
+    assert idx.backfilled_text(520).startswith("gmail")
+    assert idx.status()["docs"]["backfilled"] == 1
+
+
+def test_backfill_imap_confirmed_miss_is_never_asked_again(mail_fixture,
+                                                           monkeypatch):
+    _add_envelope_row_in(mail_fixture, 521, 2)
+    _write_imap_partial(mail_fixture, 521, "<gone-521@mail.gmail.com>")
+    idx = FtsIndex(mail_base=mail_fixture)
+    idx.build()
+    calls = []
+    monkeypatch.setattr(FtsIndex, "_graph_identities", lambda self: [])
+    monkeypatch.setattr(FtsIndex, "_imap_identities",
+                        lambda self: [_ImapIdent()])
+    monkeypatch.setattr(
+        FtsIndex, "_fetch_imap_body",
+        lambda self, ident, mid: calls.append(mid) or None)
+    out = idx.backfill()
+    assert out["misses"] == 1
+    assert _doc_sources()[521] == "imap_miss"
+    out = idx.backfill()
+    assert out["candidates"] == 0          # stamped, not re-asked
+    assert len(calls) == 1
+
+
+def test_new_imap_lane_revokes_graph_none_and_recovers(mail_fixture,
+                                                       monkeypatch):
+    """Yesterday's "no lane can ask" must not outlive today's lanes: a
+    doc stamped graph_none under a graph-only setup is revoked and
+    FETCHED once an imap identity appears (the live estate's 14,916
+    Gmail partials were stamped exactly this way)."""
+    _add_envelope_row_in(mail_fixture, 522, 2)
+    _write_imap_partial(mail_fixture, 522, "<back-522@mail.gmail.com>")
+    idx = FtsIndex(mail_base=mail_fixture)
+    idx.build()
+    monkeypatch.setattr(FtsIndex, "_graph_identities",
+                        lambda self: [_Ident()])
+    monkeypatch.setattr(
+        FtsIndex, "_fetch_remote_body",
+        lambda self, ident, mid: pytest.fail("not graph's to answer"))
+    idx.backfill()                          # graph-only: no lane for 522
+    assert _doc_sources()[522] == "graph_none"
+
+    monkeypatch.setattr(FtsIndex, "_imap_identities",
+                        lambda self: [_ImapIdent()])
+    monkeypatch.setattr(
+        FtsIndex, "_fetch_imap_body",
+        lambda self, ident, mid: {"contentType": "text",
+                                  "content": "revoked and recovered"})
+    out = idx.backfill()
+    assert out["backfilled"] == 1
+    assert _doc_sources()[522] == "imap"
+    assert idx.backfilled_text(522) == "revoked and recovered"
+
+
+def test_crawler_never_clobbers_an_imap_body(mail_fixture, monkeypatch):
+    """The partial file is still on disk after an imap backfill; a
+    recrawl of that rowid must keep the server body, exactly as it
+    does for graph."""
+    _add_envelope_row_in(mail_fixture, 523, 2)
+    _write_imap_partial(mail_fixture, 523, "<keep-523@mail.gmail.com>")
+    idx = FtsIndex(mail_base=mail_fixture)
+    idx.build()
+    monkeypatch.setattr(FtsIndex, "_graph_identities", lambda self: [])
+    monkeypatch.setattr(FtsIndex, "_imap_identities",
+                        lambda self: [_ImapIdent()])
+    monkeypatch.setattr(
+        FtsIndex, "_fetch_imap_body",
+        lambda self, ident, mid: {"contentType": "text",
+                                  "content": "server body stays"})
+    idx.backfill()
+    assert _doc_sources()[523] == "imap"
+    conn = idx._open_rw()
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        url = f"imap://{IMAP_ACCT}/%5BGmail%5D/All%20Mail"
+        assert idx._index_one(conn.cursor(), 523, url) == "indexed"
+        conn.commit()
+    finally:
+        conn.close()
+    assert _doc_sources()[523] == "imap"
+    assert idx.backfilled_text(523) == "server body stays"
+
+
+def test_backfill_without_any_identity_is_a_soft_skip(mail_fixture,
+                                                      monkeypatch):
     idx = FtsIndex(mail_base=mail_fixture)
     monkeypatch.setattr(FtsIndex, "_graph_identities", lambda self: [])
+    monkeypatch.setattr(FtsIndex, "_imap_identities", lambda self: [])
     assert idx.backfill() == {"candidates": 0, "backfilled": 0,
                               "misses": 0, "no_message_id": 0,
                               "no_remote_id": 0,
-                              "skipped_non_exchange": 0,
+                              "no_lane": 0,
                               "deferred": 0,
-                              "skipped": "no_graph_identity"}
+                              "skipped": "no_backfill_identity"}
 
 
 def test_backfill_recovers_storeless_exchange_docs(mail_fixture,
@@ -693,7 +832,7 @@ def test_backfill_retires_a_dead_identity_and_aborts(mail_fixture,
 
     monkeypatch.setattr(FtsIndex, "_fetch_remote_body", boom)
     out = idx.backfill()
-    assert out["aborted"].startswith("every graph identity failing")
+    assert out["aborted"].startswith("every backfill identity failing")
     assert len(calls) == fts._IDENT_FAIL_FAST        # not one per doc
     assert out["deferred"] == fts._IDENT_FAIL_FAST
     assert all(_doc_sources()[rid] == "local" for rid in range(530, 535))

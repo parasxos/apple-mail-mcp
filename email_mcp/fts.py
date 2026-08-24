@@ -7,18 +7,23 @@ misses message bodies. This module maintains a private SQLite database
   meta      key/value: schema_version, last_rowid high-water mark, timestamps
   docs      per-message ledger: status indexed|partial|missing|error,
             attempts, last_attempt, bytes,
-            source local|graph|graph_miss|graph_none
+            source local|graph|graph_miss|graph_none|imap|imap_miss
   body_fts  plain FTS5 over extracted body text, rowid == messages.ROWID
 
-Source is the evidence ledger of the Graph backfill lane:
+Source is the evidence ledger of the backfill lanes (Graph for ews://
+mailboxes, IMAP for imap:// mailboxes whose identity declares an
+[name.imap] table):
   local       the doc is (or may yet be) served from Mail's own store
-  graph       body fetched from the mailbox's server copy
+  graph       body fetched from the Exchange mailbox's server copy
+  imap        body fetched from the IMAP mailbox's server copy
   graph_miss  every configured graph identity answered and none holds it
               — CONFIRMED absent, relative to the identity set that was
               asked; changing that set revokes every graph_miss stamp
-  graph_none  the doc can never be asked (non-Exchange mailbox, or a
-              partial file with no Message-ID header) — local evidence,
-              independent of identities
+  imap_miss   the IMAP lane's graph_miss, under the same revocation rule
+  graph_none  no configured lane can ask for this doc (a mailbox no lane
+              covers, or a partial file with no Message-ID header) —
+              scoped, like the misses, to the lane set that concluded
+              it: changing the set revokes and re-derives these stamps
 A stamp is only ever placed on confirmed evidence. Errors, unreadable
 files and unanswered identities DEFER a doc — absence of evidence must
 never read as evidence of absence.
@@ -27,10 +32,11 @@ Design points (docs/v0.8-concept.md, movement 1):
   * Apple's store is never written. Bodies come from .emlx first; where
     Mail never downloaded one (a .partial.emlx ceiling the crawler
     cannot raise — first-user body-gap report, 2026-08-06), backfill()
-    fetches the mailbox's own server copy via Graph and records
-    source='graph', so provenance is never ambiguous. get_email may
-    serve that text with a declared body_source; search covers it like
-    any other doc.
+    fetches the mailbox's own server copy — Graph for Exchange, IMAP
+    for declared imap identities (the Gmail 15k-partials report,
+    2026-08-24) — and records source='graph'/'imap', so provenance is
+    never ambiguous. get_email may serve that text with a declared
+    body_source; search covers it like any other doc.
   * ROWIDs are AUTOINCREMENT (never reused), so "new mail" is exactly
     "ROWID > last_rowid" and deletions are absent rowids (reconcile).
   * Crawls read the Envelope Index through fresh short-lived read-only
@@ -70,7 +76,8 @@ from . import config, state
 from .log import get_logger
 from .sources.apple_mail_paths import find_emlx_path, mailbox_data_dir
 
-SCHEMA_VERSION = 2  # v2: docs.source (local | graph | graph_miss | graph_none)
+SCHEMA_VERSION = 2  # v2: docs.source column; values grew imap|imap_miss
+                    # 2026-08-24 (TEXT column — no structural change)
 LAUNCHD_LABEL = "com.email-mcp.fts"
 
 _DB_NAME = "fts.db"
@@ -209,7 +216,8 @@ class FtsIndex:
             out["docs"]["total"] = sum(counts.values())
             try:
                 out["docs"]["backfilled"] = int(conn.execute(
-                    "SELECT COUNT(*) AS n FROM docs WHERE source = 'graph'"
+                    "SELECT COUNT(*) AS n FROM docs "
+                    "WHERE source IN ('graph', 'imap')"
                 ).fetchone()["n"])
             except sqlite3.OperationalError:  # pre-v2 db: no source column
                 out["docs"]["backfilled"] = 0
@@ -362,54 +370,68 @@ class FtsIndex:
         (first-user body-gap report, 2026-08-06): bodies it never
         downloaded exist as headers-only .partial.emlx files — or, for
         EWS accounts, as Envelope rows with NO file at all (97% of a
-        live CERN account). Both classes are recovered from Exchange
-        via a graph-enabled identity:
+        live CERN account). Two lanes recover them, each answering only
+        its own mailboxes:
 
-          partial  — keyed by the RFC Message-ID read from the partial
-                     file's OWN headers (the Envelope Index stores only
-                     a hash);
-          missing  — keyed by the Envelope row's EWS remote_id,
-                     translated to a Graph REST id in bulk
-                     (translateExchangeIds), then fetched directly.
+          graph (ews:// mailboxes, any graph-enabled identity)
+            partial  — keyed by the RFC Message-ID read from the partial
+                       file's OWN headers (the Envelope Index stores
+                       only a hash);
+            missing  — keyed by the Envelope row's EWS remote_id,
+                       translated to a Graph REST id in bulk
+                       (translateExchangeIds), then fetched directly.
+          imap (imap:// mailboxes, any identity with an [name.imap]
+                table — the Gmail 15k-partials report, 2026-08-24)
+            partial only — same Message-ID key, searched over IMAP. A
+            storeless imap row has no local Message-ID to join on, so
+            that class stays out of the lane's reach.
 
-        Hits are indexed with source='graph'. Verdicts follow the
-        evidence rules of the module docstring: a miss is stamped
-        source='graph_miss' only when EVERY configured identity answered
-        without error and none holds the message (empty lookup / 404 /
-        untranslatable id) — and the stamp is scoped to that identity
-        set: when the set changes, every graph_miss is revoked and
-        re-asked. Docs no server can ever answer for (non-Exchange
-        mailbox, no Message-ID header) are stamped source='graph_none'
-        once, so no later pass re-walks the estate to re-conclude it.
-        Everything else — a GraphError, an unreadable partial file, an
-        identity that could not be asked — DEFERS the doc untouched; an
-        identity that keeps erroring and answers nothing is retired for
-        the pass, and its trouble is recorded in meta
+        Hits are indexed with source='graph'/'imap'. Verdicts follow
+        the evidence rules of the module docstring: a miss is stamped
+        source='graph_miss'/'imap_miss' only when EVERY identity in the
+        lane answered without error and none holds the message (empty
+        lookup / 404 / untranslatable id) — and every stamp, graph_none
+        included, is scoped to the lane set that placed it: when the
+        set changes (an identity added or removed, a NEW LANE
+        configured), all three stamp kinds are revoked and re-derived,
+        so yesterday's "no lane can ask" never outlives today's lanes.
+        Everything else — a GraphError/ImapError, an unreadable partial
+        file, an identity that could not be asked — DEFERS the doc
+        untouched; an identity that keeps erroring and answers nothing
+        is retired for the pass, and its trouble is recorded in meta
         last_backfill_error so status() and doctor can surface it.
-        Network calls happen OUTSIDE write transactions: Graph latency
+        Network calls happen OUTSIDE write transactions: server latency
         must never hold the index lock a search is waiting on."""
         t0 = time.monotonic()
         stats = {"candidates": 0, "backfilled": 0, "misses": 0,
                  "no_message_id": 0, "no_remote_id": 0,
-                 "skipped_non_exchange": 0, "deferred": 0}
+                 "no_lane": 0, "deferred": 0}
         idents = self._graph_identities()
-        if not idents:
-            stats["skipped"] = "no_graph_identity"
+        imap_idents = self._imap_identities()
+        if not idents and not imap_idents:
+            stats["skipped"] = "no_backfill_identity"
             return stats
         conn = self._open_rw()
         try:
-            fingerprint = ",".join(
-                sorted(str(getattr(i, "name", "")) for i in idents))
+            fingerprint = ";".join((
+                "graph:" + ",".join(sorted(
+                    str(getattr(i, "name", "")) for i in idents)),
+                "imap:" + ",".join(sorted(
+                    str(getattr(i, "name", "")) for i in imap_idents)),
+            ))
             if self._meta_get(conn, "backfill_identities") != fingerprint:
-                # A graph_miss means "absent from every mailbox asked".
-                # A different identity set can answer differently —
-                # revoke the confirmations so the new set gets asked.
+                # A miss means "absent from every mailbox asked", a
+                # graph_none "no lane could ask". A different lane set
+                # can answer differently — revoke every conclusion so
+                # the new set gets asked (or re-concluded, cheaply, for
+                # the truly unanswerable).
                 if not self._begin_immediate(conn):
                     stats["skipped"] = "busy"
                     return stats
                 cur = conn.cursor()
                 cur.execute("UPDATE docs SET source = 'local' "
-                            "WHERE source = 'graph_miss'")
+                            "WHERE source IN ('graph_miss', 'imap_miss', "
+                            "'graph_none')")
                 self._meta_set(cur, "backfill_identities", fingerprint)
                 conn.commit()
             try:
@@ -425,43 +447,48 @@ class FtsIndex:
                 return stats
             meta = self._envelope_backfill_meta(
                 classes["partial"] + classes["missing"])
-            p_todo: list[tuple[int, str]] = []       # (rowid, mailbox url)
+            p_graph: list[tuple[int, str]] = []      # (rowid, mailbox url)
+            p_imap: list[tuple[int, str]] = []       # (rowid, mailbox url)
             m_todo: list[tuple[int, str]] = []       # (rowid, ews id)
-            non_exchange: list[int] = []
+            no_lane: list[int] = []
             for rid in classes["partial"]:
                 url, _ = meta.get(rid, ("", None))
-                if not url.startswith("ews://"):
-                    non_exchange.append(rid)
+                if url.startswith("ews://") and idents:
+                    p_graph.append((rid, url))
+                elif url.startswith("imap://") and imap_idents:
+                    p_imap.append((rid, url))
                 else:
-                    p_todo.append((rid, url))
+                    no_lane.append(rid)
             for rid in classes["missing"]:
                 url, remote_id = meta.get(rid, ("", None))
-                if not url.startswith("ews://"):
-                    non_exchange.append(rid)
+                if not (url.startswith("ews://") and idents):
+                    no_lane.append(rid)
                 elif not remote_id:
                     stats["no_remote_id"] += 1
                 else:
                     m_todo.append((rid, remote_id))
-            stats["skipped_non_exchange"] = len(non_exchange)
-            if non_exchange:
-                # Not Graph's to answer, and a rowid's mailbox URL never
-                # changes: stamp once (one set-based txn), so no later
-                # pass re-derives the whole estate to re-conclude it.
+            stats["no_lane"] = len(no_lane)
+            if no_lane:
+                # No configured lane's to answer: stamp once (one
+                # set-based txn), so no later pass re-derives the whole
+                # estate to re-conclude it — revocable, like every
+                # stamp, by the lane-set fingerprint above.
                 if not self._begin_immediate(conn):
                     stats["skipped"] = "busy"
                     return stats
                 cur = conn.cursor()
-                for i in range(0, len(non_exchange), 500):
-                    chunk = non_exchange[i:i + 500]
+                for i in range(0, len(no_lane), 500):
+                    chunk = no_lane[i:i + 500]
                     marks = ",".join("?" * len(chunk))
                     cur.execute(f"UPDATE docs SET source = 'graph_none' "
                                 f"WHERE rowid IN ({marks})", chunk)
                 conn.commit()
             if max_docs is not None:
                 budget = max(0, max_docs)
-                p_todo = p_todo[:budget]
-                m_todo = m_todo[: budget - len(p_todo)]
-            stats["candidates"] = len(p_todo) + len(m_todo)
+                p_graph = p_graph[:budget]
+                p_imap = p_imap[: budget - len(p_graph)]
+                m_todo = m_todo[: budget - len(p_graph) - len(p_imap)]
+            stats["candidates"] = len(p_graph) + len(p_imap) + len(m_todo)
 
             # Per-pass identity health: evidence accumulates, verdicts
             # follow it (constants _IDENT_FAIL_FAST / _IDENT_ERROR_CAP).
@@ -479,8 +506,8 @@ class FtsIndex:
                         or (e >= _IDENT_FAIL_FAST
                             and not successes.get(n, 0)))
 
-            def _any_live() -> bool:
-                return any(not _dead(i) for i in idents)
+            def _any_live(lane) -> bool:
+                return any(not _dead(i) for i in lane)
 
             def _count_error(ident, what: str, e: Exception) -> None:
                 n = _name(ident)
@@ -489,19 +516,19 @@ class FtsIndex:
                 get_logger().warning(
                     "fts backfill: identity %r %s failed: %s", n, what, e)
 
-            def _fetch_confirmed(fetch) -> tuple[dict | None, bool]:
-                """Ask every identity. (body, confirmed): body on a hit;
-                confirmed only when EVERY identity answered without
-                error and none had it — the sole evidence that
-                justifies a graph_miss stamp."""
+            def _fetch_confirmed(fetch, lane) -> tuple[dict | None, bool]:
+                """Ask every identity in the lane. (body, confirmed):
+                body on a hit; confirmed only when EVERY identity
+                answered without error and none had it — the sole
+                evidence that justifies a miss stamp."""
                 confirmed = True
-                for ident in idents:
+                for ident in lane:
                     if _dead(ident):
                         confirmed = False
                         continue
                     try:
                         body = fetch(ident)
-                    except Exception as e:  # GraphError: no evidence
+                    except Exception as e:  # Graph/ImapError: no evidence
                         _count_error(ident, "lookup", e)
                         confirmed = False
                         continue
@@ -511,7 +538,7 @@ class FtsIndex:
                         return body, True
                 return None, confirmed
 
-            def _store_hit(rid: int, body: dict) -> bool:
+            def _store_hit(rid: int, body: dict, source: str) -> bool:
                 text = self._remote_text(body)
                 if not self._begin_immediate(conn):
                     stats["skipped"] = "busy"
@@ -523,7 +550,7 @@ class FtsIndex:
                     (rid, text))
                 self._record(cur, rid, "indexed", time.time(),
                              len(text.encode("utf-8", "replace")),
-                             source="graph")
+                             source=source)
                 conn.commit()
                 stats["backfilled"] += 1
                 if stats["backfilled"] % 500 == 0:
@@ -541,36 +568,45 @@ class FtsIndex:
                 stats[counter] += 1
                 return True
 
-            # class 1: partials — Message-ID from the file's own headers
-            for rid, url in p_todo:
-                if not _any_live() or "skipped" in stats:
-                    break
-                try:
-                    mid = self._message_id_from_partial(rid, url)
-                except Exception as e:  # unreadable now ≠ unaskable
-                    get_logger().info(
-                        "fts backfill: cannot read partial %s (%s) — "
-                        "deferred", rid, e)
-                    stats["deferred"] += 1
-                    continue
-                if mid is None:  # the file itself says: no join key, ever
-                    if not _stamp_doc(rid, "graph_none", "no_message_id"):
-                        break
-                    continue
-                body, confirmed = _fetch_confirmed(
-                    lambda i, mid=mid: self._fetch_remote_body(i, mid))
-                if body is not None:
-                    if not _store_hit(rid, body):
-                        break
-                elif confirmed:
-                    if not _stamp_doc(rid, "graph_miss", "misses"):
-                        break
-                else:
-                    stats["deferred"] += 1
+            def _run_partials(todo, lane, fetch, hit_src, miss_src) -> None:
+                """One lane's partial pass — Message-ID from the file's
+                own headers, then ask the lane's identities."""
+                for rid, url in todo:
+                    if not _any_live(lane) or "skipped" in stats:
+                        return
+                    try:
+                        mid = self._message_id_from_partial(rid, url)
+                    except Exception as e:  # unreadable now ≠ unaskable
+                        get_logger().info(
+                            "fts backfill: cannot read partial %s (%s) — "
+                            "deferred", rid, e)
+                        stats["deferred"] += 1
+                        continue
+                    if mid is None:  # the file says: no join key, ever
+                        if not _stamp_doc(rid, "graph_none",
+                                          "no_message_id"):
+                            return
+                        continue
+                    body, confirmed = _fetch_confirmed(
+                        lambda i, mid=mid: fetch(i, mid), lane)
+                    if body is not None:
+                        if not _store_hit(rid, body, hit_src):
+                            return
+                    elif confirmed:
+                        if not _stamp_doc(rid, miss_src, "misses"):
+                            return
+                    else:
+                        stats["deferred"] += 1
 
-            # class 2: storeless — remote_id → REST id → body
+            # class 1: partials, one pass per lane
+            _run_partials(p_graph, idents, self._fetch_remote_body,
+                          "graph", "graph_miss")
+            _run_partials(p_imap, imap_idents, self._fetch_imap_body,
+                          "imap", "imap_miss")
+
+            # class 2: storeless — remote_id → REST id → body (graph only)
             for i in range(0, len(m_todo), _TRANSLATE_CHUNK):
-                if not _any_live() or "skipped" in stats:
+                if not _any_live(idents) or "skipped" in stats:
                     break
                 chunk = m_todo[i:i + _TRANSLATE_CHUNK]
                 mapping: dict[str, str] = {}
@@ -603,9 +639,9 @@ class FtsIndex:
                         continue
                     body, confirmed = _fetch_confirmed(
                         lambda i, rest=rest:
-                        self._fetch_remote_body_by_id(i, rest))
+                        self._fetch_remote_body_by_id(i, rest), idents)
                     if body is not None:
-                        if not _store_hit(rid, body):
+                        if not _store_hit(rid, body, "graph"):
                             break
                     elif confirmed:
                         if not _stamp_doc(rid, "graph_miss", "misses"):
@@ -615,8 +651,8 @@ class FtsIndex:
 
             if errors:
                 stats["identity_errors"] = dict(errors)
-                if not _any_live():
-                    stats["aborted"] = "every graph identity failing: " \
+                if not _any_live(idents + imap_idents):
+                    stats["aborted"] = "every backfill identity failing: " \
                         + "; ".join(f"{n}: {m}"
                                     for n, m in sorted(last_error.items()))
             summary = "; ".join(
@@ -658,7 +694,7 @@ class FtsIndex:
                 row = conn.execute(
                     "SELECT f.body AS body FROM docs d "
                     "JOIN body_fts f ON f.rowid = d.rowid "
-                    "WHERE d.rowid = ? AND d.source = 'graph'",
+                    "WHERE d.rowid = ? AND d.source IN ('graph', 'imap')",
                     (rowid,)).fetchone()
             except sqlite3.OperationalError:  # pre-v2 db: no source column
                 return None
@@ -670,10 +706,11 @@ class FtsIndex:
         """Fresh build BESIDE the live index, then one atomic promote —
         REUSING the server-fetched bodies the live index holds.
 
-        Graph-sourced rows are not derived state: the local store never
-        had those bodies, and re-fetching ~95k of them is an overnight
-        of Graph traffic. So the fresh build runs at <db>.rebuild,
-        salvages every graph body (and stamp) straight from the LIVE db
+        Server-sourced (graph/imap) rows are not derived state: the
+        local store never had those bodies, and re-fetching ~95k of
+        them is an overnight of server traffic. So the fresh build runs
+        at <db>.rebuild, salvages every server body (and stamp)
+        straight from the LIVE db
         — read through SQLite, so WAL-resident rows are included — and
         only then replaces it, under the live writer lock so no
         concurrent commit is swapped out mid-flight. The live index is
@@ -721,14 +758,15 @@ class FtsIndex:
         return out
 
     def _salvage_graph_rows(self, old: Path) -> int:
-        """Carry graph bodies and graph_miss/graph_none stamps from the
-        live db into the fresh one — set-based, never through Python
-        memory. A rowid the new build indexed from a full local file
-        keeps the local text (local truth wins); everything the old db
-        knew from the server and the new build could not read from disk
-        is reinstated. The identity fingerprint the stamps are scoped to
-        rides along — carried stamps must stay revocable by the same
-        rule that placed them."""
+        """Carry server-fetched (graph/imap) bodies and
+        graph_miss/imap_miss/graph_none stamps from the live db into
+        the fresh one — set-based, never through Python memory. A rowid
+        the new build indexed from a full local file keeps the local
+        text (local truth wins); everything the old db knew from a
+        server and the new build could not read from disk is
+        reinstated, under its original source. The identity fingerprint
+        the stamps are scoped to rides along — carried stamps must stay
+        revocable by the same rule that placed them."""
         conn = self._open_rw()
         try:
             conn.execute("ATTACH DATABASE ? AS old", (str(old),))
@@ -739,10 +777,11 @@ class FtsIndex:
                 """
                 CREATE TEMP TABLE salv AS
                 SELECT o.rowid AS rowid, o.attempts AS attempts,
-                       o.last_attempt AS last_attempt, o.bytes AS bytes
+                       o.last_attempt AS last_attempt, o.bytes AS bytes,
+                       o.source AS source
                   FROM old.docs o
                   LEFT JOIN main.docs n ON n.rowid = o.rowid
-                 WHERE o.source = 'graph'
+                 WHERE o.source IN ('graph', 'imap')
                    AND COALESCE(n.status, '') != 'indexed'
                 """)
             cur.execute("DELETE FROM body_fts WHERE rowid IN "
@@ -758,12 +797,12 @@ class FtsIndex:
                 INSERT INTO docs(rowid, status, attempts, last_attempt,
                                  bytes, source)
                 SELECT rowid, 'indexed', attempts, last_attempt, bytes,
-                       'graph'
+                       source
                   FROM salv
                  WHERE 1  -- disambiguates ON CONFLICT from a join clause
                 ON CONFLICT(rowid) DO UPDATE SET
                     status = 'indexed', bytes = excluded.bytes,
-                    source = 'graph'
+                    source = excluded.source
                 """)
             cur.execute(
                 """
@@ -773,6 +812,7 @@ class FtsIndex:
                  WHERE source = 'local' AND status IN ('partial', 'missing')
                    AND rowid IN (SELECT rowid FROM old.docs
                                   WHERE source IN ('graph_miss',
+                                                   'imap_miss',
                                                    'graph_none'))
                 """)
             cur.execute(
@@ -1057,16 +1097,17 @@ class FtsIndex:
 
         Local truth wins, but never regresses: a full .emlx always
         overwrites (source back to 'local'); a partial file, a vanished
-        file or a parse failure never clobbers a graph-sourced body —
-        headers-only text replacing a real server-fetched body would be
-        the index un-learning what it already knows."""
+        file or a parse failure never clobbers a server-sourced body —
+        headers-only text replacing a real graph/imap-fetched body would
+        be the index un-learning what it already knows."""
         now = time.time()
         data_dir = self._data_dir(url)
         path = find_emlx_path(data_dir, rowid) if data_dir else None
-        stamps = ("graph_miss", "graph_none")
+        stamps = ("graph_miss", "graph_none", "imap_miss")
+        served = ("graph", "imap")
         if path is None:
             src = self._source_of(cur, rowid)
-            if src == "graph":
+            if src in served:
                 return "indexed"  # remote body still serves this rowid
             # A stamped doc keeps its stamp — but the attempt is RECORDED:
             # frozen attempts/last_attempt held stamped docs permanently
@@ -1079,14 +1120,14 @@ class FtsIndex:
             text = self._extract_text(path)
         except Exception as e:  # any parse failure — never abort a crawl
             src = self._source_of(cur, rowid)
-            if src == "graph":
+            if src in served:
                 return "indexed"
             get_logger().warning("fts: cannot index rowid %s (%s): %s",
                                  rowid, path, e)
             return self._record(cur, rowid, "error", now, 0,
                                 source=src if src in stamps else "local")
         status = "partial" if path.name.endswith(".partial.emlx") else "indexed"
-        if status == "partial" and self._source_of(cur, rowid) == "graph":
+        if status == "partial" and self._source_of(cur, rowid) in served:
             return "indexed"
         cur.execute("DELETE FROM body_fts WHERE rowid = ?", (rowid,))
         cur.execute("INSERT INTO body_fts(rowid, body) VALUES (?, ?)",
@@ -1158,11 +1199,31 @@ class FtsIndex:
                 if getattr(idents[n], "executor", "launchd") == "graph"
                 or getattr(idents[n], "drafts", "none") == "graph"]
 
+    def _imap_identities(self) -> list:
+        """Identities with an [name.imap] table, default first — the
+        IMAP lane's mailboxes. Same soft contract as
+        _graph_identities."""
+        from . import identities as ident_mod
+
+        try:
+            idents, default = ident_mod.load()
+        except Exception:  # noqa: BLE001 — soft by contract, like status()
+            return []
+        names = sorted(idents, key=lambda n: (n != default, n))
+        return [idents[n] for n in names
+                if dict(getattr(idents[n], "imap", {}) or {})]
+
     def _fetch_remote_body(self, ident, message_id: str) -> dict | None:
         """Network seam (partial class): tests monkeypatch this symbol."""
         from . import graph
 
         return graph.fetch_body_by_message_id(ident, message_id)
+
+    def _fetch_imap_body(self, ident, message_id: str) -> dict | None:
+        """Network seam (imap lane): tests monkeypatch this symbol."""
+        from . import imap
+
+        return imap.fetch_body_by_message_id(ident, message_id)
 
     def _translate_ews_ids(self, ident, ews_ids: list[str]) -> dict[str, str]:
         """Network seam (storeless class): bulk id translation."""

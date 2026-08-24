@@ -408,6 +408,80 @@ def test_graph_keys_never_reach_params_and_ssh_transport_constructs(
     assert transport.host == "mailhost.example.org"
 
 
+def test_imap_table_parses_and_never_reaches_params(tmp_path, monkeypatch):
+    """[name.imap] opts the identity's mailbox into the IMAP backfill
+    lane; like graph, the capability lives on the Identity — a leak
+    into the driver's kwargs would TypeError the transport."""
+    from email_mcp.transports import get_transport
+
+    _write_toml(tmp_path, monkeypatch, """\
+        default = "gmail"
+
+        [gmail]
+        from_addr = "someone@gmail.com"
+        driver = "smtp"
+        host = "smtp.gmail.com"
+        keychain = "k-item"
+
+        [gmail.imap]
+        host = "imap.gmail.com"
+        op = "op://Vault/item/password"
+    """)
+    ident = identities.get("gmail")
+    assert ident.imap == {"host": "imap.gmail.com",
+                          "op": "op://Vault/item/password"}
+    assert "imap" not in ident.params
+    transport = get_transport(ident)  # would raise SendError on a leak
+    assert transport.host == "smtp.gmail.com"
+
+
+def test_imap_table_missing_host_errors(tmp_path, monkeypatch):
+    _write_toml(tmp_path, monkeypatch, """\
+        default = "a"
+
+        [a]
+        from_addr = "a@example.org"
+        driver = "pipe"
+
+        [a.imap]
+        op = "op://Vault/item/password"
+    """)
+    with pytest.raises(IdentityError) as ei:
+        identities.load()
+    assert "host" in str(ei.value)
+
+
+def test_imap_table_missing_secret_source_errors(tmp_path, monkeypatch):
+    _write_toml(tmp_path, monkeypatch, """\
+        default = "a"
+
+        [a]
+        from_addr = "a@example.org"
+        driver = "pipe"
+
+        [a.imap]
+        host = "imap.example.org"
+    """)
+    with pytest.raises(IdentityError) as ei:
+        identities.load()
+    s = str(ei.value)
+    assert "op" in s and "keychain" in s
+
+
+def test_imap_must_be_a_table_errors(tmp_path, monkeypatch):
+    _write_toml(tmp_path, monkeypatch, """\
+        default = "a"
+
+        [a]
+        from_addr = "a@example.org"
+        driver = "pipe"
+        imap = "imap.example.org"
+    """)
+    with pytest.raises(IdentityError) as ei:
+        identities.load()
+    assert "[a.imap]" in str(ei.value)
+
+
 # --------------------------------------------------------------------- #
 # path policy — the identities file is part of the managed tree          #
 # --------------------------------------------------------------------- #

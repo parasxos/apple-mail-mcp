@@ -960,7 +960,8 @@ def _build_mcp_server():
         declared, never implied: `body_source` is null when the body was
         read live from the mail store (the normal case), and
         "server_backfill" when Mail never downloaded it and `body_text`
-        is the server copy the search index fetched via Graph — plain
+        is the server copy the search index fetched (Exchange via
+        Graph, Gmail/IMAP via the imap lane) — plain
         text only (no `body_html`), capped at the index's per-doc limit
         with a visible "[…body truncated…]" marker when cut.
         Returns {ok, email}."""

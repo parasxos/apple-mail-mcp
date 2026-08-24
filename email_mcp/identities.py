@@ -21,7 +21,7 @@ from .transports import DRIVERS, SendError
 # driver parameter and lands in `params`.
 _KNOWN_FIELDS = {
     "from_addr", "from_name", "driver", "allowlist", "allow_all", "bcc_self",
-    "executor", "graph", "drafts",
+    "executor", "graph", "drafts", "imap",
 }
 
 # Schedule executors an identity may name: the local launchd spool
@@ -72,6 +72,10 @@ class Identity:
     # [name.graph] table (tenant + client_id) when executor or drafts
     # names "graph".
     graph: dict = field(default_factory=dict)
+    # [name.imap] table (host + op/keychain secret source): opts the
+    # identity's mailbox into the IMAP backfill lane — read-side only,
+    # nothing about sending. Empty means no lane.
+    imap: dict = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         # Each identity's "self" is its own address: an empty allowlist
@@ -214,6 +218,27 @@ def load() -> tuple[dict[str, Identity], str]:
                     "tools/graph_probe.py (see docs/graph-probe.md)."
                 )
 
+        imap = t.get("imap", {})
+        if not isinstance(imap, dict):
+            raise IdentityError(
+                f"{path}: identity [{name}]: `imap` must be a table — "
+                f"write a [{name}.imap] block with `host` and an "
+                "`op` or `keychain` secret source."
+            )
+        if imap:
+            if not str(imap.get("host", "")).strip():
+                raise IdentityError(
+                    f"{path}: identity [{name}]: [{name}.imap] is missing "
+                    "`host` (e.g. imap.gmail.com)."
+                )
+            if not (str(imap.get("op", "")).strip()
+                    or str(imap.get("keychain", "")).strip()):
+                raise IdentityError(
+                    f"{path}: identity [{name}]: [{name}.imap] needs a "
+                    "secret source — set `op` (1Password secret reference) "
+                    "or `keychain` (macOS Keychain item)."
+                )
+
         identities[name] = Identity(
             name=name,
             from_addr=from_addr,
@@ -229,6 +254,7 @@ def load() -> tuple[dict[str, Identity], str]:
             executor=executor,
             drafts=drafts,
             graph=dict(graph),
+            imap=dict(imap),
         )
     return identities, default
 
