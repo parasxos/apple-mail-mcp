@@ -24,6 +24,7 @@ CLI:  python -m email_mcp.audit --tail 20
 from __future__ import annotations
 
 import argparse
+import fcntl
 import json
 import os
 import re
@@ -138,17 +139,27 @@ def emit(
         # O_RDWR (not O_WRONLY) so the torn-tail probe below can pread.
         fd = os.open(path, os.O_RDWR | os.O_CREAT | os.O_APPEND, 0o600)
         try:
+            # The probe and append are one critical section. Without this
+            # lock, a reader can observe another process extending the file
+            # before its trailing newline is visible, mistake that for a
+            # torn tail, and inject blank healing lines into a healthy log.
+            # flock is released automatically if a writer crashes.
+            fcntl.flock(fd, fcntl.LOCK_EX)
             # Torn-tail heal: a previous crash/short write can leave the
             # file without a trailing newline; appending straight after it
             # would weld THIS event onto the torn fragment and lose it too.
             # A leading newline isolates the fragment on its own (skipped,
             # counted) line. Still ONE os.write per event — lines from two
-            # processes can never interleave. If both writers heal the same
-            # torn tail, the extra blank line is skipped silently.
+            # processes can never interleave.
             size = os.fstat(fd).st_size
             if size and os.pread(fd, 1, size - 1) != b"\n":
                 line = b"\n" + line
-            os.write(fd, line + b"\n")
+            payload = line + b"\n"
+            written = os.write(fd, payload)
+            if written != len(payload):
+                raise OSError(
+                    f"short audit append: wrote {written}/{len(payload)} bytes"
+                )
         finally:
             os.close(fd)
         os.chmod(path, 0o600)  # launchd agents run with a permissive umask

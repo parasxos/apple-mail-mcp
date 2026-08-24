@@ -138,6 +138,24 @@ def test_emit_never_raises_and_returns_none_when_unwritable(
     assert not (parent / "state").exists()
 
 
+def test_short_append_is_reported_and_the_next_event_heals_it(
+    audit_dir_guard, monkeypatch
+):
+    real_write = os.write
+
+    def short_write(fd, payload):
+        return real_write(fd, payload[:-5])
+
+    with monkeypatch.context() as patch:
+        patch.setattr(audit.os, "write", short_write)
+        assert audit.emit("send", outcome="sent") is None
+
+    assert audit.emit("send", outcome="sent", detail={"after": "heal"})
+    result = audit.query(limit=10)
+    assert [e.get("detail") for e in result["events"]] == [{"after": "heal"}]
+    assert result["skipped_lines"] == 1
+
+
 def test_state_root_parent_never_chmodded(tmp_path, monkeypatch):
     """The root's parent is not ours — chmod'ing it can raise (root-owned
     temp roots) and would cost the event. Adoption locks down the root

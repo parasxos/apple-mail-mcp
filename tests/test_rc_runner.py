@@ -26,6 +26,7 @@ import os
 import re
 import stat
 import sys
+import tempfile
 from pathlib import Path
 
 import pytest
@@ -495,6 +496,14 @@ def test_context_refuses_to_write_inside_the_real_state_root(tmp_path, estate):
     kept = ctx.write(ctx.sandbox_home / "answers.json", "{}")
     assert kept.read_text() == "{}"
     assert stat.S_IMODE(kept.stat().st_mode) == 0o600
+
+
+def test_context_never_trusts_the_shared_system_temp_root(tmp_path, estate):
+    """Linux uses /tmp for pytest too; trusting it would make every sibling
+    test directory — and every other user's temporary file — writable."""
+    ctx = make_ctx(tmp_path, estate, dry_run=False)
+    system_temp = ctx._resolve(Path(tempfile.gettempdir()))
+    assert system_temp not in ctx.write_roots
 
 
 def test_sandbox_lane_refuses_commands_and_env_naming_the_real_estate(

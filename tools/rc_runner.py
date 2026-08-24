@@ -44,7 +44,6 @@ import json
 import os
 import re
 import sys
-import tempfile
 import time
 import tomllib
 from dataclasses import dataclass, field, replace
@@ -596,8 +595,10 @@ class Context:
         self.answer = answer
         self.intents: list[str] = []
         self.result: PhaseResult | None = None
-        roots = [self.sandbox_home, self.state_dir,
-                 Path(tempfile.gettempdir())]
+        # Only directories owned by this run are writable. Trusting the
+        # system-wide temporary root made the fence ineffective on Linux,
+        # where pytest, other users and unrelated processes all share /tmp.
+        roots = [self.sandbox_home, self.state_dir]
         if report.path is not None:
             roots.append(report.path.parent)
         self.write_roots = tuple(self._resolve(r) for r in roots)
