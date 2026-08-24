@@ -11,7 +11,7 @@ from __future__ import annotations
 from typing import TYPE_CHECKING, Protocol
 
 from .. import codes, config
-from ..envelope import ToolError
+from ..domain.errors import ToolError
 
 if TYPE_CHECKING:
     from ..identities import Identity

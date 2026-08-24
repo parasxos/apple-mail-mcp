@@ -27,69 +27,17 @@ import json
 import os
 import stat
 import uuid
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict
 from pathlib import Path
 
 from . import config, ids, state
+from .domain.models import (
+    IntegrityIssue,
+    ScheduledEntry as Entry,
+    ScheduledScan as Scan,
+)
 
 STATES = state.SPOOL_STATES
-
-
-@dataclass
-class Entry:
-    """Manifest for one scheduled message (mirrors <id>.json)."""
-
-    id: str
-    send_at: str                 # UTC ISO-8601
-    created_at: str              # UTC ISO-8601
-    to: list[str]
-    cc: list[str]
-    bcc: list[str]
-    subject: str
-    attachments: list[str]       # filenames embedded in the frozen .eml
-    message_id: str
-    status: str = "pending"
-    attempts: int = 0
-    next_attempt_at: str | None = None
-    last_error: str | None = None
-    delivered_at: str | None = None
-    identity: str = "default"    # sending identity; pre-0.7.0 manifests omit it
-    # Which executor fires this entry: "launchd" (the local spool path) or
-    # "graph" (Exchange-side deferred send). Pre-v0.8 manifests omit both
-    # fields — the defaults keep them on the local path unchanged.
-    executor: str = "launchd"
-    graph_draft_id: str | None = None  # Exchange draft id once armed
-
-
-@dataclass(frozen=True)
-class IntegrityIssue:
-    """One record the spool cannot account for safely."""
-
-    code: str
-    state: str
-    id: str | None
-    path: str
-    detail: str
-
-
-@dataclass
-class Scan:
-    """A state-directory inventory: raw files, readable records, issues."""
-
-    state: str
-    entries: list[Entry] = field(default_factory=list)
-    manifest_files: int = 0
-    eml_files: int = 0
-    issues: list[IntegrityIssue] = field(default_factory=list)
-    artifact_ids: tuple[str, ...] = ()
-
-    @property
-    def readable_manifests(self) -> int:
-        return len(self.entries)
-
-    @property
-    def ok(self) -> bool:
-        return not self.issues
 
 
 # Single source in ids.py (shared with plans.py and the audit ledger);

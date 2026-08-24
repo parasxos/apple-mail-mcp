@@ -20,7 +20,7 @@ from dataclasses import replace
 from datetime import datetime, timedelta
 
 from . import applescript, audit, config, plans
-from .envelope import ToolError
+from .domain.errors import ToolError
 from .log import get_logger
 from .plans import Plan, PlanAction, PlanMessage
 from .sources.base import SearchQuery

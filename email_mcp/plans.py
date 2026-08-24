@@ -13,51 +13,14 @@ process wins the rename owns the apply; the loser sees FileNotFoundError.
 from __future__ import annotations
 
 import json
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from . import audit, config, ids, state
+from .domain.models import Plan, PlanAction, PlanMessage
 
 STATUSES = ("draft", "applied", "failed", "expired")
-
-
-@dataclass
-class PlanAction:
-    action: str                      # move_to|mark_read|mark_unread|flag|unflag
-                                     # (delete: staged only via triage_plan_delete)
-    mailbox: str | None = None       # move_to only — decoded slash-joined path
-    color: int | None = None         # flag only — 0..6
-
-
-@dataclass
-class PlanMessage:
-    rowid: int
-    account: str                     # UUID host of the mailbox URL
-    scheme: str                      # "local" | "imap" | "ews" | ...
-    mailbox: str                     # decoded source-mailbox name (AppleScript name)
-    mailbox_rowid: int
-    subject: str
-    from_addr: str
-    date: str                        # ISO-8601
-    unread: bool
-    message_id_header: str           # <>-stripped; "" when the index has none
-    global_message_id: int | None    # for move outcome (b) relocation probe
-    pre: dict                        # {"read": int, "flagged": int, "flag_color": int}
-
-
-@dataclass
-class Plan:
-    id: str
-    created_at: str                  # UTC ISO
-    expires_at: str                  # UTC ISO
-    status: str                      # draft|applied|failed|expired
-    query: dict                      # original filters (audit trail)
-    actions: list[PlanAction]
-    target: dict | None              # move_to only: {account, mailbox, mailbox_rowid, url}
-    messages: list[PlanMessage]
-    summary: str
-    result: dict | None = None       # filled by apply
 
 
 # Single source in ids.py (shared with spool.py and the audit ledger);

@@ -5,7 +5,7 @@ from __future__ import annotations
 
 import logging
 
-from email_mcp import server
+from email_mcp import bootstrap, server
 
 
 class _Recorder(logging.Handler):
@@ -42,8 +42,12 @@ def test_unknown_or_bad_ids_return_not_found_and_invalid_input(
 ):
     from email_mcp.sources.apple_mail import AppleMailSource
 
-    monkeypatch.setattr(server, "_SOURCE",
-                        AppleMailSource(mail_base=mail_fixture))
+    monkeypatch.setattr(
+        bootstrap, "_application",
+        bootstrap.build_application(
+            source=AppleMailSource(mail_base=mail_fixture)
+        ),
+    )
     out = server.tool_get_email("424242")  # LookupError leak in Q5
     assert out["ok"] is False and out["code"] == "not_found"
     assert out["fix"] == "run doctor"
@@ -64,7 +68,9 @@ def test_missing_mail_store_returns_mail_unavailable(monkeypatch):
             raise FileNotFoundError(
                 "~/Library/Mail does not exist — grant Full Disk Access")
 
-    monkeypatch.setattr(server, "_SOURCE", GoneSource())
+    monkeypatch.setattr(
+        bootstrap, "_application", bootstrap.build_application(source=GoneSource())
+    )
     out = server.tool_search_emails(query="x")
     assert out["ok"] is False and out["code"] == "mail_unavailable"
     assert out["fix"] == "run doctor"
@@ -78,7 +84,9 @@ def test_unexpected_exception_returns_internal_error_and_logs_traceback(
         def search(self, q):
             raise RuntimeError("kaput")
 
-    monkeypatch.setattr(server, "_SOURCE", Boom())
+    monkeypatch.setattr(
+        bootstrap, "_application", bootstrap.build_application(source=Boom())
+    )
     recorder = _Recorder()
     logger = logging.getLogger("email_mcp")  # propagate=False: hook directly
     logger.addHandler(recorder)
@@ -99,12 +107,14 @@ def test_unexpected_exception_returns_internal_error_and_logs_traceback(
 def test_triage_apply_belt_carries_plan_id_operation_id(monkeypatch):
     from email_mcp import ids
 
-    monkeypatch.setattr(server, "_SOURCE", object())
+    monkeypatch.setattr(
+        bootstrap, "_application", bootstrap.build_application(source=object())
+    )
 
     def _boom(src, plan_id):
         raise RuntimeError("exploded mid-apply")
 
-    monkeypatch.setattr(server, "apply_plan", _boom)
+    monkeypatch.setattr("email_mcp.triage.apply_plan", _boom)
     p1, p2 = ids.new_id(), ids.new_id()
     out = server.tool_triage_apply(plan_id=p1)
     assert out["ok"] is False and out["code"] == "internal_error"

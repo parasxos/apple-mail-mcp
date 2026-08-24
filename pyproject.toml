@@ -44,7 +44,14 @@ Repository = "https://github.com/parasxos/email-mcp"
 email-mcp = "email_mcp.cli:main"
 
 [tool.setuptools]
-packages = ["email_mcp", "email_mcp.sources", "email_mcp.transports"]
+packages = [
+    "email_mcp",
+    "email_mcp.application",
+    "email_mcp.adapters",
+    "email_mcp.domain",
+    "email_mcp.sources",
+    "email_mcp.transports",
+]
 
 [tool.setuptools.dynamic]
 version = {attr = "email_mcp.__version__"}

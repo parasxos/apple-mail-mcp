@@ -9,7 +9,8 @@ from unittest.mock import patch
 
 import pytest
 
-from email_mcp import codes, sender, server, spool
+from email_mcp import bootstrap, codes, sender, server, spool
+from email_mcp.adapters import refresh as refresh_adapter
 
 
 @pytest.fixture
@@ -250,15 +251,18 @@ def _osa(returncode: int, stderr: str = "") -> subprocess.CompletedProcess:
 
 
 def test_refresh_mail_maps_error_code_to_string_code(monkeypatch):
-    monkeypatch.setattr(server, "_SOURCE", object())  # no freshness snapshot
+    monkeypatch.setattr(
+        bootstrap, "_application", bootstrap.build_application(source=object())
+    )  # no freshness snapshot
     stderr = "execution error: Not authorized to send Apple events. (-1743)"
-    with patch.object(server.subprocess, "run", return_value=_osa(1, stderr)):
+    with patch.object(refresh_adapter.subprocess, "run",
+                      return_value=_osa(1, stderr)):
         out = server.tool_refresh_mail(wait_seconds=0, timeout_seconds=1)
     assert out["ok"] is False
     assert out["error_code"] == -1743
     assert out["code"] == "automation_denied"
 
-    with patch.object(server.subprocess, "run", return_value=_osa(0)):
+    with patch.object(refresh_adapter.subprocess, "run", return_value=_osa(0)):
         out = server.tool_refresh_mail(wait_seconds=0, timeout_seconds=1)
     assert out["ok"] is True
     assert out["error_code"] is None and out["code"] is None

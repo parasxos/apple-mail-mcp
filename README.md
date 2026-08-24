@@ -96,6 +96,11 @@ Every number above was measured on a live 305,000-message mailbox.
   every input, and declare whether they read, change or can remove data. Newer
   clients receive structured results; older clients keep the same JSON text.
   Both the maintained MCP 1.x line and current MCP 2.x are tested.
+- 🧱 **Built to evolve without breaking your workflow.** Email rules are
+  isolated from MCP, Mail.app, Exchange, delivery, and local storage. Provider
+  or SDK changes stay at the edge while the 21-tool contract remains stable.
+  The dependency rules are enforced in CI and explained in the
+  [architecture guide](https://github.com/parasxos/email-mcp/blob/main/docs/architecture.md).
 - 📦 **Releases you can verify.** Every tagged release is built and installed
   in a clean environment before publishing. GitHub includes the wheel, source
   archive, SHA-256 checksums and signed build provenance—not just source code.

@@ -45,6 +45,7 @@ import typing
 from datetime import datetime
 
 from . import codes, ids, state
+from .domain.errors import InvalidInput, MailUnavailable, NotFound, ToolError
 from .log import get_logger
 
 _log = get_logger()
@@ -52,59 +53,6 @@ _log = get_logger()
 # Failure prose is byte-bounded: ~2000 UTF-8 bytes, clipped at a valid
 # character boundary with a visible ellipsis.
 MAX_ERROR_BYTES = 2000
-
-
-# --------------------------------------------------------------------- #
-# The closed typed-error hierarchy (contract §3)                        #
-# --------------------------------------------------------------------- #
-
-
-class ToolError(Exception):
-    """Base of the closed typed-error hierarchy. Every instance carries
-    exactly one `code` from the §3 namespace (codes.py): the belt-code
-    subclasses below fix theirs as a class attribute; SendError carries
-    the §3.4 assignment of its raise site; TriageError carries its §3.1
-    code. Prose is caller-fixable and safe to surface verbatim.
-
-    `fix` — optional concrete remedy (a command or Settings pane).
-    `operation_id` — set ONLY when a durable artifact id (plan id, spool
-    id) existed before the failure; the boundary passes it through.
-    `data` — the few extra wire keys a failure keeps for v0.10
-    compatibility (cancel_scheduled's too-late outcome reports the
-    entry's terminal state)."""
-
-    code: str = codes.INTERNAL_ERROR
-
-    def __init__(
-        self,
-        error: str,
-        *,
-        code: str | None = None,
-        fix: str | None = None,
-        operation_id: str | None = None,
-        data: dict | None = None,
-    ) -> None:
-        super().__init__(error)
-        if code is not None:
-            self.code = code
-        self.fix = fix
-        self.operation_id = operation_id
-        self.data = data
-
-
-class NotFound(ToolError):
-    """A referenced object does not exist (unknown id, vanished file)."""
-    code = codes.NOT_FOUND
-
-
-class InvalidInput(ToolError):
-    """A caller-supplied value could not be parsed or used."""
-    code = codes.INVALID_INPUT
-
-
-class MailUnavailable(ToolError):
-    """The Mail store is not readable (not configured, or no FDA)."""
-    code = codes.MAIL_UNAVAILABLE
 
 
 # --------------------------------------------------------------------- #

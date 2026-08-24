@@ -88,6 +88,30 @@ TOOL_SPECS: dict[str, ToolSpec] = {
     "mailbox_delete": ToolSpec("Delete a mailbox", False, True, True, True),
 }
 
+_TOOL_DESCRIPTIONS = {
+    "search_emails": "Search local envelope data and full bodies; sender filters are case-insensitive substring matches.",
+    "get_email": "Read one email by envelope ID at full, metadata, or minimal detail.",
+    "get_emails_batch": "Read up to 50 emails in one bounded request, with per-ID errors.",
+    "get_thread": "Return the messages in one conversation in chronological order.",
+    "list_mailboxes": "List configured mailboxes with server and locally readable counts.",
+    "list_recent": "List recent messages, optionally scoped to an account and mailbox.",
+    "get_attachment": "Save one attachment to the configured temporary directory for reading.",
+    "refresh_mail": "Ask Mail.app to fetch new mail and report the before/after snapshot.",
+    "list_scheduled": "List healthy and damaged scheduled-mail records by lifecycle state.",
+    "doctor": "Diagnose permissions, identities, transports, scheduling, storage, and indexing.",
+    "audit": "Read the local mutation ledger with time, tool, event, plan, and operation filters.",
+    "send_email": "Compose standards-correct MIME and send it through the selected identity.",
+    "create_draft": "Create a never-sent draft in the selected identity's server-side Drafts folder.",
+    "reply_email": "Reply with correct threading, optional history, attachments, and reply-all.",
+    "schedule_email": "Freeze an email now and schedule local or Exchange-side delivery.",
+    "cancel_scheduled": "Revoke a pending scheduled email locally and, when needed, in Exchange.",
+    "triage_plan": "Prepare a reviewable bulk-change plan; sender filters use case-insensitive substring matching.",
+    "triage_plan_delete": "Prepare a capped Trash plan whose sender filter is exact, never a broad substring match.",
+    "triage_apply": "Apply one reviewed plan and verify each resulting mailbox state.",
+    "mailbox_create": "Create a mailbox idempotently and report live and index verification.",
+    "mailbox_delete": "Delete an empty mailbox only, with live verification and safe fallback.",
+}
+
 
 _PARAMETER_HELP = {
     "query": "Words to find in the subject, sender, snippet, or indexed body.",
@@ -350,8 +374,8 @@ def _call_result(data: dict) -> CallToolResult:
 
 
 def register_tool(mcp, function, implementation):
-    """Register one nested server function with complete MCP metadata."""
-    name = function.__name__
+    """Register one inbound function with complete MCP metadata."""
+    name = function.__name__.removeprefix("tool_")
     try:
         spec = TOOL_SPECS[name]
     except KeyError as exc:
@@ -373,10 +397,10 @@ def register_tool(mcp, function, implementation):
 
     # Avoid __wrapped__: FastMCP intentionally follows it and would rediscover
     # the nested function's old -> dict annotation instead of CallToolResult.
-    wrapped.__name__ = function.__name__
-    wrapped.__qualname__ = function.__qualname__
+    wrapped.__name__ = name
+    wrapped.__qualname__ = name
     wrapped.__module__ = function.__module__
-    wrapped.__doc__ = function.__doc__
+    wrapped.__doc__ = _TOOL_DESCRIPTIONS[name]
     wrapped.__annotations__ = {**hints, "return": wire_return}
     wrapped.__signature__ = signature.replace(
         parameters=parameters, return_annotation=wire_return,
@@ -430,4 +454,3 @@ def enrich_input_schemas(mcp) -> None:
         if tool_name == "triage_plan":
             array = _branch(properties["actions"], "array")
             array["items"] = copy.deepcopy(_ACTION_ITEMS)
-

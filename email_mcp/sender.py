@@ -24,46 +24,18 @@ from __future__ import annotations
 import html as _html
 import mimetypes
 import re
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from email.message import EmailMessage
 from email.parser import BytesHeaderParser
 from email.utils import formataddr, getaddresses, make_msgid, parseaddr
 from pathlib import Path
 
 from . import codes, config, identities, transports
+from .domain.models import DraftResult, SendResult
 from .log import get_logger
 from .transports import SendError  # re-export: same class everywhere
 
 _log = get_logger()
-
-
-@dataclass
-class SendResult:
-    ok: bool
-    message_id: str
-    to: list[str]
-    cc: list[str] = field(default_factory=list)
-    bcc: list[str] = field(default_factory=list)
-    subject: str = ""
-    attachments: list[str] = field(default_factory=list)
-    bootstrapped: bool = False
-    error: str | None = None
-
-
-@dataclass
-class DraftResult:
-    """A draft filed in the identity's own Drafts folder — intent handed
-    back, never executed (docs/draft-design.md). `draft_id` is the Graph
-    message id (durable); `message_id` is the composer-minted Message-ID,
-    the cross-store join key a local search can find once Mail syncs."""
-    ok: bool
-    draft_id: str
-    message_id: str
-    to: list[str]
-    cc: list[str] = field(default_factory=list)
-    subject: str = ""
-    folder: str = "drafts"
-    account: str = ""
 
 
 @dataclass

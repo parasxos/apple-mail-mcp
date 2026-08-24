@@ -101,7 +101,13 @@ def _check_sdist(sdist: Path, version: str) -> None:
         if len(roots) != 1:
             raise VerificationError("sdist must contain exactly one root directory")
         root = next(iter(roots))
-        required = {"README.md", "LICENSE", "pyproject.toml"}
+        required = {
+            "README.md",
+            "LICENSE",
+            "MANIFEST.in",
+            "docs/architecture.md",
+            "pyproject.toml",
+        }
         required.update(
             path.relative_to(ROOT).as_posix()
             for path in PACKAGE.rglob("*.py")

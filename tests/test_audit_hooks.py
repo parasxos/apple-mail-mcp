@@ -17,7 +17,9 @@ import json
 
 import pytest
 
-from email_mcp import config, dispatcher, plans, sender, server, spool, triage
+from email_mcp import (
+    bootstrap, config, dispatcher, plans, sender, server, spool, triage,
+)
 from email_mcp.plans import PlanAction
 from email_mcp.triage import TriageError
 
@@ -94,8 +96,12 @@ def test_reply_email_emits_reply_with_orig_id_and_reply_all(
 ):
     from email_mcp.sources.apple_mail import AppleMailSource
 
-    monkeypatch.setattr(server, "_SOURCE",
-                        AppleMailSource(mail_base=mail_fixture))
+    monkeypatch.setattr(
+        bootstrap, "_application",
+        bootstrap.build_application(
+            source=AppleMailSource(mail_base=mail_fixture)
+        ),
+    )
     monkeypatch.setenv("EMAIL_MCP_SEND_ALLOW_ALL", "0")  # guard DECLARED
     blocked = server.tool_reply_email(id="100", body="x")  # allowlist fires
     assert blocked["ok"] is False
@@ -211,7 +217,9 @@ def test_cancel_emits_failed_with_reason(send_env, audit_dir_guard):
 
 
 def test_mailbox_create_emits_only_when_created(monkeypatch, audit_dir_guard):
-    monkeypatch.setattr(server, "_SOURCE", object())
+    monkeypatch.setattr(
+        bootstrap, "_application", bootstrap.build_application(source=object())
+    )
     shapes = iter([
         {"ok": True, "account": "ACC", "path": "Archive/X", "existed": False,
          "applescript": "OK", "index_verified": True, "mail_verified": True,
@@ -220,7 +228,7 @@ def test_mailbox_create_emits_only_when_created(monkeypatch, audit_dir_guard):
          "applescript": None, "index_verified": True, "mail_verified": True,
          "warning": None},
     ])
-    monkeypatch.setattr(server, "create_mailbox",
+    monkeypatch.setattr(triage, "create_mailbox",
                         lambda src, account, path: next(shapes))
     assert server.tool_mailbox_create(account="ACC", path="Archive/X")["ok"]
     assert server.tool_mailbox_create(account="ACC", path="Archive/X")["ok"]
@@ -228,7 +236,7 @@ def test_mailbox_create_emits_only_when_created(monkeypatch, audit_dir_guard):
     def _unknown(src, account, path):
         raise TriageError("unknown_account", "no such account")
 
-    monkeypatch.setattr(server, "create_mailbox", _unknown)
+    monkeypatch.setattr(triage, "create_mailbox", _unknown)
     assert server.tool_mailbox_create(account="NOPE", path="X")["ok"] is False
 
     evs = [e for e in _events(audit_dir_guard)
@@ -239,7 +247,9 @@ def test_mailbox_create_emits_only_when_created(monkeypatch, audit_dir_guard):
 
 
 def test_mailbox_delete_emits_only_when_issued(monkeypatch, audit_dir_guard):
-    monkeypatch.setattr(server, "_SOURCE", object())
+    monkeypatch.setattr(
+        bootstrap, "_application", bootstrap.build_application(source=object())
+    )
     base = {"account": "ACC", "path": "Old", "mail_verified": True}
     shapes = iter([
         {"ok": True, "existed": False, "deleted": False, "warning": None,
@@ -252,7 +262,7 @@ def test_mailbox_delete_emits_only_when_issued(monkeypatch, audit_dir_guard):
         {"ok": False, "existed": True, "deleted": False,
          "code": "delete_failed", "error": "still there", **base},
     ])
-    monkeypatch.setattr(server, "delete_mailbox",
+    monkeypatch.setattr(triage, "delete_mailbox",
                         lambda src, account, path: next(shapes))
     for _ in range(4):
         server.tool_mailbox_delete(account="ACC", path="Old")

@@ -7,6 +7,14 @@ from pathlib import Path
 
 import pytest
 
+from email_mcp import bootstrap
+
+
+@pytest.fixture(autouse=True)
+def reset_composed_application(monkeypatch):
+    """Every test receives a fresh composition root and lazy source."""
+    monkeypatch.setattr(bootstrap, "_application", None)
+
 
 def _make_emlx(rfc822: bytes, flags: int = 0) -> bytes:
     """Wrap an RFC 822 message in Apple's .emlx framing (length prefix + plist)."""

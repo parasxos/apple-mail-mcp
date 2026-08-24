@@ -11,7 +11,7 @@ import json
 
 import pytest
 
-from email_mcp import server
+from email_mcp import bootstrap, server
 from email_mcp.envelope import to_jsonable
 from email_mcp.fts import FtsIndex
 from email_mcp.server import (
@@ -27,7 +27,8 @@ from email_mcp.sources.apple_mail import AppleMailSource
 @pytest.fixture
 def src(mail_fixture, monkeypatch) -> AppleMailSource:
     s = AppleMailSource(mail_base=mail_fixture)
-    monkeypatch.setattr(server, "_SOURCE", s)
+    monkeypatch.setattr(bootstrap, "_application",
+                        bootstrap.build_application(source=s))
     return s
 
 

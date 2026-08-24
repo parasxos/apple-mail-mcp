@@ -7,7 +7,9 @@ from unittest.mock import patch
 
 import pytest
 
+from email_mcp import bootstrap
 from email_mcp import server as srv
+from email_mcp.adapters import refresh as refresh_adapter
 
 
 @pytest.fixture
@@ -16,9 +18,9 @@ def apple_source(mail_fixture, monkeypatch):
     from email_mcp.sources.apple_mail import AppleMailSource
 
     src = AppleMailSource(mail_base=mail_fixture)
-    monkeypatch.setattr(srv, "_SOURCE", src, raising=False)
+    monkeypatch.setattr(bootstrap, "_application",
+                        bootstrap.build_application(source=src))
     yield src
-    monkeypatch.setattr(srv, "_SOURCE", None, raising=False)
 
 
 def _fake_completed(returncode: int, stdout: str = "", stderr: str = "") -> subprocess.CompletedProcess:
@@ -33,7 +35,8 @@ def _fake_completed(returncode: int, stdout: str = "", stderr: str = "") -> subp
 def test_refresh_mail_success_reports_no_delta_when_writer_idle(apple_source):
     """Successful AppleScript call but Mail.app didn't fetch anything new —
     new_messages should be 0 (not None) and before/after snapshots present."""
-    with patch.object(srv.subprocess, "run", return_value=_fake_completed(0)):
+    with patch.object(refresh_adapter.subprocess, "run",
+                      return_value=_fake_completed(0)):
         result = srv.tool_refresh_mail(wait_seconds=0, timeout_seconds=5)
 
     assert result["ok"] is True
@@ -69,7 +72,7 @@ def test_refresh_mail_success_reports_delta_when_writer_adds_rows(apple_source, 
         writer.close()
         return _fake_completed(0)
 
-    with patch.object(srv.subprocess, "run", side_effect=fake_run):
+    with patch.object(refresh_adapter.subprocess, "run", side_effect=fake_run):
         result = srv.tool_refresh_mail(wait_seconds=0, timeout_seconds=5)
 
     assert result["ok"] is True
@@ -82,7 +85,8 @@ def test_refresh_mail_maps_permission_denied(apple_source):
         "execution error: Not authorized to send Apple events to Mail. "
         "(-1743)"
     )
-    with patch.object(srv.subprocess, "run", return_value=_fake_completed(1, stderr=stderr)):
+    with patch.object(refresh_adapter.subprocess, "run",
+                      return_value=_fake_completed(1, stderr=stderr)):
         result = srv.tool_refresh_mail(wait_seconds=0, timeout_seconds=5)
 
     assert result["ok"] is False
@@ -99,7 +103,8 @@ def test_refresh_mail_maps_mail_app_missing(apple_source):
         "execution error: Can't get application \"Mail\". "
         "(-1728)"
     )
-    with patch.object(srv.subprocess, "run", return_value=_fake_completed(1, stderr=stderr)):
+    with patch.object(refresh_adapter.subprocess, "run",
+                      return_value=_fake_completed(1, stderr=stderr)):
         result = srv.tool_refresh_mail(wait_seconds=0, timeout_seconds=5)
 
     assert result["ok"] is False
@@ -108,7 +113,8 @@ def test_refresh_mail_maps_mail_app_missing(apple_source):
 
 
 def test_refresh_mail_handles_osascript_missing(apple_source):
-    with patch.object(srv.subprocess, "run", side_effect=FileNotFoundError("osascript")):
+    with patch.object(refresh_adapter.subprocess, "run",
+                      side_effect=FileNotFoundError("osascript")):
         result = srv.tool_refresh_mail(wait_seconds=0, timeout_seconds=5)
 
     assert result["ok"] is False
@@ -120,7 +126,7 @@ def test_refresh_mail_handles_timeout(apple_source):
     def boom(*args, **kwargs):
         raise subprocess.TimeoutExpired(cmd=args[0], timeout=kwargs.get("timeout", 1))
 
-    with patch.object(srv.subprocess, "run", side_effect=boom):
+    with patch.object(refresh_adapter.subprocess, "run", side_effect=boom):
         result = srv.tool_refresh_mail(wait_seconds=0, timeout_seconds=1)
 
     assert result["ok"] is False
@@ -136,8 +142,9 @@ def test_refresh_mail_clamps_wait_and_timeout(apple_source):
         captured["timeout"] = kwargs.get("timeout")
         return _fake_completed(0)
 
-    with patch.object(srv.time, "sleep", side_effect=lambda s: sleeps.append(s)):
-        with patch.object(srv.subprocess, "run", side_effect=fake_run):
+    with patch.object(refresh_adapter.time, "sleep",
+                      side_effect=lambda s: sleeps.append(s)):
+        with patch.object(refresh_adapter.subprocess, "run", side_effect=fake_run):
             result = srv.tool_refresh_mail(wait_seconds=9999, timeout_seconds=9999)
 
     # Timeout clamp: 120s max.
@@ -154,8 +161,10 @@ def test_refresh_mail_skips_wait_on_failure(apple_source):
 
     sleeps: list[float] = []
     real_sleep = time_mod.sleep
-    with patch.object(srv.time, "sleep", side_effect=lambda s: sleeps.append(s)):
-        with patch.object(srv.subprocess, "run", return_value=_fake_completed(1, stderr="(-1743)")):
+    with patch.object(refresh_adapter.time, "sleep",
+                      side_effect=lambda s: sleeps.append(s)):
+        with patch.object(refresh_adapter.subprocess, "run",
+                          return_value=_fake_completed(1, stderr="(-1743)")):
             srv.tool_refresh_mail(wait_seconds=5, timeout_seconds=5)
 
     # No sleep should have happened on the failure path.

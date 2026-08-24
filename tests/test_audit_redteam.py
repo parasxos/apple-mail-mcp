@@ -24,7 +24,9 @@ from pathlib import Path
 
 import pytest
 
-from email_mcp import audit, ids, plans, sender, server, spool, state, triage
+from email_mcp import (
+    audit, bootstrap, ids, plans, sender, server, spool, state, triage,
+)
 from email_mcp.plans import PlanAction
 from email_mcp.sources.base import SearchQuery
 
@@ -290,9 +292,11 @@ def test_f4_broken_audit_leaf_never_blocks_mail(
                              [{"action": "mark_read"}])
     assert plan.id and plans.load(plan.id) is not None
 
-    monkeypatch.setattr(server, "_SOURCE", object())
     monkeypatch.setattr(
-        server, "create_mailbox",
+        bootstrap, "_application", bootstrap.build_application(source=object())
+    )
+    monkeypatch.setattr(
+        triage, "create_mailbox",
         lambda src, account, path: {
             "ok": True, "account": account, "path": path,
             "existed": False, "applescript": "OK",
@@ -355,7 +359,10 @@ def test_f5_body_sentinel_grep_is_empty(
                                      body=f"later {SENTINEL}",
                                      send_at=_iso_in(60))
     assert sch["ok"] is True
-    monkeypatch.setattr(server, "_SOURCE", _mail_source(mail_fixture))
+    monkeypatch.setattr(
+        bootstrap, "_application",
+        bootstrap.build_application(source=_mail_source(mail_fixture)),
+    )
     assert server.tool_reply_email(id="100",
                                    body=f"re: {SENTINEL}")["ok"] is True
     # triage: the fixture message 100's BODY says "should be retracted";
