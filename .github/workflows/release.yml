@@ -10,25 +10,41 @@ jobs:
 
   release:
     needs: ci
-    runs-on: macos-latest
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
     permissions:
       contents: write
+      id-token: write
+      attestations: write
+      artifact-metadata: write
     steps:
-      - uses: actions/checkout@v4
-      - name: verify the tag matches __version__
-        run: |
-          version="$(python3 -c 'import email_mcp; print(email_mcp.__version__)')"
-          if [ "${GITHUB_REF_NAME}" != "v${version}" ]; then
-            echo "tag ${GITHUB_REF_NAME} != v${version}" >&2
-            exit 1
-          fi
-      - name: create the GitHub release
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.11"
+      - uses: actions/download-artifact@v8
+        with:
+          name: python-distributions
+          path: dist
+      - name: verify tag and downloaded release packages
+        run: python tools/verify_dist.py dist --tag "${GITHUB_REF_NAME}"
+      - name: write release checksums
+        run: sha256sum dist/*.whl dist/*.tar.gz > dist/SHA256SUMS
+      - name: attest release provenance
+        uses: actions/attest@v4
+        with:
+          subject-path: |
+            dist/*.whl
+            dist/*.tar.gz
+            dist/SHA256SUMS
+      - name: create GitHub release with installable packages
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          flags=""
+          release_flags=()
           case "${GITHUB_REF_NAME}" in
-            *rc[0-9]*) flags="--prerelease" ;;  # release candidates
+            *rc[0-9]*) release_flags+=(--prerelease) ;;
           esac
-          gh release create "${GITHUB_REF_NAME}" --title "${GITHUB_REF_NAME}" \
-            --generate-notes $flags
+          gh release create "${GITHUB_REF_NAME}" dist/* \
+            --title "${GITHUB_REF_NAME}" --generate-notes \
+            "${release_flags[@]}"

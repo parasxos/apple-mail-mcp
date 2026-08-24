@@ -32,6 +32,8 @@ from pathlib import Path
 
 from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
+from jsonschema import Draft202012Validator
+from tests._mcp_sdk import sdk_attr
 
 READ_ONLY_TOOLS = {
     "search_emails", "get_email", "get_emails_batch", "get_thread",
@@ -109,7 +111,10 @@ def _envelope(result) -> dict:
     assert result.content, "tool result carried no content"
     payload = result.content[0]
     assert payload.type == "text", f"unexpected content type {payload.type!r}"
-    return json.loads(payload.text)
+    envelope = json.loads(payload.text)
+    structured = sdk_attr(result, "structuredContent", "structured_content")
+    assert structured == envelope
+    return envelope
 
 
 # --------------------------------------------------------------------- #
@@ -126,8 +131,8 @@ def test_bare_invocation_completes_a_real_initialize_handshake(
         return init
 
     init = _talk(_server_env(tmp_path, mail_fixture), body)
-    assert init.serverInfo.name == "apple-mail"
-    assert init.protocolVersion  # negotiated, not assumed
+    assert sdk_attr(init, "serverInfo", "server_info").name == "apple-mail"
+    assert sdk_attr(init, "protocolVersion", "protocol_version")
     assert init.capabilities.tools is not None
 
 
@@ -168,11 +173,17 @@ def test_read_tool_call_returns_the_contract_envelope_with_fixture_data(
     ok-envelope alone could be faked by a stub, the fixture mailboxes
     could not."""
     async def body(session, init):
-        return await session.call_tool("list_mailboxes", {})
+        tools = {tool.name: tool for tool in (await session.list_tools()).tools}
+        result = await session.call_tool("list_mailboxes", {})
+        schema = sdk_attr(
+            tools["list_mailboxes"], "outputSchema", "output_schema",
+        )
+        return result, schema
 
-    result = _talk(_server_env(tmp_path, mail_fixture), body)
-    assert result.isError is False
+    result, schema = _talk(_server_env(tmp_path, mail_fixture), body)
+    assert sdk_attr(result, "isError", "is_error") is False
     envelope = _envelope(result)
+    Draft202012Validator(schema).validate(envelope)
     assert envelope["ok"] is True
     paths = {m["path"] for m in envelope["mailboxes"]}
     assert "local://AAAAAAAA-0000-0000-0000-000000000001/Inbox" in paths
@@ -187,7 +198,7 @@ def test_tool_failure_crosses_the_wire_as_an_envelope_not_an_exception(
         return await session.call_tool("get_email", {"id": "no-such-id"})
 
     result = _talk(_server_env(tmp_path, mail_fixture), body)
-    assert result.isError is False
+    assert sdk_attr(result, "isError", "is_error") is False
     envelope = _envelope(result)
     assert envelope["ok"] is False
     assert envelope["code"] == "invalid_input"
@@ -331,7 +342,7 @@ def test_over_cap_page_cannot_kill_the_server(tmp_path, mail_fixture):
         return first, second
 
     first, second = _talk(_server_env(tmp_path, mail_fixture), body)
-    assert first.isError is False
+    assert sdk_attr(first, "isError", "is_error") is False
     reject = _envelope(first)
     assert reject["ok"] is False and reject["code"] == "invalid_input"
     assert "500" in reject["error"]

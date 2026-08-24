@@ -15,10 +15,11 @@ schema v1 · 7 wire safety · 8 versioning.
 
 ## 1. Scope and per-tool conformance
 
-The contract covers all 20 MCP tools of v0.10: the 19 shipping at v0.9 plus
-`audit` (new in v0.10, contract-compliant from birth). With
-`EMAIL_MCP_READ_ONLY=1` exactly the 11 read-side tools register (10 at v0.9
-+ `audit`); the 9 mutating tools never exist in that session.
+The contract originally covered all 20 MCP tools of v0.10: the 19 shipping at
+v0.9 plus `audit` (new in v0.10, contract-compliant from birth). The additive
+`create_draft` tool brings the current surface to 21. With
+`EMAIL_MCP_READ_ONLY=1` exactly the 11 read-side tools register; the 10
+mutating tools never exist in that session.
 
 Conformance is staged deliberately:
 
@@ -57,11 +58,10 @@ Conformance is staged deliberately:
 | 20 | `mailbox_delete` | W | `{ok: true, existed, deleted, mail_verified, method?, warning}` | `{ok: false, code, error}` (incl. the literal-only codes, §3.1) | audit `mailbox_delete` event (issued only) | **v0.10** |
 | 21 | `create_draft` | W | `{ok: true, draft_id, message_id, to, cc, subject, folder, account}` — files our composer's MIME into the identity's own Drafts via Graph, NEVER sends (docs/draft-design.md); verified by three-legged readback (isDraft / our internetMessageId / the drafts folder) | `{ok: false, code, error}` — `draft_unsupported` when the identity declares no drafts lane (no fallback, ever) | **new at 2026-08-02** (additive, §8) — audit `draft` event on both terminals | born conformant |
 
-The three bare-**list** tools (4–6) are the only ones whose v0.10 status is
-"conformance deferred, stated here": their registered outputSchema declares
-an array, so even a failure envelope would violate the schema the client
-already holds. They gain envelopes exactly once, at v0.11, together with the
-outputSchema snapshot freeze.
+The three formerly bare-**list** tools (4–6) were the only v0.10 tools whose
+conformance was deferred: their old output shape was an array, so a failure
+envelope would have broken it. They gained envelopes exactly once at v0.11,
+together with the output-shape snapshot freeze.
 
 ## 2. Envelope semantics
 
@@ -400,13 +400,18 @@ gains an `audit` check (dir exists, perms, writability).
 - **No exception crosses the wire.** Every tool is total: any path that
   could raise is either handled with a specific code or caught by a belt
   that logs the full traceback and returns
-  `{ok: false, code: "internal_error", error, fix: "run doctor"}`.
-  *v0.10 carve-out (audit finding F1):* the three array-shaped tools
-  (`get_thread`, `list_mailboxes`, `list_recent`) are un-belted until their
-  v0.11 envelope migration — §1 rows 4-6 govern; this sentence becomes
-  absolute at v0.11.
+  `{ok: false, code: "internal_error", error, fix: "run doctor"}`. The v0.10
+  carve-out for the three formerly array-shaped tools ended at v0.11.
 - Every tool return is JSON-serializable (dataclasses/datetimes converted
   at the boundary).
+- **One result, two compatible representations.** Tool calls carry the same
+  envelope as legacy JSON text and as MCP `structuredContent`; the two are
+  byte-semantically identical. `{ok: false}` remains an application result
+  with MCP `isError: false`, preserving the v1 error-handling contract.
+- **The advertised surface is complete.** Every tool has a human title,
+  parameter descriptions, safety annotations, bounded/enum input schemas,
+  and a JSON output schema with its typed success shape plus the common
+  failure envelope.
 - **Secrets never appear in envelopes, logs, or audit events.** Secret
   *references* (a Keychain item name, an `op://` path) may be named in
   error prose — the secret *values* never leave the driver.
@@ -425,9 +430,12 @@ gains an `audit` check (dir exists, perms, writability).
   removed. A breaking change means v2.
 - **Codes**: the namespace in §3 only grows. Dispatching on a code is safe
   forever; dispatching on error prose is not (prose may be reworded).
-- **inputSchema: frozen at v0.10** (snapshot tests; inputs do not change in
-  v0.11). Tool *descriptions* are excluded from the freeze — docstrings may
-  evolve.
+- **inputSchema: accepted parameters frozen at v0.10.** The Python call
+  signatures remain unchanged. On 2026-08-24 the advertised snapshot was
+  deliberately regenerated to publish descriptions plus constraints and
+  vocabularies that the implementation already enforced or bounded (page
+  caps, views, scheduled states, refresh limits, triage actions). This changes
+  client guidance, not the v1 parameters or envelope behavior.
 - **outputSchema: frozen at v0.11**, after the bare shapes (§1, tools
   2, 4–7) take their one allowed break into envelopes. That break is the
   known normalization debt named in the roadmap and happens exactly once.
@@ -448,6 +456,14 @@ gains an `audit` check (dir exists, perms, writability).
     implied. `search_emails.fts` gains `partial` (headers-only local
     files — the same coverage hole `missing` always reported) and
     `backfilled` (docs recovered by the Graph lane).
+  - *MCP declaration 2026-08-24:* the frozen typed success shapes are now
+    emitted as standards-valid MCP `outputSchema` entries, paired with the
+    common failure envelope. Previously they were enforced only by the local
+    derived snapshot. The response itself is unchanged and remains available
+    as legacy text as well as identical structured content.
+- **SDK compatibility:** CI exercises the maintained MCP SDK 1.x floor and
+  current MCP SDK 2.x. The v2 server continues to negotiate earlier protocol
+  revisions, and the stdio command and server name remain unchanged.
 - **Audit schema**: `v` is bumped only for breaking changes to the event
   envelope; adding optional fields does not bump it. Readers must ignore
   unknown fields and tolerate mixed `v` within one file month.

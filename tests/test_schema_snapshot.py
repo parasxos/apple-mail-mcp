@@ -1,7 +1,10 @@
-"""inputSchema snapshot: the 20-tool input surface is FROZEN at v0.10
-(docs/v1-contract.md §8 — inputs do not change in v0.11). Descriptions are
-EXCLUDED from the snapshot: docstring churn is allowed, schemas are not.
-The outputSchema freeze lives in test_output_schemas.py."""
+"""inputSchema snapshot for the 21-tool surface.
+
+The accepted parameters were frozen at v0.10.  The 2026-08-24 snapshot adds
+machine-readable constraints for behavior already enforced or bounded by the
+tools (docs/v1-contract.md §8). Descriptions remain excluded: prose may evolve,
+but properties, types, defaults, constraints, and required fields may not.
+"""
 from __future__ import annotations
 
 import asyncio
@@ -11,6 +14,7 @@ import pytest
 from pathlib import Path
 
 from email_mcp import server
+from tests._mcp_sdk import sdk_attr
 
 SNAPSHOT = Path(__file__).parent / "snapshots" / "input_schemas.json"
 
@@ -31,7 +35,7 @@ def _current_schemas(monkeypatch) -> dict:
     monkeypatch.delenv("EMAIL_MCP_READ_ONLY", raising=False)
     mcp = server._build_mcp_server()
     try:
-        pairs = {t.name: t.inputSchema
+        pairs = {t.name: sdk_attr(t, "inputSchema", "input_schema")
                  for t in asyncio.run(mcp.list_tools())}
     except Exception:
         # FastMCP API drift fallback: enumerate the tool manager directly.

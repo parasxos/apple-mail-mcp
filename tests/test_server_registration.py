@@ -1,7 +1,7 @@
 """Registration-surface tests: the twenty-one-tool default surface, and the
 exact eleven read-side tools under EMAIL_MCP_READ_ONLY=1.
 
-The gate is lexical — in a read-only session the mutating nine are never
+The gate is lexical — in a read-only session the mutating ten are never
 registered, so they cannot be re-enabled by any later call."""
 from __future__ import annotations
 

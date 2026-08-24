@@ -12,6 +12,8 @@ and let Exchange deliver scheduled messages even while your Mac is asleep.
 ![ci](https://github.com/parasxos/email-mcp/actions/workflows/ci.yml/badge.svg)
 ![tools](https://img.shields.io/badge/MCP%20tools-21-brightgreen)
 ![platform](https://img.shields.io/badge/platform-macOS%20%2B%20Mail.app-orange)
+![python](https://img.shields.io/badge/Python-3.11%E2%80%933.14-blue)
+![mcp](https://img.shields.io/badge/MCP%20SDK-1.x%20%2B%202.x-purple)
 ![contract](https://img.shields.io/badge/wire%20contract-frozen%20v1-blue)
 
 </div>
@@ -90,6 +92,13 @@ Every number above was measured on a live 305,000-message mailbox.
   cache under `~/.email-mcp/graph/`.
 - 📜 **A written contract.** Since v1.0 every tool's shapes, error codes and
   caps evolve additively, held in place by 800+ automated tests.
+- 🤝 **Clear to every MCP client.** All 21 tools identify what they do, explain
+  every input, and declare whether they read, change or can remove data. Newer
+  clients receive structured results; older clients keep the same JSON text.
+  Both the maintained MCP 1.x line and current MCP 2.x are tested.
+- 📦 **Releases you can verify.** Every tagged release is built and installed
+  in a clean environment before publishing. GitHub includes the wheel, source
+  archive, SHA-256 checksums and signed build provenance—not just source code.
 - 🩺 **Self-diagnosing.** `email-mcp status` gives one readable readiness,
   scheduling and recovery screen. `email-mcp doctor` provides the complete
   diagnostic detail and an exact fix for anything red.
@@ -173,7 +182,7 @@ needs no sending configuration at all.
 
 <div align="center">
 
-**v1.3** · 21 tools · 795+ tests · additive wire contract since v1.0
+**v1.3** · 21 tools · 800+ tests · additive wire contract since v1.0
 Live-calibrated end-to-end on a 305k-message store.
 
 Built for one Mac — and for anyone else whose Mac runs Mail.app.

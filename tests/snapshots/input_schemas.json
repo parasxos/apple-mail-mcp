@@ -15,6 +15,8 @@
       },
       "limit": {
         "default": 50,
+        "maximum": 500,
+        "minimum": 1,
         "title": "Limit",
         "type": "integer"
       },
@@ -178,6 +180,11 @@
       },
       "view": {
         "default": "full",
+        "enum": [
+          "full",
+          "metadata",
+          "minimal"
+        ],
         "title": "View",
         "type": "string"
       }
@@ -194,11 +201,17 @@
         "items": {
           "type": "string"
         },
+        "maxItems": 50,
         "title": "Ids",
         "type": "array"
       },
       "view": {
         "default": "full",
+        "enum": [
+          "full",
+          "metadata",
+          "minimal"
+        ],
         "title": "View",
         "type": "string"
       }
@@ -243,6 +256,8 @@
       },
       "limit": {
         "default": 50,
+        "maximum": 500,
+        "minimum": 1,
         "title": "Limit",
         "type": "integer"
       },
@@ -266,12 +281,21 @@
     "properties": {
       "limit": {
         "default": 50,
+        "maximum": 500,
+        "minimum": 1,
         "title": "Limit",
         "type": "integer"
       },
       "state": {
         "anyOf": [
           {
+            "enum": [
+              "pending",
+              "sending",
+              "sent",
+              "failed",
+              "cancelled"
+            ],
             "type": "string"
           },
           {
@@ -288,10 +312,12 @@
   "mailbox_create": {
     "properties": {
       "account": {
+        "minLength": 1,
         "title": "Account",
         "type": "string"
       },
       "path": {
+        "minLength": 1,
         "title": "Path",
         "type": "string"
       }
@@ -306,10 +332,12 @@
   "mailbox_delete": {
     "properties": {
       "account": {
+        "minLength": 1,
         "title": "Account",
         "type": "string"
       },
       "path": {
+        "minLength": 1,
         "title": "Path",
         "type": "string"
       }
@@ -325,11 +353,15 @@
     "properties": {
       "timeout_seconds": {
         "default": 30.0,
+        "maximum": 120,
+        "minimum": 1,
         "title": "Timeout Seconds",
         "type": "number"
       },
       "wait_seconds": {
         "default": 5.0,
+        "maximum": 60,
+        "minimum": 0,
         "title": "Wait Seconds",
         "type": "number"
       }
@@ -559,6 +591,8 @@
       },
       "limit": {
         "default": 50,
+        "maximum": 500,
+        "minimum": 1,
         "title": "Limit",
         "type": "integer"
       },
@@ -576,6 +610,7 @@
       },
       "offset": {
         "default": 0,
+        "minimum": 0,
         "title": "Offset",
         "type": "integer"
       },
@@ -710,7 +745,40 @@
         "anyOf": [
           {
             "items": {
-              "additionalProperties": true,
+              "additionalProperties": false,
+              "properties": {
+                "action": {
+                  "enum": [
+                    "move_to",
+                    "mark_read",
+                    "mark_unread",
+                    "flag",
+                    "unflag"
+                  ],
+                  "type": "string"
+                },
+                "color": {
+                  "anyOf": [
+                    {
+                      "maximum": 6,
+                      "minimum": 0,
+                      "type": "integer"
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ]
+                },
+                "mailbox": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                }
+              },
+              "required": [
+                "action"
+              ],
               "type": "object"
             },
             "type": "array"
@@ -772,6 +840,7 @@
       },
       "limit": {
         "default": 0,
+        "minimum": 0,
         "title": "Limit",
         "type": "integer"
       },
@@ -877,6 +946,7 @@
       },
       "limit": {
         "default": 0,
+        "minimum": 0,
         "title": "Limit",
         "type": "integer"
       },

@@ -6,8 +6,10 @@ build-backend = "setuptools.build_meta"
 name = "email-mcp"
 dynamic = ["version"]
 description = "Local MCP server exposing Apple Mail read access + guarded sending for Claude Code."
+readme = "README.md"
 license = "MIT"
 requires-python = ">=3.11"
+keywords = ["apple-mail", "email", "mcp", "model-context-protocol"]
 classifiers = [
     "Development Status :: 4 - Beta",
     "Environment :: MacOS X",
@@ -19,14 +21,24 @@ classifiers = [
     "Topic :: Communications :: Email",
 ]
 dependencies = [
-    "mcp>=1.2,<2",
+    "mcp>=1.27.1,<3",
+    "pydantic>=2,<3",
 ]
 
 [project.optional-dependencies]
 dev = [
+    "build>=1.2",
+    "jsonschema>=4",
     "pytest>=7",
-    "setuptools>=68",
+    "setuptools>=77",
+    "twine>=6",
 ]
+
+[project.urls]
+Homepage = "https://github.com/parasxos/email-mcp"
+Documentation = "https://github.com/parasxos/email-mcp#readme"
+Issues = "https://github.com/parasxos/email-mcp/issues"
+Repository = "https://github.com/parasxos/email-mcp"
 
 [project.scripts]
 email-mcp = "email_mcp.cli:main"

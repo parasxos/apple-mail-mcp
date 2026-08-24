@@ -100,7 +100,7 @@ def _search_query(
 
 
 # ---------------------------------------------------------------------- #
-# Wire result types — the success shapes of the 20 tools (contract §1).  #
+# Wire result types — the success shapes of the 21 tools (contract §1).  #
 # Fields typed `dict` are dynamic passthroughs the types cannot see      #
 # into (fts health, doctor checks, audit events, freshness snapshots).   #
 # ---------------------------------------------------------------------- #
@@ -981,14 +981,26 @@ def _build_mcp_server():
     """Build the FastMCP Server: twenty-one tools, or exactly the eleven
     read-side tools when EMAIL_MCP_READ_ONLY=1 — the mutating ten are
     lexically gated below, so in a read-only session they never exist."""
-    from mcp.server.fastmcp import FastMCP  # type: ignore
+    try:
+        # MCP SDK 2.x: FastMCP was renamed, while the decorator surface and
+        # every pre-2.0 wire revision remain supported by MCPServer.
+        from mcp.server.mcpserver import MCPServer as FastMCP  # type: ignore
+    except ImportError:
+        # Maintained MCP SDK 1.x compatibility lane.
+        from mcp.server.fastmcp import FastMCP  # type: ignore
 
     from .config import read_only
+    from .mcp_compat import enrich_input_schemas, register_tool
 
     mcp = FastMCP("apple-mail")
     ro = read_only()
 
-    @mcp.tool()
+    def register(function):
+        """Bind the stable tool function through the MCP compatibility layer."""
+        implementation = globals()[f"tool_{function.__name__}"]
+        return register_tool(mcp, function, implementation)
+
+    @register
     def search_emails(
         query: str = "",
         from_addr: str | None = None,
@@ -1024,7 +1036,7 @@ def _build_mcp_server():
             limit=limit, offset=offset,
         )
 
-    @mcp.tool()
+    @register
     def get_email(id: str, view: str = "full") -> dict:
         """Get one message by its envelope id. `view` sizes the payload to
         the question: "full" (headers + text/HTML bodies + attachment list —
@@ -1040,7 +1052,7 @@ def _build_mcp_server():
         Returns {ok, email}."""
         return tool_get_email(id, view=view)
 
-    @mcp.tool()
+    @register
     def get_emails_batch(ids: list[str], view: str = "full") -> dict:
         """Fetch up to 50 messages in one call — the token-efficient bulk
         read. `ids` are envelope ids from search/list/thread; `view` works
@@ -1050,13 +1062,13 @@ def _build_mcp_server():
         — split the request."""
         return tool_get_emails_batch(ids, view=view)
 
-    @mcp.tool()
+    @register
     def get_thread(thread_id: str) -> dict:
         """Get every message in a conversation, oldest first.
         Returns {ok, thread}."""
         return tool_get_thread(thread_id)
 
-    @mcp.tool()
+    @register
     def list_mailboxes() -> dict:
         """List all known mailboxes across all accounts. Each entry
         carries two counts: `total` (what the account reports server-side)
@@ -1066,7 +1078,7 @@ def _build_mcp_server():
         [Gmail]/All Mail. Returns {ok, mailboxes}."""
         return tool_list_mailboxes()
 
-    @mcp.tool()
+    @register
     def list_recent(
         mailbox: str | None = None,
         account: str | None = None,
@@ -1078,14 +1090,14 @@ def _build_mcp_server():
         Returns {ok, messages}."""
         return tool_list_recent(mailbox=mailbox, account=account, limit=limit)
 
-    @mcp.tool()
+    @register
     def get_attachment(id: str, attachment_id: str) -> dict:
         """Materialise an attachment to a tmp file and return its path. The
         caller (Claude) can then `Read` the file. Bytes are never inlined.
         Returns {ok, attachment}."""
         return tool_get_attachment(id, attachment_id)
 
-    @mcp.tool()
+    @register
     def refresh_mail(wait_seconds: float = 5.0, timeout_seconds: float = 30.0) -> dict:
         """Nudge Mail.app to fetch new mail, then report what changed.
 
@@ -1104,7 +1116,7 @@ def _build_mcp_server():
             wait_seconds=wait_seconds, timeout_seconds=timeout_seconds
         )
 
-    @mcp.tool()
+    @register
     def list_scheduled(state: str | None = None, limit: int = 50) -> dict:
         """List scheduled emails by state: pending (waiting), sending
         (mid-flight), sent (delivered, with delivered_at), failed (gave up
@@ -1120,7 +1132,7 @@ def _build_mcp_server():
         result is `ok: false`, code `spool_integrity`, with named issues."""
         return tool_list_scheduled(state=state, limit=limit)
 
-    @mcp.tool()
+    @register
     def doctor() -> dict:
         """Diagnose this MCP's environment in one pass: mail-store
         readability (Full Disk Access), Mail.app Automation permission,
@@ -1136,7 +1148,7 @@ def _build_mcp_server():
         when any other tool misbehaves."""
         return tool_doctor()
 
-    @mcp.tool()
+    @register
     def audit(
         since: str | None = None,
         until: str | None = None,
@@ -1177,7 +1189,7 @@ def _build_mcp_server():
         # Mutating tools — everything below can move mail or leave a
         # durable trace; under EMAIL_MCP_READ_ONLY=1 none of it registers.
 
-        @mcp.tool()
+        @register
         def send_email(
             to: str,
             subject: str,
@@ -1220,7 +1232,7 @@ def _build_mcp_server():
                 attachments=attachments, from_identity=from_identity,
             )
 
-        @mcp.tool()
+        @register
         def create_draft(
             to: str,
             subject: str,
@@ -1254,7 +1266,7 @@ def _build_mcp_server():
                 in_reply_to=in_reply_to, from_identity=from_identity,
             )
 
-        @mcp.tool()
+        @register
         def reply_email(
             id: str,
             body: str,
@@ -1289,7 +1301,7 @@ def _build_mcp_server():
                 from_identity=from_identity,
             )
 
-        @mcp.tool()
+        @register
         def schedule_email(
             to: str,
             subject: str,
@@ -1344,7 +1356,7 @@ def _build_mcp_server():
                     )
             return res
 
-        @mcp.tool()
+        @register
         def cancel_scheduled(id: str) -> dict:
             """Cancel a pending scheduled email by id (from schedule_email /
             list_scheduled). Only pending messages can be cancelled — anything
@@ -1357,7 +1369,7 @@ def _build_mcp_server():
             the entry moves to sent/."""
             return tool_cancel_scheduled(id=id)
 
-        @mcp.tool()
+        @register
         def triage_plan(
             query: str = "",
             from_addr: str | None = None,
@@ -1400,7 +1412,7 @@ def _build_mcp_server():
                 limit=limit, actions=actions,
             )
 
-        @mcp.tool()
+        @register
         def triage_plan_delete(
             query: str = "",
             from_addr: str | None = None,
@@ -1439,7 +1451,7 @@ def _build_mcp_server():
                 limit=limit,
             )
 
-        @mcp.tool()
+        @register
         def triage_apply(plan_id: str) -> dict:
             """Execute a plan staged by triage_plan / triage_plan_delete: one
             batched AppleScript against Mail.app (messages addressed by
@@ -1456,7 +1468,7 @@ def _build_mcp_server():
             """
             return tool_triage_apply(plan_id=plan_id)
 
-        @mcp.tool()
+        @register
         def mailbox_create(account: str, path: str) -> dict:
             """Create a mailbox/folder in an account (account = the UUID shown
             in search results; path may nest with slashes, e.g. "Archive/JIRA").
@@ -1472,7 +1484,7 @@ def _build_mcp_server():
             plain-IMAP accounts."""
             return tool_mailbox_create(account=account, path=path)
 
-        @mcp.tool()
+        @register
         def mailbox_delete(account: str, path: str) -> dict:
             """Delete an EMPTY mailbox (non-empty ones are refused — triage the
             messages out first). Idempotent: already-absent returns ok with
@@ -1483,6 +1495,7 @@ def _build_mcp_server():
             folders — remove those in Mail.app/OWA)."""
             return tool_mailbox_delete(account=account, path=path)
 
+    enrich_input_schemas(mcp)
     return mcp
 
 

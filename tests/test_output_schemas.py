@@ -24,13 +24,14 @@ from pathlib import Path
 import pytest
 
 from email_mcp import envelope, server
+from tests._mcp_sdk import sdk_attr
 
 SNAPSHOT = Path(__file__).parent / "snapshots" / "output_schemas.json"
 ORACLE = Path(__file__).parent / "snapshots" / "oracle_output_schemas.json"
 
 
 def derived_schemas() -> dict:
-    """{tool name: success shape} for the 20-tool surface, derived from
+    """{tool name: success shape} for the 21-tool surface, derived from
     the return annotations of server.tool_* (the boundary adds ok)."""
     shapes = {}
     for name in dir(server):
@@ -86,15 +87,18 @@ def test_snapshot_regeneration_is_byte_stable():
     assert first == SNAPSHOT.read_text(encoding="utf-8")
 
 
-def test_no_tool_declares_a_structured_output_schema(monkeypatch):
-    """The oracle froze `declared: null` for all 20 tools — clients get
-    the envelope as unstructured content, exactly like the shipped build."""
+def test_every_tool_declares_a_structured_output_schema(monkeypatch):
+    """Modern clients get a declared envelope as well as legacy JSON text."""
     monkeypatch.delenv("EMAIL_MCP_READ_ONLY", raising=False)
     mcp = server._build_mcp_server()
     tools = asyncio.run(mcp.list_tools())
     assert len(tools) == 21
-    assert {t.name: t.outputSchema for t in tools} == \
-        {t.name: None for t in tools}
+    schemas = {t.name: sdk_attr(t, "outputSchema", "output_schema")
+               for t in tools}
+    assert all(schema is not None for schema in schemas.values())
+    assert all(schema.get("type") == "object" for schema in schemas.values())
+    assert all(len(schema.get("anyOf", [])) == 2
+               for schema in schemas.values())
 
 
 # --------------------------------------------------------------------- #

@@ -277,7 +277,10 @@ def test_packaging_single_sources_the_version():
         {"attr": "email_mcp.__version__"}
     assert py["project"]["scripts"]["email-mcp"] == "email_mcp.cli:main"
     assert py["project"]["requires-python"] == ">=3.11"
-    assert py["project"]["dependencies"] == ["mcp>=1.2,<2"]
+    assert py["project"]["dependencies"] == [
+        "mcp>=1.27.1,<3",
+        "pydantic>=2,<3",
+    ]
 
 
 def test_declared_build_floor_supports_the_license_form():

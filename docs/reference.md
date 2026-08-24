@@ -310,6 +310,19 @@ requested file, and `refresh_mail` asks Mail.app to sync. Provider-backed body
 backfill, drafts and server-side scheduling contact only the configured mail
 provider.
 
+MCP clients also receive a human title, help for every parameter, and safety
+hints saying whether a tool is read-only, destructive, repeat-safe, or reaches
+Mail.app/a provider. Existing bounds and choices—such as the 500-result page
+cap, the three email views, and scheduled states—are published as JSON Schema
+instead of living only in error messages.
+
+Every call carries the same envelope twice: JSON text for existing clients and
+`structuredContent` for clients that can consume typed results. Both contain
+the identical `{ok: true, ...}` or `{ok: false, code, error, ...}` object;
+application failures remain normal envelopes rather than protocol crashes.
+The server is tested against MCP SDK 1.27.1+ and 2.x. SDK 2.x negotiates older
+MCP wire revisions too, so existing stdio registrations do not need to change.
+
 | Tool | Purpose |
 |---|---|
 | `search_emails(query, from_addr?, to_addr?, mailbox?, account?, before?, after?, has_attachment?, unread_only?, limit?, offset?)` | Full-text search over subject + sender + snippet, plus AND filters. |

@@ -4,21 +4,93 @@ on:
   push:
     branches: [main]
   pull_request:
+  workflow_dispatch:
   workflow_call:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
   test:
-    runs-on: macos-latest
+    name: test (${{ matrix.os }}, Python ${{ matrix.python }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
     strategy:
       fail-fast: false
       matrix:
-        python: ["3.11", "3.14"]
+        include:
+          - os: macos-latest
+            python: "3.11"
+          - os: macos-latest
+            python: "3.12"
+          - os: macos-latest
+            python: "3.13"
+          - os: macos-latest
+            python: "3.14"
+          - os: ubuntu-latest
+            python: "3.11"
+          - os: ubuntu-latest
+            python: "3.14"
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
         with:
           python-version: ${{ matrix.python }}
           cache: pip
           cache-dependency-path: pyproject.toml
-      - run: python -m pip install -e ".[dev]"
-      - run: python -m pytest -q tests
+      - name: install package and test tools
+        run: python -m pip install -e ".[dev]"
+      - name: run test suite
+        run: python -m pytest -q tests
+
+  mcp-v1:
+    name: MCP SDK 1.x compatibility
+    runs-on: macos-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.11"
+          cache: pip
+          cache-dependency-path: pyproject.toml
+      - name: install the supported MCP 1.x floor
+        run: python -m pip install -e ".[dev]" "mcp==1.27.1"
+      - name: run test suite against MCP 1.x
+        run: python -m pytest -q tests
+
+  package:
+    name: build and verify release packages
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.11"
+          cache: pip
+          cache-dependency-path: pyproject.toml
+      - name: install packaging tools
+        run: python -m pip install ".[dev]"
+      - name: build wheel and source distribution
+        run: python -m build --outdir dist
+      - name: validate package metadata and contents
+        run: |
+          python -m twine check dist/*
+          python tools/verify_dist.py dist
+      - name: smoke-test the installed wheel
+        run: |
+          python -m venv wheel-smoke
+          wheel-smoke/bin/python -m pip install dist/*.whl
+          wheel-smoke/bin/email-mcp --help
+          wheel-smoke/bin/python -c "import email_mcp.mcp_compat"
+      - uses: actions/upload-artifact@v7
+        with:
+          name: python-distributions
+          path: dist/
+          if-no-files-found: error
+          retention-days: 14
