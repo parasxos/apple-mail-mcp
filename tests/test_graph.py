@@ -1546,3 +1546,32 @@ def test_fetch_body_by_message_id_shapes(monkeypatch):
                         lambda *a, **k: (503, {"error": {"message": "down"}}))
     with pytest.raises(graph.GraphError):
         graph.fetch_body_by_message_id(Ident(), "<m@x>")
+
+
+def test_fetch_body_by_graph_id_uses_the_same_body_shape(monkeypatch):
+    """Direct-id and Message-ID backfill must return one provider shape."""
+    from email_mcp import graph
+
+    class Ident:
+        name = "main"
+        from_addr = "a@cern.ch"
+        graph = {"tenant": "organizations", "client_id": "x"}
+
+    monkeypatch.setattr(
+        graph, "_graph",
+        lambda *a, **k: (200, {"body": {"contentType": "html",
+                                         "content": "<p>direct</p>"}}),
+    )
+    assert graph.fetch_body_by_graph_id(Ident(), "A/B+C=") == {
+        "contentType": "html", "content": "<p>direct</p>",
+    }
+
+    monkeypatch.setattr(graph, "_graph", lambda *a, **k: (404, {}))
+    assert graph.fetch_body_by_graph_id(Ident(), "gone") is None
+
+    monkeypatch.setattr(
+        graph, "_graph",
+        lambda *a, **k: (503, {"error": {"message": "down"}}),
+    )
+    with pytest.raises(graph.GraphError):
+        graph.fetch_body_by_graph_id(Ident(), "retry")

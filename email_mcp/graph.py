@@ -604,6 +604,14 @@ def create_deferred_draft(ident, raw: bytes, when: datetime) -> str:
     return draft_id
 
 
+def _body_payload(body: dict) -> dict:
+    """Normalize one Graph ``body`` object to the provider body contract."""
+    return {
+        "contentType": str(body.get("contentType") or "text"),
+        "content": str(body.get("content") or ""),
+    }
+
+
 def fetch_body_by_message_id(ident, message_id: str) -> dict | None:
     """The mailbox's own copy of a message body, located by RFC
     Message-ID across every folder. Returns {"contentType", "content"}
@@ -627,9 +635,7 @@ def fetch_body_by_message_id(ident, message_id: str) -> dict | None:
     value = body.get("value") or []
     if not value:
         return None
-    b = value[0].get("body") or {}
-    return {"contentType": str(b.get("contentType") or "text"),
-            "content": str(b.get("content") or "")}
+    return _body_payload(value[0].get("body") or {})
 
 
 def translate_ews_ids(ident, ews_ids: list[str]) -> dict[str, str]:
@@ -672,9 +678,7 @@ def fetch_body_by_graph_id(ident, rest_id: str) -> dict | None:
             f"[{_name(ident)}/graph] message body fetch failed "
             f"(HTTP {status}): {_graph_reason(body)}"
         )
-    b = body.get("body") or {}
-    return {"contentType": str(b.get("contentType") or "text"),
-            "content": str(b.get("content") or "")}
+    return _body_payload(body.get("body") or {})
 
 
 def _find_by_message_id(ident, folder: str, message_id: str) -> str | None:

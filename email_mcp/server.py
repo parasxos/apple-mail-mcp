@@ -24,7 +24,7 @@ import urllib.parse
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 
-from . import audit, codes, envelope, spool
+from . import applescript, audit, codes, envelope, spool
 from .config import source_name
 from .envelope import InvalidInput, NotFound
 from .log import get_logger
@@ -67,6 +67,36 @@ def _parse_dt(s: str | None) -> datetime | None:
     if dt.tzinfo is None:
         dt = dt.replace(tzinfo=timezone.utc)
     return dt
+
+
+def _search_query(
+    *,
+    query: str = "",
+    from_addr: str | None = None,
+    to_addr: str | None = None,
+    mailbox: str | None = None,
+    account: str | None = None,
+    before: str | None = None,
+    after: str | None = None,
+    has_attachment: bool | None = None,
+    unread_only: bool = False,
+    limit: int = 50,
+    offset: int = 0,
+) -> SearchQuery:
+    """Build the one read/triage filter object from MCP-facing values."""
+    return SearchQuery(
+        query=query,
+        from_addr=from_addr,
+        to_addr=to_addr,
+        mailbox=mailbox,
+        account=account,
+        before=_parse_dt(before),
+        after=_parse_dt(after),
+        has_attachment=has_attachment,
+        unread_only=unread_only,
+        limit=limit,
+        offset=offset,
+    )
 
 
 # ---------------------------------------------------------------------- #
@@ -223,18 +253,11 @@ def tool_search_emails(
     offset: int = 0,
 ) -> SearchPage:
     _check_page(limit)
-    q = SearchQuery(
-        query=query,
-        from_addr=from_addr,
-        to_addr=to_addr,
-        mailbox=mailbox,
-        account=account,
-        before=_parse_dt(before),
-        after=_parse_dt(after),
-        has_attachment=has_attachment,
-        unread_only=unread_only,
-        limit=limit,
-        offset=offset,
+    q = _search_query(
+        query=query, from_addr=from_addr, to_addr=to_addr,
+        mailbox=mailbox, account=account, before=before, after=after,
+        has_attachment=has_attachment, unread_only=unread_only,
+        limit=limit, offset=offset,
     )
     src = _source()
     hits = src.search(q)
@@ -377,13 +400,6 @@ def tool_get_attachment(id: str, attachment_id: str) -> AttachmentOut:
 # ---------------------------------------------------------------------- #
 
 
-# AppleScript / osascript error codes we map to friendly diagnostics.
-# Mail.app not installed (or AppleScript can't reach it).
-_OSA_ERR_NO_APP = -1728
-# Sending app is not authorised in Privacy & Security → Automation.
-_OSA_ERR_NOT_AUTHORIZED = -1743
-
-
 def _run_mail_check_for_new(timeout_seconds: float) -> dict:
     """Invoke `tell application "Mail" to check for new mail` via osascript.
 
@@ -420,20 +436,14 @@ def _run_mail_check_for_new(timeout_seconds: float) -> dict:
         return {"ok": True, "duration_ms": duration_ms}
 
     stderr = (proc.stderr or "").strip()
-    code: int | None = None
-    # osascript stderr looks like: "...: execution error: ... (-1743)"
-    if "(-" in stderr and stderr.rstrip().endswith(")"):
-        try:
-            code = int(stderr.rsplit("(", 1)[1].rstrip(")"))
-        except ValueError:
-            code = None
+    code = applescript.error_code(stderr)
 
-    if code == _OSA_ERR_NOT_AUTHORIZED:
+    if code == applescript.NOT_AUTHORIZED:
         msg = (
             "Mail.app automation is not authorised for this terminal. Grant it "
             "in System Settings → Privacy & Security → Automation, then retry."
         )
-    elif code == _OSA_ERR_NO_APP:
+    elif code == applescript.NO_APP:
         msg = "Mail.app is not installed or not reachable via AppleScript."
     else:
         msg = stderr or f"osascript failed with exit code {proc.returncode}."
@@ -495,6 +505,38 @@ def tool_refresh_mail(wait_seconds: float = 5.0, timeout_seconds: float = 30.0) 
 # ---------------------------------------------------------------------- #
 
 
+def _audit_send_failure(
+    event: str,
+    tool: str,
+    error: SendError,
+    *,
+    subject: str | None = None,
+    detail: dict | None = None,
+) -> None:
+    """Record the common failed compose/transmit audit shape."""
+    failure_detail = dict(detail or {})
+    failure_detail["error"] = str(error)[:300]
+    audit.emit(event, outcome="failed", tool=tool, subject=subject,
+               detail=failure_detail)
+
+
+def _audit_sent(
+    event: str,
+    tool: str,
+    result: SendResult,
+    identity: str | None,
+    *,
+    detail: dict | None = None,
+) -> None:
+    """Record the common successful immediate-send/reply audit shape."""
+    audit.emit(
+        event, outcome="sent", tool=tool,
+        message_id=result.message_id, identity=identity,
+        to=result.to, cc=result.cc or None, bcc=result.bcc or None,
+        subject=result.subject, detail=detail,
+    )
+
+
 @envelope.tool
 def tool_send_email(
     to: str,
@@ -514,15 +556,12 @@ def tool_send_email(
             attachments=attachments, from_identity=from_identity,
         )
     except SendError as e:
-        audit.emit("send", outcome="failed", tool="send_email",
-                   subject=subject, detail={"error": str(e)[:300]})
+        _audit_send_failure("send", "send_email", e, subject=subject)
         raise
-    audit.emit("send", outcome="sent", tool="send_email",
-               message_id=res.message_id, identity=from_identity,
-               to=res.to, cc=res.cc or None, bcc=res.bcc or None,
-               subject=res.subject,
-               detail={"attachments": res.attachments}
-               if res.attachments else None)
+    _audit_sent(
+        "send", "send_email", res, from_identity,
+        detail={"attachments": res.attachments} if res.attachments else None,
+    )
     return res
 
 
@@ -544,8 +583,7 @@ def tool_create_draft(
             in_reply_to=in_reply_to, from_identity=from_identity,
         )
     except SendError as e:
-        audit.emit("draft", outcome="failed", tool="create_draft",
-                   subject=subject, detail={"error": str(e)[:300]})
+        _audit_send_failure("draft", "create_draft", e, subject=subject)
         raise
     audit.emit("draft", outcome="created", tool="create_draft",
                message_id=res.message_id, identity=from_identity,
@@ -574,15 +612,15 @@ def tool_reply_email(
     except SendError as e:
         # The reply context (which message, whether reply-all) is lost
         # below the sender return — record it here, at the tool layer.
-        audit.emit("reply", outcome="failed", tool="reply_email",
-                   detail={"orig_id": id, "reply_all": reply_all,
-                           "error": str(e)[:300]})
+        _audit_send_failure(
+            "reply", "reply_email", e,
+            detail={"orig_id": id, "reply_all": reply_all},
+        )
         raise
-    audit.emit("reply", outcome="sent", tool="reply_email",
-               message_id=res.message_id, identity=from_identity,
-               to=res.to, cc=res.cc or None, bcc=res.bcc or None,
-               subject=res.subject,
-               detail={"orig_id": id, "reply_all": reply_all})
+    _audit_sent(
+        "reply", "reply_email", res, from_identity,
+        detail={"orig_id": id, "reply_all": reply_all},
+    )
     return res
 
 
@@ -604,8 +642,8 @@ def tool_schedule_email(
             from_identity=from_identity,
         )
     except SendError as e:
-        audit.emit("schedule", outcome="failed", tool="schedule_email",
-                   subject=subject, detail={"error": str(e)[:300]})
+        _audit_send_failure("schedule", "schedule_email", e,
+                            subject=subject)
         raise
     # graph_fallback: the identity asked for Exchange-side deferred send
     # but the entry landed on launchd — the silent-fallback decision is
@@ -681,6 +719,30 @@ def _plan_receipt(plan) -> PlanReceipt:
     )
 
 
+def _plan_query(
+    *,
+    cap: int,
+    query: str = "",
+    from_addr: str | None = None,
+    to_addr: str | None = None,
+    mailbox: str | None = None,
+    account: str | None = None,
+    before: str | None = None,
+    after: str | None = None,
+    has_attachment: bool | None = None,
+    unread_only: bool = False,
+    limit: int = 0,
+) -> SearchQuery:
+    """Build a stable, unpaged triage selection with one over-cap sentinel."""
+    return _search_query(
+        query=query, from_addr=from_addr, to_addr=to_addr,
+        mailbox=mailbox, account=account, before=before, after=after,
+        has_attachment=has_attachment, unread_only=unread_only,
+        limit=limit if 0 < limit <= cap else cap + 1,
+        offset=0,
+    )
+
+
 @envelope.tool
 def tool_triage_plan(
     query: str = "",
@@ -698,13 +760,10 @@ def tool_triage_plan(
     from .config import triage_max_messages
 
     cap = triage_max_messages()
-    q = SearchQuery(
-        query=query, from_addr=from_addr, to_addr=to_addr,
-        mailbox=mailbox, account=account,
-        before=_parse_dt(before), after=_parse_dt(after),
-        has_attachment=has_attachment, unread_only=unread_only,
-        limit=limit if 0 < limit <= cap else cap + 1,  # +1 exposes over-cap
-        offset=0,  # plans must be stable selections — no paging
+    q = _plan_query(
+        cap=cap, query=query, from_addr=from_addr, to_addr=to_addr,
+        mailbox=mailbox, account=account, before=before, after=after,
+        has_attachment=has_attachment, unread_only=unread_only, limit=limit,
     )
     return _plan_receipt(build_plan(_source(), q, actions))
 
@@ -725,13 +784,10 @@ def tool_triage_plan_delete(
     from .triage import delete_max
 
     cap = delete_max()
-    q = SearchQuery(
-        query=query, from_addr=from_addr, to_addr=to_addr,
-        mailbox=mailbox, account=account,
-        before=_parse_dt(before), after=_parse_dt(after),
-        has_attachment=has_attachment, unread_only=unread_only,
-        limit=limit if 0 < limit <= cap else cap + 1,  # +1 exposes over-cap
-        offset=0,  # plans must be stable selections — no paging
+    q = _plan_query(
+        cap=cap, query=query, from_addr=from_addr, to_addr=to_addr,
+        mailbox=mailbox, account=account, before=before, after=after,
+        has_attachment=has_attachment, unread_only=unread_only, limit=limit,
     )
     return _plan_receipt(build_delete_plan(_source(), q))
 

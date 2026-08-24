@@ -66,6 +66,22 @@ class DraftResult:
     account: str = ""
 
 
+@dataclass
+class _PreparedTransmission:
+    """One fully validated message ready for immediate or deferred send.
+
+    Keeping the normalized envelope and composed MIME together prevents the
+    send and schedule paths from growing separate validation/composition
+    rules.  Attachments are already embedded; ``attachment_names`` is only
+    receipt metadata.
+    """
+    message: EmailMessage
+    to: list[str]
+    cc: list[str]
+    bcc: list[str]
+    attachment_names: list[str]
+
+
 # --------------------------------------------------------------------- #
 # address handling                                                      #
 # --------------------------------------------------------------------- #
@@ -376,6 +392,60 @@ def compose(
     return msg
 
 
+def _require_message_fields(to: list[str], subject: str, body: str) -> None:
+    """Validate fields shared by sends, schedules, and Graph drafts."""
+    if not to:
+        raise SendError("`to` is required (no valid recipient address).",
+                        code=codes.INVALID_INPUT)
+    if not subject:
+        raise SendError("`subject` is required.", code=codes.INVALID_INPUT)
+    if not body.strip():
+        raise SendError("`body` is empty.", code=codes.INVALID_INPUT)
+
+
+def _prepare_transmission(
+    ident: identities.Identity,
+    *,
+    to: str | list[str],
+    subject: str,
+    body: str,
+    cc: str | list[str] | None = None,
+    bcc: str | list[str] | None = None,
+    in_reply_to: str = "",
+    references: str = "",
+    quote_text: str = "",
+    quote_html: str = "",
+    attachments: str | list[str] | None = None,
+) -> _PreparedTransmission:
+    """Normalize, authorize, and compose one transmittable message.
+
+    This is the single preparation path for immediate and scheduled sends.
+    Delivery timing and transport ownership stay with their callers.
+    """
+    to_l, cc_l, bcc_l = _recipient_lists(to, cc, bcc)
+    _require_message_fields(to_l, subject, body)
+    loaded = _load_attachments(attachments)
+
+    if ident.bcc_self and _bare(ident.from_addr) not in {
+            _bare(address) for address in bcc_l}:
+        bcc_l.append(ident.from_addr)
+
+    _enforce_allowlist(to_l + cc_l + bcc_l, ident)
+    message = compose(
+        to=to_l, subject=subject, body=body, cc=cc_l, bcc=bcc_l,
+        in_reply_to=in_reply_to, references=references,
+        quote_text=quote_text, quote_html=quote_html,
+        attachments=loaded, identity=ident,
+    )
+    return _PreparedTransmission(
+        message=message,
+        to=to_l,
+        cc=cc_l,
+        bcc=bcc_l,
+        attachment_names=[filename for _, _, _, filename in loaded],
+    )
+
+
 # --------------------------------------------------------------------- #
 # delivery                                                              #
 # --------------------------------------------------------------------- #
@@ -544,28 +614,11 @@ def send_email(
     from_identity: str | None = None,
 ) -> SendResult:
     ident = identities.get(from_identity)
-    to_l, cc_l, bcc_l = _recipient_lists(to, cc, bcc)
-    if not to_l:
-        raise SendError("`to` is required (no valid recipient address).",
-                        code=codes.INVALID_INPUT)
-    if not subject:
-        raise SendError("`subject` is required.", code=codes.INVALID_INPUT)
-    if not body.strip():
-        raise SendError("`body` is empty.", code=codes.INVALID_INPUT)
-
-    attach_loaded = _load_attachments(attachments)
-
-    if ident.bcc_self:
-        if _bare(ident.from_addr) not in {_bare(b) for b in bcc_l}:
-            bcc_l.append(ident.from_addr)
-
-    _enforce_allowlist(to_l + cc_l + bcc_l, ident)
-
-    msg = compose(
-        to=to_l, subject=subject, body=body, cc=cc_l, bcc=bcc_l,
+    prepared = _prepare_transmission(
+        ident, to=to, subject=subject, body=body, cc=cc, bcc=bcc,
         in_reply_to=in_reply_to, references=references,
         quote_text=quote_text, quote_html=quote_html,
-        attachments=attach_loaded, identity=ident,
+        attachments=attachments,
     )
 
     ok, bootstrapped = preflight(ident)
@@ -574,15 +627,19 @@ def send_email(
                         code=codes.TRANSPORT_UNAVAILABLE)
 
     if _is_default(ident):
-        _deliver(msg)
+        _deliver(prepared.message)
     else:
-        deliver_for(ident, msg.as_bytes(), rcpt_to=to_l + cc_l + bcc_l)
+        deliver_for(
+            ident,
+            prepared.message.as_bytes(),
+            rcpt_to=prepared.to + prepared.cc + prepared.bcc,
+        )
     return SendResult(
         ok=True,
-        message_id=msg["Message-ID"],
-        to=to_l, cc=cc_l, bcc=bcc_l,
+        message_id=prepared.message["Message-ID"],
+        to=prepared.to, cc=prepared.cc, bcc=prepared.bcc,
         subject=subject,
-        attachments=[fn for _, _, _, fn in attach_loaded],
+        attachments=prepared.attachment_names,
         bootstrapped=bootstrapped,
     )
 
@@ -632,13 +689,7 @@ def create_draft(
             code=codes.DRAFT_UNSUPPORTED,
         )
     to_l, cc_l, _ = _recipient_lists(to, cc, None)
-    if not to_l:
-        raise SendError("`to` is required (no valid recipient address).",
-                        code=codes.INVALID_INPUT)
-    if not subject:
-        raise SendError("`subject` is required.", code=codes.INVALID_INPUT)
-    if not body.strip():
-        raise SendError("`body` is empty.", code=codes.INVALID_INPUT)
+    _require_message_fields(to_l, subject, body)
 
     msg = compose(to=to_l, subject=subject, body=body, cc=cc_l, bcc=[],
                   in_reply_to=in_reply_to, identity=ident)
@@ -723,35 +774,18 @@ def schedule_email(
             code=codes.SEND_AT_IN_PAST,
         )
 
-    to_l, cc_l, bcc_l = _recipient_lists(to, cc, bcc)
-    if not to_l:
-        raise SendError("`to` is required (no valid recipient address).",
-                        code=codes.INVALID_INPUT)
-    if not subject:
-        raise SendError("`subject` is required.", code=codes.INVALID_INPUT)
-    if not body.strip():
-        raise SendError("`body` is empty.", code=codes.INVALID_INPUT)
-
-    attach_loaded = _load_attachments(attachments)
-
-    if ident.bcc_self:
-        if _bare(ident.from_addr) not in {_bare(b) for b in bcc_l}:
-            bcc_l.append(ident.from_addr)
-
-    _enforce_allowlist(to_l + cc_l + bcc_l, ident)
-
-    msg = compose(
-        to=to_l, subject=subject, body=body, cc=cc_l, bcc=bcc_l,
-        attachments=attach_loaded, identity=ident,
+    prepared = _prepare_transmission(
+        ident, to=to, subject=subject, body=body, cc=cc, bcc=bcc,
+        attachments=attachments,
     )
     entry = spool.Entry(
         id=spool.new_id(now),
         send_at=spool.iso(when),
         created_at=spool.iso(now),
-        to=to_l, cc=cc_l, bcc=bcc_l,
+        to=prepared.to, cc=prepared.cc, bcc=prepared.bcc,
         subject=subject,
-        attachments=[fn for _, _, _, fn in attach_loaded],
-        message_id=msg["Message-ID"],
+        attachments=prepared.attachment_names,
+        message_id=prepared.message["Message-ID"],
         identity=ident.name,
     )
     if ident.executor == "graph":
@@ -759,8 +793,8 @@ def schedule_email(
         # importer garbles QP (see _reencode_text_base64). Re-encode
         # BEFORE freezing: the launchd fallback must deliver the same
         # bytes Exchange was shown.
-        _reencode_text_base64(msg)
-    raw = msg.as_bytes()
+        _reencode_text_base64(prepared.message)
+    raw = prepared.message.as_bytes()
     if ident.executor != "graph":
         spool.save(raw, entry)
         return entry

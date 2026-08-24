@@ -32,22 +32,13 @@ import urllib.parse
 from datetime import datetime, timezone
 from pathlib import Path
 
-from . import config, identities
+from . import applescript, config, identities
 from .log import get_logger
 from .transports import SendError, get_transport
 
 _log = get_logger()
 
 _OSA_TIMEOUT = 15.0
-
-# osascript error codes. Deliberately duplicated minimally (third small
-# copy alongside server._run_mail_check_for_new and triage._osa_error_code)
-# rather than refactored mid-stage — unifying the three is a post-v0.8
-# cleanup, and the refresh path's tests must keep binding server's copy.
-_OSA_ERR_NO_APP = -1728
-_OSA_ERR_NOT_AUTHORIZED = -1743
-# Accessibility denials observed live from the System Events UI path.
-_OSA_ERR_ACCESSIBILITY = (-1719, -25211)
 
 _FDA_FIX = (
     "Grant Full Disk Access to the app running this server: System Settings "
@@ -70,17 +61,6 @@ def _osascript(line: str, timeout: float = _OSA_TIMEOUT) -> subprocess.Completed
         ["osascript", "-e", line],
         capture_output=True, text=True, timeout=timeout,
     )
-
-
-def _osa_error_code(stderr: str) -> int | None:
-    """osascript stderr looks like: '...: execution error: ... (-1743)'."""
-    stderr = (stderr or "").strip()
-    if "(-" in stderr and stderr.endswith(")"):
-        try:
-            return int(stderr.rsplit("(", 1)[1].rstrip(")"))
-        except ValueError:
-            return None
-    return None
 
 
 # ---------------------------------------------------------------------- #
@@ -134,13 +114,13 @@ def check_automation() -> dict:
                           "(Mail.app unresponsive?)."}
     if proc.returncode == 0:
         return {"ok": True, "detail": "Mail.app reachable via AppleScript."}
-    code = _osa_error_code(proc.stderr)
-    if code == _OSA_ERR_NOT_AUTHORIZED:
+    code = applescript.error_code(proc.stderr)
+    if code == applescript.NOT_AUTHORIZED:
         return {"ok": False, "error_code": code,
                 "detail": "Mail.app automation is not authorised for this "
                           "process.",
                 "fix": _AUTOMATION_FIX}
-    if code == _OSA_ERR_NO_APP:
+    if code == applescript.NO_APP:
         return {"ok": False, "error_code": code,
                 "detail": "Mail.app is not installed or not reachable via "
                           "AppleScript."}
@@ -168,7 +148,7 @@ def check_accessibility() -> dict:
                 "detail": f"System Events probe timed out after "
                           f"{_OSA_TIMEOUT:g}s ({_ACCESSIBILITY_NOTE})."}
     if proc.returncode != 0:
-        code = _osa_error_code(proc.stderr)
+        code = applescript.error_code(proc.stderr)
         out = {"ok": False, "advisory": True,
                "detail": f"System Events not scriptable "
                          f"({(proc.stderr or '').strip()[:150]}; "
@@ -176,7 +156,7 @@ def check_accessibility() -> dict:
                "fix": _ACCESSIBILITY_FIX}
         if code is not None:
             out["error_code"] = code
-            if code == _OSA_ERR_NOT_AUTHORIZED:
+            if code == applescript.NOT_AUTHORIZED:
                 out["fix"] = (_ACCESSIBILITY_FIX +
                               " Also authorise System Events under "
                               "Automation.")

@@ -19,7 +19,7 @@ import time
 from dataclasses import replace
 from datetime import datetime, timedelta
 
-from . import audit, config, plans
+from . import applescript, audit, config, plans
 from .envelope import ToolError
 from .log import get_logger
 from .plans import Plan, PlanAction, PlanMessage
@@ -410,16 +410,6 @@ def _run_osascript(script: str, timeout: float) -> subprocess.CompletedProcess:
     )
 
 
-def _osa_error_code(stderr: str) -> int | None:
-    stderr = (stderr or "").strip()
-    if "(-" in stderr and stderr.endswith(")"):
-        try:
-            return int(stderr.rsplit("(", 1)[1].rstrip(")"))
-        except ValueError:
-            return None
-    return None
-
-
 # Apply runs the plan in sub-scripts of this many messages: small enough
 # that a killed chunk forfeits at most ten messages' stdout (and the
 # post-kill drain window in _verify stays ~2.5 min), large enough that
@@ -627,15 +617,15 @@ def _apply_plan(source, plan_id: str) -> dict:
         raise TriageError("mail_unresponsive",
                           "Mail.app did not answer the pre-flight within 15s.")
     if pre.returncode != 0:
-        code = _osa_error_code(pre.stderr)
+        code = applescript.error_code(pre.stderr)
         plans.finish(plan, "failed", {"error": (pre.stderr or "").strip()[:300]})
-        if code == -1743:
+        if code == applescript.NOT_AUTHORIZED:
             raise TriageError(
                 "automation_denied",
                 "Mail.app automation is not authorised — System Settings → "
                 "Privacy & Security → Automation.",
             )
-        if code == -1728:
+        if code == applescript.NO_APP:
             raise TriageError("no_app", "Mail.app is not reachable.")
         raise TriageError("script_error",
                           f"pre-flight failed: {(pre.stderr or '').strip()[:200]}")
@@ -818,8 +808,8 @@ def _gui_delete_mailbox(spec: str) -> tuple[bool, str | None]:
         return False, "ui path timed out"
     if proc.returncode != 0:
         stderr = (proc.stderr or "").strip()
-        code = _osa_error_code(stderr)
-        if code in (-1719, -25211, -1743):
+        code = applescript.error_code(stderr)
+        if code in applescript.ACCESSIBILITY_DENIED:
             return False, "accessibility_denied"
         return False, stderr[:200]
     return (proc.stdout or "").strip() == "DELETED", None
@@ -879,8 +869,8 @@ def delete_mailbox(source, account: str, path: str) -> dict:
         proc = None
         swallowed = "osascript timeout (30s); outcome decided by re-probe"
     if proc is not None and proc.returncode != 0:
-        code = _osa_error_code(proc.stderr)
-        if code == -1743:
+        code = applescript.error_code(proc.stderr)
+        if code == applescript.NOT_AUTHORIZED:
             raise TriageError("automation_denied",
                               "Mail.app automation is not authorised.")
         # -10000 and friends: the verb frequently errors even on success —
@@ -980,8 +970,8 @@ def create_mailbox(source, account: str, path: str) -> dict:
     except subprocess.TimeoutExpired:
         raise TriageError("mail_unresponsive", "mailbox_create timed out (30s).")
     if proc.returncode != 0:
-        code = _osa_error_code(proc.stderr)
-        if code == -1743:
+        code = applescript.error_code(proc.stderr)
+        if code == applescript.NOT_AUTHORIZED:
             raise TriageError("automation_denied",
                               "Mail.app automation is not authorised.")
         raise TriageError("script_error",
