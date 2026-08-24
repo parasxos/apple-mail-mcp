@@ -11,30 +11,44 @@ except ``doctor``, whose job is to report it.
 from __future__ import annotations
 
 import argparse
+import difflib
 import importlib
+import json
 import sys
 
 from . import __version__, state
 
 _PASSTHROUGH = ("audit", "fts", "graph", "dispatcher")
-_VERBS = ("serve", "setup", "doctor", "update", "uninstall", "version",
-          *_PASSTHROUGH)
+_VERBS = ("serve", "setup", "status", "doctor", "update", "uninstall",
+          "version", "help", *_PASSTHROUGH)
 
 _USAGE = """\
+Email MCP — private, local-first access to Apple Mail
+
 usage: email-mcp [verb] [options]
 
-  (bare) / serve                 serve MCP over stdio
+Get started:
   setup                          first-run wizard: adopt state, identity,
                                  launchd agents, client config, smoke test
+  status [--json]                one readiness, queue, and recovery overview
   doctor [--fix] [--dry-run]     report problems; --fix repairs them
+
+Run:
+  (bare) / serve                 serve MCP over stdio
+
+Maintain:
   update                         migrate an existing install forward
   uninstall [--purge] [--yes]    agents out, token caches removed;
                                  --purge also removes state + logs
   version                        print the version
-  audit|fts|graph|dispatcher ... module CLIs (arguments forwarded)
+  help / --help                  show this help
 
-Leading-dash arguments forward to the legacy server flags
-(`email-mcp --help` lists them).
+Advanced:
+  audit|fts|graph|dispatcher ... module commands (arguments forwarded)
+  serve --help                   legacy server diagnostics and test sends
+
+Start with `email-mcp setup`; use `email-mcp status` whenever something
+looks wrong.
 """
 
 
@@ -76,12 +90,34 @@ def _uninstall(rest: list[str]) -> int:
     return lifecycle.uninstall(purge=args.purge, yes=args.yes)
 
 
+def _status(rest: list[str]) -> int:
+    """Recovery-safe overview: like doctor, it must run when state refuses."""
+    parser = argparse.ArgumentParser(prog="email-mcp status")
+    parser.add_argument("--json", action="store_true",
+                        help="print the same status snapshot as JSON")
+    args = parser.parse_args(rest)
+    from . import overview
+
+    snap = overview.snapshot()
+    if args.json:
+        print(json.dumps(snap, indent=2))
+    else:
+        print("\n".join(overview.render(snap)))
+    return 0 if snap["ready"] else 1
+
+
 def _no_flags(verb: str, rest: list[str]) -> None:
     argparse.ArgumentParser(prog=f"email-mcp {verb}").parse_args(rest)
 
 
 def main(argv: list[str] | None = None) -> int:
     argv = list(sys.argv[1:]) if argv is None else list(argv)
+    if argv and argv[0] in ("help", "-h", "--help"):
+        if len(argv) > 1:
+            print("usage: email-mcp help", file=sys.stderr)
+            return 2
+        print(_USAGE, end="")
+        return 0
     if argv and argv[0].startswith("-"):
         from . import server
 
@@ -89,7 +125,13 @@ def main(argv: list[str] | None = None) -> int:
     verb, rest = (argv[0], argv[1:]) if argv else ("serve", [])
     if verb == "doctor":
         return _doctor(rest)
+    if verb == "status":
+        return _status(rest)
     if verb not in _VERBS:
+        print(f"error: unknown command {verb!r}", file=sys.stderr)
+        close = difflib.get_close_matches(verb, _VERBS, n=1, cutoff=0.55)
+        if close:
+            print(f"Did you mean {close[0]!r}?", file=sys.stderr)
         sys.stderr.write(_USAGE)
         return 2
 

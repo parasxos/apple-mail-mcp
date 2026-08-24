@@ -37,6 +37,27 @@ across search, sending, scheduling, triage and diagnostics; the complete list
 is in [Tool reference](#tool-reference). With `EMAIL_MCP_READ_ONLY=1`, only
 the 11 non-mutating mail tools register.
 
+## Command-line status and recovery
+
+The normal operator view is intentionally human-readable:
+
+```bash
+email-mcp --help
+email-mcp status
+```
+
+`status` groups mail access, sending, search, activity history and scheduled
+delivery into one READY / NEEDS ATTENTION verdict. It shows queue counts, the
+next readable scheduled message, and every failed message's id, recipients,
+attempt count and last error. Its numbered next steps prefer automatic repair
+when available and otherwise name the exact diagnostic or recovery command.
+It remains available when the managed state configuration itself is refused.
+
+For scripts, `email-mcp status --json` prints the same snapshot as JSON. For
+the complete low-level diagnostic report use `email-mcp doctor`; safe managed
+repairs are previewed and applied with `email-mcp doctor --fix`. Raw scheduled
+record details remain available with `email-mcp dispatcher --status`.
+
 For a cautious first run, restrict an environment-configured identity to its
 own address by adding this flag to the server's `env` block:
 
@@ -364,8 +385,11 @@ database:
   so it can fire while the Mac is offline.
 - Failures retry with backoff (2/5/15/45/120 min, `EMAIL_MCP_SEND_RETRIES`
   attempts, default 5), then park in `failed/` with the error + a macOS
-  notification. Atomic claim renames prevent overlapping dispatcher runs from
-  owning the same record concurrently.
+  notification. `email-mcp status` lists each parked message and its actual
+  error. Fix the reported cause, reschedule it from the MCP client, and keep
+  the failed record until the replacement is confirmed. Atomic claim renames
+  prevent overlapping dispatcher runs from owning the same record
+  concurrently.
 - Local scheduled delivery is **at-least-once across the transport handoff**.
   If the process dies after the provider accepts the message but before the
   record moves from `sending/` to `sent/`, recovery cannot know the outcome
@@ -374,8 +398,9 @@ database:
 - Authorization happens at **schedule time** (inside the MCP server, where
   your config lives); the dispatcher deliberately does not re-check — it
   runs under launchd's bare environment where identity policy is not loaded.
-- `email-mcp setup` installs the background sender. Its direct operational
-  commands are `email-mcp dispatcher --status`,
+- `email-mcp setup` installs the background sender and ends with a readiness
+  or guided-recovery handoff. Use `email-mcp status` for the normal overview.
+  Its direct operational commands are `email-mcp dispatcher --status`,
   `email-mcp dispatcher --install-launchd` and
   `email-mcp dispatcher --uninstall-launchd`; the log is at
   `~/.email-mcp/dispatcher.log`.

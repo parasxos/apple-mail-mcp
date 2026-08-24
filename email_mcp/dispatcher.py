@@ -544,23 +544,36 @@ def uninstall_launchd() -> str:
     return f"removed {LAUNCHD_LABEL}{note}"
 
 
+def _status_entry(entry: spool.Entry) -> dict:
+    """The operator-facing fields shared by active and failed records."""
+    return {
+        "id": entry.id,
+        "send_at": entry.send_at,
+        "to": entry.to,
+        "subject": entry.subject,
+        "attempts": entry.attempts,
+        "next_attempt_at": entry.next_attempt_at,
+        "last_error": entry.last_error,
+        "executor": entry.executor,
+    }
+
+
 def status() -> dict:
     scans = spool.scan_all()
     integrity = spool.integrity(scans)
-    pending = next(result for result in scans if result.state == "pending")
+    by_state = {result.state: result for result in scans}
     out = {
         "ok": integrity["ok"],
         "spool": str(config.spool_dir()),
         "launchd_plist": str(_plist_path()),
         "launchd_installed": _plist_path().exists(),
         "counts": integrity["counts"],
-        "pending": [
-            {"id": e.id, "send_at": e.send_at, "to": e.to,
-             "subject": e.subject, "attempts": e.attempts,
-             "next_attempt_at": e.next_attempt_at, "last_error": e.last_error,
-             "executor": e.executor}
-            for e in pending.entries
-        ],
+        # Pending was the original detail surface. Sending and failed are
+        # additive operator views: a count without the id/error gave a human
+        # no way to identify or recover a stuck message.
+        "pending": [_status_entry(e) for e in by_state["pending"].entries],
+        "sending": [_status_entry(e) for e in by_state["sending"].entries],
+        "failed": [_status_entry(e) for e in by_state["failed"].entries],
     }
     if not integrity["ok"]:
         out["integrity"] = integrity

@@ -80,6 +80,21 @@ def test_bare_serve_and_dash_argv_reach_server_main(home, monkeypatch):
     assert calls == [[], [], ["--selftest", "--refresh-wait", "2"]]
 
 
+def test_top_level_help_is_for_people_not_legacy_server_flags(
+    home, monkeypatch, capsys,
+):
+    monkeypatch.setattr(
+        "email_mcp.server.main",
+        lambda argv=None: (_ for _ in ()).throw(AssertionError("not server")),
+    )
+    assert cli.main(["--help"]) == 0
+    assert cli.main(["help"]) == 0
+    out = capsys.readouterr().out
+    assert out.count("Email MCP") == 2
+    assert "status" in out and "setup" in out and "doctor" in out
+    assert "--send-test" not in out
+
+
 # ---------------------------------------------------------------------- #
 # the one gate: Refused prints to stderr and exits 2                       #
 # ---------------------------------------------------------------------- #
@@ -121,6 +136,37 @@ def test_doctor_healthy_exits_zero(home, report, capsys):
     assert "mail_store: 42 messages" in out
     assert "audit: no events yet" in out
     assert "FAIL" not in out
+
+
+def test_status_is_recovery_safe_and_supports_json(
+    home, monkeypatch, capsys,
+):
+    snap = {"ready": True, "version": "test", "next_steps": []}
+    monkeypatch.setattr("email_mcp.overview.snapshot", lambda: snap)
+    monkeypatch.setattr("email_mcp.overview.render",
+                        lambda value: ["Email MCP test", "Status: READY"])
+
+    assert cli.main(["status"]) == 0
+    assert "Status: READY" in capsys.readouterr().out
+    assert cli.main(["status", "--json"]) == 0
+    assert '"ready": true' in capsys.readouterr().out
+
+
+def test_status_still_runs_when_the_state_root_is_refused(
+    home, monkeypatch, capsys,
+):
+    monkeypatch.setenv("EMAIL_MCP_SPOOL_DIR", str(home / "retired"))
+    calls = []
+    monkeypatch.setattr(
+        "email_mcp.overview.snapshot",
+        lambda: (calls.append(True) or {"ready": False, "next_steps": []}),
+    )
+    monkeypatch.setattr("email_mcp.overview.render",
+                        lambda value: ["Status: NEEDS ATTENTION"])
+
+    assert cli.main(["status"]) == 1
+    assert calls == [True]
+    assert "NEEDS ATTENTION" in capsys.readouterr().out
 
 
 def test_doctor_renders_findings_and_the_fix_hint(home, report, capsys):
@@ -181,9 +227,11 @@ def test_passthrough_forwards_rest_argv(home, monkeypatch, verb):
 
 
 def test_unknown_verb_prints_usage_and_exits_2(home, capsys):
-    assert cli.main(["frobnicate"]) == 2
+    assert cli.main(["stats"]) == 2
     cap = capsys.readouterr()
     assert "usage: email-mcp" in cap.err
+    assert "unknown command 'stats'" in cap.err
+    assert "Did you mean 'status'?" in cap.err
     assert cap.out == ""
 
 

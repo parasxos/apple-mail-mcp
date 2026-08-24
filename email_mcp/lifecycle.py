@@ -554,12 +554,13 @@ def _fts_agent_aftercare() -> None:
 def _print_client_config() -> None:
     cfg = {"mcpServers": {"apple-mail": {
         "command": sys.executable, "args": ["-m", "email_mcp.server"]}}}
-    print("\nMCP client config (claude mcp add-json / "
-          "claude_desktop_config.json):")
+    print("\nConnect your MCP client")
+    print("Paste this server entry into your client's MCP configuration "
+          "(for example Claude Desktop's claude_desktop_config.json):")
     print(json.dumps(cfg, indent=2))
 
 
-def _smoke() -> None:
+def _smoke() -> bool:
     from . import doctor
 
     print("\nsmoke test (doctor):")
@@ -568,12 +569,13 @@ def _smoke() -> None:
         print(line)
     if not report["ok"]:
         print("  => NOT ready — fix the FAIL lines and re-run doctor")
-        return
+        return False
     warns = sum(1 for c in {**report["checks"],
                             "audit": report["audit"]}.values()
                 if not c["ok"] and c.get("advisory"))
     print(f"  => ready ({warns} warning(s) — none block use)"
           if warns else "  => ready")
+    return True
 
 
 def setup(*, yes: bool = False) -> int:
@@ -588,6 +590,9 @@ def setup(*, yes: bool = False) -> int:
     if isinstance(r, state.Refused):
         print(f"cannot set up: {r.reason}")
         return 1
+    print("Email MCP setup")
+    print("This configures private local state, optional sending, "
+          "background scheduling, and body search.")
     # Adoption is a BUILD effect here, deliberately — unlike --fix/update,
     # where it rides the plan. Setup is the create verb: the registry
     # reads an absent root as healthy (doctor stays quiet on machines
@@ -629,5 +634,14 @@ def setup(*, yes: bool = False) -> int:
                       "python -m email_mcp.fts --build")
         _fts_agent_aftercare()
     _print_client_config()
-    _smoke()
+    ready = _smoke()
+    if code == 0 and ready:
+        print("\nSetup complete — Email MCP is ready.")
+        print("Check it anytime with: email-mcp status")
+    else:
+        print("\nSetup finished, but Email MCP still needs attention.")
+        print("  1) Follow the FAIL fixes above.")
+        print("  2) Run `email-mcp doctor --fix` for automatic repairs "
+              "where offered.")
+        print("  3) Run `email-mcp status` to confirm recovery.")
     return code

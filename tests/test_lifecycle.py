@@ -424,6 +424,36 @@ def test_setup_yes_adopts_stamps_and_prints_config(home, smoke, monkeypatch,
     out = capsys.readouterr().out
     assert '"apple-mail"' in out and "email_mcp.server" in out
     assert "42 messages" in out  # the smoke test rendered
+    assert "Setup complete" in out
+    assert "email-mcp status" in out
+
+
+def test_setup_not_ready_ends_with_a_guided_recovery_handoff(
+    home, monkeypatch, capsys,
+):
+    report = {
+        "ok": False,
+        "read_only": False,
+        "checks": {
+            "mail_store": {
+                "ok": False,
+                "detail": "Mail access is blocked",
+                "fix": "grant Full Disk Access",
+            },
+        },
+        "audit": {"ok": True, "detail": "no events yet"},
+    }
+    monkeypatch.setattr("email_mcp.doctor.run", lambda: report)
+    _no_input(monkeypatch)
+
+    # Setup itself completed; the final handoff clearly says the install is
+    # not ready instead of ending after a wall of diagnostic output.
+    assert lifecycle.setup(yes=True) == 0
+    out = capsys.readouterr().out
+    assert "Setup finished, but Email MCP still needs attention" in out
+    assert "grant Full Disk Access" in out
+    assert "email-mcp doctor --fix" in out
+    assert "email-mcp status" in out
 
 
 def test_setup_interactive_smtp_identity_never_stores_the_secret(

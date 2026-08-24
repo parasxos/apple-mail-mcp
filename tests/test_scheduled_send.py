@@ -149,6 +149,21 @@ def test_retry_backoff_then_park_failed(monkeypatch, delivered):
     assert spool.load("failed", entry.id).attempts == 2
     assert notes  # user was notified of the final failure
 
+    # Operational status must identify the failed message and preserve the
+    # actual cause; a bare count gives the user no recovery path.
+    status = dispatcher.status()
+    assert status["sending"] == []
+    assert status["failed"] == [{
+        "id": entry.id,
+        "send_at": entry.send_at,
+        "to": ["paris.moschovakos@cern.ch"],
+        "subject": "s",
+        "attempts": 2,
+        "next_attempt_at": spool.load("failed", entry.id).next_attempt_at,
+        "last_error": "smtp exploded",
+        "executor": "launchd",
+    }]
+
 
 def test_stranded_sending_recovers_then_delivers(delivered):
     """A crashed dispatcher leaves its claim in sending/; the next pass

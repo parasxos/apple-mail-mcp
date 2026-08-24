@@ -89,15 +89,17 @@ Every number above was measured on a live 305,000-message mailbox.
   macOS Keychain or 1Password; Microsoft OAuth tokens live in a private 0600
   cache under `~/.email-mcp/graph/`.
 - 📜 **A written contract.** Since v1.0 every tool's shapes, error codes and
-  caps evolve additively, held in place by 795+ automated tests.
-- 🩺 **Self-diagnosing.** `email-mcp doctor` checks every permission,
-  identity and transport lane and tells you the exact fix for anything red.
+  caps evolve additively, held in place by 800+ automated tests.
+- 🩺 **Self-diagnosing.** `email-mcp status` gives one readable readiness,
+  scheduling and recovery screen. `email-mcp doctor` provides the complete
+  diagnostic detail and an exact fix for anything red.
 
 ## 🚀 Quick start
 
 ```bash
 pipx install git+https://github.com/parasxos/email-mcp
 email-mcp setup
+email-mcp status
 ```
 
 Before running `setup`, grant your terminal app **Full Disk Access**
@@ -119,8 +121,10 @@ paste into your MCP client:
 }
 ```
 
-Grant **Automation → Mail** when triage first asks for it. Check the whole
-installation anytime with `email-mcp doctor`.
+Setup ends with a clear **ready** verdict or numbered recovery steps. Grant
+**Automation → Mail** when triage first asks for it. Check the installation,
+the next scheduled message, and failed scheduled sends anytime with
+`email-mcp status`; use `email-mcp doctor` for the full technical detail.
 
 > 💡 *New to the terminal?* Three things that look wrong and aren't:
 > `brew install pipx` wants a typed `y` (Enter alone is rejected);
