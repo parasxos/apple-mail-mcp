@@ -1,6 +1,7 @@
 """Outbound interfaces used by the application layer."""
 from __future__ import annotations
 
+from datetime import datetime
 from typing import Any, Protocol
 
 from ..domain.events import EventPublisher
@@ -85,6 +86,61 @@ class OperationsGateway(Protocol):
     def classify(self, error: BaseException) -> str: ...
 
 
+class BackgroundIdentityError(Exception):
+    """A scheduled entry refers to an unavailable identity."""
+
+
+class BackgroundProviderError(Exception):
+    """A remote deferred-delivery provider could not give a safe answer."""
+
+
+class BackgroundDeliveryError(Exception):
+    """The local delivery transport rejected or could not send a message."""
+
+
+class BackgroundGateway(Protocol):
+    """Infrastructure needed by the scheduled-delivery use case."""
+
+    def now(self) -> datetime: ...
+
+    def iso(self, value: datetime) -> str: ...
+
+    def entries(self, state: str) -> list[ScheduledEntry]: ...
+
+    def load(self, state: str, operation_id: str) -> ScheduledEntry | None: ...
+
+    def claim(self, operation_id: str) -> bool: ...
+
+    def move(self, entry: ScheduledEntry, source: str, target: str) -> None: ...
+
+    def update(self, state: str, entry: ScheduledEntry) -> None: ...
+
+    def read_message(self, state: str, operation_id: str) -> bytes: ...
+
+    def integrity(self) -> dict: ...
+
+    def max_retries(self) -> int: ...
+
+    def identity(self, name: str) -> Any: ...
+
+    def preflight(self, identity: Any) -> tuple[bool, str | None]: ...
+
+    def deliver(self, identity: Any, raw: bytes,
+                recipients: list[str]) -> None: ...
+
+    def find_deferred_draft(self, identity: Any,
+                            message_id: str) -> str | None: ...
+
+    def deferred_was_sent(self, identity: Any, message_id: str) -> bool: ...
+
+    def deferred_status(self, identity: Any, draft_id: str,
+                        message_id: str) -> str: ...
+
+    def delete_deferred_draft(self, identity: Any, draft_id: str) -> str: ...
+
+    def notify(self, title: str, text: str) -> None: ...
+
+
 class ApplicationPorts(Protocol):
     source: SourceProvider
     delivery: DeliveryGateway
@@ -94,3 +150,4 @@ class ApplicationPorts(Protocol):
     refresh: RefreshGateway
     operations: OperationsGateway
     events: EventPublisher
+    background: BackgroundGateway | None

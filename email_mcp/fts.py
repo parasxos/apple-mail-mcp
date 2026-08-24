@@ -60,19 +60,16 @@ CLI:
 """
 from __future__ import annotations
 
-import argparse
-import json
 import os
 import re
 import sqlite3
-import subprocess
-import sys
 import time
 import urllib.parse
 from datetime import datetime, timezone
 from pathlib import Path
 
 from . import config, state
+from . import fts_runtime
 from .log import get_logger
 from .sources.apple_mail_paths import find_emlx_path, mailbox_data_dir
 
@@ -1324,190 +1321,47 @@ class FtsIndex:
 
 
 # ---------------------------------------------------------------------- #
-# launchd install (mirrors email_mcp.dispatcher)                          #
+# launchd install and CLI compatibility facade                           #
 # ---------------------------------------------------------------------- #
 
 
 def _plist_path() -> Path:
-    return Path.home() / "Library" / "LaunchAgents" / f"{LAUNCHD_LABEL}.plist"
+    return fts_runtime.plist_path()
 
 
 def _log_path() -> Path:
-    return config.state_dir() / "fts.log"
+    return fts_runtime.log_path()
 
 
 def _plist_content() -> str:
-    # Same PATH-baking rationale as the dispatcher: launchd's bare PATH can
-    # resolve the wrong python3; the installing shell's PATH is known-good.
-    path = os.environ.get("PATH", "/usr/bin:/bin:/usr/sbin:/sbin")
-    return f"""<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-<dict>
-    <key>Label</key><string>{LAUNCHD_LABEL}</string>
-    <key>ProgramArguments</key>
-    <array>
-        <string>{sys.executable}</string>
-        <string>-m</string>
-        <string>email_mcp.fts</string>
-        <string>--sync</string>
-    </array>
-    <key>EnvironmentVariables</key>
-    <dict>
-        <key>PATH</key><string>{path}</string>
-    </dict>
-    <key>StartCalendarInterval</key>
-    <dict>
-        <key>Hour</key><integer>3</integer>
-        <key>Minute</key><integer>30</integer>
-    </dict>
-    <key>ProcessType</key><string>Background</string>
-    <key>StandardOutPath</key><string>{_log_path()}</string>
-    <key>StandardErrorPath</key><string>{_log_path()}</string>
-</dict>
-</plist>
-"""
+    return fts_runtime.plist_content()
 
 
 def install_launchd() -> str:
-    state.State.resolve().adopt()  # the agent's log lands in the state root
-    plist = _plist_path()
-    plist.parent.mkdir(parents=True, exist_ok=True)
-    plist.write_text(_plist_content())
-    uid = os.getuid()
-    subprocess.run(["launchctl", "bootout", f"gui/{uid}", str(plist)],
-                   capture_output=True)
-    proc = subprocess.run(["launchctl", "bootstrap", f"gui/{uid}", str(plist)],
-                          capture_output=True, text=True)
-    if proc.returncode != 0:
-        return f"bootstrap failed: {proc.stderr.strip()}"
-    return f"installed {LAUNCHD_LABEL} (daily 03:30 --sync), log: {_log_path()}"
+    return fts_runtime.install_launchd()
 
 
 def uninstall_launchd() -> str:
-    plist = _plist_path()
-    subprocess.run(["launchctl", "bootout", f"gui/{os.getuid()}", str(plist)],
-                   capture_output=True)
-    if plist.exists():
-        plist.unlink()
-    return f"removed {LAUNCHD_LABEL}"
-
-
-# ---------------------------------------------------------------------- #
-# CLI                                                                    #
-# ---------------------------------------------------------------------- #
+    return fts_runtime.uninstall_launchd()
 
 
 def _reconcile_due(idx: FtsIndex) -> bool:
-    stamp = idx.status().get("last_reconcile_at")
-    if not stamp:
-        return True
-    try:
-        last = datetime.fromisoformat(stamp)
-    except ValueError:
-        return True
-    age = datetime.now(timezone.utc) - last
-    return age.days >= config.fts_reconcile_days()
+    return fts_runtime.reconcile_due(idx)
 
 
-_BACKFILL_CAP = 500  # per-sync ceiling: polite to Graph, resumes nightly
+_BACKFILL_CAP = fts_runtime.BACKFILL_CAP
 
 
 def _sync(idx: FtsIndex, limit: int | None) -> dict:
-    out = idx.incremental(max_docs=limit)
-    if out.get("skipped") == "busy":
-        return out
-    if _reconcile_due(idx):
-        out["reconcile"] = idx.reconcile()
-    out["backfill"] = idx.backfill(max_docs=_BACKFILL_CAP)
-    return out
+    return fts_runtime.sync(idx, limit)
 
 
 def _print_status(st: dict, as_json: bool) -> None:
-    if as_json:
-        json.dump(st, sys.stdout, indent=2)
-        sys.stdout.write("\n")
-        return
-    if st["state"] == "absent":
-        print(f"index: {st['db']} (absent)")
-        print(f"build it: {st['remedy']}")
-        return
-    if st["state"] == "error":
-        print(f"index: {st['db']} (error: {st.get('error')})")
-        return
-    d = st["docs"]
-    mb = st["db_bytes"] / 1_048_576
-    print(f"index: {st['db']} ({st['state']}, {mb:.1f} MB, "
-          f"schema v{st['schema_version']})")
-    print(f"docs: {d['indexed']} indexed, {d['partial']} partial, "
-          f"{d['missing']} missing, {d['error']} error "
-          f"(hwm rowid {st['last_rowid']})")
-    print(f"built: {st['built_at'] or '-'}  synced: {st['last_sync_at'] or '-'}  "
-          f"reconciled: {st['last_reconcile_at'] or '-'}  "
-          f"backfilled: {st.get('last_backfill_at') or '-'}")
-    if st.get("last_backfill_error"):
-        print(f"backfill trouble: {st['last_backfill_error']}")
+    fts_runtime.print_status(st, as_json)
 
 
 def main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(
-        prog="email_mcp.fts",
-        description="Local FTS5 body index over Apple Mail.",
-    )
-    parser.add_argument("--build", action="store_true",
-                        help="crawl all unindexed messages (resumable)")
-    parser.add_argument("--sync", action="store_true",
-                        help="incremental catch-up + miss retries "
-                             "(+ weekly reconcile)")
-    parser.add_argument("--reconcile", action="store_true",
-                        help="full rowid-set diff against the Envelope Index")
-    parser.add_argument("--backfill", action="store_true",
-                        help="fetch bodies Mail never downloaded from the "
-                             "server (Exchange accounts with a graph "
-                             "identity)")
-    parser.add_argument("--rebuild", action="store_true",
-                        help="drop the index and build from scratch")
-    parser.add_argument("--status", action="store_true")
-    parser.add_argument("--json", action="store_true",
-                        help="machine-readable output")
-    parser.add_argument("--limit", type=int, default=None, metavar="N",
-                        help="cap documents processed this run")
-    parser.add_argument("--install-launchd", action="store_true")
-    parser.add_argument("--uninstall-launchd", action="store_true")
-    args = parser.parse_args(argv)
-
-    if args.install_launchd:
-        print(install_launchd())
-        return 0
-    if args.uninstall_launchd:
-        print(uninstall_launchd())
-        return 0
-
-    idx = FtsIndex()
-    if args.status:
-        _print_status(idx.status(), args.json)
-        return 0
-
-    try:
-        if args.build:
-            out = idx.build(limit=args.limit)
-        elif args.rebuild:
-            out = idx.rebuild(limit=args.limit)
-        elif args.reconcile:
-            out = idx.reconcile()
-        elif args.backfill:
-            out = idx.backfill(max_docs=args.limit)
-        elif args.sync:
-            out = _sync(idx, args.limit)
-        else:
-            parser.print_help()
-            return 2
-    except (FileNotFoundError, sqlite3.Error) as e:
-        print(f"error: {e}", file=sys.stderr)
-        return 1
-    json.dump(out, sys.stdout, indent=2 if args.json else None)
-    sys.stdout.write("\n")
-    return 0
+    return fts_runtime.main(FtsIndex, sqlite3.Error, argv)
 
 
 if __name__ == "__main__":

@@ -16,266 +16,54 @@ from __future__ import annotations
 import math
 import subprocess
 import time
-from dataclasses import replace
-from datetime import datetime, timedelta
+from datetime import datetime
 
 from . import applescript, audit, config, plans
-from .domain.errors import ToolError
 from .log import get_logger
 from .plans import Plan, PlanAction, PlanMessage
 from .sources.base import SearchQuery
+from .triage_planning import (
+    ACTIONS,
+    DESTRUCTIVE,
+    RELOCATING,
+    TriageError,
+    TriagePlanner,
+    parse_actions as _parse_actions,
+    scheme as _scheme,
+    summary as _summary,
+)
 
 _log = get_logger()
-
-RELOCATING = {"move_to", "delete"}
-# The destructive verb is segregated: `delete` is NOT in the shared actions
-# vocabulary — it enters only through build_delete_plan (triage_plan_delete),
-# so a fumbled parameter on triage_plan can never reach the Trash.
-ACTIONS = {"move_to", "mark_read", "mark_unread", "flag", "unflag"}
-DESTRUCTIVE = {"delete"}
-
-
-class TriageError(ToolError):
-    """Caller-fixable triage failure with a machine-readable §3.1 code."""
-
-    def __init__(self, code: str, message: str):
-        super().__init__(message, code=code)
-
 
 # --------------------------------------------------------------------- #
 # plan side                                                             #
 # --------------------------------------------------------------------- #
 
 
-def _parse_actions(raw: list[dict] | None,
-                   allowed: set[str] = ACTIONS) -> list[PlanAction]:
-    if not raw:
-        raise TriageError("invalid_action", "`actions` is required (non-empty list).")
-    parsed: list[PlanAction] = []
-    for item in raw:
-        if not isinstance(item, dict) or "action" not in item:
-            raise TriageError("invalid_action", f"malformed action entry: {item!r}")
-        verb = str(item["action"])
-        if verb not in allowed:
-            if verb in DESTRUCTIVE:
-                raise TriageError(
-                    "destructive_action",
-                    "delete has its own tool — use triage_plan_delete.",
-                )
-            raise TriageError(
-                "invalid_action",
-                f"unknown action {verb!r} (want one of {sorted(allowed)})",
-            )
-        mailbox = item.get("mailbox")
-        color = item.get("color")
-        if verb == "move_to" and not mailbox:
-            raise TriageError("invalid_action", "move_to needs `mailbox`.")
-        if verb == "flag":
-            color = 0 if color is None else int(color)
-            if not 0 <= color <= 6:
-                raise TriageError("invalid_action", f"flag color {color} not in 0..6.")
-        parsed.append(PlanAction(action=verb, mailbox=mailbox, color=color))
-
-    verbs = [a.action for a in parsed]
-    if len(verbs) != len(set(verbs)):
-        raise TriageError("conflicting_actions", "duplicate actions in one plan.")
-    conflicts = [
-        {"mark_read", "mark_unread"},
-        {"flag", "unflag"},
-        {"move_to", "delete"},
-    ]
-    for pair in conflicts:
-        if pair <= set(verbs):
-            raise TriageError(
-                "conflicting_actions", f"{' + '.join(sorted(pair))} conflict."
-            )
-    # A relocating action kills the by-ROWID specifier — always run it last.
-    parsed.sort(key=lambda a: a.action in RELOCATING)
-    return parsed
+def _planner() -> TriagePlanner:
+    """Bind planning to the current, monkeypatchable Mail.app seams."""
+    return TriagePlanner(_mailbox_exists_in_mail, _as_literal, _log)
 
 
-def _summary(messages: list[PlanMessage], actions: list[PlanAction],
-             target: dict | None) -> str:
-    verbs = " + ".join(
-        a.action + (f" '{a.mailbox}'" if a.action == "move_to" else "")
-        for a in actions
-    )
-    senders = len({m.from_addr for m in messages})
-    dates = sorted(m.date[:10] for m in messages)
-    accounts = {m.account for m in messages}
-    return (
-        f"{verbs}: {len(messages)} msg(s), {senders} sender(s), "
-        f"{dates[0]}…{dates[-1]}, account(s) {', '.join(sorted(accounts))}"
-    )
-
-
-def _scheme(url: str) -> str:
-    return url.split("://", 1)[0] if "://" in url else ""
-
-
-def build_plan(source, q: SearchQuery, actions: list[dict] | None,
-               allowed: set[str] = ACTIONS) -> Plan:
-    plans.gc()
-    parsed = _parse_actions(actions, allowed=allowed)
-
-    snap_fn = getattr(source, "triage_snapshot", None)
-    resolve_fn = getattr(source, "resolve_mailbox", None)
-    if snap_fn is None or resolve_fn is None:
-        raise TriageError("unsupported_source",
-                          "this email source does not support triage.")
-
-    cap = config.triage_max_messages()
-    refs = source.search(q)
-    if not refs:
-        raise TriageError("empty_selection", "no messages match the query.")
-    if len(refs) > cap:
-        raise TriageError(
-            "selection_too_large",
-            f"query matched more than {cap} messages (the cap; counting "
-            "stopped there) — narrow the query, or raise EMAIL_MCP_TRIAGE_MAX "
-            "if the selection is genuinely intended.",
-        )
-
-    rowids = [int(r.id) for r in refs]
-    snap = snap_fn(rowids)
-
-    target: dict | None = None
-    move = next((a for a in parsed if a.action == "move_to"), None)
-    if move is not None:
-        accounts = {r.account for r in refs}
-        if len(accounts) > 1:
-            raise TriageError(
-                "cross_account",
-                f"selection spans {len(accounts)} accounts "
-                f"({', '.join(sorted(accounts))}); move_to needs one — "
-                "add the account= filter to pick which.",
-            )
-        account = next(iter(accounts))
-        hit = resolve_fn(account, move.mailbox)
-        if hit is not None:
-            target = {"account": account, "mailbox": move.mailbox,
-                      "mailbox_rowid": hit[0], "url": hit[1]}
-            if all(snap.get(rid, {}).get("mailbox_rowid") == hit[0]
-                   for rid in rowids):
-                raise TriageError(
-                    "noop_move",
-                    "every selected message is already in that mailbox.")
-        else:
-            # Not in the Envelope Index — a freshly created, never-synced
-            # mailbox has no index row yet (observed live). Ask Mail itself;
-            # if it exists, plan with an unknown target rowid and verify the
-            # move as "message left the source mailbox".
-            scheme = _scheme(snap[rowids[0]]["mailbox_url"])
-            if not _mailbox_exists_in_mail(scheme, account, move.mailbox):
-                raise TriageError(
-                    "unknown_mailbox",
-                    f"mailbox {move.mailbox!r} not found in account {account} "
-                    "(neither in the index nor in Mail.app).",
-                )
-            target = {"account": account, "mailbox": move.mailbox,
-                      "mailbox_rowid": None, "url": f"{scheme}://{account}/?unsynced"}
-
-    messages: list[PlanMessage] = []
-    for ref in refs:
-        rid = int(ref.id)
-        s = snap.get(rid)
-        if s is None:
-            continue  # vanished between search and snapshot; plan what exists
-        _as_literal(ref.mailbox)   # fail early on unrepresentable names
-        messages.append(PlanMessage(
-            rowid=rid,
-            account=ref.account,
-            scheme=_scheme(s["mailbox_url"]),
-            mailbox=ref.mailbox,
-            mailbox_rowid=s["mailbox_rowid"],
-            subject=ref.subject,
-            from_addr=ref.from_addr,
-            date=ref.date.isoformat(),
-            unread=ref.unread,
-            message_id_header=s["mid_header"],
-            global_message_id=s["gmid"],
-            pre={"read": s["read"], "flagged": s["flagged"],
-                 "flag_color": s["flag_color"]},
-        ))
-    if not messages:
-        raise TriageError("empty_selection",
-                          "all matched messages vanished before planning.")
-
-    now = plans.utcnow()
-    plan = Plan(
-        id=plans.new_id(now),
-        created_at=plans.iso(now),
-        expires_at=plans.iso(now + timedelta(seconds=config.triage_ttl_seconds())),
-        status="draft",
-        query={k: v for k, v in vars(q).items() if v not in (None, "", False, 0)},
-        actions=parsed,
-        target=target,
-        messages=messages,
-        summary=_summary(messages, parsed, target),
-    )
-    plans.save(plan)
-    detail: dict = {
-        "count": len(plan.messages),
-        "actions": [{k: v for k, v in vars(a).items() if v is not None}
-                    for a in plan.actions],
-    }
-    if plan.target is not None:
-        detail["target"] = plan.target
-    audit.emit("plan_create", outcome="created", operation_id=plan.id,
-               plan_id=plan.id, summary=plan.summary, detail=detail)
-    _log.info("triage plan %s: %s", plan.id, plan.summary)
-    return plan
+def build_plan(
+    source,
+    q: SearchQuery,
+    actions: list[dict] | None,
+    allowed: set[str] = ACTIONS,
+) -> Plan:
+    return _planner().build(source, q, actions, allowed=allowed)
 
 
 def delete_max() -> int:
-    """Cap for delete plans (tighter than triage_max_messages — the verb is
-    destructive)."""
-    return config.triage_delete_max()
+    return _planner().delete_max()
 
 
 def build_delete_plan(source, q: SearchQuery) -> Plan:
-    """Stage deletion — the destructive verb's own door (triage_plan_delete).
-
-    Two guards run before the ordinary planning path: the selection must
-    live in ONE account (symmetric with move_to's guard) and must fit the
-    tighter delete cap. The result is a normal frozen Plan carrying the one
-    `delete` action — it expires, is reviewed and applies through the
-    unchanged apply_plan exactly like any other plan.
-
-    The selection never sees the Trash: trashed mail keeps deleted=0 and
-    lives on in the account's Trash mailbox under a fresh id, so a delete
-    plan that selected it would re-delete prior work on every round and
-    never converge (observed live 2026-08-01). This is the one place the
-    exclusion is decided; plain searches stay Trash-inclusive.
-
-    from_addr is an EXACT bare-address match here (case-insensitive),
-    never search's substring — a fragment like "google.com" must select
-    nothing rather than stage a domain-wide delete (observed live
-    2026-08-01). Decided here, alongside the Trash exclusion."""
-    q = replace(q, exclude_trash=True, from_exact=True)
-    refs = source.search(q)
-    accounts = {r.account for r in refs}
-    if len(accounts) > 1:
-        raise TriageError(
-            "cross_account",
-            f"selection spans {len(accounts)} accounts "
-            f"({', '.join(sorted(accounts))}); delete needs one — "
-            "add the account= filter to pick which.",
-        )
-    cap = delete_max()
-    if len(refs) > cap:
-        raise TriageError(
-            "selection_too_large",
-            f"query matched more than {cap} messages (the delete cap) — "
-            "narrow the query, or raise EMAIL_MCP_TRIAGE_DELETE_MAX if the "
-            "deletion is genuinely intended.",
-        )
-    return build_plan(source, q, [{"action": "delete"}],
-                      allowed=ACTIONS | DESTRUCTIVE)
+    return _planner().build_delete(source, q)
 
 
 # --------------------------------------------------------------------- #
-# AppleScript generation                                                #
+# AppleScript generation
 # --------------------------------------------------------------------- #
 
 

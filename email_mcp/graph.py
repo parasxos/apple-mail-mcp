@@ -29,7 +29,6 @@ CLI:  python -m email_mcp.graph --login NAME    interactive device login
 from __future__ import annotations
 
 import argparse
-import base64
 import json
 import os
 import sys
@@ -43,6 +42,7 @@ from email.utils import parsedate_to_datetime
 from pathlib import Path
 
 from . import codes, config, state
+from .graph_mail import GraphMailbox
 from .log import get_logger
 from .transports import SendError
 
@@ -470,298 +470,71 @@ def device_login(ident) -> Path:
 # --------------------------------------------------------------------- #
 
 
+def _mailbox() -> GraphMailbox:
+    """Bind mailbox semantics to the current, monkeypatchable Graph client."""
+    return GraphMailbox(
+        _graph, GraphError, GraphTransportError, _log, DEFERRED_PROP,
+    )
+
+
 def _iso_utc(when: datetime) -> str:
-    if when.tzinfo is None:
-        when = when.replace(tzinfo=timezone.utc)
-    return when.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    return _mailbox()._iso_utc(when)
 
 
 def create_mime_draft(ident, raw: bytes) -> str:
-    """File our composer's MIME as a PLAIN draft in Exchange's Drafts —
-    the send path with the transport removed (docs/draft-design.md,
-    panel decision 2026-08-02).
-
-    Exactly two arguments by design: arming — the deferred-time property
-    and the submission call — lives ONLY in create_deferred_draft's own
-    body, so no shared helper can ever grow a draft into a transmission
-    (tests pin this lexically). Returns the Graph message id — the
-    durable draft_id; Envelope Index ROWIDs are rewritten by sync and
-    are never used as draft identity."""
-    status, draft = _graph(
-        "POST", "/me/messages", ident,
-        body=base64.b64encode(raw), ctype="text/plain",
-    )
-    if status != 201 or "id" not in draft:
-        raise GraphError(
-            f"[{_name(ident)}/graph] draft create failed "
-            f"(HTTP {status}): {_graph_reason(draft)}"
-        )
-    return str(draft["id"])
+    return _mailbox().create_mime_draft(ident, raw)
 
 
 def draft_receipt(ident, draft_id: str) -> dict:
-    """The acceptance readback for a filed draft (docs/draft-design.md):
-    {is_draft, internet_message_id, in_drafts_folder}. All three true or
-    the draft does not count as created — evidence, never assertion."""
-    status, msg = _graph(
-        "GET",
-        f"/me/messages/{urllib.parse.quote(draft_id)}"
-        "?$select=isDraft,internetMessageId,parentFolderId", ident,
-    )
-    if status != 200:
-        raise GraphError(
-            f"[{_name(ident)}/graph] draft readback failed "
-            f"(HTTP {status}): {_graph_reason(msg)}"
-        )
-    status, folder = _graph("GET", "/me/mailFolders/drafts", ident)
-    if status != 200 or "id" not in folder:
-        raise GraphError(
-            f"[{_name(ident)}/graph] cannot resolve the Drafts folder "
-            f"(HTTP {status}): {_graph_reason(folder)}"
-        )
-    return {
-        "is_draft": bool(msg.get("isDraft")),
-        "internet_message_id": str(msg.get("internetMessageId") or ""),
-        "in_drafts_folder": str(msg.get("parentFolderId")) == str(folder["id"]),
-    }
+    return _mailbox().draft_receipt(ident, draft_id)
 
 
 def create_deferred_draft(ident, raw: bytes, when: datetime) -> str:
-    """Hand the frozen .eml to Exchange for deferred transmission.
-
-    POST the raw MIME as a draft, PATCH PidTagDeferredSendTime, POST
-    /send; returns the draft id. If ANYTHING fails after the draft was
-    created, a best-effort DELETE removes it before re-raising — no
-    orphan armed drafts, so the launchd fallback can never double-send.
-    """
-    status, draft = _graph(
-        "POST", "/me/messages", ident,
-        body=base64.b64encode(raw), ctype="text/plain",
-    )
-    if status != 201 or "id" not in draft:
-        raise GraphError(
-            f"[{_name(ident)}/graph] MIME draft create failed "
-            f"(HTTP {status}): {_graph_reason(draft)}"
-        )
-    draft_id = str(draft["id"])
-    send_ambiguous = False
-    try:
-        status, body = _graph(
-            "PATCH", f"/me/messages/{draft_id}", ident,
-            body={"singleValueExtendedProperties":
-                  [{"id": DEFERRED_PROP, "value": _iso_utc(when)}]},
-        )
-        if status != 200:
-            raise GraphError(
-                f"[{_name(ident)}/graph] deferred-send property rejected "
-                f"(HTTP {status}): {_graph_reason(body)}"
-            )
-        try:
-            status, body = _graph(
-                "POST", f"/me/messages/{draft_id}/send", ident
-            )
-        except GraphTransportError:
-            # The wire died mid-/send: Exchange MAY have accepted it and
-            # armed the draft — this is the one step where "failed" can
-            # still mean "sent".
-            send_ambiguous = True
-            raise
-        if status != 202:
-            raise GraphError(
-                f"[{_name(ident)}/graph] deferred /send rejected "
-                f"(HTTP {status}): {_graph_reason(body)}"
-            )
-    except Exception:
-        cleanup_status: int | None = None
-        try:
-            st, _b = _graph("DELETE", f"/me/messages/{draft_id}", ident)
-            cleanup_status = st
-            if st not in (204, 404):
-                _log.warning(
-                    "graph: cleanup DELETE of draft %s got HTTP %s [%s]",
-                    draft_id, st, _name(ident),
-                )
-        except Exception as cleanup:  # best-effort only; original error wins
-            _log.warning("graph: cleanup DELETE of draft %s failed: %s [%s]",
-                         draft_id, cleanup, _name(ident))
-        if send_ambiguous and cleanup_status != 204:
-            # Double-send fence: /send's outcome is unknown AND the revoke
-            # is unconfirmed. A cleanup 404 means the draft already left
-            # Drafts — almost certainly because /send won; any other
-            # unconfirmed outcome may still leave an armed draft behind.
-            # Falling back to launchd here could transmit the message
-            # twice, so the entry STAYS on graph: return the draft id and
-            # let the reconcile pass disambiguate via draft_status /
-            # Sent Items at send_at + grace.
-            _log.warning(
-                "graph: /send outcome for draft %s is ambiguous (cleanup "
-                "DELETE -> %s) — treating as armed; the reconcile pass "
-                "will disambiguate [%s]",
-                draft_id, cleanup_status, _name(ident),
-            )
-            return draft_id
-        raise
-    return draft_id
+    return _mailbox().create_deferred_draft(ident, raw, when)
 
 
 def _body_payload(body: dict) -> dict:
-    """Normalize one Graph ``body`` object to the provider body contract."""
-    return {
-        "contentType": str(body.get("contentType") or "text"),
-        "content": str(body.get("content") or ""),
-    }
+    return _mailbox()._body_payload(body)
 
 
 def fetch_body_by_message_id(ident, message_id: str) -> dict | None:
-    """The mailbox's own copy of a message body, located by RFC
-    Message-ID across every folder. Returns {"contentType", "content"}
-    verbatim from the wire (usually contentType "html") — text
-    extraction is the index's business, not the transport's. None on a
-    CONFIRMED empty result (this mailbox does not hold the message);
-    lookup failures raise GraphError — absence of evidence must never
-    read as evidence of absence (the backfill would stamp a permanent
-    graph_miss off a transient 503)."""
-    quoted = message_id.replace("'", "''")
-    query = urllib.parse.urlencode({
-        "$filter": f"internetMessageId eq '{quoted}'",
-        "$select": "body",
-    })
-    status, body = _graph("GET", f"/me/messages?{query}", ident)
-    if status != 200:
-        raise GraphError(
-            f"[{_name(ident)}/graph] message lookup by internetMessageId "
-            f"failed (HTTP {status}): {_graph_reason(body)}"
-        )
-    value = body.get("value") or []
-    if not value:
-        return None
-    return _body_payload(value[0].get("body") or {})
+    return _mailbox().fetch_body_by_message_id(ident, message_id)
 
 
 def translate_ews_ids(ident, ews_ids: list[str]) -> dict[str, str]:
-    """EWS ItemIds (Mail.app's messages.remote_id) → Graph REST ids, in
-    one call. Purely an id-format conversion: a translated id says
-    nothing about the message still existing — existence is decided by
-    the body GET (404). Returns {ews_id: rest_id} for every id Graph
-    could convert; omitted ids simply are not in the mapping. Raises
-    GraphError on a failed call."""
-    if not ews_ids:
-        return {}
-    status, body = _graph(
-        "POST", "/me/translateExchangeIds", ident,
-        body={"inputIds": ews_ids, "sourceIdType": "ewsId",
-              "targetIdType": "restId"})
-    if status != 200:
-        raise GraphError(
-            f"[{_name(ident)}/graph] translateExchangeIds failed "
-            f"(HTTP {status}): {_graph_reason(body)}"
-        )
-    out: dict[str, str] = {}
-    for row in body.get("value") or []:
-        src, tgt = row.get("sourceId"), row.get("targetId")
-        if src and tgt:
-            out[str(src)] = str(tgt)
-    return out
+    return _mailbox().translate_ews_ids(ident, ews_ids)
 
 
 def fetch_body_by_graph_id(ident, rest_id: str) -> dict | None:
-    """One message's body by Graph REST id. None on a CONFIRMED 404 —
-    the mailbox no longer holds it; anything else non-200 raises
-    (absence of evidence must never read as evidence of absence)."""
-    quoted = urllib.parse.quote(rest_id, safe="")
-    status, body = _graph(
-        "GET", f"/me/messages/{quoted}?$select=body", ident)
-    if status == 404:
-        return None
-    if status != 200:
-        raise GraphError(
-            f"[{_name(ident)}/graph] message body fetch failed "
-            f"(HTTP {status}): {_graph_reason(body)}"
-        )
-    return _body_payload(body.get("body") or {})
+    return _mailbox().fetch_body_by_graph_id(ident, rest_id)
 
 
-def _find_by_message_id(ident, folder: str, message_id: str) -> str | None:
-    """First message id in `folder` whose internetMessageId matches, or
-    None on a CONFIRMED empty result. Lookup failures raise GraphError —
-    absence of evidence must never read as evidence of absence."""
-    quoted = message_id.replace("'", "''")
-    query = urllib.parse.urlencode({
-        "$filter": f"internetMessageId eq '{quoted}'",
-        "$select": "id",
-    })
-    status, body = _graph(
-        "GET", f"/me/mailFolders/{folder}/messages?{query}", ident
-    )
-    if status != 200:
-        raise GraphError(
-            f"[{_name(ident)}/graph] {folder} lookup by internetMessageId "
-            f"failed (HTTP {status}): {_graph_reason(body)}"
-        )
-    value = body.get("value") or []
-    return str(value[0].get("id")) if value else None
+def _find_by_message_id(
+    ident,
+    folder: str,
+    message_id: str,
+) -> str | None:
+    return _mailbox()._find_by_message_id(ident, folder, message_id)
 
 
 def find_draft_by_message_id(ident, message_id: str) -> str | None:
-    """Drafts-folder lookup by the frozen .eml's Message-ID — the recovery
-    key for both crash windows of the two-phase manifest write."""
-    return _find_by_message_id(ident, "drafts", message_id)
+    return _mailbox().find_draft_by_message_id(ident, message_id)
 
 
 def sent_by_message_id(ident, message_id: str) -> bool:
-    """True iff Sent Items holds the message — the ONLY admissible
-    positive evidence that Exchange transmitted it."""
-    return _find_by_message_id(ident, "sentitems", message_id) is not None
+    return _mailbox().sent_by_message_id(ident, message_id)
 
 
 def draft_status(ident, draft_id: str, message_id: str) -> str:
-    """'held' | 'sent' | 'cancelled_externally' | 'unknown'.
-
-    'sent' requires positive evidence (a Sent Items hit by
-    internetMessageId). A vanished draft with a CONFIRMED empty Sent
-    Items is 'cancelled_externally' (someone discarded it, e.g. in OWA).
-    Anything ambiguous — lookup failure, odd status — is 'unknown':
-    leave the entry and retry; guessing 'sent' here would drop mail,
-    guessing 'cancelled' would double-send.
-    """
-    status, body = _graph(
-        "GET", f"/me/messages/{draft_id}?$select=id,isDraft", ident
-    )
-    if status == 200 and body.get("isDraft", True):
-        return "held"
-    if status not in (200, 404):
-        return "unknown"  # 5xx / permission blip: no evidence either way
-    try:
-        sent = sent_by_message_id(ident, message_id)
-    except GraphError:
-        return "unknown"  # vanished, but Sent Items unreachable right now
-    if sent:
-        return "sent"
-    # 200-but-not-a-draft with no Sent hit is a transitional oddity; only
-    # a confirmed 404 + confirmed Sent miss reads as an external cancel.
-    return "cancelled_externally" if status == 404 else "unknown"
+    return _mailbox().draft_status(ident, draft_id, message_id)
 
 
 def delete_draft(ident, draft_id: str) -> str:
-    """DELETE the deferred draft: 'deleted' (204) or 'gone' (404).
-
-    Anything else raises GraphError, and the caller must NOT flip the
-    entry to another executor — only a confirmed delete revokes
-    Exchange's claim on the message.
-    """
-    status, body = _graph("DELETE", f"/me/messages/{draft_id}", ident)
-    if status == 204:
-        return "deleted"
-    if status == 404:
-        return "gone"
-    raise GraphError(
-        f"[{_name(ident)}/graph] draft delete failed (HTTP {status}): "
-        f"{_graph_reason(body)} — entry stays on graph; retried next pass"
-    )
+    return _mailbox().delete_draft(ident, draft_id)
 
 
 # --------------------------------------------------------------------- #
-# CLI                                                                    #
+# CLI
 # --------------------------------------------------------------------- #
 
 

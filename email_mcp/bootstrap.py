@@ -9,6 +9,7 @@ from __future__ import annotations
 from threading import Lock
 
 from .adapters.delivery import DefaultDeliveryGateway
+from .adapters.background import DefaultBackgroundGateway
 from .adapters.events import AuditEventPublisher
 from .adapters.operations import DefaultOperationsGateway
 from .adapters.refresh import AppleMailRefreshGateway
@@ -24,6 +25,7 @@ _lock = Lock()
 def build_application(
     *, source=None, source_provider=None, delivery=None, schedules=None,
     deferred=None, triage=None, refresh=None, operations=None, events=None,
+    background=None,
 ) -> EmailApplication:
     if source is not None and source_provider is not None:
         raise ValueError("pass source or source_provider, not both")
@@ -43,6 +45,8 @@ def build_application(
         operations=(operations if operations is not None
                     else DefaultOperationsGateway()),
         events=(events if events is not None else AuditEventPublisher()),
+        background=(background if background is not None
+                    else DefaultBackgroundGateway()),
     ))
 
 

@@ -21,401 +21,42 @@ prompt is the checkpoint.
 """
 from __future__ import annotations
 
-import html as _html
-import mimetypes
-import re
-from dataclasses import dataclass
 from email.message import EmailMessage
 from email.parser import BytesHeaderParser
-from email.utils import formataddr, getaddresses, make_msgid, parseaddr
-from pathlib import Path
+from email.utils import getaddresses
 
-from . import codes, config, identities, transports
+from . import codes, identities, transports
+from .addressing import (
+    CONTROL_RE as _CTL_RE,
+    bare_address as _bare,
+    enforce_allowlist as _enforce_allowlist,
+    recipient_lists as _recipient_lists,
+    reject_header_injection as _reject_header_injection,
+    split_addresses as _split,
+    validate_bare_addresses as _validate_bare_addresses,
+)
+from .attachments import (
+    attachment_paths as _attachment_paths,
+    load_attachments as _load_attachments,
+)
 from .domain.models import DraftResult, SendResult
 from .log import get_logger
+from .mime import (
+    PreparedTransmission as _PreparedTransmission,
+    attribution as _attribution,
+    compose,
+    html_body as _html_body,
+    html_paragraphs as _html_paras,
+    prepare_transmission as _prepare_transmission,
+    quote_html as _quote_html,
+    quote_plain as _quote_plain,
+    reencode_text_base64 as _reencode_text_base64,
+    require_message_fields as _require_message_fields,
+    strip_tags as _strip_tags,
+)
 from .transports import SendError  # re-export: same class everywhere
 
 _log = get_logger()
-
-
-@dataclass
-class _PreparedTransmission:
-    """One fully validated message ready for immediate or deferred send.
-
-    Keeping the normalized envelope and composed MIME together prevents the
-    send and schedule paths from growing separate validation/composition
-    rules.  Attachments are already embedded; ``attachment_names`` is only
-    receipt metadata.
-    """
-    message: EmailMessage
-    to: list[str]
-    cc: list[str]
-    bcc: list[str]
-    attachment_names: list[str]
-
-
-# --------------------------------------------------------------------- #
-# address handling                                                      #
-# --------------------------------------------------------------------- #
-
-# Header-injection fence: CR/LF/NUL anywhere in a header-bound value lets a
-# caller smuggle extra headers (Bcc:, a second From:) into the wire format.
-# Provenance rule: REFUSE what the model supplies (compose-time check below);
-# SANITIZE what the store supplies (reply subjects are space-joined instead).
-_CTL_RE = re.compile(r"[\r\n\x00]")
-
-
-def _reject_header_injection(fields: dict[str, object]) -> None:
-    """Refuse control characters in model-supplied header values."""
-    for name, value in fields.items():
-        items = value if isinstance(value, list) else [value]
-        for item in items:
-            if item and _CTL_RE.search(str(item)):
-                raise SendError(
-                    f"header_injection: control character (CR/LF/NUL) in "
-                    f"`{name}`: {str(item)!r} — headers are single-line; "
-                    "put extra recipients in to/cc/bcc, extra text in body.",
-                    code=codes.HEADER_INJECTION,
-                )
-
-
-def _validate_bare_addresses(field: str, addrs: list[str]) -> None:
-    """Each split entry must contain a plausible bare address: exactly one
-    @ with non-empty sides and no whitespace/control characters."""
-    for entry in addrs:
-        bare = parseaddr(entry)[1].strip()
-        local, sep, domain = bare.partition("@")
-        if (not sep or not local or not domain or "@" in domain
-                or any(c.isspace() or ord(c) < 0x20 for c in bare)):
-            raise SendError(
-                f"invalid_recipient: {entry!r} in `{field}` is not a usable "
-                "address (want user@domain, optionally as 'Name <user@domain>').",
-                code=codes.INVALID_RECIPIENT,
-            )
-
-
-def _recipient_lists(
-    to: str | list[str] | None,
-    cc: str | list[str] | None,
-    bcc: str | list[str] | None,
-) -> tuple[list[str], list[str], list[str]]:
-    """to/cc/bcc → clean lists. Raw CR/LF/NUL is rejected BEFORE _split
-    (getaddresses would degrade an injected line into extra recipients),
-    then every split entry gets the bare-address sanity check."""
-    out: list[list[str]] = []
-    for name, raw in (("to", to), ("cc", cc), ("bcc", bcc)):
-        items = [] if not raw else ([raw] if isinstance(raw, str) else list(raw))
-        for item in items:
-            if _CTL_RE.search(str(item)):
-                raise SendError(
-                    f"invalid_recipient: control character (CR/LF/NUL) in "
-                    f"`{name}`: {str(item)!r} — addresses are single-line, "
-                    "comma-separated.",
-                    code=codes.INVALID_RECIPIENT,
-                )
-        split = _split(raw)
-        _validate_bare_addresses(name, split)
-        out.append(split)
-    return out[0], out[1], out[2]
-
-
-def _split(addrs: str | list[str] | None) -> list[str]:
-    """Normalise a recipient field (str with commas, or list) to a clean list
-    of 'Name <addr>' / 'addr' entries, dropping empties."""
-    if not addrs:
-        return []
-    if isinstance(addrs, str):
-        parts = [a for _, a in getaddresses([addrs])]
-        # getaddresses discards display names; re-run to keep them.
-        pairs = getaddresses([addrs])
-        return [formataddr(p) if p[0] else p[1] for p in pairs if p[1]]
-    out: list[str] = []
-    for item in addrs:
-        for name, addr in getaddresses([item]):
-            if addr:
-                out.append(formataddr((name, addr)) if name else addr)
-    return out
-
-
-def _bare(addr: str) -> str:
-    """Extract the lower-cased bare address from a 'Name <addr>' entry."""
-    return parseaddr(addr)[1].strip().lower()
-
-
-def _enforce_allowlist(recipients: list[str], ident: identities.Identity) -> None:
-    # The identity OWNS the whole decision: env synthesis bakes
-    # config.send_allow_all() into the synthesized identity, a TOML block
-    # bakes its own declaration in at load. Consulting config here too was
-    # a second spelling of the same rule.
-    if ident.allow_all:
-        return
-    # An engaged guard always admits the identity's own address: bcc_self
-    # rides on every send, and a guard that blocks even self-mail blocked
-    # EVERYTHING for a TOML identity with allow_all = false and no list.
-    allowed = ({a.strip().lower() for a in ident.allowlist}
-               | {_bare(ident.from_addr)})
-    blocked = sorted({_bare(r) for r in recipients if _bare(r) not in allowed})
-    if blocked:
-        raise SendError(
-            f"Refusing to send as identity [{ident.name}]: recipient(s) not "
-            f"on its allowlist — {', '.join(blocked)}. Sending is restricted "
-            f"to {', '.join(sorted(allowed))} by this identity's declared "
-            f"guard (allowlist / allow_all = false) — extend the allowlist, "
-            f"or remove the declaration to lift it.",
-            code=codes.RECIPIENT_NOT_ALLOWED,
-        )
-
-
-# --------------------------------------------------------------------- #
-# attachments                                                           #
-# --------------------------------------------------------------------- #
-
-
-def _attachment_paths(attachments: str | list[str] | None) -> list[Path]:
-    """Normalise the attachments argument to a list of Paths.
-
-    A bare string is ONE path — never comma-split (paths may legally
-    contain commas); pass a list for multiple files.
-    """
-    if not attachments:
-        return []
-    items = [attachments] if isinstance(attachments, str) else list(attachments)
-    return [Path(p).expanduser() for p in items if str(p).strip()]
-
-
-def _load_attachments(
-    attachments: str | list[str] | None,
-) -> list[tuple[bytes, str, str, str]]:
-    """Read attachment files, returning (data, maintype, subtype, filename)
-    tuples ready for EmailMessage.add_attachment. Raises SendError with a
-    caller-fixable message for missing files, directories, or a total size
-    over the configured budget."""
-    paths = _attachment_paths(attachments)
-    if not paths:
-        return []
-
-    loaded: list[tuple[bytes, str, str, str]] = []
-    total = 0
-    for p in paths:
-        if not p.exists():
-            raise SendError(f"attachment not found: {p}",
-                            code=codes.ATTACHMENT_NOT_FOUND)
-        if p.is_dir():
-            raise SendError(
-                f"attachment is a directory: {p} — zip it first and attach "
-                "the archive.",
-                code=codes.ATTACHMENT_UNREADABLE,
-            )
-        try:
-            data = p.read_bytes()
-        except OSError as e:
-            raise SendError(f"cannot read attachment {p}: {e}",
-                            code=codes.ATTACHMENT_UNREADABLE) from e
-        total += len(data)
-        ctype, _ = mimetypes.guess_type(p.name)
-        maintype, _, subtype = (ctype or "application/octet-stream").partition("/")
-        loaded.append((data, maintype, subtype, p.name))
-
-    budget = config.send_max_attach_mb()
-    if total > budget * 1024 * 1024:
-        raise SendError(
-            f"attachments total {total / (1024 * 1024):.1f} MB, over the "
-            f"{budget:g} MB budget (base64 adds ~33% on top; servers commonly "
-            "reject large mail). Shrink the set, or raise "
-            "EMAIL_MCP_MAX_ATTACH_MB if the recipient's server allows it.",
-            code=codes.ATTACHMENTS_TOO_LARGE,
-        )
-    return loaded
-
-
-# --------------------------------------------------------------------- #
-# MIME composition                                                      #
-# --------------------------------------------------------------------- #
-
-
-def _html_paras(text: str) -> str:
-    return "".join(
-        "<p>" + _html.escape(p).replace("\n", "<br>") + "</p>"
-        for p in text.split("\n\n")
-        if p.strip()
-    )
-
-
-def _html_body(text: str, quote_html: str = "") -> str:
-    return f"<html><body>{_html_paras(text)}{quote_html}</body></html>"
-
-
-# --------------------------------------------------------------------- #
-# reply-history quoting                                                 #
-# --------------------------------------------------------------------- #
-
-_HTML_INNER_RE = re.compile(r"(?is)^.*?<body[^>]*>(.*)</body>.*$")
-_TAG_BLOCK_RE = re.compile(r"(?is)<(script|style)[^>]*>.*?</\1>")
-_TAG_RE = re.compile(r"(?s)<[^>]+>")
-
-
-def _attribution(ref) -> str:
-    """'On Mon, 13 Jul 2026 at 09:24, Name <addr> wrote:' — the original's
-    UTC timestamp rendered in local time, matching what mail clients write."""
-    stamp = ref.date.astimezone().strftime("%a, %d %b %Y at %H:%M")
-    return f"On {stamp}, {ref.from_addr} wrote:"
-
-
-def _strip_tags(html_doc: str) -> str:
-    """Crude HTML→text for quoting when the original has no plain part."""
-    text = _TAG_BLOCK_RE.sub("", html_doc)
-    text = re.sub(r"(?i)<br\s*/?>", "\n", text)
-    text = re.sub(r"(?i)</p>", "\n\n", text)
-    text = _TAG_RE.sub("", text)
-    text = _html.unescape(text)
-    return re.sub(r"\n{3,}", "\n\n", text).strip()
-
-
-def _quote_plain(original_text: str, original_html: str, attribution: str) -> str:
-    source = original_text.strip() or _strip_tags(original_html)
-    quoted = "\n".join("> " + line for line in source.rstrip().splitlines())
-    return f"{attribution}\n{quoted}" if quoted else attribution
-
-
-def _quote_html(original_html: str, original_text: str, attribution: str) -> str:
-    if original_html.strip():
-        m = _HTML_INNER_RE.match(original_html)
-        inner = m.group(1) if m else original_html
-        # Read-side fence: quoted history must not carry live script/style
-        # from a hostile original into the outgoing message.
-        inner = _TAG_BLOCK_RE.sub("", inner)
-    else:
-        inner = _html_paras(original_text)
-    return (
-        f"<div>{_html.escape(attribution)}</div>"
-        '<blockquote type="cite" style="margin:0 0 0 0.8ex;'
-        f'border-left:2px solid #cccccc;padding-left:1ex">{inner}</blockquote>'
-    )
-
-
-def compose(
-    *,
-    to: list[str],
-    subject: str,
-    body: str,
-    cc: list[str] | None = None,
-    bcc: list[str] | None = None,
-    in_reply_to: str = "",
-    references: str = "",
-    quote_text: str = "",
-    quote_html: str = "",
-    attachments: list[tuple[bytes, str, str, str]] | None = None,
-    identity: identities.Identity | None = None,
-) -> EmailMessage:
-    """Build a multipart/alternative message (plain + minimal HTML).
-
-    The HTML part is a plain `<p>`-wrapped rendering — no Apple wrapper class,
-    so it displays as normal body text everywhere. `quote_text`/`quote_html`
-    carry an optional quoted-history block appended below the body (plain
-    `>`-prefixed lines / a `<blockquote type="cite">`).
-
-    `identity` supplies the From: header and the Message-ID domain; None
-    means the default identity (which, with no identities file, mirrors the
-    env getters exactly as before).
-
-    `attachments` are pre-loaded (data, maintype, subtype, filename) tuples
-    (see `_load_attachments`); adding one wraps the alternative pair in
-    multipart/mixed, which is exactly the structure normal clients emit.
-    """
-    ident = identity if identity is not None else identities.get(None)
-    from_addr = ident.from_addr
-    _reject_header_injection({
-        "subject": subject,
-        "in_reply_to": in_reply_to,
-        "references": references,
-        "to": to,
-        "cc": cc or [],
-        "bcc": bcc or [],
-        "from_addr": from_addr,
-        "from_name": ident.from_name,
-    })
-    msg = EmailMessage()
-    try:
-        # Belt to the fence above: the stdlib refuses some malformed header
-        # values with a bare ValueError — surface those as caller-fixable
-        # SendErrors instead of a traceback on the MCP wire.
-        msg["From"] = formataddr((ident.from_name, from_addr))
-        msg["To"] = ", ".join(to)
-        if cc:
-            msg["Cc"] = ", ".join(cc)
-        if bcc:
-            msg["Bcc"] = ", ".join(bcc)
-        msg["Subject"] = subject
-        domain = from_addr.rsplit("@", 1)[-1] if "@" in from_addr else "localhost"
-        msg["Message-ID"] = make_msgid(domain=domain)
-        if in_reply_to:
-            msg["In-Reply-To"] = in_reply_to
-            refs = (references + " " + in_reply_to).strip()
-            msg["References"] = refs
-    except ValueError as e:
-        raise SendError(f"invalid header content: {e}",
-                        code=codes.INVALID_HEADER) from e
-    msg.set_content(f"{body}\n\n{quote_text}\n" if quote_text else body)
-    msg.add_alternative(_html_body(body, quote_html), subtype="html")
-    for data, maintype, subtype, filename in attachments or []:
-        msg.add_attachment(
-            data, maintype=maintype, subtype=subtype, filename=filename
-        )
-    return msg
-
-
-def _require_message_fields(to: list[str], subject: str, body: str) -> None:
-    """Validate fields shared by sends, schedules, and Graph drafts."""
-    if not to:
-        raise SendError("`to` is required (no valid recipient address).",
-                        code=codes.INVALID_INPUT)
-    if not subject:
-        raise SendError("`subject` is required.", code=codes.INVALID_INPUT)
-    if not body.strip():
-        raise SendError("`body` is empty.", code=codes.INVALID_INPUT)
-
-
-def _prepare_transmission(
-    ident: identities.Identity,
-    *,
-    to: str | list[str],
-    subject: str,
-    body: str,
-    cc: str | list[str] | None = None,
-    bcc: str | list[str] | None = None,
-    in_reply_to: str = "",
-    references: str = "",
-    quote_text: str = "",
-    quote_html: str = "",
-    attachments: str | list[str] | None = None,
-) -> _PreparedTransmission:
-    """Normalize, authorize, and compose one transmittable message.
-
-    This is the single preparation path for immediate and scheduled sends.
-    Delivery timing and transport ownership stay with their callers.
-    """
-    to_l, cc_l, bcc_l = _recipient_lists(to, cc, bcc)
-    _require_message_fields(to_l, subject, body)
-    loaded = _load_attachments(attachments)
-
-    if ident.bcc_self and _bare(ident.from_addr) not in {
-            _bare(address) for address in bcc_l}:
-        bcc_l.append(ident.from_addr)
-
-    _enforce_allowlist(to_l + cc_l + bcc_l, ident)
-    message = compose(
-        to=to_l, subject=subject, body=body, cc=cc_l, bcc=bcc_l,
-        in_reply_to=in_reply_to, references=references,
-        quote_text=quote_text, quote_html=quote_html,
-        attachments=loaded, identity=ident,
-    )
-    return _PreparedTransmission(
-        message=message,
-        to=to_l,
-        cc=cc_l,
-        bcc=bcc_l,
-        attachment_names=[filename for _, _, _, filename in loaded],
-    )
 
 
 # --------------------------------------------------------------------- #
@@ -614,21 +255,6 @@ def send_email(
         attachments=prepared.attachment_names,
         bootstrapped=bootstrapped,
     )
-
-
-def _reencode_text_base64(msg: EmailMessage) -> None:
-    """Re-encode text parts as base64 on ANY MIME handed to Graph.
-
-    Quoted-printable is fine on the transports (months in production),
-    but Exchange's MIME importer mangles QP soft breaks: "sent" arrived
-    as "se=t" in a draft (measured 2026-08-02, first acceptance run) and
-    "prepared" as "prepar=d" in a deferred-send readback (measured
-    2026-08-03). Base64 has no continuation semantics to fumble."""
-    for part in msg.walk():
-        if part.get_content_type() in ("text/plain", "text/html"):
-            part.set_content(part.get_content(),
-                             subtype=part.get_content_subtype(),
-                             charset="utf-8", cte="base64")
 
 
 def create_draft(
