@@ -28,7 +28,12 @@ def _imports(path: Path):
             for alias in node.names:
                 yield 0, alias.name
         elif isinstance(node, ast.ImportFrom):
-            yield node.level, node.module or ""
+            if node.module:
+                yield node.level, node.module
+            else:
+                # `from . import x, y` names modules, not attributes.
+                for alias in node.names:
+                    yield node.level, alias.name
 
 
 def _public_methods(protocol) -> set[str]:

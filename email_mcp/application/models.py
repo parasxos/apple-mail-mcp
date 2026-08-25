@@ -167,7 +167,8 @@ class ScheduleListing:
         out: dict[str, Any] = {
             "dispatcher_installed": self.dispatcher_installed,
             "dispatcher_label": self.dispatcher_label,
-            **self.entries,
+            **{state: [asdict(entry) for entry in items]
+               for state, items in self.entries.items()},
         }
         if not self.integrity.ok:
             out.update({
