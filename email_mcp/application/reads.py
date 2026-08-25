@@ -4,7 +4,7 @@ from __future__ import annotations
 from dataclasses import asdict
 
 from ..domain.errors import InvalidInput
-from .base import ApplicationService
+from ..domain.mail import EmailSource
 from .models import (
     AttachmentOut,
     BatchItemError,
@@ -25,20 +25,60 @@ from .query import (
     search_query,
     shape_email,
 )
+from .ports import ErrorClassifier, RefreshGateway, SourceProvider
 
 
-class ReadUseCases(ApplicationService):
-    def search_emails(self, **values) -> SearchPage:
-        limit = values.get("limit", 50)
+class ReadUseCases:
+    def __init__(
+        self,
+        *,
+        source: SourceProvider,
+        refresh: RefreshGateway,
+        classifier: ErrorClassifier,
+    ) -> None:
+        self._source = source
+        self._refresh = refresh
+        self._classifier = classifier
+
+    @property
+    def source(self) -> EmailSource:
+        return self._source.get()
+
+    def search_emails(
+        self,
+        query: str = "",
+        from_addr: str | None = None,
+        to_addr: str | None = None,
+        mailbox: str | None = None,
+        account: str | None = None,
+        before: str | None = None,
+        after: str | None = None,
+        has_attachment: bool | None = None,
+        unread_only: bool = False,
+        limit: int = 50,
+        offset: int = 0,
+    ) -> SearchPage:
         check_page(limit)
-        query = search_query(**values)
+        criteria = search_query(
+            query=query,
+            from_addr=from_addr,
+            to_addr=to_addr,
+            mailbox=mailbox,
+            account=account,
+            before=before,
+            after=after,
+            has_attachment=has_attachment,
+            unread_only=unread_only,
+            limit=limit,
+            offset=offset,
+        )
         source = self.source
-        hits = source.search(query)
+        hits = source.search(criteria)
         fts = dict(getattr(source, "fts_status", lambda: None)() or {
             "state": "unavailable", "hits": 0, "hits_capped": False,
         })
         hit_ids = {str(rowid) for rowid in fts.pop("rowids", [])}
-        query_lower = values.get("query", "").lower()
+        query_lower = query.lower()
         results = []
         for hit in hits:
             visible = bool(query_lower) and (
@@ -50,8 +90,7 @@ class ReadUseCases(ApplicationService):
                 **asdict(hit),
                 body_match=hit.id in hit_ids and not visible,
             ))
-        mailbox = values.get("mailbox")
-        note = (empty_scope_note(source, mailbox, values.get("account"))
+        note = (empty_scope_note(source, mailbox, account)
                 if mailbox and not results else None)
         return SearchPage(fts=fts, results=results, note=note)
 
@@ -79,7 +118,7 @@ class ReadUseCases(ApplicationService):
                 errors.append(BatchItemError(
                     id=str(message_id),
                     error=str(error),
-                    code=self._deps.operations.classify(error),
+                    code=self._classifier.classify(error),
                 ))
         return EmailBatch(view=view, emails=emails, errors=errors)
 
@@ -114,6 +153,6 @@ class ReadUseCases(ApplicationService):
     ) -> RefreshOutcome:
         wait_seconds = max(0.0, min(60.0, float(wait_seconds)))
         timeout_seconds = max(1.0, min(120.0, float(timeout_seconds)))
-        return self._deps.refresh.refresh(
+        return self._refresh.refresh(
             self.source, wait_seconds, timeout_seconds,
         )

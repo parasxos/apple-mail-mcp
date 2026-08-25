@@ -2,11 +2,37 @@
 from __future__ import annotations
 
 from ..domain.errors import ToolError
-from ..domain.models import DraftResult, ScheduledEntry, SendResult
+from ..domain.events import EventPublisher
+from ..domain.mail import EmailSource
+from ..domain.models import (
+    DraftRequest,
+    DraftResult,
+    ReplyRequest,
+    ScheduleRequest,
+    ScheduledEntry,
+    SendRequest,
+    SendResult,
+)
 from .base import ApplicationService
+from .ports import DeliveryGateway, SourceProvider
 
 
 class DeliveryUseCases(ApplicationService):
+    def __init__(
+        self,
+        *,
+        source: SourceProvider,
+        delivery: DeliveryGateway,
+        events: EventPublisher,
+    ) -> None:
+        super().__init__(events)
+        self._source = source
+        self._delivery = delivery
+
+    @property
+    def source(self) -> EmailSource:
+        return self._source.get()
+
     def _failed_delivery(
         self,
         name: str,
@@ -42,33 +68,67 @@ class DeliveryUseCases(ApplicationService):
             detail=detail,
         )
 
-    def send_email(self, **values) -> SendResult:
+    def send_email(
+        self,
+        to: str,
+        subject: str,
+        body: str,
+        cc: str | None = None,
+        bcc: str | None = None,
+        attachments: list[str] | None = None,
+        from_identity: str | None = None,
+    ) -> SendResult:
+        request = SendRequest(
+            to=to,
+            subject=subject,
+            body=body,
+            cc=cc,
+            bcc=bcc,
+            attachments=tuple(attachments or ()),
+            from_identity=from_identity,
+        )
         try:
-            result = self._deps.delivery.send(**values)
+            result = self._delivery.send(request)
         except ToolError as error:
             self._failed_delivery(
-                "send", "send_email", error, subject=values.get("subject")
+                "send", "send_email", error, subject=subject,
             )
             raise
         self._sent(
-            "send", "send_email", result, values.get("from_identity"),
+            "send", "send_email", result, from_identity,
             detail=({"attachments": result.attachments}
                     if result.attachments else None),
         )
         return result
 
-    def create_draft(self, **values) -> DraftResult:
+    def create_draft(
+        self,
+        to: str,
+        subject: str,
+        body: str,
+        cc: str | None = None,
+        in_reply_to: str = "",
+        from_identity: str | None = None,
+    ) -> DraftResult:
+        request = DraftRequest(
+            to=to,
+            subject=subject,
+            body=body,
+            cc=cc,
+            in_reply_to=in_reply_to,
+            from_identity=from_identity,
+        )
         try:
-            result = self._deps.delivery.create_draft(**values)
+            result = self._delivery.create_draft(request)
         except ToolError as error:
             self._failed_delivery(
-                "draft", "create_draft", error, subject=values.get("subject")
+                "draft", "create_draft", error, subject=subject,
             )
             raise
         self._event(
             "draft", "created", tool="create_draft",
             message_id=result.message_id,
-            identity=values.get("from_identity"),
+            identity=from_identity,
             to=result.to,
             cc=result.cc or None,
             subject=result.subject,
@@ -76,39 +136,78 @@ class DeliveryUseCases(ApplicationService):
         )
         return result
 
-    def reply_email(self, **values) -> SendResult:
-        original_id = values["id"]
+    def reply_email(
+        self,
+        id: str,
+        body: str,
+        reply_all: bool = False,
+        cc: str | None = None,
+        bcc: str | None = None,
+        include_history: bool = True,
+        attachments: list[str] | None = None,
+        from_identity: str | None = None,
+    ) -> SendResult:
+        request = ReplyRequest(
+            id=id,
+            body=body,
+            reply_all=reply_all,
+            cc=cc,
+            bcc=bcc,
+            include_history=include_history,
+            attachments=tuple(attachments or ()),
+            from_identity=from_identity,
+        )
         try:
-            result = self._deps.delivery.reply(self.source, **values)
+            result = self._delivery.reply(self.source, request)
         except ToolError as error:
             self._failed_delivery(
                 "reply", "reply_email", error,
                 detail={
-                    "orig_id": original_id,
-                    "reply_all": values.get("reply_all", False),
+                    "orig_id": id,
+                    "reply_all": reply_all,
                 },
             )
             raise
         self._sent(
-            "reply", "reply_email", result, values.get("from_identity"),
+            "reply", "reply_email", result, from_identity,
             detail={
-                "orig_id": original_id,
-                "reply_all": values.get("reply_all", False),
+                "orig_id": id,
+                "reply_all": reply_all,
             },
         )
         return result
 
-    def schedule_email(self, **values) -> ScheduledEntry:
+    def schedule_email(
+        self,
+        to: str,
+        subject: str,
+        body: str,
+        send_at: str,
+        cc: str | None = None,
+        bcc: str | None = None,
+        attachments: list[str] | None = None,
+        from_identity: str | None = None,
+    ) -> ScheduledEntry:
+        request = ScheduleRequest(
+            to=to,
+            subject=subject,
+            body=body,
+            send_at=send_at,
+            cc=cc,
+            bcc=bcc,
+            attachments=tuple(attachments or ()),
+            from_identity=from_identity,
+        )
         try:
-            entry = self._deps.delivery.schedule(**values)
+            entry = self._delivery.schedule(request)
         except ToolError as error:
             self._failed_delivery(
                 "schedule", "schedule_email", error,
-                subject=values.get("subject"),
+                subject=subject,
             )
             raise
         requested = (
-            self._deps.delivery.requested_executor(entry.identity)
+            self._delivery.requested_executor(entry.identity)
             if entry.executor == "launchd" else None
         )
         self._event(

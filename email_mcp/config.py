@@ -182,6 +182,18 @@ def send_max_retries() -> int:
     return int(os.environ.get("EMAIL_MCP_SEND_RETRIES", "5"))
 
 
+LAUNCHD_LABEL = "com.email-mcp.dispatcher"
+LEGACY_LAUNCHD_LABELS = ("com.paris.email-mcp-dispatcher",)
+
+
+def dispatcher_plist() -> Path:
+    """Path of the per-user scheduled-delivery launch agent."""
+    return (
+        Path.home() / "Library" / "LaunchAgents"
+        / f"{LAUNCHD_LABEL}.plist"
+    )
+
+
 def graph_dir() -> Path:
     """Path of the Graph executor state (per-identity OAuth token caches):
     <state root>/graph. A path question only — never creates."""

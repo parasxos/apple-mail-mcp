@@ -5,18 +5,21 @@ import re
 from datetime import datetime
 
 from ..domain.errors import InvalidInput
-from .base import ApplicationService
-from .models import AuditPage
+from .models import AuditPage, AuditQuery, DoctorReport, TransportReport
+from .ports import OperationsGateway
 
 _ISO_BOUND_RE = re.compile(r"\d{4}(-\d{2}(-\d{2})?)?")
 
 
-class OperationsUseCases(ApplicationService):
-    def doctor(self) -> dict:
-        return self._deps.operations.doctor()
+class OperationsUseCases:
+    def __init__(self, *, operations: OperationsGateway) -> None:
+        self._operations = operations
 
-    def transport_check(self) -> dict:
-        return self._deps.operations.transport_check()
+    def doctor(self) -> DoctorReport:
+        return self._operations.doctor()
+
+    def transport_check(self) -> TransportReport:
+        return self._operations.transport_check()
 
     @staticmethod
     def _valid_iso_bound(value: str) -> bool:
@@ -46,7 +49,7 @@ class OperationsUseCases(ApplicationService):
                     "(want ISO-8601; prefixes allowed, e.g. "
                     "2026-07 or 2026-07-29)"
                 )
-        return AuditPage(**self._deps.operations.audit(
+        return self._operations.audit(AuditQuery(
             since=since, until=until, tool=tool, event=event,
             plan_id=plan_id, operation_id=operation_id, limit=limit,
         ))

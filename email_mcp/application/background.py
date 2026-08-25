@@ -7,16 +7,21 @@ the safety rules that prevent local and Exchange delivery from racing.
 from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
-from typing import Any
-
 from ..domain import codes
+from ..domain.events import EventPublisher
 from ..domain.models import ScheduledEntry
 from .base import ApplicationService
+from .models import DispatchSummary
 from .ports import (
     BackgroundDeliveryError,
-    BackgroundGateway,
     BackgroundIdentityError,
     BackgroundProviderError,
+    Clock,
+    DeferredDelivery,
+    DispatchQueue,
+    IdentityResolver,
+    LocalDelivery,
+    UserNotifier,
 )
 
 BACKOFF_MINUTES = (2, 5, 15, 45, 120)
@@ -49,12 +54,26 @@ def is_due(entry: ScheduledEntry, now: datetime) -> bool:
 class BackgroundUseCases(ApplicationService):
     """Recover and dispatch scheduled messages through injected ports."""
 
-    @property
-    def _background(self) -> BackgroundGateway:
-        gateway = self._deps.background
-        if gateway is None:
-            raise RuntimeError("background delivery is not configured")
-        return gateway
+    def __init__(
+        self,
+        *,
+        queue: DispatchQueue,
+        clock: Clock,
+        identities: IdentityResolver,
+        delivery: LocalDelivery,
+        deferred: DeferredDelivery,
+        notifier: UserNotifier,
+        events: EventPublisher,
+        max_retries: int,
+    ) -> None:
+        super().__init__(events)
+        self._queue = queue
+        self._clock = clock
+        self._identities = identities
+        self._delivery = delivery
+        self._deferred = deferred
+        self._notifier = notifier
+        self._max_retries = max(1, int(max_retries))
 
     def _fail_or_retry(
         self,
@@ -65,9 +84,9 @@ class BackgroundUseCases(ApplicationService):
     ) -> str:
         entry.attempts += 1
         entry.last_error = error
-        if entry.attempts >= self._background.max_retries():
-            self._background.move(entry, source, "failed")
-            self._background.notify(
+        if entry.attempts >= self._max_retries:
+            self._queue.move(entry, source, "failed")
+            self._notifier.notify(
                 "email-mcp: send FAILED",
                 f"{entry.subject!r} to {', '.join(entry.to)} — {error[:120]}",
             )
@@ -76,10 +95,10 @@ class BackgroundUseCases(ApplicationService):
             delay = BACKOFF_MINUTES[min(
                 entry.attempts - 1, len(BACKOFF_MINUTES) - 1,
             )]
-            entry.next_attempt_at = self._background.iso(
+            entry.next_attempt_at = self._clock.format(
                 now + timedelta(minutes=delay),
             )
-            self._background.move(entry, source, "pending")
+            self._queue.move(entry, source, "pending")
             outcome, note = "retry", f"retry in {delay}m"
         self._event(
             "deliver", outcome, operation_id=entry.id,
@@ -91,7 +110,7 @@ class BackgroundUseCases(ApplicationService):
 
     def recover_stranded(self, now: datetime) -> list[str]:
         recovered: list[str] = []
-        for entry in self._background.entries("sending"):
+        for entry in self._queue.entries("sending"):
             reference = (
                 parse_timestamp(entry.next_attempt_at)
                 or parse_timestamp(entry.send_at)
@@ -106,16 +125,16 @@ class BackgroundUseCases(ApplicationService):
             entry.last_error = entry.last_error or (
                 "dispatcher died mid-delivery (recovered from sending/)"
             )
-            if entry.attempts >= self._background.max_retries():
-                self._background.move(entry, "sending", "failed")
+            if entry.attempts >= self._max_retries:
+                self._queue.move(entry, "sending", "failed")
                 self._event(
                     "recover", "failed", operation_id=entry.id,
                     spool_id=entry.id, subject=entry.subject,
                     detail={"attempts": entry.attempts},
                 )
             else:
-                entry.next_attempt_at = self._background.iso(now)
-                self._background.move(entry, "sending", "pending")
+                entry.next_attempt_at = self._clock.format(now)
+                self._queue.move(entry, "sending", "pending")
                 self._event(
                     "recover", "requeued", operation_id=entry.id,
                     spool_id=entry.id, subject=entry.subject,
@@ -126,7 +145,7 @@ class BackgroundUseCases(ApplicationService):
 
     def graph_current(self, entry: ScheduledEntry) -> bool:
         try:
-            current = self._background.load("pending", entry.id)
+            current = self._queue.load("pending", entry.id)
         except Exception:
             return False
         return (
@@ -138,10 +157,10 @@ class BackgroundUseCases(ApplicationService):
     def graph_mark_sent(self, entry: ScheduledEntry, now: datetime) -> str:
         if not self.graph_current(entry):
             return SUPERSEDED
-        entry.delivered_at = self._background.iso(now)
+        entry.delivered_at = self._clock.format(now)
         entry.next_attempt_at = None
         entry.last_error = None
-        self._background.move(entry, "pending", "sent")
+        self._queue.move(entry, "pending", "sent")
         self._event(
             "graph_sent", "sent", operation_id=entry.id,
             spool_id=entry.id, identity=entry.identity,
@@ -154,7 +173,7 @@ class BackgroundUseCases(ApplicationService):
             return SUPERSEDED
         entry.graph_draft_id = draft_id
         entry.last_error = None
-        self._background.update("pending", entry)
+        self._queue.update("pending", entry)
         self._event(
             "graph_adopt", "adopted", operation_id=entry.id,
             spool_id=entry.id, draft_id=draft_id,
@@ -174,9 +193,9 @@ class BackgroundUseCases(ApplicationService):
         entry.executor = "launchd"
         if clear_draft:
             entry.graph_draft_id = None
-        entry.next_attempt_at = self._background.iso(now)
+        entry.next_attempt_at = self._clock.format(now)
         entry.last_error = None
-        self._background.update("pending", entry)
+        self._queue.update("pending", entry)
         self._event(
             "graph_flip", "flipped", operation_id=entry.id,
             spool_id=entry.id, message_id=entry.message_id,
@@ -193,7 +212,7 @@ class BackgroundUseCases(ApplicationService):
         if not self.graph_current(entry):
             return SUPERSEDED
         entry.last_error = error
-        self._background.update("pending", entry)
+        self._queue.update("pending", entry)
         return note
 
     def graph_apply_status(
@@ -212,7 +231,7 @@ class BackgroundUseCases(ApplicationService):
                 "deferred draft was discarded outside the spool (e.g. in "
                 "Outlook/OWA Drafts) — not sent, not sendable locally"
             )
-            self._background.move(entry, "pending", "cancelled")
+            self._queue.move(entry, "pending", "cancelled")
             self._event(
                 "graph_cancelled_external", "cancelled",
                 operation_id=entry.id, spool_id=entry.id,
@@ -223,7 +242,7 @@ class BackgroundUseCases(ApplicationService):
 
     def reconcile_deferred(self, now: datetime) -> dict[str, str]:
         entries = [
-            entry for entry in self._background.entries("pending")
+            entry for entry in self._queue.entries("pending")
             if entry.executor == "graph"
         ]
         results: dict[str, str] = {}
@@ -236,7 +255,7 @@ class BackgroundUseCases(ApplicationService):
             if next_attempt is not None and next_attempt > now:
                 continue
             try:
-                identity = self._background.identity(entry.identity)
+                identity = self._identities.resolve(entry.identity)
             except BackgroundIdentityError as error:
                 results[entry.id] = self._fail_or_retry(
                     entry, str(error), now, source="pending",
@@ -245,7 +264,7 @@ class BackgroundUseCases(ApplicationService):
 
             if not entry.graph_draft_id:
                 try:
-                    draft_id = self._background.find_deferred_draft(
+                    draft_id = self._deferred.find_draft(
                         identity, entry.message_id,
                     )
                 except BackgroundProviderError as error:
@@ -258,7 +277,7 @@ class BackgroundUseCases(ApplicationService):
                     results[entry.id] = self.graph_adopt(entry, draft_id)
                     continue
                 try:
-                    sent = self._background.deferred_was_sent(
+                    sent = self._deferred.was_sent(
                         identity, entry.message_id,
                     )
                 except BackgroundProviderError as error:
@@ -276,7 +295,7 @@ class BackgroundUseCases(ApplicationService):
                 continue
 
             try:
-                status = self._background.deferred_status(
+                status = self._deferred.status(
                     identity, entry.graph_draft_id, entry.message_id,
                 )
             except BackgroundProviderError as error:
@@ -290,7 +309,7 @@ class BackgroundUseCases(ApplicationService):
                 continue
 
             try:
-                outcome = self._background.delete_deferred_draft(
+                outcome = self._deferred.delete_draft(
                     identity, entry.graph_draft_id,
                 )
             except BackgroundProviderError as error:
@@ -305,7 +324,7 @@ class BackgroundUseCases(ApplicationService):
                 )
                 continue
             try:
-                status = self._background.deferred_status(
+                status = self._deferred.status(
                     identity, entry.graph_draft_id, entry.message_id,
                 )
             except BackgroundProviderError as error:
@@ -317,40 +336,42 @@ class BackgroundUseCases(ApplicationService):
             results[entry.id] = self.graph_apply_status(entry, status, now)
         return results
 
-    def dispatch_scheduled(self, now: datetime | None = None) -> dict:
-        now = now or self._background.now()
+    def dispatch_scheduled(
+        self, now: datetime | None = None,
+    ) -> DispatchSummary:
+        now = now or self._clock.now()
         self.recover_stranded(now)
         due = [
-            entry for entry in self._background.entries("pending")
+            entry for entry in self._queue.entries("pending")
             if entry.executor != "graph" and is_due(entry, now)
         ]
         results = self.reconcile_deferred(now)
         if not due:
-            summary = {
-                "checked_at": self._background.iso(now),
-                "due": 0,
-                "results": results,
-            }
-            integrity = self._background.integrity()
-            if not integrity["ok"]:
-                summary["integrity"] = integrity
-            return summary
+            integrity = self._queue.integrity()
+            return DispatchSummary(
+                checked_at=self._clock.format(now),
+                due=0,
+                results=results,
+                integrity=None if integrity.ok else integrity,
+            )
 
-        ready: dict[str, tuple[bool, str | None, Any | None]] = {}
+        ready: dict[str, tuple[bool, str | None, object | None]] = {}
 
-        def transport_ready(name: str) -> tuple[bool, str | None, Any | None]:
+        def transport_ready(
+            name: str,
+        ) -> tuple[bool, str | None, object | None]:
             if name not in ready:
                 try:
-                    identity = self._background.identity(name)
+                    identity = self._identities.resolve(name)
                 except BackgroundIdentityError as error:
                     ready[name] = (False, str(error), None)
                 else:
-                    ok, error = self._background.preflight(identity)
+                    ok, error = self._delivery.preflight(identity)
                     ready[name] = (ok, error, identity)
             return ready[name]
 
         for entry in due:
-            if not self._background.claim(entry.id):
+            if not self._queue.claim(entry.id):
                 results[entry.id] = "claimed elsewhere"
                 continue
             entry.status = "sending"
@@ -363,13 +384,13 @@ class BackgroundUseCases(ApplicationService):
                 )
                 continue
             try:
-                raw = self._background.read_message("sending", entry.id)
+                raw = self._queue.read_message("sending", entry.id)
             except OSError as error:
                 entry.last_error = (
                     "spool .eml missing" if isinstance(error, FileNotFoundError)
                     else f"spool .eml unreadable: {error}"
                 )
-                self._background.move(entry, "sending", "failed")
+                self._queue.move(entry, "sending", "failed")
                 self._event(
                     "deliver", "failed", operation_id=entry.id,
                     spool_id=entry.id, identity=entry.identity,
@@ -379,16 +400,16 @@ class BackgroundUseCases(ApplicationService):
                 results[entry.id] = "failed"
                 continue
             try:
-                self._background.deliver(
+                self._delivery.deliver(
                     identity, raw, entry.to + entry.cc + entry.bcc,
                 )
             except BackgroundDeliveryError as error:
                 results[entry.id] = self._fail_or_retry(entry, str(error), now)
                 continue
-            entry.delivered_at = self._background.iso(self._background.now())
+            entry.delivered_at = self._clock.format(self._clock.now())
             entry.next_attempt_at = None
             entry.last_error = None
-            self._background.move(entry, "sending", "sent")
+            self._queue.move(entry, "sending", "sent")
             self._event(
                 "deliver", "sent", operation_id=entry.id,
                 spool_id=entry.id, identity=entry.identity,
@@ -397,12 +418,10 @@ class BackgroundUseCases(ApplicationService):
             )
             results[entry.id] = "sent"
 
-        summary = {
-            "checked_at": self._background.iso(now),
-            "due": len(due),
-            "results": results,
-        }
-        integrity = self._background.integrity()
-        if not integrity["ok"]:
-            summary["integrity"] = integrity
-        return summary
+        integrity = self._queue.integrity()
+        return DispatchSummary(
+            checked_at=self._clock.format(now),
+            due=len(due),
+            results=results,
+            integrity=None if integrity.ok else integrity,
+        )

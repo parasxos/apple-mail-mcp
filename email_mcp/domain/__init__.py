@@ -16,13 +16,17 @@ from .mail import (
     SearchQuery,
 )
 from .models import (
+    DraftRequest,
     DraftResult,
     IntegrityIssue,
     Plan,
     PlanAction,
     PlanMessage,
+    ReplyRequest,
+    ScheduleRequest,
     ScheduledEntry,
     ScheduledScan,
+    SendRequest,
     SendResult,
 )
 
@@ -31,6 +35,7 @@ __all__ = [
     "AttachmentRef",
     "DomainEvent",
     "DraftResult",
+    "DraftRequest",
     "Email",
     "EmailRef",
     "EmailSource",
@@ -44,9 +49,12 @@ __all__ = [
     "Plan",
     "PlanAction",
     "PlanMessage",
+    "ReplyRequest",
+    "ScheduleRequest",
     "ScheduledEntry",
     "ScheduledScan",
     "SearchQuery",
+    "SendRequest",
     "SendResult",
     "ToolError",
 ]

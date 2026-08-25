@@ -11,6 +11,7 @@ from datetime import datetime, timedelta, timezone
 import pytest
 
 from email_mcp import dispatcher, sender, spool
+from email_mcp.adapters.background import MacOSNotifier
 
 
 @pytest.fixture(autouse=True)
@@ -31,7 +32,7 @@ def delivered(monkeypatch):
     sent: list[bytes] = []
     monkeypatch.setattr(sender, "_socket_alive", lambda: True)
     monkeypatch.setattr(sender, "_deliver_bytes", lambda raw: sent.append(raw))
-    monkeypatch.setattr(dispatcher, "_notify", lambda *a, **k: None)
+    monkeypatch.setattr(MacOSNotifier, "notify", lambda *a, **k: None)
     return sent
 
 
@@ -127,7 +128,9 @@ def test_dispatcher_idle_pass_is_quiet(delivered):
 def test_retry_backoff_then_park_failed(monkeypatch, delivered):
     monkeypatch.setenv("EMAIL_MCP_SEND_RETRIES", "2")
     notes = []
-    monkeypatch.setattr(dispatcher, "_notify", lambda t, x: notes.append(t))
+    monkeypatch.setattr(
+        MacOSNotifier, "notify", lambda self, title, text: notes.append(title),
+    )
 
     def boom(raw):
         raise sender.SendError("smtp exploded")
@@ -368,7 +371,7 @@ def test_fire_time_envelope_uses_frozen_from_not_current_env(monkeypatch):
 
     monkeypatch.setattr(
         sender.transports, "get_transport", lambda ident: FakeTransport())
-    monkeypatch.setattr(dispatcher, "_notify", lambda *a, **k: None)
+    monkeypatch.setattr(MacOSNotifier, "notify", lambda *a, **k: None)
     assert dispatcher.run_once()["results"][entry.id] == "sent"
     raw, mail_from, rcpt_to = seen[-1]
     assert mail_from == "frozen@example.org"      # frozen, not drifted

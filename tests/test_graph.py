@@ -24,6 +24,7 @@ from datetime import datetime, timedelta, timezone
 import pytest
 
 from email_mcp import config, dispatcher, graph, sender, server, spool, state
+from email_mcp.adapters.background import MacOSNotifier
 from email_mcp.graph import GraphError
 from email_mcp.identities import Identity
 from email_mcp.transports import SendError
@@ -686,7 +687,7 @@ def local_delivery(monkeypatch):
     delivered: list[bytes] = []
     monkeypatch.setattr(sender, "_socket_alive", lambda: True)
     monkeypatch.setattr(sender, "_deliver_bytes", delivered.append)
-    monkeypatch.setattr(dispatcher, "_notify", lambda *a, **k: None)
+    monkeypatch.setattr(MacOSNotifier, "notify", lambda *a, **k: None)
     return delivered
 
 

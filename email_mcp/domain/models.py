@@ -4,6 +4,59 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 
 
+@dataclass(frozen=True)
+class SendRequest:
+    """Complete application-owned command for immediate delivery."""
+
+    to: str
+    subject: str
+    body: str
+    cc: str | None = None
+    bcc: str | None = None
+    attachments: tuple[str, ...] = ()
+    from_identity: str | None = None
+
+
+@dataclass(frozen=True)
+class DraftRequest:
+    """Complete application-owned command for creating a provider draft."""
+
+    to: str
+    subject: str
+    body: str
+    cc: str | None = None
+    in_reply_to: str = ""
+    from_identity: str | None = None
+
+
+@dataclass(frozen=True)
+class ReplyRequest:
+    """Complete application-owned command for replying to a message."""
+
+    id: str
+    body: str
+    reply_all: bool = False
+    cc: str | None = None
+    bcc: str | None = None
+    include_history: bool = True
+    attachments: tuple[str, ...] = ()
+    from_identity: str | None = None
+
+
+@dataclass(frozen=True)
+class ScheduleRequest:
+    """Complete application-owned command for durable deferred delivery."""
+
+    to: str
+    subject: str
+    body: str
+    send_at: str
+    cc: str | None = None
+    bcc: str | None = None
+    attachments: tuple[str, ...] = ()
+    from_identity: str | None = None
+
+
 @dataclass
 class SendResult:
     ok: bool

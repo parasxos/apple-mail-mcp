@@ -1,13 +1,33 @@
-"""Outbound interfaces used by the application layer."""
+"""Small, role-specific interfaces owned by the application layer."""
 from __future__ import annotations
 
 from datetime import datetime
-from typing import Any, Protocol
+from typing import Protocol
 
-from ..domain.events import EventPublisher
 from ..domain.mail import EmailSource, SearchQuery
-from ..domain.models import DraftResult, Plan, ScheduledEntry, SendResult
-from .models import RefreshOutcome
+from ..domain.errors import ToolError
+from ..domain.models import (
+    DraftRequest,
+    DraftResult,
+    Plan,
+    ReplyRequest,
+    ScheduleRequest,
+    ScheduledEntry,
+    SendRequest,
+    SendResult,
+)
+from .models import (
+    AuditPage,
+    AuditQuery,
+    DoctorReport,
+    MailboxCreateResult,
+    MailboxDeleteResult,
+    QueueIntegrity,
+    RefreshOutcome,
+    ScheduleListing,
+    TransportReport,
+    TriageApplyResult,
+)
 
 
 class SourceProvider(Protocol):
@@ -15,13 +35,14 @@ class SourceProvider(Protocol):
 
 
 class DeliveryGateway(Protocol):
-    def send(self, **values: Any) -> SendResult: ...
+    def send(self, request: SendRequest) -> SendResult: ...
 
-    def create_draft(self, **values: Any) -> DraftResult: ...
+    def create_draft(self, request: DraftRequest) -> DraftResult: ...
 
-    def reply(self, source: EmailSource, **values: Any) -> SendResult: ...
+    def reply(self, source: EmailSource,
+              request: ReplyRequest) -> SendResult: ...
 
-    def schedule(self, **values: Any) -> ScheduledEntry: ...
+    def schedule(self, request: ScheduleRequest) -> ScheduledEntry: ...
 
     def requested_executor(self, identity: str) -> str | None: ...
 
@@ -31,7 +52,7 @@ class ScheduleStore(Protocol):
 
     def dispatcher_installed(self) -> bool: ...
 
-    def listing(self, state: str | None, limit: int) -> dict: ...
+    def listing(self, state: str | None, limit: int) -> ScheduleListing: ...
 
     def find(self, operation_id: str) -> tuple[str, ScheduledEntry] | None: ...
 
@@ -42,14 +63,24 @@ class ScheduleStore(Protocol):
     def mark_delivered_now(self, entry: ScheduledEntry) -> None: ...
 
 
-class DeferredScheduler(Protocol):
-    def identity(self, name: str) -> Any: ...
+class IdentityResolver(Protocol):
+    """Resolve a configured name to an opaque adapter-owned identity."""
 
-    def find_draft(self, identity: Any, message_id: str) -> str | None: ...
+    def resolve(self, name: str) -> object: ...
 
-    def delete_draft(self, identity: Any, draft_id: str) -> str: ...
 
-    def was_sent(self, identity: Any, message_id: str) -> bool: ...
+class DeferredDelivery(Protocol):
+    """Remote provider operations needed for safe deferred delivery."""
+
+    def find_draft(self, identity: object,
+                   message_id: str) -> str | None: ...
+
+    def delete_draft(self, identity: object, draft_id: str) -> str: ...
+
+    def was_sent(self, identity: object, message_id: str) -> bool: ...
+
+    def status(self, identity: object, draft_id: str,
+               message_id: str) -> str: ...
 
 
 class TriageGateway(Protocol):
@@ -62,13 +93,13 @@ class TriageGateway(Protocol):
 
     def build_delete(self, source: EmailSource, query: SearchQuery) -> Plan: ...
 
-    def apply(self, source: EmailSource, plan_id: str) -> dict: ...
+    def apply(self, source: EmailSource, plan_id: str) -> TriageApplyResult: ...
 
     def create_mailbox(self, source: EmailSource, account: str,
-                       path: str) -> dict: ...
+                       path: str) -> MailboxCreateResult: ...
 
     def delete_mailbox(self, source: EmailSource, account: str,
-                       path: str) -> dict: ...
+                       path: str) -> MailboxDeleteResult: ...
 
 
 class RefreshGateway(Protocol):
@@ -76,34 +107,38 @@ class RefreshGateway(Protocol):
                 timeout_seconds: float) -> RefreshOutcome: ...
 
 
-class OperationsGateway(Protocol):
-    def doctor(self) -> dict: ...
-
-    def transport_check(self) -> dict: ...
-
-    def audit(self, **filters: Any) -> dict: ...
-
+class ErrorClassifier(Protocol):
     def classify(self, error: BaseException) -> str: ...
 
 
-class BackgroundIdentityError(Exception):
+class OperationsGateway(Protocol):
+    def doctor(self) -> DoctorReport: ...
+
+    def transport_check(self) -> TransportReport: ...
+
+    def audit(self, query: AuditQuery) -> AuditPage: ...
+
+
+class BackgroundIdentityError(ToolError):
     """A scheduled entry refers to an unavailable identity."""
 
 
-class BackgroundProviderError(Exception):
-    """A remote deferred-delivery provider could not give a safe answer."""
+class BackgroundProviderError(ToolError):
+    """A remote deferred provider could not give a safe answer."""
 
 
-class BackgroundDeliveryError(Exception):
-    """The local delivery transport rejected or could not send a message."""
+class BackgroundDeliveryError(ToolError):
+    """The local transport rejected or could not send a message."""
 
 
-class BackgroundGateway(Protocol):
-    """Infrastructure needed by the scheduled-delivery use case."""
-
+class Clock(Protocol):
     def now(self) -> datetime: ...
 
-    def iso(self, value: datetime) -> str: ...
+    def format(self, value: datetime) -> str: ...
+
+
+class DispatchQueue(Protocol):
+    """Durable queue role used by the one-pass delivery state machine."""
 
     def entries(self, state: str) -> list[ScheduledEntry]: ...
 
@@ -117,37 +152,15 @@ class BackgroundGateway(Protocol):
 
     def read_message(self, state: str, operation_id: str) -> bytes: ...
 
-    def integrity(self) -> dict: ...
+    def integrity(self) -> QueueIntegrity: ...
 
-    def max_retries(self) -> int: ...
 
-    def identity(self, name: str) -> Any: ...
+class LocalDelivery(Protocol):
+    def preflight(self, identity: object) -> tuple[bool, str | None]: ...
 
-    def preflight(self, identity: Any) -> tuple[bool, str | None]: ...
-
-    def deliver(self, identity: Any, raw: bytes,
+    def deliver(self, identity: object, raw: bytes,
                 recipients: list[str]) -> None: ...
 
-    def find_deferred_draft(self, identity: Any,
-                            message_id: str) -> str | None: ...
 
-    def deferred_was_sent(self, identity: Any, message_id: str) -> bool: ...
-
-    def deferred_status(self, identity: Any, draft_id: str,
-                        message_id: str) -> str: ...
-
-    def delete_deferred_draft(self, identity: Any, draft_id: str) -> str: ...
-
+class UserNotifier(Protocol):
     def notify(self, title: str, text: str) -> None: ...
-
-
-class ApplicationPorts(Protocol):
-    source: SourceProvider
-    delivery: DeliveryGateway
-    schedules: ScheduleStore
-    deferred: DeferredScheduler
-    triage: TriageGateway
-    refresh: RefreshGateway
-    operations: OperationsGateway
-    events: EventPublisher
-    background: BackgroundGateway | None

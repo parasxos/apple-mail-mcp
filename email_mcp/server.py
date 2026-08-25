@@ -195,7 +195,7 @@ def _send_test(
 
 def _transport_check() -> int:
     """Deprecated compatibility view of the doctor's transport checks."""
-    check = get_application().transport_check()
+    check = get_application().transport_check().to_wire()
     json.dump(check, sys.stdout, indent=2, default=str)
     sys.stdout.write("\n")
     return 0 if check.get("ok") else 1

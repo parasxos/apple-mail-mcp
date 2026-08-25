@@ -132,7 +132,9 @@ def tool_schedule_email(
 
 @envelope.tool
 def tool_list_scheduled(state: str | None = None, limit: int = 50) -> dict:
-    return get_application().list_scheduled(state=state, limit=limit)
+    return get_application().list_scheduled(
+        state=state, limit=limit,
+    ).to_wire()
 
 
 @envelope.tool
@@ -170,17 +172,21 @@ def tool_triage_plan_delete(
 
 @envelope.tool(op_from="plan_id")
 def tool_triage_apply(plan_id: str) -> dict:
-    return get_application().triage_apply(plan_id=plan_id)
+    return get_application().triage_apply(plan_id=plan_id).to_wire()
 
 
 @envelope.tool
 def tool_mailbox_create(account: str, path: str) -> dict:
-    return get_application().mailbox_create(account=account, path=path)
+    return get_application().mailbox_create(
+        account=account, path=path,
+    ).to_wire()
 
 
 @envelope.tool
 def tool_mailbox_delete(account: str, path: str) -> dict:
-    return get_application().mailbox_delete(account=account, path=path)
+    return get_application().mailbox_delete(
+        account=account, path=path,
+    ).to_wire()
 
 
 @envelope.tool
@@ -190,7 +196,7 @@ def tool_cancel_scheduled(id: str) -> CancelReceipt:
 
 @envelope.tool
 def tool_doctor() -> dict:
-    return get_application().doctor()
+    return get_application().doctor().to_wire()
 
 
 @envelope.tool

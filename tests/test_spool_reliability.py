@@ -15,6 +15,7 @@ import pytest
 
 from email_mcp import (codes, config, dispatcher, doctor, sender, server,
                        spool, state)
+from email_mcp.adapters.background import MacOSNotifier
 
 
 @pytest.fixture(autouse=True)
@@ -188,7 +189,7 @@ def test_dispatcher_delivers_healthy_sibling_and_reports_corruption(monkeypatch)
     sent: list[bytes] = []
     monkeypatch.setattr(sender, "_socket_alive", lambda: True)
     monkeypatch.setattr(sender, "_deliver_bytes", lambda raw: sent.append(raw))
-    monkeypatch.setattr(dispatcher, "_notify", lambda *a, **k: None)
+    monkeypatch.setattr(MacOSNotifier, "notify", lambda *a, **k: None)
 
     due = _entry("dispatch-good")
     due.send_at = spool.iso(spool.utcnow() - timedelta(minutes=1))

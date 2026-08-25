@@ -20,6 +20,7 @@ import pytest
 from email_mcp import (
     bootstrap, config, dispatcher, plans, sender, server, spool, triage,
 )
+from email_mcp.adapters.background import MacOSNotifier
 from email_mcp.plans import PlanAction
 from email_mcp.triage import TriageError
 
@@ -58,7 +59,7 @@ def delivered(monkeypatch):
     sent: list[bytes] = []
     monkeypatch.setattr(sender, "_socket_alive", lambda: True)
     monkeypatch.setattr(sender, "_deliver_bytes", sent.append)
-    monkeypatch.setattr(dispatcher, "_notify", lambda *a, **k: None)
+    monkeypatch.setattr(MacOSNotifier, "notify", lambda *a, **k: None)
     return sent
 
 
