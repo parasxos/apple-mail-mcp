@@ -23,7 +23,7 @@ _VERBS = ("serve", "setup", "status", "doctor", "update", "uninstall",
           "version", "help", *_PASSTHROUGH)
 
 _USAGE = """\
-Email MCP — private, local-first access to Apple Mail
+apple-mailbox-mcp — private, local-first access to Apple Mail
 
 usage: email-mcp [verb] [options]
 

@@ -62,15 +62,16 @@ folder, ready to open in Outlook or OWA — created, never auto-sent.
 Every other Apple-Mail MCP drives AppleScript for both finding and acting.
 This one doesn't — and it shows:
 
-| Operation | AppleScript-based MCPs | apple-mail-mcp |
+| Operation | AppleScript whose-clause | apple-mailbox-mcp |
 |---|---|---|
 | 🔍 Search 300k messages | seconds-to-timeout | **milliseconds** |
-| 🎯 Address one message in a 72k mailbox | **85.6 s** (measured) | **0.16 s** — 535× faster |
+| 🎯 Address one message in a 71k mailbox | **7.2 s** ([measured](docs/benchmarks.md)) | **0.1 ms** |
 | ✉️ Send mail | body renders **blank in Outlook** | renders everywhere, plain+HTML |
 | ⏰ Schedule mail | — | server-side on Exchange; reliable local queue everywhere else |
 | 🗂️ Bulk triage | one call per message, fire-and-forget | one reviewed plan, one apply, **verified** |
 
-Every number above was measured on a live 305,000-message mailbox.
+Every number above was measured on a live ~300,000-message store; the
+script and full method are in [docs/benchmarks.md](docs/benchmarks.md).
 
 ## 🛡️ Built to be trusted
 
