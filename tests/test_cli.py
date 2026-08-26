@@ -90,7 +90,7 @@ def test_top_level_help_is_for_people_not_legacy_server_flags(
     assert cli.main(["--help"]) == 0
     assert cli.main(["help"]) == 0
     out = capsys.readouterr().out
-    assert out.count("apple-mailbox-mcp") == 2
+    assert out.count("apple-mailbox-mcp") == 4
     assert "status" in out and "setup" in out and "doctor" in out
     assert "--send-test" not in out
 
@@ -229,7 +229,7 @@ def test_passthrough_forwards_rest_argv(home, monkeypatch, verb):
 def test_unknown_verb_prints_usage_and_exits_2(home, capsys):
     assert cli.main(["stats"]) == 2
     cap = capsys.readouterr()
-    assert "usage: email-mcp" in cap.err
+    assert "usage: apple-mailbox-mcp" in cap.err
     assert "unknown command 'stats'" in cap.err
     assert "Did you mean 'status'?" in cap.err
     assert cap.out == ""

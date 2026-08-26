@@ -235,7 +235,7 @@ needs no sending configuration at all.
 
 <div align="center">
 
-**v1.3** · 21 tools · 800+ tests · additive wire contract since v1.0
+21 tools · 849 tests · additive wire contract since v1.0
 Live-calibrated end-to-end on a 305k-message store.
 
 Built for one Mac — and for anyone else whose Mac runs Mail.app.

@@ -35,10 +35,10 @@ dev = [
 ]
 
 [project.urls]
-Homepage = "https://github.com/parasxos/email-mcp"
-Documentation = "https://github.com/parasxos/email-mcp#readme"
-Issues = "https://github.com/parasxos/email-mcp/issues"
-Repository = "https://github.com/parasxos/email-mcp"
+Homepage = "https://github.com/parasxos/apple-mail-mcp"
+Documentation = "https://github.com/parasxos/apple-mail-mcp#readme"
+Issues = "https://github.com/parasxos/apple-mail-mcp/issues"
+Repository = "https://github.com/parasxos/apple-mail-mcp"
 
 [project.scripts]
 apple-mailbox-mcp = "email_mcp.cli:main"

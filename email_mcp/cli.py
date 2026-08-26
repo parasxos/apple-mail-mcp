@@ -25,7 +25,7 @@ _VERBS = ("serve", "setup", "status", "doctor", "update", "uninstall",
 _USAGE = """\
 apple-mailbox-mcp — private, local-first access to Apple Mail
 
-usage: email-mcp [verb] [options]
+usage: apple-mailbox-mcp [verb] [options]
 
 Get started:
   setup                          first-run wizard: adopt state, identity,
@@ -114,7 +114,7 @@ def main(argv: list[str] | None = None) -> int:
     argv = list(sys.argv[1:]) if argv is None else list(argv)
     if argv and argv[0] in ("help", "-h", "--help"):
         if len(argv) > 1:
-            print("usage: email-mcp help", file=sys.stderr)
+            print("usage: apple-mailbox-mcp help", file=sys.stderr)
             return 2
         print(_USAGE, end="")
         return 0

@@ -139,7 +139,13 @@ def _build_mcp_server():
     from .config import read_only
     from .mcp_compat import enrich_input_schemas, register_tool
 
-    mcp = FastMCP("apple-mail")
+    from email_mcp import __version__ as _pkg_version
+    try:
+        # Newer SDKs surface the version in initialize serverInfo.
+        mcp = FastMCP("apple-mail", version=_pkg_version)
+    except TypeError:
+        # MCP SDK 1.x FastMCP has no version kwarg.
+        mcp = FastMCP("apple-mail")
     for function in _READ_TOOLS:
         register_tool(mcp, function, function)
     if not read_only():
