@@ -1,3 +1,4 @@
+<!-- mcp-name: io.github.parasxos/apple-mail-mcp -->
 <div align="center">
 
 # ✉️ apple-mail-mcp
