@@ -67,7 +67,7 @@ This one doesn't — and it shows:
 | Operation | AppleScript whose-clause | apple-mailbox-mcp |
 |---|---|---|
 | 🔍 Search 300k messages | seconds-to-timeout | **milliseconds** |
-| 🎯 Address one message in a 71k mailbox | **7.2 s** ([measured](docs/benchmarks.md)) | **0.1 ms** |
+| 🎯 Address one message in a 71k mailbox | **7–10 s** ([measured](docs/benchmarks.md)) | **< 0.1 ms** |
 | ✉️ Send mail | body renders **blank in Outlook** | renders everywhere, plain+HTML |
 | ⏰ Schedule mail | — | server-side on Exchange; reliable local queue everywhere else |
 | 🗂️ Bulk triage | one call per message, fire-and-forget | one reviewed plan, one apply, **verified** |

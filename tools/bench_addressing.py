@@ -134,7 +134,25 @@ def main() -> None:
 
     report("index", bench_index(conn, rowid, args.runs))
     if args.applescript:
-        report("applescript", bench_applescript(subject, mbox_name, max(1, args.runs // 5) or 1))
+        # Three targets at different scan depths: whose-clause time depends on
+        # where the message sits, so one depth would overstate or understate.
+        depths = [("shallow", mbox_n // 10), ("middle", mbox_n // 2),
+                  ("deep", (mbox_n * 9) // 10)]
+        for label, offset in depths:
+            r = conn.execute(
+                """SELECT m.ROWID, s.subject FROM messages m
+                   JOIN subjects s ON m.subject = s.ROWID
+                   WHERE m.mailbox = (SELECT mb.ROWID FROM messages mm
+                        JOIN mailboxes mb ON mm.mailbox = mb.ROWID
+                        GROUP BY mb.ROWID ORDER BY COUNT(*) DESC LIMIT 1)
+                     AND s.subject != ''
+                   ORDER BY m.ROWID LIMIT 1 OFFSET ?""", (offset,)).fetchone()
+            if not r:
+                continue
+            try:
+                report(f"as:{label}", bench_applescript(r[1], mbox_name, 2))
+            except SystemExit as exc:
+                print(f"  as:{label:9} FAILED: {exc}")
     else:
         print("  applescript  skipped (pass --applescript; expect minutes on a large mailbox)")
     conn.close()

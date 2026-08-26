@@ -13,8 +13,12 @@ largest mailbox in the store.
 
 | Mechanism | What it does | Result |
 |---|---|---|
-| Envelope Index (this server) | `SELECT ... WHERE ROWID = ?` against Mail's own SQLite store, read-only | **0.1 ms** median (5 runs) |
-| AppleScript whose-clause | `first message of mailbox M whose subject is S` via Mail.app | **7.2 s** (1 run) |
+| Envelope Index (this server) | `SELECT ... WHERE ROWID = ?` against Mail's own SQLite store, read-only | **< 0.1 ms** median (10 runs) |
+| AppleScript whose-clause | `first message of mailbox M whose subject is S` via Mail.app | **7.2–9.9 s** (7 runs, three scan depths) |
+
+The whose-clause time was measured at three target depths (10%, 50%, 90% into
+the mailbox) and is essentially depth-independent on this Mail version —
+about 9.3 s median wherever the message sits.
 
 Measured 2026-08-26 on Apple Silicon (arm64), macOS 26.5.2, against a live
 store of 298,980 messages; the haystack mailbox held 71,344 messages. The
@@ -29,8 +33,8 @@ current reproducible number, not the historical one.
 ## Caveats, stated plainly
 
 - The index side reads Mail's store directly and requires Full Disk Access.
-- One AppleScript run per benchmark invocation: at seconds per run, variance
-  is dominated by Mail.app state, not sampling noise. Run it a few times.
+- AppleScript timings vary with Mail.app state (cold vs warm); the reported
+  range covers 7 runs across two sessions.
 - Search-speed claims ("milliseconds over hundreds of thousands of messages")
   are FTS5 queries against the local body index; build time for that index on
   first setup is minutes and is reported by `status`.
