@@ -28,6 +28,17 @@ jobs:
           path: dist
       - name: verify tag and downloaded release packages
         run: python tools/verify_dist.py dist --tag "${GITHUB_REF_NAME}"
+      - name: publish to PyPI (trusted publishing)
+        # Publisher registered on pypi.org: apple-mailbox-mcp ->
+        # parasxos/apple-mail-mcp release.yml. Runs BEFORE checksums are
+        # written: twine rejects non-distribution files in dist/
+        # (the v1.5.0 run failed on SHA256SUMS). Skips prereleases.
+        if: ${{ !contains(github.ref_name, 'rc') }}
+        uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          packages-dir: dist
+          skip-existing: true
+
       - name: write release checksums
         run: sha256sum dist/*.whl dist/*.tar.gz > dist/SHA256SUMS
       - name: attest release provenance
@@ -37,16 +48,6 @@ jobs:
             dist/*.whl
             dist/*.tar.gz
             dist/SHA256SUMS
-      - name: publish to PyPI (trusted publishing)
-        # Requires the pending publisher registered on pypi.org for
-        # project apple-mail-mcp -> parasxos/apple-mail-mcp release.yml.
-        # Skips prereleases; OIDC via the id-token permission above.
-        if: ${{ !contains(github.ref_name, 'rc') }}
-        uses: pypa/gh-action-pypi-publish@release/v1
-        with:
-          packages-dir: dist
-          skip-existing: true
-
       - name: create GitHub release with installable packages
         env:
           GH_TOKEN: ${{ github.token }}
