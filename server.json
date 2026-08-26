@@ -10,7 +10,7 @@
   "packages": [
     {
       "registryType": "pypi",
-      "identifier": "apple-mail-mcp",
+      "identifier": "apple-mailbox-mcp",
       "version": "1.5.0",
       "transport": { "type": "stdio" },
       "runtimeHint": "uvx"

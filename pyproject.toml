@@ -3,7 +3,7 @@ requires = ["setuptools>=77"]  # license = "MIT" is PEP 639; older setuptools re
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "apple-mail-mcp"
+name = "apple-mailbox-mcp"
 dynamic = ["version"]
 description = "Fast local MCP server for Apple Mail: search, read, triage, verified send. Works with Claude, Cursor, VS Code, or any MCP client."
 readme = "README.md"
@@ -41,8 +41,8 @@ Issues = "https://github.com/parasxos/email-mcp/issues"
 Repository = "https://github.com/parasxos/email-mcp"
 
 [project.scripts]
+apple-mailbox-mcp = "email_mcp.cli:main"
 apple-mail-mcp = "email_mcp.cli:main"
-apple_mail_mcp = "email_mcp.cli:main"
 # Back-compat alias for existing local configs; not advertised.
 email-mcp = "email_mcp.cli:main"
 

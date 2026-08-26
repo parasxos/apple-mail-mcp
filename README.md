@@ -124,13 +124,13 @@ Every number above was measured on a live 305,000-message mailbox.
 2. **Install and set up:**
 
    ```bash
-   uvx apple-mail-mcp setup        # or: pipx install apple-mail-mcp
+   uvx apple-mailbox-mcp setup     # or: pipx install apple-mailbox-mcp
    ```
 
 3. **Register with your client** — one line for Claude Code:
 
    ```bash
-   claude mcp add --transport stdio --scope user apple-mail -- uvx apple-mail-mcp
+   claude mcp add --transport stdio --scope user apple-mail -- uvx apple-mailbox-mcp
    ```
 
    or the same JSON block for Claude Desktop / Cursor / VS Code
@@ -139,12 +139,12 @@ Every number above was measured on a live 305,000-message mailbox.
    ```json
    {
      "mcpServers": {
-       "apple-mail": { "command": "uvx", "args": ["apple-mail-mcp"] }
+       "apple-mail": { "command": "uvx", "args": ["apple-mailbox-mcp"] }
      }
    }
    ```
 
-4. **Verify:** `uvx apple-mail-mcp status` prints one readiness screen —
+4. **Verify:** `uvx apple-mailbox-mcp status` prints one readiness screen —
    or just ask your client to run the `doctor` tool; every red line comes
    with its exact fix. The first body-index build on a large mailbox runs in
    the background and can take a few minutes; search works immediately and
@@ -184,7 +184,7 @@ the next scheduled message, and failed scheduled sends anytime with
 
 | Symptom | Fix |
 |---|---|
-| Client says the server failed to start, but `uvx apple-mail-mcp` works in your terminal | GUI apps don't inherit your shell PATH. Use the absolute path: `"command": "/opt/homebrew/bin/uvx"` (find yours with `which uvx`). |
+| Client says the server failed to start, but `uvx apple-mailbox-mcp` works in your terminal | GUI apps don't inherit your shell PATH. Use the absolute path: `"command": "/opt/homebrew/bin/uvx"` (find yours with `which uvx`). |
 | `database is locked` or empty results | Full Disk Access is missing for the app that *launches* the server (the client, not the terminal). Grant it, then fully quit and reopen that app. |
 | Search finds recent mail but not bodies of old mail | The body index is still building — first build on a 100k+ mailbox takes minutes. `status` shows progress. |
 | Send fails with `transport_unavailable` | Run `doctor`: it names the failing lane (Keychain item missing, SSH socket cold, SMTP host unreachable) and prints the exact fix. |
