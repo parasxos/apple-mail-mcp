@@ -1,15 +1,21 @@
 <div align="center">
 
-# ✉️ email-mcp
+# ✉️ apple-mail-mcp
 
 ### Your Apple Mail, fully agent-operable.
 
-Connect your MCP client to Mail.app and your mailbox becomes something you can
+**Runs locally on your Mac.** It opens the Mail store read-only, returns only
+what a client asks for, and sends only when the client explicitly calls the
+send tool. No third-party relay, no cloud copy of your mail.
+
+Use **Claude, Codex, Cursor, VS Code, or any local MCP client** to search,
+read, triage, and send email through Apple Mail — your mailbox becomes
+something you can
 **ask, search and delegate to** — find anything in seconds, file hundreds of
 messages through a reviewed plan, send polished mail as the right identity,
 and let Exchange deliver scheduled messages even while your Mac is asleep.
 
-![ci](https://github.com/parasxos/email-mcp/actions/workflows/ci.yml/badge.svg)
+![ci](https://github.com/parasxos/apple-mail-mcp/actions/workflows/ci.yml/badge.svg)
 ![tools](https://img.shields.io/badge/MCP%20tools-21-brightgreen)
 ![platform](https://img.shields.io/badge/platform-macOS%20%2B%20Mail.app-orange)
 ![python](https://img.shields.io/badge/Python-3.11%E2%80%933.14-blue)
@@ -27,7 +33,7 @@ last week?"* Search runs at database speed — sender, mailbox, dates, unread,
 attachments — and reconstructs whole conversations.
 
 🕳️ **Find what Mail itself can't.** Mail's built-in search only skims the
-first line of most messages. email-mcp indexes every message **body** on your
+first line of most messages. apple-mail-mcp indexes every message **body** on your
 Mac — and for Exchange accounts it even fetches the bodies Mail never
 downloaded, straight from your own mailbox on the server. Queries that
 returned nothing return twenty.
@@ -56,7 +62,7 @@ folder, ready to open in Outlook or OWA — created, never auto-sent.
 Every other Apple-Mail MCP drives AppleScript for both finding and acting.
 This one doesn't — and it shows:
 
-| Operation | AppleScript-based MCPs | email-mcp |
+| Operation | AppleScript-based MCPs | apple-mail-mcp |
 |---|---|---|
 | 🔍 Search 300k messages | seconds-to-timeout | **milliseconds** |
 | 🎯 Address one message in a 72k mailbox | **85.6 s** (measured) | **0.16 s** — 535× faster |
@@ -100,21 +106,49 @@ Every number above was measured on a live 305,000-message mailbox.
   isolated from MCP, Mail.app, Exchange, delivery, and local storage. Provider
   or SDK changes stay at the edge while the 21-tool contract remains stable.
   The dependency rules are enforced in CI and explained in the
-  [architecture guide](https://github.com/parasxos/email-mcp/blob/main/docs/architecture.md).
+  [architecture guide](https://github.com/parasxos/apple-mail-mcp/blob/main/docs/architecture.md).
 - 📦 **Releases you can verify.** Every tagged release is built and installed
   in a clean environment before publishing. GitHub includes the wheel, source
   archive, SHA-256 checksums and signed build provenance—not just source code.
-- 🩺 **Self-diagnosing.** `email-mcp status` gives one readable readiness,
-  scheduling and recovery screen. `email-mcp doctor` provides the complete
+- 🩺 **Self-diagnosing.** `apple-mail-mcp status` gives one readable readiness,
+  scheduling and recovery screen. `apple-mail-mcp doctor` provides the complete
   diagnostic detail and an exact fix for anything red.
 
 ## 🚀 Quick start
 
-```bash
-pipx install git+https://github.com/parasxos/email-mcp
-email-mcp setup
-email-mcp status
-```
+1. **Grant Full Disk Access** to your terminal app
+   (System Settings → Privacy & Security → Full Disk Access), then **quit and
+   reopen the terminal**. This is Apple's one manual toggle — there is no
+   pop-up for it.
+
+2. **Install and set up:**
+
+   ```bash
+   uvx apple-mail-mcp setup        # or: pipx install apple-mail-mcp
+   ```
+
+3. **Register with your client** — one line for Claude Code:
+
+   ```bash
+   claude mcp add --transport stdio --scope user apple-mail -- uvx apple-mail-mcp
+   ```
+
+   or the same JSON block for Claude Desktop / Cursor / VS Code
+   (`claude_desktop_config.json` / `.cursor/mcp.json` / `.vscode/mcp.json`):
+
+   ```json
+   {
+     "mcpServers": {
+       "apple-mail": { "command": "uvx", "args": ["apple-mail-mcp"] }
+     }
+   }
+   ```
+
+4. **Verify:** `uvx apple-mail-mcp status` prints one readiness screen —
+   or just ask your client to run the `doctor` tool; every red line comes
+   with its exact fix. The first body-index build on a large mailbox runs in
+   the background and can take a few minutes; search works immediately and
+   completes as the index fills.
 
 Before running `setup`, grant your terminal app **Full Disk Access**
 (System Settings → Privacy & Security → Full Disk Access) — that is how
@@ -130,7 +164,7 @@ paste into your MCP client:
 ```json
 {
   "mcpServers": {
-    "apple-mail": { "command": "email-mcp" }
+    "apple-mail": { "command": "apple-mail-mcp" }
   }
 }
 ```
@@ -138,13 +172,23 @@ paste into your MCP client:
 Setup ends with a clear **ready** verdict or numbered recovery steps. Grant
 **Automation → Mail** when triage first asks for it. Check the installation,
 the next scheduled message, and failed scheduled sends anytime with
-`email-mcp status`; use `email-mcp doctor` for the full technical detail.
+`apple-mail-mcp status`; use `apple-mail-mcp doctor` for the full technical detail.
 
 > 💡 *New to the terminal?* Three things that look wrong and aren't:
 > `brew install pipx` wants a typed `y` (Enter alone is rejected);
 > `pipx ensurepath` may print a ⚠️ — the "pipx is ready to go!" line after it
 > is the verdict; and after `ensurepath`, close and reopen the terminal once
-> so `email-mcp` is found.
+> so `apple-mail-mcp` is found.
+
+## 🔧 Troubleshooting
+
+| Symptom | Fix |
+|---|---|
+| Client says the server failed to start, but `uvx apple-mail-mcp` works in your terminal | GUI apps don't inherit your shell PATH. Use the absolute path: `"command": "/opt/homebrew/bin/uvx"` (find yours with `which uvx`). |
+| `database is locked` or empty results | Full Disk Access is missing for the app that *launches* the server (the client, not the terminal). Grant it, then fully quit and reopen that app. |
+| Search finds recent mail but not bodies of old mail | The body index is still building — first build on a 100k+ mailbox takes minutes. `status` shows progress. |
+| Send fails with `transport_unavailable` | Run `doctor`: it names the failing lane (Keychain item missing, SSH socket cold, SMTP host unreachable) and prints the exact fix. |
+| Triage does nothing the first time | Grant **Automation → Mail** when macOS asks; the prompt appears on first use, not at install. |
 
 ## 🧰 The 21 tools
 
@@ -167,9 +211,9 @@ The From: address decides how mail travels. `~/.email-mcp/identities.toml`:
 default = "work"
 
 [work]                    # sent through a host you already trust, over SSH
-from_addr = "you@cern.ch"
+from_addr = "you@example.org"
 driver    = "ssh_sendmail"
-host      = "lxplus.cern.ch"
+host      = "bastion.example.org"   # any login host you already SSH to
 
 [gmail]                   # classic SMTP — the app password stays in 1Password
 from_addr = "you@gmail.com"

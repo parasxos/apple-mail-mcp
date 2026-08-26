@@ -14,7 +14,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 PACKAGE = ROOT / "email_mcp"
-PROJECT_NAME = "email-mcp"
+PROJECT_NAME = "apple-mail-mcp"
 CONSOLE_SCRIPT = "email-mcp = email_mcp.cli:main"
 
 

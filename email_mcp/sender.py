@@ -8,7 +8,7 @@ RFC-822 ourselves.
 
 Delivery is routed by identity (see `email_mcp.identities`): the resolved
 From: address names a `MailTransport` driver — `ssh_sendmail` (the original
-CERN path), `smtp`, or `pipe` (see `email_mcp.transports`). With no
+bastion path), `smtp`, or `pipe` (see `email_mcp.transports`). With no
 identities file a single default identity is synthesized from the env
 getters, so the original env-only setup keeps working unchanged.
 

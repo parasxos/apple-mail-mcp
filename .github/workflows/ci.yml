@@ -86,7 +86,7 @@ jobs:
         run: |
           python -m venv wheel-smoke
           wheel-smoke/bin/python -m pip install dist/*.whl
-          wheel-smoke/bin/email-mcp --help
+          wheel-smoke/bin/apple-mail-mcp --help
           wheel-smoke/bin/python -c "import email_mcp.mcp_compat"
       - uses: actions/upload-artifact@v7
         with:

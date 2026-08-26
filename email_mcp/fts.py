@@ -367,7 +367,7 @@ class FtsIndex:
         (first-user body-gap report, 2026-08-06): bodies it never
         downloaded exist as headers-only .partial.emlx files — or, for
         EWS accounts, as Envelope rows with NO file at all (97% of a
-        live CERN account). Two lanes recover them, each answering only
+        live Exchange account). Two lanes recover them, each answering only
         its own mailboxes:
 
           graph (ews:// mailboxes, any graph-enabled identity)
