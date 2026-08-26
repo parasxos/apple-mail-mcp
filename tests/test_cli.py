@@ -90,7 +90,7 @@ def test_top_level_help_is_for_people_not_legacy_server_flags(
     assert cli.main(["--help"]) == 0
     assert cli.main(["help"]) == 0
     out = capsys.readouterr().out
-    assert out.count("Email MCP") == 2
+    assert out.count("apple-mailbox-mcp") == 2
     assert "status" in out and "setup" in out and "doctor" in out
     assert "--send-test" not in out
 
