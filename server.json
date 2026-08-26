@@ -1,0 +1,19 @@
+{
+  "$schema": "https://static.modelcontextprotocol.io/schemas/2025-09-29/server.schema.json",
+  "name": "io.github.parasxos/apple-mail-mcp",
+  "description": "Fast local MCP server for Apple Mail: indexed search, full-text bodies, verified multi-identity send, scheduled sends, reviewed triage. macOS.",
+  "repository": {
+    "url": "https://github.com/parasxos/apple-mail-mcp",
+    "source": "github"
+  },
+  "version": "1.5.0",
+  "packages": [
+    {
+      "registryType": "pypi",
+      "identifier": "apple-mail-mcp",
+      "version": "1.5.0",
+      "transport": { "type": "stdio" },
+      "runtimeHint": "uvx"
+    }
+  ]
+}
