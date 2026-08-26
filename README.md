@@ -26,6 +26,8 @@ and let Exchange deliver scheduled messages even while your Mac is asleep.
 
 ---
 
+![demo: uvx install, status, and a Claude search over a 298k-message store](docs/assets/demo.gif)
+
 ## ✨ What you can do
 
 🔍 **Ask your mailbox questions.** *"What did Stefan send me about the memo
