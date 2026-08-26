@@ -9,7 +9,7 @@
 what a client asks for, and sends only when the client explicitly calls the
 send tool. No third-party relay, no cloud copy of your mail.
 
-Use **Claude, Codex, Cursor, VS Code, or any local MCP client** to search,
+Use **Claude Code, Claude Desktop, Codex, Cursor, VS Code, or any local MCP client** to search,
 read, triage, and send email through Apple Mail — your mailbox becomes
 something you can
 **ask, search and delegate to** — find anything in seconds, file hundreds of
@@ -75,6 +75,8 @@ This one doesn't — and it shows:
 
 Every number above was measured on a live ~300,000-message store; the
 script and full method are in [docs/benchmarks.md](docs/benchmarks.md).
+
+If the benchmarks hold up on your mailbox, a ⭐ helps others find this.
 
 ## 🛡️ Built to be trusted
 
@@ -183,6 +185,38 @@ the next scheduled message, and failed scheduled sends anytime with
 > `pipx ensurepath` may print a ⚠️ — the "pipx is ready to go!" line after it
 > is the verdict; and after `ensurepath`, close and reopen the terminal once
 > so `apple-mail-mcp` is found.
+
+## 🔌 Works with
+
+Every client below speaks stdio MCP; the command is always `uvx apple-mailbox-mcp`.
+
+### Claude Code
+```bash
+claude mcp add --transport stdio --scope user apple-mail -- uvx apple-mailbox-mcp
+```
+
+### Claude Desktop
+Add to `~/Library/Application Support/Claude/claude_desktop_config.json`:
+```json
+{ "mcpServers": { "apple-mail": { "command": "uvx", "args": ["apple-mailbox-mcp"] } } }
+```
+
+### Cursor
+Add the same block to `~/.cursor/mcp.json` (or per-project `.cursor/mcp.json`).
+
+### VS Code (Copilot MCP)
+Add the same block under `"servers"` in `.vscode/mcp.json`.
+
+### Codex CLI
+```toml
+# ~/.codex/config.toml
+[mcp_servers.apple-mail]
+command = "uvx"
+args = ["apple-mailbox-mcp"]
+```
+
+### Any stdio MCP client
+Point it at `uvx apple-mailbox-mcp`. The wire contract is additive-only since v1.0.
 
 ## 🔧 Troubleshooting
 
