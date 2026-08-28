@@ -131,6 +131,8 @@ If the benchmarks hold up on your mailbox, a ⭐ helps others find this.
 
    ```bash
    uvx apple-mailbox-mcp setup     # or: pipx install apple-mailbox-mcp
+   # or via Homebrew:
+   brew install parasxos/tap/apple-mail-mcp && apple-mail-mcp setup
    ```
 
 3. **Register with your client** — one line for Claude Code:
