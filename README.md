@@ -9,6 +9,13 @@
 what a client asks for, and sends only when the client explicitly calls the
 send tool. No third-party relay, no cloud copy of your mail.
 
+```
+uvx apple-mailbox-mcp setup
+```
+Measured on a 300k-message store: addressing one message **0.1 ms** via Mail's own
+index, against **7 to 10 s** for the AppleScript whose-clause; full-text search
+**p95 under 1 ms**. Method and script: [`docs/benchmarks.md`](docs/benchmarks.md).
+
 Use **Claude Code, Claude Desktop, Codex, Cursor, VS Code, or any local MCP client** to search,
 read, triage, and send email through Apple Mail — your mailbox becomes
 something you can
@@ -31,7 +38,7 @@ and let Exchange deliver scheduled messages even while your Mac is asleep.
 
 ## ✨ What you can do
 
-🔍 **Ask your mailbox questions.** *"What did Stefan send me about the memo
+🔍 **Ask your mailbox questions.** *"What did Maria send me about the memo
 last week?"* Search runs at database speed — sender, mailbox, dates, unread,
 attachments — and reconstructs whole conversations.
 
