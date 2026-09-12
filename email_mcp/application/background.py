@@ -33,6 +33,7 @@ SPOOL_HELD = "another dispatcher holds the spool"
 RECORD_HELD = (
     "graph: record held elsewhere (schedule or cancel in flight) — skipped"
 )
+SUPERSEDED = "graph: record moved before this pass owned it — skipped"
 
 
 def parse_timestamp(stamp: str | None) -> datetime | None:
@@ -272,9 +273,17 @@ class BackgroundUseCases(ApplicationService):
             # Ownership spans probe → rewrite, so a cancel cannot move the
             # record under this pass and this pass cannot overwrite a
             # cancel; a record someone else holds waits for the next pass.
+            # The listing was taken before ownership, so the record is
+            # re-read under it: a cancel that landed in between has moved
+            # it, and a stale copy must never be written back.
             try:
                 with self._queue.own(entry.id):
-                    results[entry.id] = self._reconcile_one(entry, now)
+                    current = self._queue.load("pending", entry.id)
+                    results[entry.id] = (
+                        self._reconcile_one(current, now)
+                        if current is not None and current.executor == "graph"
+                        else SUPERSEDED
+                    )
             except SpoolBusy:
                 results[entry.id] = RECORD_HELD
         return results

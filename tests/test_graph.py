@@ -1524,6 +1524,40 @@ def test_cancel_during_reconcile_is_refused_not_interleaved(
     assert local_delivery == []
 
 
+def test_cancel_between_listing_and_ownership_is_not_written_back(
+    monkeypatch, tmp_path, local_delivery,
+):
+    """Codex reconcile_race: a cancel landing after the pass listed
+    pending/ but before it owns the record moves it to cancelled/. The
+    pass re-reads the record under ownership, finds it gone and skips —
+    its stale copy is never written back, so the record stands in one
+    state, not in pending/ and cancelled/ at once."""
+    from email_mcp.application.background import SUPERSEDED
+
+    _write_graph_toml(tmp_path, monkeypatch)
+    _seed_token()
+    entry = _spool_entry()
+    fake = _fake(monkeypatch, (204, {}))  # the cancel's revoke, nothing else
+    real_own = spool.own
+    receipts: list[dict] = []
+
+    def racing_own(name):
+        if name == entry.id and not receipts:
+            receipts.append({})  # the cancel below re-enters own(): once
+            receipts[0] = server.tool_cancel_scheduled(entry.id)
+        return real_own(name)
+
+    monkeypatch.setattr(spool, "own", racing_own)
+    summary = dispatcher.run_once()
+    cancelled, = receipts
+    assert cancelled["ok"] is True and cancelled["status"] == "cancelled"
+    assert summary["results"][entry.id] == SUPERSEDED
+    assert spool.load("pending", entry.id) is None
+    assert spool.load("cancelled", entry.id) is not None
+    assert [call[0] for call in fake.calls] == ["DELETE"]
+    assert local_delivery == []
+
+
 def test_cancel_after_ambiguous_send_revokes_or_names_the_armed_draft(
     monkeypatch, tmp_path,
 ):

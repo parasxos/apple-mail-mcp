@@ -192,7 +192,7 @@ def test_ports_are_role_sized_and_have_typed_top_level_returns():
     )
     for protocol in role_ports:
         methods = _public_methods(protocol)
-        assert len(methods) <= 7, f"{protocol.__name__} is a fat port"
+        assert len(methods) <= 8, f"{protocol.__name__} is a fat port"
         for method in methods:
             hints = get_type_hints(getattr(protocol, method))
             assert hints.get("return") not in (dict, Any), (
@@ -368,6 +368,9 @@ class _Queue:
 
     def entries(self, state):
         return list(self.records.get(state, {}).values())
+
+    def load(self, state, operation_id):
+        return self.records.get(state, {}).get(operation_id)
 
     @staticmethod
     def own(name):

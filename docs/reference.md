@@ -418,6 +418,9 @@ database:
   holds an exclusive lock on the spool (`spool/locks/`) for recovery,
   reconcile and dispatch together: an overlapping pass is refused with
   `skipped: "another dispatcher holds the spool"` instead of interleaving.
+  Each record has its own lock as well, held by `schedule_email`,
+  `cancel_scheduled` and the reconcile probe for their whole
+  read-and-rewrite, so none of them acts on a record another has moved.
   Each claim stamps its own lease (`claimed_at` on the record); a claim in
   `sending/` counts as stranded only 10 minutes after that stamp, never
   because `send_at` is old.
@@ -433,9 +436,7 @@ database:
   record moves from `sending/` to `sent/`, recovery cannot know the outcome
   and may deliver it again 10 minutes after the claim. The frozen
   `Message-ID` is the deduplication key. Graph schedules reconcile against
-  Exchange Drafts/Sent; schedule creation, cancellation and the reconcile
-  pass each hold the record's lock for their whole read-arm-rewrite, so a
-  record is never cancelled under the process arming it.
+  Exchange Drafts/Sent.
 - Authorization happens at **schedule time** (inside the MCP server, where
   your config lives); the dispatcher deliberately does not re-check — it
   runs under launchd's bare environment where identity policy is not loaded.
