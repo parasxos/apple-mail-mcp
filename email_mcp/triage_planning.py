@@ -103,7 +103,7 @@ def scheme(url: str) -> str:
 class TriagePlanner:
     def __init__(
         self,
-        mailbox_exists: Callable[[str, str, str], bool],
+        mailbox_exists: Callable[[str, str, str], bool | None],
         validate_literal: Callable[[str], str],
         logger,
     ) -> None:
@@ -175,9 +175,9 @@ class TriagePlanner:
                 mailbox_scheme = scheme(
                     snapshots[rowids[0]]["mailbox_url"]
                 )
-                if not self._mailbox_exists(
+                if self._mailbox_exists(  # None (no answer) plans nothing
                     mailbox_scheme, account, move.mailbox,
-                ):
+                ) is not True:
                     raise TriageError(
                         "unknown_mailbox",
                         f"mailbox {move.mailbox!r} not found in account "

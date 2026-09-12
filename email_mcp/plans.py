@@ -30,12 +30,22 @@ iso = ids.iso
 new_id = ids.new_id
 
 
+class UnknownPlanId(LookupError):
+    """The id is outside the minted vocabulary, so no plan file can carry
+    it — refused before it ever becomes a path (a caller's `../x` or
+    `/etc/x` never reaches the filesystem)."""
+
+
 def _path(plan_id: str) -> Path:
+    # The one builder of plan paths: an id is minted by ids.new_id or it
+    # was never minted, so this is where "inside plans_dir" is guaranteed.
+    if not ids.is_minted_id(plan_id):
+        raise UnknownPlanId(plan_id)
     return config.plans_dir() / f"{plan_id}.json"
 
 
 def _claim_path(plan_id: str) -> Path:
-    return config.plans_dir() / f"{plan_id}.json.applying"
+    return _path(plan_id).with_suffix(".json.applying")
 
 
 def _revive(data: dict) -> Plan:
@@ -53,14 +63,23 @@ def save(plan: Plan) -> None:
     tmp.rename(path)
 
 
+def _read(plan_id: str, path: Path) -> Plan | None:
+    """The plan file at `path`, or None when it is not plan `plan_id`:
+    unparsable, or carrying another id under this name. FileNotFoundError
+    passes through — absence is the caller's branch."""
+    try:
+        plan = _revive(json.loads(path.read_bytes()))
+    except (json.JSONDecodeError, TypeError):
+        return None
+    return plan if plan.id == plan_id else None
+
+
 def load(plan_id: str) -> Plan | None:
     for path in (_path(plan_id), _claim_path(plan_id)):
         try:
-            return _revive(json.loads(path.read_bytes()))
+            return _read(plan_id, path)
         except FileNotFoundError:
             continue
-        except (json.JSONDecodeError, TypeError):
-            return None
     return None
 
 
@@ -72,9 +91,8 @@ def claim(plan_id: str) -> Plan | None:
         _path(plan_id).rename(_claim_path(plan_id))
     except FileNotFoundError:
         return None
-    try:
-        plan = _revive(json.loads(_claim_path(plan_id).read_bytes()))
-    except (json.JSONDecodeError, TypeError):
+    plan = _read(plan_id, _claim_path(plan_id))
+    if plan is None:
         return None
     if plan.status != "draft":
         _claim_path(plan_id).rename(_path(plan_id))  # hand it back
