@@ -284,6 +284,77 @@ def test_query_prunes_months_and_filters_fields(audit_dir_guard):
         == ["july2"]
 
 
+def _ops(**bounds) -> list[str]:
+    return [e["op"] for e in audit.query(**bounds)["events"]]
+
+
+def test_query_bounds_compare_instants_not_strings(audit_dir_guard):
+    """Codex AUDIT_TIME_BOUNDS: equivalent bounds select the same events.
+    The ledger stamps +00:00; a caller's +02:00 or Z spelling of the same
+    instant used to be compared as text."""
+    _seed(audit_dir_guard, "2026-09", [
+        _event("2026-09-12T10:00:00+00:00", "ten"),
+    ])
+    for since in ("2026-09-12T09:30:00+00:00", "2026-09-12T11:30:00+02:00",
+                  "2026-09-12T10:00:00Z", "2026-09-12T10:00:00"):
+        assert _ops(since=since) == ["ten"], since
+    # both bounds are inclusive at the exact instant
+    assert _ops(until="2026-09-12T10:00:00Z") == ["ten"]
+    assert _ops(until="2026-09-12T12:00:00+02:00") == ["ten"]
+    assert _ops(since="2026-09-12T10:00:01Z") == []
+    assert _ops(until="2026-09-12T09:59:59Z") == []
+    assert _ops(until="2026-09-12T11:59:59+02:00") == []
+
+
+def test_query_offset_bound_crossing_a_month_edge(audit_dir_guard):
+    """Month pruning follows the bound's UTC instant, not its spelling:
+    2026-09-30T23:30-02:00 IS 2026-10-01T01:30Z and must reach the
+    October file."""
+    _seed(audit_dir_guard, "2026-09", [
+        _event("2026-09-30T23:00:00+00:00", "sep"),
+    ])
+    _seed(audit_dir_guard, "2026-10", [
+        _event("2026-10-01T01:30:00+00:00", "oct"),
+    ])
+    late = audit.query(until="2026-09-30T23:30:00-02:00")
+    assert late["files_scanned"] == 2
+    assert [e["op"] for e in late["events"]] == ["oct", "sep"]
+    # 2026-10-01T00:00+02:00 is still September in UTC
+    early = audit.query(since="2026-10-01T00:00:00+02:00")
+    assert early["files_scanned"] == 2
+    assert [e["op"] for e in early["events"]] == ["oct", "sep"]
+    assert _ops(since="2026-10-01T01:30:00+00:00") == ["oct"]
+
+
+def test_query_calendar_prefixes_span_their_period(audit_dir_guard):
+    """YYYY, YYYY-MM and YYYY-MM-DD stay the documented inclusive forms."""
+    _seed(audit_dir_guard, "2025-12", [
+        _event("2025-12-31T23:59:59+00:00", "y25"),
+    ])
+    _seed(audit_dir_guard, "2026-02", [
+        _event("2026-02-01T00:00:00+00:00", "feb_first"),
+        _event("2026-02-28T23:59:59+00:00", "feb_last"),
+    ])
+    _seed(audit_dir_guard, "2026-03", [
+        _event("2026-03-01T00:00:00+00:00", "mar"),
+    ])
+    assert _ops(since="2026") == ["mar", "feb_last", "feb_first"]
+    assert _ops(until="2025") == ["y25"]
+    assert _ops(since="2026-02", until="2026-02") == ["feb_last", "feb_first"]
+    assert audit.query(since="2026-02", until="2026-02")["files_scanned"] == 1
+    assert _ops(until="2026-02") == ["feb_last", "feb_first", "y25"]
+    assert _ops(since="2026-02-28") == ["mar", "feb_last"]
+    assert _ops(until="2026-02-28") == ["feb_last", "feb_first", "y25"]
+    assert _ops(since="2026-02-28", until="2026-02-28") == ["feb_last"]
+
+
+def test_cli_rejects_malformed_bound(audit_dir_guard, capsys):
+    with pytest.raises(SystemExit) as exc:
+        audit.main(["--since", "2026-13"])
+    assert exc.value.code == 2
+    assert "--since" in capsys.readouterr().err
+
+
 def test_query_absent_dir_returns_empty(tmp_path, monkeypatch):
     missing = tmp_path / "never-created"
     monkeypatch.setenv("EMAIL_MCP_STATE_DIR", str(missing))
