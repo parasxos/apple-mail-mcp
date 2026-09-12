@@ -1036,8 +1036,9 @@ class FtsIndex:
 
     def _retry_missing(self, conn: sqlite3.Connection, stats: dict,
                        max_docs: int | None, deadline: float | None) -> None:
-        """Re-stat `missing` docs whose backoff has elapsed. A rowid that
-        also vanished from the Envelope Index is dropped (mini-reconcile)."""
+        """Re-stat `missing`, `error` and `partial` docs whose backoff has
+        elapsed. A rowid that also vanished from the Envelope Index is
+        dropped (mini-reconcile)."""
         now = time.time()
         rows = conn.execute(
             # 'error' retries too: an extraction error can be as transient
@@ -1050,8 +1051,13 @@ class FtsIndex:
             # permanently starve any late-materializing recent message
             # (RC P04, live 2026-08-03 — a body that arrived on disk 21h
             # after its last retry was still unindexed).
+            # 'partial' retries too: the crawl only advances past the
+            # high-water mark, so headers-only text read from a
+            # .partial.emlx stayed the doc's text forever once Mail
+            # finished the download (2026-09-12 review).
             "SELECT rowid, attempts, last_attempt FROM docs "
-            "WHERE status IN ('missing', 'error') AND attempts < ? "
+            "WHERE status IN ('missing', 'error', 'partial') "
+            "AND attempts < ? "
             "ORDER BY last_attempt, rowid",
             (_MAX_ATTEMPTS,),
         ).fetchall()
@@ -1124,13 +1130,18 @@ class FtsIndex:
             return self._record(cur, rowid, "error", now, 0,
                                 source=src if src in stamps else "local")
         status = "partial" if path.name.endswith(".partial.emlx") else "indexed"
-        if status == "partial" and self._source_of(cur, rowid) in served:
+        src = self._source_of(cur, rowid)
+        if status == "partial" and src in served:
             return "indexed"
         cur.execute("DELETE FROM body_fts WHERE rowid = ?", (rowid,))
         cur.execute("INSERT INTO body_fts(rowid, body) VALUES (?, ?)",
                     (rowid, text))
+        # A still-partial file is no new evidence: the stamp stays, so a
+        # retry never re-enters the doc into the backfill's candidates.
         return self._record(cur, rowid, status, now,
-                            len(text.encode("utf-8", "replace")))
+                            len(text.encode("utf-8", "replace")),
+                            source=src if status == "partial"
+                            and src in stamps else "local")
 
     @staticmethod
     def _source_of(cur: sqlite3.Cursor, rowid: int) -> str | None:
