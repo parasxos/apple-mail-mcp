@@ -4,6 +4,8 @@ conversation itself is exercised against the live estate; these lock
 the parsing rules a truncated first-window FETCH depends on."""
 from __future__ import annotations
 
+from types import SimpleNamespace
+
 from email_mcp import imap
 
 
@@ -65,3 +67,30 @@ def test_extract_empty_message_is_an_empty_hit_not_a_crash():
 def test_quote_escapes_imap_string_specials():
     assert imap._quote('[Gmail]/All Mail') == '"[Gmail]/All Mail"'
     assert imap._quote('a"b\\c') == '"a\\"b\\\\c"'
+
+
+def _scope_for(listing: list[bytes]) -> list[str]:
+    """_search_folders over a canned LIST answer — no login, no socket."""
+    sess = object.__new__(imap._Session)
+    sess.prefix = "[fixture/imap]"
+    sess.conn = SimpleNamespace(list=lambda: ("OK", listing))
+    return sess._search_folders()
+
+
+def test_scope_without_all_mail_searches_inbox_before_the_bins():
+    """Codex IMAP_NO_ALL_SCOPE (2026-09-12): a server advertising Trash
+    and Junk but no \\All used to scope to the bins alone, so every
+    INBOX message backfilled as a confirmed miss."""
+    assert _scope_for([
+        b'(\\HasNoChildren) "/" "INBOX"',
+        b'(\\HasNoChildren \\Trash) "/" "Trash"',
+        b'(\\HasNoChildren \\Junk) "/" "Junk"',
+    ]) == ["INBOX", "Trash", "Junk"]
+
+
+def test_scope_with_all_mail_puts_it_first():
+    assert _scope_for([
+        b'(\\HasNoChildren) "/" "INBOX"',
+        b'(\\HasNoChildren \\Trash) "/" "[Gmail]/Trash"',
+        b'(\\HasNoChildren \\All) "/" "[Gmail]/All Mail"',
+    ]) == ["[Gmail]/All Mail", "[Gmail]/Trash"]

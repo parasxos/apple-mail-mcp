@@ -116,8 +116,8 @@ class _Session:
     def _search_folders(self) -> list[str]:
         """Special-use folders worth asking, in order: \\All (Gmail:
         "[Gmail]/All Mail" in the account's locale — every message that
-        is not Spam or Trash), then \\Trash and \\Junk. Servers without
-        special-use fall back to INBOX; declare `folder` in the
+        is not Spam or Trash), then \\Trash and \\Junk. A server without
+        \\All searches INBOX in its place; declare `folder` in the
         [*.imap] table when that is wrong."""
         try:
             status, listing = self.conn.list()
@@ -139,9 +139,9 @@ class _Session:
                             if name.startswith('"') and name.endswith('"'):
                                 name = name[1:-1]
                             found[attr] = name
-        ordered = [found[a] for a in (rb"\All", rb"\Trash", rb"\Junk")
-                   if a in found]
-        return ordered or ["INBOX"]
+        scope = [found[rb"\All"]] if rb"\All" in found else ["INBOX"]
+        scope += [found[a] for a in (rb"\Trash", rb"\Junk") if a in found]
+        return scope
 
     def search_uid(self, message_id: str) -> str | None:
         """First UID holding this Message-ID, searched across the scope

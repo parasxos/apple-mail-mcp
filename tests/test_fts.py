@@ -275,6 +275,57 @@ def test_partial_emlx_indexed_with_partial_status(mail_fixture):
     assert idx.status()["docs"]["partial"] == 1
 
 
+def test_partial_doc_is_replaced_once_the_full_emlx_arrives(mail_fixture):
+    """Codex PARTIAL_TO_FULL (2026-09-12): a doc first read from a
+    .partial.emlx must pick up the full body on the retry lane — the
+    crawl never revisits rowids below the high-water mark."""
+    _add_envelope_row(mail_fixture, 500)
+    _write_body(mail_fixture, 500, "only partial content", partial=True)
+    idx = FtsIndex(mail_base=mail_fixture)
+    idx.build()
+    assert _doc_statuses()[500] == "partial"
+
+    # Mail finishes the download: full file lands, the partial goes.
+    _write_body(mail_fixture, 500, "uniquenewcompletebody")
+    rel = emlx_relpath_for_rowid(500).with_name("500.partial.emlx")
+    (mail_fixture / LOCAL_ACCT / "Inbox.mbox" / INNER / "Data" / rel).unlink()
+
+    # Same backoff as a miss: not yet due right after the first read.
+    assert idx.incremental()["retried"] == 0
+    assert idx.rowids_matching("uniquenewcompletebody") == []
+
+    conn = _fts_db()
+    conn.execute("UPDATE docs SET last_attempt = 0 WHERE rowid = 500")
+    conn.commit()
+    conn.close()
+    out = idx.incremental()
+    assert out["retried"] == 1
+    assert _doc_statuses()[500] == "indexed"
+    assert idx.rowids_matching("uniquenewcompletebody") == [500]
+    assert idx.rowids_matching("partial") == []
+
+
+def test_partial_retry_keeps_a_miss_stamp_while_still_partial(mail_fixture):
+    """Re-reading an unchanged .partial.emlx is no new evidence: the
+    lane's miss stamp survives, so the doc never re-enters the backfill
+    candidate set (source='local') through the retry lane."""
+    _add_envelope_row(mail_fixture, 500)
+    _write_body(mail_fixture, 500, "still only partial", partial=True)
+    idx = FtsIndex(mail_base=mail_fixture)
+    idx.build()
+    conn = _fts_db()
+    conn.execute("UPDATE docs SET source = 'imap_miss', last_attempt = 0 "
+                 "WHERE rowid = 500")
+    conn.commit()
+    assert idx.incremental()["retried"] == 1
+    row = conn.execute("SELECT status, source, attempts FROM docs "
+                       "WHERE rowid = 500").fetchone()
+    conn.close()
+    assert (row["status"], row["source"], row["attempts"]) == \
+        ("partial", "imap_miss", 2)
+    assert idx.rowids_matching("partial") == [500]
+
+
 def test_reconcile_removes_vanished_rowid(mail_fixture):
     idx = FtsIndex(mail_base=mail_fixture)
     idx.build()
