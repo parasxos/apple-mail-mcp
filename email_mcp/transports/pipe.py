@@ -44,11 +44,14 @@ class PipeTransport:
     # MailTransport protocol                                            #
     # ----------------------------------------------------------------- #
 
-    def deliver(self, raw: bytes, mail_from: str, rcpt_to: list[str]) -> None:
+    def deliver(
+        self, raw: bytes, mail_from: str, rcpt_to: list[str],
+    ) -> dict[str, str]:
         """Pipe the bytes to the command. `mail_from`/`rcpt_to` are
         deliberately unused: `-t`-style commands read the recipients from
         the message's own headers, and the command line stays exactly what
-        the user configured."""
+        the user configured. The MTA owns the envelope from here, so a
+        per-recipient refusal becomes a bounce, never a return value."""
         t0 = time.monotonic()
         _log.info("pipe deliver start: %s, %d bytes", self.argv[0], len(raw))
         try:
@@ -78,6 +81,7 @@ class PipeTransport:
                 code=codes.DELIVERY_FAILED,
             )
         _log.info("pipe deliver ok (%.1fs)", time.monotonic() - t0)
+        return {}
 
     def ensure(self) -> bool:
         self.last_ensure_error = None

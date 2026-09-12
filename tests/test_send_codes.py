@@ -152,6 +152,35 @@ def test_delivery_failure_default_code(send_env, monkeypatch):
     assert _send()["code"] == "delivery_failed"
 
 
+def test_partial_refusal_code_on_the_wire_and_in_the_ledger(
+    send_env, monkeypatch,
+):
+    """Review F7: a server that takes the self-Bcc copy but refuses the
+    only real addressee used to produce ok:true naming every recipient
+    AND a "sent" ledger line. The wire carries partial_delivery with the
+    envelope truth, and the ledger records the same verdict — never
+    "sent"."""
+    monkeypatch.setattr(sender, "_socket_alive", lambda: True)
+    monkeypatch.setattr(
+        sender, "_deliver_bytes",
+        lambda raw: {"stranger@example.org": "550 5.1.1 no such user"},
+    )
+    out = _send(to="stranger@example.org")
+    assert out["ok"] is False
+    assert out["code"] == "partial_delivery"
+    assert out["refused"] == {"stranger@example.org": "550 5.1.1 no such user"}
+    assert out["accepted"] == ["paris@example.org"]   # the self-Bcc copy
+    assert out["message_id"]                          # it went out to them
+    assert "stranger@example.org (550 5.1.1 no such user)" in out["error"]
+
+    events = server.tool_audit(event="send")["events"]
+    assert [e["outcome"] for e in events] == ["partial"]
+    assert events[0]["message_id"] == out["message_id"]
+    assert events[0]["detail"]["code"] == "partial_delivery"
+    assert events[0]["detail"]["refused"] == out["refused"]
+    assert events[0]["detail"]["accepted"] == out["accepted"]
+
+
 def test_smtp_secret_errors_carry_code_and_lane_prefix(monkeypatch):
     """The known §3.4 gap, closed: smtp's formerly UNPREFIXED secret
     errors are credentials_unavailable AND name their [identity/smtp] lane."""

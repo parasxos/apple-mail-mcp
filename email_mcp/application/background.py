@@ -9,7 +9,7 @@ from __future__ import annotations
 from datetime import datetime, timedelta, timezone
 from ..domain import codes
 from ..domain.events import EventPublisher
-from ..domain.models import ScheduledEntry
+from ..domain.models import DeliveryReport, ScheduledEntry
 from .base import ApplicationService
 from .models import DispatchSummary
 from .ports import (
@@ -107,6 +107,35 @@ class BackgroundUseCases(ApplicationService):
             detail={"attempts": entry.attempts, "error": error[:300]},
         )
         return note
+
+    def _park_partial(
+        self, entry: ScheduledEntry, report: DeliveryReport,
+    ) -> str:
+        """A partial refusal is terminal, never a retry: the accepted
+        recipients already hold the message, so a whole resend would
+        duplicate it. The manifest keeps who got it and who did not."""
+        entry.attempts += 1
+        entry.next_attempt_at = None
+        entry.code = codes.PARTIAL_DELIVERY
+        entry.accepted, entry.refused = report.accepted, report.refused
+        entry.last_error = (
+            f"the server refused {report.refusals} — the message reached "
+            "the rest; resend to the refused addresses only"
+        )
+        self._queue.move(entry, "sending", "failed")
+        self._notifier.notify(
+            "email-mcp: send PARTIAL",
+            f"{entry.subject!r} — refused: {', '.join(report.refused)}",
+        )
+        self._event(
+            "deliver", "partial", operation_id=entry.id,
+            spool_id=entry.id, identity=entry.identity,
+            message_id=entry.message_id, to=entry.to,
+            subject=entry.subject,
+            detail={"code": codes.PARTIAL_DELIVERY,
+                    "accepted": report.accepted, "refused": report.refused},
+        )
+        return "partial delivery — parked in failed/"
 
     def recover_stranded(self, now: datetime) -> list[str]:
         recovered: list[str] = []
@@ -400,15 +429,19 @@ class BackgroundUseCases(ApplicationService):
                 results[entry.id] = "failed"
                 continue
             try:
-                self._delivery.deliver(
+                report = self._delivery.deliver(
                     identity, raw, entry.to + entry.cc + entry.bcc,
                 )
             except BackgroundDeliveryError as error:
                 results[entry.id] = self._fail_or_retry(entry, str(error), now)
                 continue
+            if report.partial:
+                results[entry.id] = self._park_partial(entry, report)
+                continue
             entry.delivered_at = self._clock.format(self._clock.now())
             entry.next_attempt_at = None
             entry.last_error = None
+            entry.accepted, entry.refused = report.accepted, report.refused
             self._queue.move(entry, "sending", "sent")
             self._event(
                 "deliver", "sent", operation_id=entry.id,

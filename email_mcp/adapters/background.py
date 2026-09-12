@@ -7,6 +7,7 @@ from datetime import datetime
 from .. import sender, spool
 from ..application.models import QueueIntegrity
 from ..application.ports import BackgroundDeliveryError
+from ..domain.models import DeliveryReport
 from .queue import queue_integrity
 
 
@@ -47,13 +48,14 @@ class DefaultLocalDelivery:
         return ok, None if ok else sender._transport_unavailable(identity)
 
     def deliver(self, identity: object, raw: bytes,
-                recipients: list[str]) -> None:
+                recipients: list[str]) -> DeliveryReport:
         try:
-            sender.deliver_for(identity, raw, rcpt_to=recipients)
+            refused = sender.deliver_for(identity, raw, rcpt_to=recipients)
         except sender.SendError as error:
             raise BackgroundDeliveryError(
                 str(error), code=error.code,
             ) from error
+        return sender.delivery_report(raw, refused)
 
 
 class MacOSNotifier:

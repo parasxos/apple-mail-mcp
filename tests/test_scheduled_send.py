@@ -419,3 +419,72 @@ def test_corrupt_manifest_stamp_never_kills_the_whole_pass(delivered):
     assert summary["results"][good.id] == "sent"
     assert summary["results"][bad.id] == "sent"  # late beats never
     assert len(delivered) == 2
+
+
+# --------------------------------------------------------------------- #
+# partial recipient refusal at fire time (review F7)                    #
+# --------------------------------------------------------------------- #
+
+
+def test_partial_refusal_parks_in_failed_and_is_never_retried_whole(
+    monkeypatch, delivered,
+):
+    """The server takes the self-Bcc copy and refuses the addressee. The
+    entry used to be marked sent. It must park in the EXISTING failed/
+    state at once — not through the retry funnel, since a whole resend
+    would duplicate the mail to the accepted recipients — with the
+    partial_delivery code, both recipient lists and the Message-ID in
+    the manifest."""
+    notes = []
+    monkeypatch.setattr(
+        MacOSNotifier, "notify",
+        lambda self, title, text: notes.append((title, text)),
+    )
+    sent: list[bytes] = []
+
+    def refuse_addressee(raw):
+        sent.append(raw)
+        return {"colleague@example.org": "550 5.1.1 no such user"}
+    monkeypatch.setattr(sender, "_deliver_bytes", refuse_addressee)
+
+    entry = sender.schedule_email(
+        to="colleague@example.org", subject="s", body="b",
+        send_at=_future(-1),
+    )
+    summary = dispatcher.run_once()
+    assert summary["results"][entry.id] == "partial delivery — parked in failed/"
+    assert len(sent) == 1
+
+    parked = spool.load("failed", entry.id)
+    assert parked is not None and spool.load("pending", entry.id) is None
+    assert parked.code == "partial_delivery"
+    assert parked.refused == {"colleague@example.org": "550 5.1.1 no such user"}
+    assert parked.accepted == ["paris.moschovakos@cern.ch"]  # the self copy
+    assert parked.message_id == entry.message_id
+    assert parked.attempts == 1 and parked.next_attempt_at is None
+    assert "colleague@example.org (550 5.1.1 no such user)" in parked.last_error
+    assert notes and "PARTIAL" in notes[0][0]
+
+    # Terminal: a later pass, well past every backoff, sends nothing again.
+    later = spool.utcnow() + timedelta(hours=3)
+    assert dispatcher.run_once(now=later)["results"] == {}
+    assert len(sent) == 1
+    assert spool.load("failed", entry.id).attempts == 1
+
+
+def test_refused_self_copy_still_counts_as_sent(monkeypatch, delivered):
+    """Only the sender's own Bcc copy refused: the addressee has the
+    message, so the entry is sent — with the refusal kept on the record."""
+    monkeypatch.setattr(
+        sender, "_deliver_bytes",
+        lambda raw: {"paris.moschovakos@cern.ch": "452 4.2.2 mailbox full"},
+    )
+    entry = sender.schedule_email(
+        to="colleague@example.org", subject="s", body="b",
+        send_at=_future(-1),
+    )
+    assert dispatcher.run_once()["results"][entry.id] == "sent"
+    got = spool.load("sent", entry.id)
+    assert got.code is None and got.delivered_at
+    assert got.accepted == ["colleague@example.org"]
+    assert got.refused == {"paris.moschovakos@cern.ch": "452 4.2.2 mailbox full"}

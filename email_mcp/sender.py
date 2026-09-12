@@ -39,7 +39,7 @@ from .attachments import (
     attachment_paths as _attachment_paths,
     load_attachments as _load_attachments,
 )
-from .domain.models import DraftResult, SendResult
+from .domain.models import DeliveryReport, DraftResult, SendResult
 from .log import get_logger
 from .mime import (
     PreparedTransmission as _PreparedTransmission,
@@ -119,20 +119,46 @@ def _raw_rcpt_to(raw: bytes) -> list[str]:
     return [a.strip() for _, a in getaddresses(fields) if a.strip()]
 
 
-def _deliver(msg: EmailMessage) -> None:
+def _deliver(msg: EmailMessage) -> dict[str, str]:
     """Deliver a composed message via the default identity's transport.
     (Seam: default-identity send_email lands here.)"""
-    _deliver_bytes(msg.as_bytes())
+    return _deliver_bytes(msg.as_bytes())
 
 
-def _deliver_bytes(raw: bytes) -> None:
+def _deliver_bytes(raw: bytes) -> dict[str, str]:
     """Deliver pre-serialised RFC-822 bytes via the default identity's
     transport. (Seam: the dispatcher's default-identity replays land here.)"""
     ident = identities.get(None)
-    transports.get_transport(ident).deliver(
+    return transports.get_transport(ident).deliver(
         raw,
         mail_from=_raw_mail_from(raw) or ident.from_addr,
         rcpt_to=_raw_rcpt_to(raw),
+    )
+
+
+def delivery_report(
+    raw: bytes, refused: dict[str, str] | None,
+) -> DeliveryReport:
+    """The one verdict on a transport's refusals, read off the frozen
+    bytes so the immediate and the scheduled lane cannot disagree: who
+    got the message, and whether a refusal makes the delivery partial.
+    The sender's own Bcc copy is a record, not a delivery — a copy the
+    server would not take is reported, never counted. (A seam replaced
+    by a recorder hands back None: nothing refused.)"""
+    refused = refused or {}
+    hdr = BytesHeaderParser().parsebytes(raw, headersonly=True)
+
+    def header(name: str) -> set[str]:
+        values = [str(v) for v in (hdr.get_all(name) or [])]
+        return {_bare(a) for _, a in getaddresses(values) if a.strip()}
+
+    own = _bare(_raw_mail_from(raw))
+    copy = own if own in header("Bcc") - header("To") - header("Cc") else None
+    refused_bare = {_bare(a) for a in refused}
+    return DeliveryReport(
+        accepted=[a for a in _raw_rcpt_to(raw) if _bare(a) not in refused_bare],
+        refused=refused,
+        partial=any(a != copy for a in refused_bare),
     )
 
 
@@ -187,20 +213,20 @@ def deliver_for(
     ident: identities.Identity,
     raw: bytes,
     rcpt_to: list[str] | None = None,
-) -> None:
+) -> dict[str, str]:
     """Deliver raw RFC-822 bytes as `ident`. Default-identity traffic goes
     through the _deliver_bytes seam (which re-derives the envelope from the
     frozen headers); other identities go straight to their transport, with
-    `rcpt_to` (or, if None, the raw To/Cc/Bcc headers) as the envelope."""
+    `rcpt_to` (or, if None, the raw To/Cc/Bcc headers) as the envelope.
+    Returns the transport's refusals (see MailTransport.deliver)."""
     if _is_default(ident):
-        _deliver_bytes(raw)
-        return
+        return _deliver_bytes(raw)
     envelope = (
         [b for b in (_bare(r) for r in rcpt_to) if b]
         if rcpt_to is not None
         else _raw_rcpt_to(raw)
     )
-    transports.get_transport(ident).deliver(
+    return transports.get_transport(ident).deliver(
         raw,
         mail_from=_raw_mail_from(raw) or ident.from_addr,
         rcpt_to=envelope,
@@ -239,21 +265,30 @@ def send_email(
         raise SendError(_transport_unavailable(ident),
                         code=codes.TRANSPORT_UNAVAILABLE)
 
-    if _is_default(ident):
-        _deliver(prepared.message)
-    else:
-        deliver_for(
-            ident,
-            prepared.message.as_bytes(),
-            rcpt_to=prepared.to + prepared.cc + prepared.bcc,
+    raw = prepared.message.as_bytes()
+    refused = (
+        _deliver(prepared.message) if _is_default(ident)
+        else deliver_for(
+            ident, raw, rcpt_to=prepared.to + prepared.cc + prepared.bcc,
         )
+    )
+    report = delivery_report(raw, refused)
     return SendResult(
-        ok=True,
+        ok=not report.partial,
         message_id=prepared.message["Message-ID"],
         to=prepared.to, cc=prepared.cc, bcc=prepared.bcc,
         subject=subject,
         attachments=prepared.attachment_names,
         bootstrapped=bootstrapped,
+        # A partial refusal is a receipt, not an exception: the message_id
+        # went out to `accepted`, and only the refused need a resend.
+        error=(f"[{ident.name}/{ident.driver}] the server refused "
+               f"{report.refusals} — the message reached the rest; resend "
+               "to the refused addresses only"
+               if report.partial else None),
+        accepted=report.accepted,
+        refused=report.refused,
+        code=codes.PARTIAL_DELIVERY if report.partial else None,
     )
 
 

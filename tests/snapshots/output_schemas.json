@@ -279,6 +279,9 @@
     "waited_seconds": "float"
   },
   "reply_email": {
+    "accepted": [
+      "str"
+    ],
     "attachments": [
       "str"
     ],
@@ -289,15 +292,20 @@
     "cc": [
       "str"
     ],
+    "code": "str|null",
     "error": "str|null",
     "message_id": "str",
     "ok": "bool",
+    "refused": "dict",
     "subject": "str",
     "to": [
       "str"
     ]
   },
   "schedule_email": {
+    "accepted": [
+      "str"
+    ],
     "attachments": [
       "str"
     ],
@@ -308,6 +316,7 @@
     "cc": [
       "str"
     ],
+    "code": "str|null",
     "created_at": "str",
     "delivered_at": "str|null",
     "executor": "str",
@@ -318,6 +327,7 @@
     "message_id": "str",
     "next_attempt_at": "str|null",
     "ok": "bool",
+    "refused": "dict",
     "send_at": "str",
     "status": "str",
     "subject": "str",
@@ -352,6 +362,9 @@
     ]
   },
   "send_email": {
+    "accepted": [
+      "str"
+    ],
     "attachments": [
       "str"
     ],
@@ -362,9 +375,11 @@
     "cc": [
       "str"
     ],
+    "code": "str|null",
     "error": "str|null",
     "message_id": "str",
     "ok": "bool",
+    "refused": "dict",
     "subject": "str",
     "to": [
       "str"

@@ -48,7 +48,7 @@ class DeliveryUseCases(ApplicationService):
             name, "failed", tool=tool, subject=subject, detail=failure_detail,
         )
 
-    def _sent(
+    def _delivered(
         self,
         name: str,
         tool: str,
@@ -57,8 +57,13 @@ class DeliveryUseCases(ApplicationService):
         *,
         detail: dict | None = None,
     ) -> None:
+        """The receipt's own verdict names the ledger outcome: a partial
+        refusal is audited as `partial`, never as `sent`."""
+        if not result.ok:
+            detail = {**(detail or {}), "code": result.code,
+                      "accepted": result.accepted, "refused": result.refused}
         self._event(
-            name, "sent", tool=tool,
+            name, "sent" if result.ok else "partial", tool=tool,
             message_id=result.message_id,
             identity=identity,
             to=result.to,
@@ -94,7 +99,7 @@ class DeliveryUseCases(ApplicationService):
                 "send", "send_email", error, subject=subject,
             )
             raise
-        self._sent(
+        self._delivered(
             "send", "send_email", result, from_identity,
             detail=({"attachments": result.attachments}
                     if result.attachments else None),
@@ -168,7 +173,7 @@ class DeliveryUseCases(ApplicationService):
                 },
             )
             raise
-        self._sent(
+        self._delivered(
             "reply", "reply_email", result, from_identity,
             detail={
                 "orig_id": id,

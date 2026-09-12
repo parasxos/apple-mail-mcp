@@ -15,7 +15,12 @@ from email_mcp.application.models import QueueIntegrity
 from email_mcp.application.reads import ReadUseCases
 from email_mcp.domain.events import DomainEvent
 from email_mcp.domain.mail import EmailRef
-from email_mcp.domain.models import ScheduledEntry, SendRequest, SendResult
+from email_mcp.domain.models import (
+    DeliveryReport,
+    ScheduledEntry,
+    SendRequest,
+    SendResult,
+)
 
 ROOT = Path(__file__).parents[1]
 PACKAGE = ROOT / "email_mcp"
@@ -407,6 +412,7 @@ class _LocalDelivery:
 
     def deliver(self, identity, raw, recipients):
         self.delivered.append((raw, recipients))
+        return DeliveryReport(accepted=recipients, refused={}, partial=False)
 
 
 class _Deferred:

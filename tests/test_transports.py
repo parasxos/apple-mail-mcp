@@ -47,19 +47,23 @@ def _ssh(**kw) -> SshSendmailTransport:
     return SshSendmailTransport(**defaults)
 
 
-def _fake_smtp_cls(fail_login: Exception | None = None):
-    """A fresh fake smtplib.SMTP/SMTP_SSL class per test (records calls)."""
+def _fake_smtp_cls(fail_login: Exception | None = None,
+                   refused: dict | None = None):
+    """A fresh fake smtplib.SMTP/SMTP_SSL class per test (records calls).
+    `refused` is what sendmail() hands back, in smtplib's own shape:
+    {address: (code, bytes)} for the recipients the server would not take."""
 
     class FakeSMTP:
         instances: list = []
 
-        def __init__(self, host, port, timeout=None):
+        def __init__(self, host, port, timeout=None, context=None):
             self.host, self.port, self.timeout = host, port, timeout
+            self.context = context
             self.calls: list = []
             FakeSMTP.instances.append(self)
 
-        def starttls(self):
-            self.calls.append(("starttls",))
+        def starttls(self, context=None):
+            self.calls.append(("starttls", context))
 
         def ehlo(self):
             self.calls.append(("ehlo",))
@@ -71,6 +75,7 @@ def _fake_smtp_cls(fail_login: Exception | None = None):
 
         def sendmail(self, mail_from, rcpt_to, data):
             self.calls.append(("sendmail", mail_from, rcpt_to, data))
+            return dict(refused or {})
 
         def quit(self):
             self.calls.append(("quit",))
@@ -269,6 +274,57 @@ def test_smtp_port_465_is_ssl_else_starttls(monkeypatch):
     _smtp(port=587).deliver(_RAW_WITH_BCC, "g@example.org", ["a@example.org"])
     plain_calls = [c[0] for c in FakePlain.instances[0].calls]
     assert plain_calls.index("starttls") < plain_calls.index("login")
+
+
+def test_smtp_verifies_the_peer_on_both_tls_paths(monkeypatch):
+    """Review F2: smtplib's default context verifies nothing on Python
+    3.11 (CERT_NONE, no hostname check), so a bare SMTP_SSL()/starttls()
+    would hand the app password to any impersonator. Both paths must
+    speak through a context that requires the certificate AND checks the
+    hostname — asserted on the context object the driver handed over."""
+    import ssl
+
+    FakeSSL, FakePlain = _fake_smtp_cls(), _fake_smtp_cls()
+    monkeypatch.setattr(smtp_mod.smtplib, "SMTP_SSL", FakeSSL)
+    monkeypatch.setattr(smtp_mod.smtplib, "SMTP", FakePlain)
+    monkeypatch.setattr(smtp_mod, "_read_keychain", lambda item, account: "pw")
+
+    _smtp(port=465).deliver(_RAW_WITH_BCC, "g@example.org", ["a@example.org"])
+    implicit = FakeSSL.instances[0].context
+    assert isinstance(implicit, ssl.SSLContext)
+    assert implicit.verify_mode == ssl.CERT_REQUIRED
+    assert implicit.check_hostname is True
+
+    _smtp(port=587).deliver(_RAW_WITH_BCC, "g@example.org", ["a@example.org"])
+    plain = FakePlain.instances[0]
+    assert plain.context is None                     # plain connect…
+    _, upgraded = next(c for c in plain.calls if c[0] == "starttls")
+    assert isinstance(upgraded, ssl.SSLContext)      # …verified upgrade
+    assert upgraded.verify_mode == ssl.CERT_REQUIRED
+    assert upgraded.check_hostname is True
+
+
+def test_smtp_reports_partial_refusal_instead_of_swallowing_it(monkeypatch):
+    """Review F7: sendmail() returns the recipients the server refused
+    while accepting the others; the driver used to discard it. The
+    refusals come back keyed by envelope address with the server's own
+    line, and the accepted delivery is not an error."""
+    FakeSMTP = _fake_smtp_cls(
+        refused={"refused@example.org": (550, b"5.1.1 no such user")},
+    )
+    monkeypatch.setattr(smtp_mod.smtplib, "SMTP", FakeSMTP)
+    monkeypatch.setattr(smtp_mod, "_read_keychain", lambda item, account: "pw")
+    refused = _smtp().deliver(
+        _RAW_WITH_BCC, "g@example.org",
+        ["a@example.org", "refused@example.org"],
+    )
+    assert refused == {"refused@example.org": "550 5.1.1 no such user"}
+    assert ("quit",) in FakeSMTP.instances[0].calls
+
+    FakeSMTP = _fake_smtp_cls()
+    monkeypatch.setattr(smtp_mod.smtplib, "SMTP", FakeSMTP)
+    assert _smtp().deliver(_RAW_WITH_BCC, "g@example.org",
+                           ["a@example.org"]) == {}
 
 
 def test_smtp_auth_failure_names_lane_and_keychain_item(monkeypatch):

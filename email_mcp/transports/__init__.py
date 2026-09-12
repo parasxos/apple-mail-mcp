@@ -43,10 +43,15 @@ class MailTransport(Protocol):
     name: str                       # driver name, e.g. "smtp"
     last_ensure_error: str | None   # set by ensure() on failure
 
-    def deliver(self, raw: bytes, mail_from: str, rcpt_to: list[str]) -> None:
+    def deliver(
+        self, raw: bytes, mail_from: str, rcpt_to: list[str],
+    ) -> dict[str, str]:
         """Deliver pre-serialised RFC-822 bytes. `mail_from` is the envelope
         sender; drivers whose command reads recipients from the headers
-        (`sendmail -t`) may ignore `rcpt_to`. Raises SendError."""
+        (`sendmail -t`) may ignore `rcpt_to`. Returns the envelope
+        recipients the server refused while taking the rest, address →
+        its refusal line ("550 5.1.1 no such user"); {} when every one was
+        accepted. Raises SendError when nothing was delivered."""
         ...
 
     def ensure(self) -> bool:

@@ -7,6 +7,7 @@ from typing import Protocol
 from ..domain.mail import EmailSource, SearchQuery
 from ..domain.errors import ToolError
 from ..domain.models import (
+    DeliveryReport,
     DraftRequest,
     DraftResult,
     Plan,
@@ -159,7 +160,7 @@ class LocalDelivery(Protocol):
     def preflight(self, identity: object) -> tuple[bool, str | None]: ...
 
     def deliver(self, identity: object, raw: bytes,
-                recipients: list[str]) -> None: ...
+                recipients: list[str]) -> DeliveryReport: ...
 
 
 class UserNotifier(Protocol):

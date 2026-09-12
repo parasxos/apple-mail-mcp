@@ -3,13 +3,16 @@
 The app password never lives in the repo, the env, or the identities file:
 it sits in 1Password (an `op://` secret reference, read via the `op` CLI)
 or the macOS Keychain (`security` CLI) and is read at delivery time. Port 465 means implicit TLS
-(SMTP_SSL); anything else connects plain and upgrades with STARTTLS.
+(SMTP_SSL); anything else connects plain and upgrades with STARTTLS. Either
+way the peer is verified against the system trust store before the
+password is spoken.
 """
 from __future__ import annotations
 
 import email
 import smtplib
 import socket
+import ssl
 import subprocess
 import time
 
@@ -153,22 +156,34 @@ class SmtpTransport:
         return self.op or self.keychain
 
     def _connect(self, timeout: float) -> smtplib.SMTP:
-        """Port 465 → implicit TLS; anything else → plain + STARTTLS."""
+        """Port 465 → implicit TLS; anything else → plain + STARTTLS.
+
+        One default context on both paths: certificate required, hostname
+        checked. smtplib's own default verifies nothing on Python 3.11, so
+        without it the app password would go to any impersonator."""
+        context = ssl.create_default_context()
         if self.port == 465:
-            return smtplib.SMTP_SSL(self.host, self.port, timeout=timeout)
+            return smtplib.SMTP_SSL(
+                self.host, self.port, timeout=timeout, context=context,
+            )
         server = smtplib.SMTP(self.host, self.port, timeout=timeout)
-        server.starttls()
+        server.starttls(context=context)
         return server
 
     # ----------------------------------------------------------------- #
     # MailTransport protocol                                            #
     # ----------------------------------------------------------------- #
 
-    def deliver(self, raw: bytes, mail_from: str, rcpt_to: list[str]) -> None:
+    def deliver(
+        self, raw: bytes, mail_from: str, rcpt_to: list[str],
+    ) -> dict[str, str]:
         """Submit the message with explicit envelope recipients.
 
         Bcc recipients travel ONLY in the envelope (`rcpt_to`): the Bcc
         header is stripped before DATA so no recipient's copy reveals it.
+        A server may take some recipients and refuse others in the same
+        session; those refusals are the return value, never an error —
+        the message already went out to the rest.
         """
         msg = email.message_from_bytes(raw)
         del msg["Bcc"]
@@ -182,7 +197,7 @@ class SmtpTransport:
         try:
             server = self._connect(timeout=60)
             server.login(self.username, password)
-            server.sendmail(mail_from, rcpt_to, msg.as_bytes())
+            refused = server.sendmail(mail_from, rcpt_to, msg.as_bytes())
         except smtplib.SMTPAuthenticationError as e:
             _log.error("smtp auth failed for %s at %s:%d", self.username,
                        self.host, self.port)
@@ -206,7 +221,10 @@ class SmtpTransport:
                     server.quit()
                 except Exception:
                     pass
-        _log.info("smtp deliver ok (%.1fs)", time.monotonic() - t0)
+        _log.info("smtp deliver ok (%.1fs), %d refused",
+                  time.monotonic() - t0, len(refused))
+        return {addr: f"{code} {resp.decode('utf-8', 'replace')}"
+                for addr, (code, resp) in refused.items()}
 
     def ensure(self) -> bool:
         """Cheap readiness: the secret source reads and the port answers.

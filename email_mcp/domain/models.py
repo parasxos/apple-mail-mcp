@@ -57,6 +57,24 @@ class ScheduleRequest:
     from_identity: str | None = None
 
 
+@dataclass(frozen=True)
+class DeliveryReport:
+    """The transport's word on one submission, in envelope addresses: who
+    the server took, who it refused (address → the server's refusal
+    line), and whether anyone MEANT to receive the message is among the
+    refused. The sender's own Bcc copy is a record, not a delivery, so
+    its refusal alone never makes a send partial."""
+
+    accepted: list[str]
+    refused: dict[str, str]
+    partial: bool
+
+    @property
+    def refusals(self) -> str:
+        """The refused recipients with their server lines, as prose."""
+        return ", ".join(f"{a} ({why})" for a, why in self.refused.items())
+
+
 @dataclass
 class SendResult:
     ok: bool
@@ -68,6 +86,12 @@ class SendResult:
     attachments: list[str] = field(default_factory=list)
     bootstrapped: bool = False
     error: str | None = None
+    # Envelope truth beside the headers: who the server took and who it
+    # refused. A refused intended recipient makes ok False with
+    # code partial_delivery — the message_id still went out to `accepted`.
+    accepted: list[str] = field(default_factory=list)
+    refused: dict[str, str] = field(default_factory=dict)
+    code: str | None = None
 
 
 @dataclass
@@ -140,6 +164,12 @@ class ScheduledEntry:
     identity: str = "default"
     executor: str = "launchd"
     graph_draft_id: str | None = None
+    # Envelope truth of the delivery that went out (see SendResult): a
+    # partial refusal parks the record in failed/ with code
+    # partial_delivery, never retried whole.
+    accepted: list[str] = field(default_factory=list)
+    refused: dict[str, str] = field(default_factory=dict)
+    code: str | None = None
 
 
 @dataclass(frozen=True)
