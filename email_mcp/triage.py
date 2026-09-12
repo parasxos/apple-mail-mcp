@@ -280,25 +280,30 @@ def _check_one(s: dict | None, exp: dict, msg: PlanMessage,
             or s["mailbox_rowid"] != exp["gone_from"]
     if "relocated_to" in exp:
         tgt = exp["relocated_to"]
+        left = s is None or bool(s["deleted"]) \
+            or s["mailbox_rowid"] != msg.mailbox_rowid
         if tgt is None:
-            # Target mailbox not yet in the index (fresh, unsynced): the
-            # strongest checkable claim is "the message left its source".
-            return s is None or bool(s["deleted"]) \
-                or s["mailbox_rowid"] != msg.mailbox_rowid
-        moved = s is not None and s["mailbox_rowid"] == tgt and not s["deleted"]
-        if not moved:  # outcome (b): reinserted under a fresh ROWID
-            left = s is None or bool(s["deleted"]) \
-                or s["mailbox_rowid"] != msg.mailbox_rowid
-            if not (left or gmail_like):  # labels: original row persists
+            # Target not yet in the index (fresh, unsynced): the strongest
+            # destination claim is "left its source"; a row still visible
+            # answers for read/flag below, a vanished one only for a move.
+            if not left:
                 return False
-            s = None if msg.global_message_id is None \
-                else relocated(msg.global_message_id, tgt)
+            if s is None or s["deleted"]:
+                return not any(key in exp for key in _STATE_KEYS)
+        else:
+            moved = s is not None and s["mailbox_rowid"] == tgt \
+                and not s["deleted"]
+            if not moved:  # outcome (b): reinserted under a fresh ROWID
+                if not (left or gmail_like):  # labels: original row persists
+                    return False
+                s = None if msg.global_message_id is None \
+                    else relocated(msg.global_message_id, tgt)
     if s is None:
         return False
-    for key in ("read", "flagged", "flag_color"):
-        if key in exp and s[key] != exp[key]:
-            return False
-    return True
+    return all(s[key] == exp[key] for key in _STATE_KEYS if key in exp)
+
+
+_STATE_KEYS = ("read", "flagged", "flag_color")
 
 
 def _observed(s: dict | None) -> dict:
@@ -817,7 +822,7 @@ def create_mailbox(source, account: str, path: str) -> dict:
     mail_verified = verdict in ("OK", "EXISTS")
     if not mail_verified:
         mail_verified = _mailbox_exists_in_mail(
-            "local" if is_local else "x", account, path)
+            "local" if is_local else "x", account, path) is True
 
     index_verified = False
     for _ in range(config.triage_verify_polls()):

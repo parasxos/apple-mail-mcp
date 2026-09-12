@@ -352,6 +352,54 @@ def test_move_to_unsynced_mailbox_falls_back_to_mail_probe(src, db, fake_osa):
     assert res["verified"] == 1 and res["pending"] == []
 
 
+def test_compound_move_to_unsynced_mailbox_judges_read_state(src, db,
+                                                              fake_osa):
+    """Codex F13 verification: a destination not yet in the index limits
+    what can be said about the move, not about the surviving row's read
+    state. A vanished row satisfies only a plain move."""
+    def router(read, delete=False):
+        def batch(script):
+            if "exists mailbox" in script and "«class mssg»" not in script:
+                return subprocess.CompletedProcess([], 0, "YES\n", "")
+            if delete:
+                db.execute("DELETE FROM messages WHERE ROWID=100")
+            else:
+                db.execute("UPDATE messages SET mailbox=999, read=? "
+                           "WHERE ROWID=100", (read,))
+            db.commit()
+            return subprocess.CompletedProcess([], 0, "OK 100\n", "")
+        return batch
+    actions = [{"action": "mark_read"},
+               {"action": "move_to", "mailbox": "BrandNew"}]
+
+    # The snapshot joins mailboxes, so a row in the unindexed destination is
+    # invisible: the compound plan stays pending rather than verified.
+    fake_osa.batch = router(read=0)  # the plan-time probe answers YES too
+    plan = _plan(src, actions, unread_only=True)
+    assert plan.target["mailbox_rowid"] is None
+    res = triage.apply_plan(src, plan.id)
+    assert res["verified"] == 0
+    (p,) = res["pending"]
+    assert p["expected"] == {"read": 1, "relocated_to": None}
+    assert p["observed"] == {"row": "gone"}
+
+    # Index synced by verify time: the surviving row is judged on read too.
+    _add_mailbox(db, 999, f"local://{LOCAL_ACCT}/BrandNew")
+    db.execute("UPDATE messages SET mailbox=1, read=0 WHERE ROWID=100")
+    db.commit()
+    fake_osa.batch = router(read=0)
+    plan = _plan(src, actions, unread_only=True)
+    res = triage.apply_plan(src, plan.id)
+    assert res["verified"] == 0
+    assert res["pending"][0]["observed"]["mailbox_rowid"] == 999
+
+    db.execute("UPDATE messages SET mailbox=1, read=0 WHERE ROWID=100")
+    db.commit()
+    fake_osa.batch = router(read=1)
+    plan = _plan(src, actions, unread_only=True)
+    assert triage.apply_plan(src, plan.id)["verified"] == 1
+
+
 def test_apply_delete_plan_verifies_via_deleted_flag(src, db, fake_osa):
     """build_delete_plan's output applies through the UNCHANGED apply_plan."""
     plan = triage.build_delete_plan(src, SearchQuery(unread_only=True))
@@ -1095,6 +1143,19 @@ def test_mailbox_create_reports_mail_verified(src, db, fake_osa):
     res2 = triage.create_mailbox(src, LOCAL_ACCT, "Filed3")
     assert res2["existed"] is True and res2["mail_verified"] is True
     assert "warning" in res2
+
+
+def test_mailbox_create_unanswered_probe_is_not_verified(src, db, fake_osa):
+    """MADE_UNVERIFIED followed by a probe that never answers: the public
+    boolean stays False, never None (Codex verification, 2026-09-12)."""
+    def router(script):
+        if "exists" in script and "make new mailbox" not in script:
+            raise subprocess.TimeoutExpired("osascript", 15)
+        _add_mailbox(db, 8, f"local://{LOCAL_ACCT}/Filed4")
+        return subprocess.CompletedProcess([], 0, "MADE_UNVERIFIED\n", "")
+    fake_osa.batch = router
+    res = triage.create_mailbox(src, LOCAL_ACCT, "Filed4")
+    assert res["mail_verified"] is False
 
 
 def test_preflight_account_check_and_automation_denied(src, db, fake_osa):
