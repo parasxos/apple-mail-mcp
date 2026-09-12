@@ -21,6 +21,20 @@ def _state() -> state.StateReader:
     return state.State.resolve().reader()
 
 
+_PATH_VARS: set[str] = set()
+
+
+def _path_setting(var: str):
+    """Mark the getter below as the reader of the path-valued setting
+    `var`. The marks are the set launchd_environment absolutizes, so a
+    path getter cannot exist without its plist spelling: a relative value
+    is anchored to the cwd of the process reading it, and launchd's cwd
+    is not ours."""
+    _PATH_VARS.add(var)
+    return lambda getter: getter
+
+
+@_path_setting("EMAIL_MCP_MAIL_DIR")
 def mail_dir() -> Path:
     """Return the active Mail.app data directory.
 
@@ -81,6 +95,7 @@ def max_body_bytes() -> int:
     return int(os.environ.get("EMAIL_MCP_MAX_BODY_BYTES", "2000000"))
 
 
+@_path_setting("EMAIL_MCP_ATTACH_DIR")
 def attach_dir() -> Path:
     raw = os.environ.get("EMAIL_MCP_ATTACH_DIR", "").strip()
     if raw:
@@ -156,6 +171,7 @@ def send_user() -> str:
     return os.environ.get("EMAIL_MCP_SEND_USER", "").strip()
 
 
+@_path_setting("EMAIL_MCP_SSH_SOCKET")
 def send_ssh_socket() -> Path:
     raw = os.environ.get(
         "EMAIL_MCP_SSH_SOCKET", "~/.ssh/email-mcp-sock"
@@ -167,6 +183,7 @@ def send_delivery_cmd() -> str:
     return os.environ.get("EMAIL_MCP_DELIVERY_CMD", "/usr/sbin/sendmail").strip()
 
 
+@_path_setting(state.ENV_VAR)
 def state_dir() -> Path:
     """Path of the managed state root itself. A path question only —
     never creates."""
@@ -196,13 +213,6 @@ def dispatcher_plist() -> Path:
     )
 
 
-# The settings whose value names a file or directory. A relative one is
-# anchored to the cwd of the process reading it (state.py for the root,
-# the getters above for the rest), and launchd's cwd is not ours.
-_PATH_VARS = frozenset({
-    "EMAIL_MCP_STATE_DIR", "EMAIL_MCP_IDENTITIES", "EMAIL_MCP_MAIL_DIR",
-    "EMAIL_MCP_LOG_FILE", "EMAIL_MCP_ATTACH_DIR", "EMAIL_MCP_SSH_SOCKET",
-})
 _LOG_OFF = frozenset({"off", "none", "0"})
 
 
@@ -353,6 +363,7 @@ def send_max_attach_mb() -> float:
     return float(os.environ.get("EMAIL_MCP_MAX_ATTACH_MB", "20"))
 
 
+@_path_setting("EMAIL_MCP_LOG_FILE")
 def log_file() -> Path | None:
     """Where the MCP writes its debug log (delivery pipeline, SSH health).
 
@@ -383,6 +394,7 @@ def send_bootstrap_cmd() -> str:
     return os.environ.get("EMAIL_MCP_SSH_BOOTSTRAP", "").strip()
 
 
+@_path_setting("EMAIL_MCP_IDENTITIES")
 def identities_file() -> Path:
     """The identities TOML routing From: addresses to transports.
 
