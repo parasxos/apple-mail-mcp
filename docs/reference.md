@@ -343,7 +343,7 @@ MCP wire revisions too, so existing stdio registrations do not need to change.
 | `triage_plan_delete(filters...)` | Stage a Trash move through the separate destructive door and tighter 50-message cap; still mutates nothing until apply. |
 | `triage_apply(plan_id)` | Execute a staged plan (one batched AppleScript, by-ROWID addressing) + verify against the index. Per-message failures are data. |
 | `mailbox_create(account, path)` | Create a (nested) mailbox; idempotent. |
-| `mailbox_delete(account, path)` | Delete an EMPTY mailbox; idempotent. Outcome decided by live re-probe (Mail's delete verb lies); escalates to UI scripting when the verb has no effect (needs Accessibility permission). |
+| `mailbox_delete(account, path)` | Delete an EMPTY LEAF mailbox; idempotent. Refuses `not_empty` (holds messages) and `not_leaf` (holds child mailboxes — Mail would delete the subtree). Outcome decided by live re-probe (Mail's delete verb lies); a probe Mail does not answer is `mail_unresponsive`, never absence (`mail_verified: false` when it happens after the verb). Escalates to UI scripting when the verb verifiably has no effect (needs Accessibility permission). |
 | `doctor()` | Full installation, permission, transport, queue and index diagnostics with concrete fixes. |
 | `audit(filters...)` | Query the local best-effort activity ledger; skipped torn/corrupt lines are counted explicitly. |
 

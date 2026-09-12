@@ -7,6 +7,7 @@ Mail.app."""
 from __future__ import annotations
 
 import json
+import os
 import re
 import sqlite3
 import subprocess
@@ -809,12 +810,75 @@ def test_mailbox_delete_idempotent_and_guards(src, db, fake_osa):
         if "exists" in script:
             return subprocess.CompletedProcess([], 0, "YES\n", "")
         if "count of messages" in script:
-            return subprocess.CompletedProcess([], 0, "3\n", "")
+            return subprocess.CompletedProcess([], 0, "3 0\n", "")
         raise AssertionError("delete must not be reached")
     fake_osa.batch = router_nonempty
     with pytest.raises(triage.TriageError) as ei:
         triage.delete_mailbox(src, LOCAL_ACCT, "Inbox")
     assert ei.value.code == "not_empty" and "3 message" in str(ei.value)
+
+
+def test_mailbox_delete_refuses_parent_of_populated_child(src, db, fake_osa):
+    """Codex T1 (2026-09-12): a parent with zero direct messages and a
+    populated child passed the empty-only guard, and Mail deletes the
+    whole subtree. Non-leaf → not_leaf, decided by the ONE census probe."""
+    def router(script):
+        if "exists" in script:
+            return subprocess.CompletedProcess([], 0, "YES\n", "")
+        if "count of messages" in script:
+            assert "count of mailboxes" in script  # one probe, both counts
+            return subprocess.CompletedProcess([], 0, "0 1\n", "")
+        raise AssertionError("delete must not be reached")
+    fake_osa.batch = router
+
+    with pytest.raises(triage.TriageError) as ei:
+        triage.delete_mailbox(src, LOCAL_ACCT, "Parent")
+    assert ei.value.code == "not_leaf" and "1 child mailbox" in str(ei.value)
+    assert all("delete" not in s for s in fake_osa.batch_scripts)
+
+
+def test_mailbox_delete_unanswered_probe_is_not_absence(src, db, fake_osa):
+    """Codex T3 (2026-09-12): automation denied on the first probe used to
+    read as 'already absent' → idempotent success with mail_verified=True.
+    No answer is no verdict: refuse, and issue no delete."""
+    def denied(script):
+        return subprocess.CompletedProcess(
+            [], 1, "", "execution error: Not authorized. (-1743)")
+    fake_osa.batch = denied
+
+    with pytest.raises(triage.TriageError) as ei:
+        triage.delete_mailbox(src, LOCAL_ACCT, "Unknown")
+    assert ei.value.code == "mail_unresponsive"
+    assert all("delete" not in s for s in fake_osa.batch_scripts)
+
+
+def test_mailbox_delete_probe_timeout_after_verb_is_unverified(
+        src, db, fake_osa):
+    """Codex T3, second half: verb fails (-10000), then the re-probe times
+    out. Used to report deleted=True 'verifiably gone'. Now: not deleted,
+    not verified, mail_unresponsive as a value, and no blind UI tier."""
+    probes = []
+
+    def router(script):
+        if "System Events" in script:
+            raise AssertionError("UI tier must not run on an unverified box")
+        if "count of messages" in script:
+            return subprocess.CompletedProcess([], 0, "0 0\n", "")
+        if "exists" in script:
+            probes.append(script)
+            if len(probes) == 1:
+                return subprocess.CompletedProcess([], 0, "YES\n", "")
+            raise subprocess.TimeoutExpired("osascript", 15)
+        if "delete" in script:
+            return subprocess.CompletedProcess(
+                [], 1, "", "execution error: AppleEvent handler failed. (-10000)")
+        raise AssertionError("unexpected script")
+    fake_osa.batch = router
+
+    res = triage.delete_mailbox(src, LOCAL_ACCT, "Limbo")
+    assert res["ok"] is False and res["deleted"] is False
+    assert res["mail_verified"] is False and res["code"] == "mail_unresponsive"
+    assert "unverified" in res["error"] and "-10000" in res["error"]
 
 
 def test_mailbox_delete_swallows_false_error_and_verifies(src, db, fake_osa):
@@ -824,7 +888,7 @@ def test_mailbox_delete_swallows_false_error_and_verifies(src, db, fake_osa):
 
     def router(script):
         if "count of messages" in script:
-            return subprocess.CompletedProcess([], 0, "0\n", "")
+            return subprocess.CompletedProcess([], 0, "0 0\n", "")
         if "exists" in script:
             return subprocess.CompletedProcess(
                 [], 0, ("YES" if state["exists"] else "NO") + "\n", "")
@@ -847,7 +911,7 @@ def test_mailbox_delete_honest_failure_when_survives(src, db, fake_osa):
         if "System Events" in script:
             return subprocess.CompletedProcess([], 0, "NO_SHEET\n", "")
         if "count of messages" in script:
-            return subprocess.CompletedProcess([], 0, "0\n", "")
+            return subprocess.CompletedProcess([], 0, "0 0\n", "")
         if "exists" in script:
             return subprocess.CompletedProcess([], 0, "YES\n", "")
         if "delete" in script:
@@ -871,7 +935,7 @@ def test_mailbox_delete_ui_escalation_succeeds(src, db, fake_osa):
             state["exists"] = False
             return subprocess.CompletedProcess([], 0, "DELETED\n", "")
         if "count of messages" in script:
-            return subprocess.CompletedProcess([], 0, "0\n", "")
+            return subprocess.CompletedProcess([], 0, "0 0\n", "")
         if "exists" in script:
             return subprocess.CompletedProcess(
                 [], 0, ("YES" if state["exists"] else "NO") + "\n", "")
@@ -892,7 +956,7 @@ def test_mailbox_delete_accessibility_denied(src, db, fake_osa):
             return subprocess.CompletedProcess(
                 [], 1, "", "execution error: osascript is not allowed assistive access. (-1719)")
         if "count of messages" in script:
-            return subprocess.CompletedProcess([], 0, "0\n", "")
+            return subprocess.CompletedProcess([], 0, "0 0\n", "")
         if "exists" in script:
             return subprocess.CompletedProcess([], 0, "YES\n", "")
         if "delete" in script:
@@ -950,6 +1014,43 @@ def test_preflight_account_check_and_automation_denied(src, db, fake_osa):
         return subprocess.CompletedProcess([], 0, "OK 100\n", "")
     fake_osa.batch = batch
     assert triage.apply_plan(src, plan3.id)["verified"] == 1
+
+
+def test_apply_refuses_unminted_plan_ids_before_touching_disk(src, tmp_path):
+    """Codex T0 (2026-09-12): the plan id used to become a path before
+    anything looked at it, so `/tmp/x` or `../x` renamed an unrelated
+    JSON file to `.applying`. An id is minted or it never was: the path
+    builder in plans.py refuses it, apply says plan_not_found."""
+    victim = tmp_path / "unrelated.json"
+    victim.write_text('{"hello": "world"}')
+    stem = victim.with_suffix("")
+    for plan_id in (str(stem), os.path.relpath(stem, config.plans_dir())):
+        with pytest.raises(triage.TriageError) as ei:
+            triage.apply_plan(src, plan_id)
+        assert ei.value.code == "plan_not_found"
+        assert ei.value.operation_id is None
+    assert victim.read_text() == '{"hello": "world"}'
+    assert list(tmp_path.glob("*.applying")) == []
+
+
+def test_apply_ignores_file_whose_stored_id_differs(src, db, fake_osa):
+    """A validly named file is only the plan it claims to be: a copy of a
+    draft under another minted name is never applied, and the real plan
+    stays untouched under its own id."""
+    plan = _plan(src, [{"action": "mark_read"}], unread_only=True)
+    alias = plans.new_id()
+    (config.plans_dir() / f"{alias}.json").write_bytes(
+        (config.plans_dir() / f"{plan.id}.json").read_bytes())
+    fake_osa.batch = lambda script: (_ for _ in ()).throw(
+        AssertionError("nothing may be applied under an alias"))
+
+    with pytest.raises(triage.TriageError) as ei:
+        triage.apply_plan(src, alias)
+    assert ei.value.code == "plan_not_found"
+    assert fake_osa.scripts == []
+    assert plans.load(alias) is None
+    assert plans.load(plan.id).status == "draft"
+    assert db.execute("SELECT read FROM messages WHERE ROWID=100").fetchone()[0] == 0
 
 
 def test_plan_not_found_refusal_threads_nothing(src):

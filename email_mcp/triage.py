@@ -76,9 +76,12 @@ def _as_literal(s: str) -> str:
     return '"' + s.replace("\\", "\\\\").replace('"', '\\"') + '"'
 
 
-def _mailbox_exists_in_mail(scheme: str, account: str, name: str) -> bool:
-    """Plan-time existence probe straight at Mail.app, for mailboxes the
-    Envelope Index hasn't synced yet. Best-effort: errors read as absent."""
+def _mailbox_exists_in_mail(scheme: str, account: str,
+                            name: str) -> bool | None:
+    """Existence probe straight at Mail.app, for mailboxes the Envelope
+    Index hasn't synced yet. Tri-state: True / False are Mail's answer,
+    None means Mail gave none (timeout, no osascript, script error) —
+    a failed probe can never read as absence."""
     spec = _mailbox_specifier(scheme, account, name)
     script = (
         'tell application "Mail"\n'
@@ -91,8 +94,10 @@ def _mailbox_exists_in_mail(scheme: str, account: str, name: str) -> bool:
     try:
         proc = _run_osascript(script, timeout=15)
     except (subprocess.TimeoutExpired, FileNotFoundError):
-        return False
-    return proc.returncode == 0 and (proc.stdout or "").strip() == "YES"
+        return None
+    if proc.returncode != 0:
+        return None
+    return (proc.stdout or "").strip() == "YES"
 
 
 def _mailbox_specifier(scheme: str, account: str, name: str) -> str:
@@ -369,7 +374,10 @@ def apply_plan(source, plan_id: str) -> dict:
 
 def _apply_plan(source, plan_id: str) -> dict:
     plans.gc()
-    plan = plans.claim(plan_id)
+    try:
+        plan = plans.claim(plan_id)
+    except plans.UnknownPlanId:
+        raise TriageError("plan_not_found", f"no plan with id {plan_id!r}.")
     if plan is None:
         existing = plans.load(plan_id)
         if existing is None:
@@ -536,11 +544,14 @@ def _apply_plan(source, plan_id: str) -> dict:
 # --------------------------------------------------------------------- #
 
 
-def _mailbox_message_count(spec: str) -> int | None:
-    """Live message count for a mailbox specifier; None = could not tell."""
+def _mailbox_census(spec: str) -> tuple[int, int] | None:
+    """Live (messages, child mailboxes) of a mailbox specifier in ONE
+    probe — Mail keeps the two as separate collections, and deleting a
+    parent takes the children with it. None = could not tell."""
     script = (
         'tell application "Mail"\n'
-        f"    return (count of messages of {spec}) as text\n"
+        f"    return ((count of messages of {spec}) as text) & \" \" & "
+        f"((count of mailboxes of {spec}) as text)\n"
         "end tell\n"
     )
     try:
@@ -550,9 +561,10 @@ def _mailbox_message_count(spec: str) -> int | None:
     if proc.returncode != 0:
         return None
     try:
-        return int((proc.stdout or "").strip())
+        messages, children = (int(n) for n in (proc.stdout or "").split())
     except ValueError:
         return None
+    return messages, children
 
 
 def _gui_delete_mailbox(spec: str) -> tuple[bool, str | None]:
@@ -604,7 +616,7 @@ def _gui_delete_mailbox(spec: str) -> tuple[bool, str | None]:
 
 
 def delete_mailbox(source, account: str, path: str) -> dict:
-    """Delete an EMPTY mailbox. Robustness knowledge baked in (fleet-tested
+    """Delete an EMPTY LEAF mailbox. Robustness knowledge baked in (fleet-tested
     2026-07-28): Mail's AppleScript `delete` verb on a mailbox often returns
     -10000 ("AppleEvent handler failed") even when the deletion SUCCEEDED —
     so the error is treated as advisory and the outcome is decided by a
@@ -625,24 +637,40 @@ def delete_mailbox(source, account: str, path: str) -> dict:
     scheme = _scheme(getattr(sample, "path", "")) if sample else ""
     spec = _mailbox_specifier(scheme, account, path)
 
-    # Truth = live probe. Absent already → idempotent success.
-    if not _mailbox_exists_in_mail(scheme, account, path):
+    # Truth = live probe. Absent already → idempotent success; no answer
+    # is not absence.
+    exists = _mailbox_exists_in_mail(scheme, account, path)
+    if exists is None:
+        raise TriageError(
+            "mail_unresponsive",
+            f"Mail.app did not answer whether {path!r} exists — refusing "
+            "to decide blind.",
+        )
+    if not exists:
         return {"ok": True, "account": account, "path": path,
                 "existed": False, "deleted": False, "mail_verified": True,
                 "warning": None}
 
-    # Empty-only guard: refuse to delete anything holding mail.
-    count = _mailbox_message_count(spec)
-    if count is None:
+    # Empty-leaf guard: refuse to delete anything holding mail, directly
+    # or through a child (Mail deletes the whole subtree).
+    census = _mailbox_census(spec)
+    if census is None:
         raise TriageError(
             "mail_unresponsive",
-            f"could not count messages in {path!r} — refusing to delete blind.",
+            f"could not count the contents of {path!r} — refusing to delete blind.",
         )
-    if count > 0:
+    messages, children = census
+    if messages > 0:
         raise TriageError(
             "not_empty",
-            f"mailbox {path!r} holds {count} message(s) — only empty "
+            f"mailbox {path!r} holds {messages} message(s) — only empty "
             "mailboxes can be deleted. Triage the messages out first.",
+        )
+    if children > 0:
+        raise TriageError(
+            "not_leaf",
+            f"mailbox {path!r} holds {children} child mailbox(es) — only "
+            "leaf mailboxes can be deleted. Delete the children first.",
         )
 
     script = (
@@ -665,19 +693,24 @@ def delete_mailbox(source, account: str, path: str) -> dict:
         # note it and let the re-probe decide.
         swallowed = (proc.stderr or "").strip()[:200]
 
-    def _gone() -> bool:
+    def _gone() -> bool | None:
+        """Tri-state like the probe: True = confirmed gone, False = Mail
+        still shows it, None = the last probe got no answer."""
+        exists = True
         for attempt in range(max(1, config.triage_verify_polls())):
             if attempt and config.triage_verify_interval():
                 time.sleep(config.triage_verify_interval())
-            if not _mailbox_exists_in_mail(scheme, account, path):
+            exists = _mailbox_exists_in_mail(scheme, account, path)
+            if exists is False:
                 return True
-        return False
+        return None if exists is None else False
 
     method = "applescript"
     gone = _gone()
     ui_error: str | None = None
-    if not gone:
+    if gone is False:
         # Tier 2: the deterministic path — Mail's own Delete Mailbox menu.
+        # Only on a confirmed survivor: never drive the UI blind.
         ui_ok, ui_error = _gui_delete_mailbox(spec)
         method = "ui"
         if ui_error == "accessibility_denied":
@@ -701,6 +734,14 @@ def delete_mailbox(source, account: str, path: str) -> dict:
         return {"ok": True, "account": account, "path": path,
                 "existed": True, "deleted": True, "mail_verified": True,
                 "method": method, "warning": note}
+    if gone is None:
+        return {"ok": False, "account": account, "path": path,
+                "existed": True, "deleted": False, "mail_verified": False,
+                "code": "mail_unresponsive",
+                "error": (f"Mail stopped answering after the delete verb "
+                          f"({swallowed or 'no error'}) — whether {path!r} "
+                          "survived is unverified. mailbox_delete is "
+                          "idempotent: re-run it once Mail answers.")}
     return {"ok": False, "account": account, "path": path,
             "existed": True, "deleted": False, "mail_verified": True,
             "code": "delete_failed",
