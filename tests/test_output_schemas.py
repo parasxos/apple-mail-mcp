@@ -137,6 +137,8 @@ EXPECTED_SKIPS = frozenset({
     # body-gap fix (2026-08-06): declared provenance on backfilled bodies
     "get_email.email.body_source",
     "get_emails_batch.emails[].body_source",
+    # claim lease (2026-09-12): when a dispatcher claim last took the record
+    "schedule_email.claimed_at",
 })
 
 # oracle keys whose ABSENCE from the derived shape is expected (see above)
@@ -152,6 +154,8 @@ _WAIVED_ADDED = frozenset({
     # provenance — additive on the full view only
     "get_email.email.body_source",
     "get_emails_batch.emails[].body_source",
+    # claim lease (2026-09-12): when a dispatcher claim last took the record
+    "schedule_email.claimed_at",
 })
 
 

@@ -405,21 +405,29 @@ def schedule_email(
     # Message-ID is the recovery key — the dispatcher's reconcile pass
     # searches Drafts by internetMessageId and adopts or flips (F1/F2).
     entry.executor = "graph"
-    spool.save(raw, entry)
-    try:
-        entry.graph_draft_id = graph.create_deferred_draft(ident, raw, when)
-    except graph.GraphError as e:
-        # F5/F8: Graph refused (auth, throttle, 5xx…) — silent fallback to
-        # the launchd executor. The frozen .eml is already in pending/, so
-        # nothing is lost and nothing can double-send (create_deferred_draft
-        # deletes its own draft on any post-create failure).
-        entry.executor = "launchd"
-        spool.update("pending", entry)
-        _log.warning(
-            "graph: schedule of %s via identity %r failed, falling back to "
-            "launchd executor: %s", entry.id, ident.name, e)
-    else:
-        spool.update("pending", entry)
+    # Ownership spans save → arm → final rewrite: cancel_scheduled cannot
+    # move the record while Exchange is being armed, so the rewrite below
+    # can only ever land on a record that is still pending — never
+    # resurrect one that was cancelled meanwhile.
+    with spool.own(entry.id):
+        spool.save(raw, entry)
+        try:
+            entry.graph_draft_id = graph.create_deferred_draft(
+                ident, raw, when,
+            )
+        except graph.GraphError as e:
+            # F5/F8: Graph refused (auth, throttle, 5xx…) — silent fallback
+            # to the launchd executor. The frozen .eml is already in
+            # pending/, so nothing is lost and nothing can double-send
+            # (create_deferred_draft deletes its own draft on any
+            # post-create failure).
+            entry.executor = "launchd"
+            spool.update("pending", entry)
+            _log.warning(
+                "graph: schedule of %s via identity %r failed, falling back "
+                "to launchd executor: %s", entry.id, ident.name, e)
+        else:
+            spool.update("pending", entry)
     return entry
 
 

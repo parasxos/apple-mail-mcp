@@ -9,13 +9,14 @@ import errno
 import json
 import os
 import stat
-from datetime import timedelta
+from datetime import datetime, timedelta
 
 import pytest
 
 from email_mcp import (codes, config, dispatcher, doctor, sender, server,
                        spool, state)
 from email_mcp.adapters.background import MacOSNotifier
+from email_mcp.domain.errors import SpoolBusy
 
 
 @pytest.fixture(autouse=True)
@@ -104,6 +105,44 @@ def test_atomic_update_syncs_file_and_parent_directory(monkeypatch):
     assert "file" in synced
     assert "directory" in synced
     assert spool.load("pending", entry.id).subject == "after"
+
+
+def test_claim_stamps_its_own_lease():
+    """The claim is the only writer of claimed_at: the manifest that lands
+    in sending/ says when THIS claim took it, and the loser of the rename
+    stamps nothing."""
+    entry = _entry("lease")
+    spool.save(b"Subject: lease\r\n\r\nbody", entry)
+    before = spool.utcnow().replace(microsecond=0)
+
+    assert spool.claim(entry.id) is True
+
+    claimed = spool.load("sending", entry.id)
+    assert claimed.status == "sending"
+    stamped = datetime.fromisoformat(claimed.claimed_at)
+    assert before <= stamped <= spool.utcnow()
+    assert spool.claim(entry.id) is False
+    assert spool.load("pending", entry.id) is None
+
+
+def test_own_is_exclusive_and_cannot_name_a_file_outside_locks():
+    """One owner at a time per name, across descriptors (the same rule the
+    MCP server and the dispatcher share); release is the end of the block;
+    a hostile name creates nothing outside <spool>/locks/."""
+    with spool.own("../escaped"):
+        with pytest.raises(SpoolBusy):
+            with spool.own("../escaped"):
+                pass
+        with spool.own("other"):
+            pass  # a different name is independent
+    with spool.own("../escaped"):
+        pass  # released with the block
+
+    locks = config.spool_dir() / "locks"
+    assert not (config.spool_dir() / "escaped").exists()
+    assert not (config.spool_dir().parent / "escaped").exists()
+    assert len(os.listdir(locks)) == 2
+    assert all(len(name) == 64 for name in os.listdir(locks))
 
 
 def test_scan_counts_corrupt_manifest_instead_of_hiding_it():

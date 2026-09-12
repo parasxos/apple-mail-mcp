@@ -1,6 +1,7 @@
 """Small, role-specific interfaces owned by the application layer."""
 from __future__ import annotations
 
+from contextlib import AbstractContextManager
 from datetime import datetime
 from typing import Protocol
 
@@ -57,6 +58,8 @@ class ScheduleStore(Protocol):
     def find(self, operation_id: str) -> tuple[str, ScheduledEntry] | None: ...
 
     def claim(self, operation_id: str, old: str, new: str) -> bool: ...
+
+    def own(self, name: str) -> AbstractContextManager[None]: ...
 
     def update(self, state: str, entry: ScheduledEntry) -> None: ...
 
@@ -138,11 +141,16 @@ class Clock(Protocol):
 
 
 class DispatchQueue(Protocol):
-    """Durable queue role used by the one-pass delivery state machine."""
+    """Durable queue role used by the one-pass delivery state machine.
+
+    ``own`` is exclusive cross-process ownership of one record (its id) or
+    of the whole run (``"dispatcher"``); a name held elsewhere raises
+    SpoolBusy instead of waiting.
+    """
 
     def entries(self, state: str) -> list[ScheduledEntry]: ...
 
-    def load(self, state: str, operation_id: str) -> ScheduledEntry | None: ...
+    def own(self, name: str) -> AbstractContextManager[None]: ...
 
     def claim(self, operation_id: str) -> bool: ...
 

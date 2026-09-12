@@ -10,7 +10,16 @@ scheduling cannot change what goes out.
 Ownership hand-off is the atomic rename of the .json manifest between
 state directories (rename is atomic on APFS): whichever dispatcher run
 wins the rename owns the message; the loser sees FileNotFoundError and
-moves on. That makes overlapping dispatcher runs double-send-safe.
+moves on. The claim then stamps its own lease (``claimed_at``), the only
+clock stranded-claim recovery reads, so an overdue message that was just
+claimed is never mistaken for an abandoned one.
+
+Work that spans several steps on one record — arming an Exchange draft
+at schedule time, revoking it on cancel, the dispatcher's reconcile
+probe — and the dispatcher run itself hold :func:`own`, one non-blocking
+``flock`` under ``<spool>/locks/`` shared by the MCP server and the
+launchd dispatcher. A record can therefore never be cancelled under the
+process arming it, and two dispatcher passes can never interleave.
 
 The manifest is the commit record. Every create/rewrite is written to a
 unique file in the same directory, fsynced, atomically replaced, then the
@@ -23,14 +32,18 @@ healthy siblings from being dispatched.
 from __future__ import annotations
 
 import errno
+import fcntl
+import hashlib
 import json
 import os
 import stat
 import uuid
+from contextlib import contextmanager
 from dataclasses import asdict
 from pathlib import Path
 
 from . import config, ids, state
+from .domain.errors import SpoolBusy
 from .domain.models import (
     IntegrityIssue,
     ScheduledEntry as Entry,
@@ -353,8 +366,40 @@ def find(id: str) -> tuple[str, Entry] | None:
     return None
 
 
+@contextmanager
+def own(name: str):
+    """Exclusive, cross-process ownership of one spool record (its id) or
+    of the dispatcher run (``"dispatcher"``) for the duration of the block.
+
+    An fcntl.flock on a file under ``<spool>/locks/``, so the MCP server
+    and the launchd dispatcher exclude each other and the kernel drops the
+    lock when its holder exits or crashes — there is no stale lock to
+    clean up. Non-blocking by design: a second owner gets SpoolBusy at
+    once and reports "held elsewhere" instead of queueing behind unknown
+    Graph traffic (a blocking wait would also deadlock a process that
+    re-enters its own record). Lock files are never unlinked — unlink
+    after release lets two holders own different inodes of one name — and
+    are named by digest, so a caller-supplied id can name nothing outside
+    ``locks/``.
+    """
+    locks = state.State.resolve().adopt().spool / "locks"
+    path = locks / hashlib.sha256(name.encode()).hexdigest()
+    flags = os.O_RDWR | os.O_CREAT
+    flags |= getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+    fd = os.open(path, flags, 0o600)
+    try:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            raise SpoolBusy(f"{name} is held by another process") from None
+        yield
+    finally:
+        os.close(fd)
+
+
 def claim(id: str, src: str = "pending", dst: str = "sending") -> bool:
-    """Atomically take ownership by renaming the manifest src → dst.
+    """Atomically take ownership by renaming the manifest src → dst, then
+    stamp the lease: ``claimed_at`` is when THIS claim took the record.
     Returns False if another run (or a cancel) got there first."""
     src_eml, src_manifest = _paths(src, id)
     dst_eml, dst_manifest = _paths(dst, id)
@@ -366,8 +411,11 @@ def claim(id: str, src: str = "pending", dst: str = "sending") -> bool:
         os.replace(src_eml, dst_eml)
     except FileNotFoundError:
         pass  # .eml missing is handled by the dispatcher (parks to failed)
+    entry = _read_manifest(dst_manifest)
+    entry.status = dst
+    entry.claimed_at = iso(utcnow())
+    _atomic_write(dst_manifest, _dumps(entry))  # syncs the dst directory
     _sync_dir(src_manifest.parent)
-    _sync_dir(dst_manifest.parent)
     return True
 
 

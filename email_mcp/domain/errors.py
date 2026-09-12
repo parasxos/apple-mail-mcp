@@ -34,3 +34,10 @@ class InvalidInput(ToolError):
 
 class MailUnavailable(ToolError):
     code = codes.MAIL_UNAVAILABLE
+
+
+class SpoolBusy(ToolError):
+    """Another process owns the spool record (or the dispatcher run) right
+    now; the caller reports "held elsewhere" and the work is retried."""
+
+    code = codes.SPOOL_BUSY

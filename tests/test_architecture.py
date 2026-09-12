@@ -5,6 +5,7 @@ import ast
 import inspect
 import subprocess
 import sys
+from contextlib import nullcontext
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, get_type_hints
@@ -363,8 +364,9 @@ class _Queue:
     def entries(self, state):
         return list(self.records.get(state, {}).values())
 
-    def load(self, state, operation_id):
-        return self.records.get(state, {}).get(operation_id)
+    @staticmethod
+    def own(name):
+        return nullcontext()
 
     def claim(self, operation_id):
         entry = self.records["pending"].pop(operation_id, None)

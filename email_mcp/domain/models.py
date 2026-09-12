@@ -140,10 +140,14 @@ class ScheduledEntry:
     identity: str = "default"
     executor: str = "launchd"
     graph_draft_id: str | None = None
+    # The lease: stamped by the claim that last took this record (spool
+    # .claim). Stranded-claim recovery reads only this, never send_at.
+    claimed_at: str | None = None
 
 
 @dataclass(frozen=True)
 class IntegrityIssue:
+
     code: str
     state: str
     id: str | None

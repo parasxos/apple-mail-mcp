@@ -12,14 +12,13 @@ from .application.background import (
     BACKOFF_MINUTES,
     GRAPH_GRACE_MINUTES,
     STALE_SENDING_MINUTES,
-    SUPERSEDED,
     is_due,
+    is_stale,
     parse_timestamp,
 )
 
 LAUNCHD_LABEL = dispatcher_runtime.LAUNCHD_LABEL
 LEGACY_LABELS = dispatcher_runtime.LEGACY_LABELS
-_SUPERSEDED = SUPERSEDED
 _parse_iso = parse_timestamp
 _due = is_due
 
@@ -38,10 +37,6 @@ def _fail_or_retry(entry, error: str, now: datetime,
 
 def _recover_stranded(now: datetime) -> list[str]:
     return _application().recover_stranded(now)
-
-
-def _graph_current(entry) -> bool:
-    return _application().graph_current(entry)
 
 
 def _graph_mark_sent(entry, now: datetime) -> str:
@@ -123,7 +118,8 @@ def main(argv: list[str] | None = None) -> int:
         print(uninstall_launchd())
         return 0
     summary = run_once()
-    if summary["due"] or summary["results"] or "integrity" in summary:
+    if (summary["due"] or summary["results"] or "integrity" in summary
+            or "skipped" in summary):
         json.dump(summary, sys.stdout)
         sys.stdout.write("\n")
     return 1 if "integrity" in summary else 0

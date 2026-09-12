@@ -57,7 +57,9 @@ BELT_CODES = frozenset({
 
 SPOOL_EML_MISSING = "spool_eml_missing"
 SPOOL_INTEGRITY = "spool_integrity"
-SPOOL_CODES = frozenset({SPOOL_EML_MISSING, SPOOL_INTEGRITY})
+SPOOL_BUSY = "spool_busy"
+SPOOL_CODES = frozenset({SPOOL_EML_MISSING, SPOOL_INTEGRITY, SPOOL_BUSY})
+
 
 HEADER_INJECTION = "header_injection"
 INVALID_RECIPIENT = "invalid_recipient"

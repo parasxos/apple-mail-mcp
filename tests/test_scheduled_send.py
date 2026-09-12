@@ -186,6 +186,72 @@ def test_stranded_sending_recovers_then_delivers(delivered):
     assert got.attempts == 1 and got.last_error is None
 
 
+def test_recovery_measures_staleness_from_the_claim_not_the_schedule(
+    delivered,
+):
+    """An overdue message that was just claimed is an active delivery, not
+    a stranded one: staleness is the age of the claim's own lease, never
+    of send_at. Doctor reads the same rule. A sending/ manifest without a
+    lease (pre-lease dispatcher) is recovered at once."""
+    from email_mcp import doctor
+
+    now = spool.utcnow()
+    entry = spool.Entry(
+        id=spool.new_id(now), send_at=spool.iso(now - timedelta(minutes=30)),
+        created_at=spool.iso(now - timedelta(hours=1)),
+        to=["paris.moschovakos@cern.ch"], cc=[], bcc=[], subject="overdue",
+        attachments=[], message_id="<overdue@example.org>",
+    )
+    spool.save(b"Subject: overdue\r\n\r\nbody", entry)
+    assert spool.claim(entry.id)
+    assert dispatcher._recover_stranded(now) == []
+    assert spool.load("sending", entry.id) is not None  # still active
+    assert doctor.check_spool_plans()["stranded_sending"] == []
+
+    later = now + timedelta(minutes=dispatcher.STALE_SENDING_MINUTES + 1)
+    assert dispatcher._recover_stranded(later) == [entry.id]
+    assert spool.load("pending", entry.id).attempts == 1
+
+    assert spool.claim(entry.id)
+    legacy = spool.load("sending", entry.id)
+    legacy.claimed_at = None
+    spool.update("sending", legacy)
+    assert dispatcher._recover_stranded(now) == [entry.id]
+
+
+def test_overlapping_dispatcher_is_refused_while_a_pass_holds_the_spool(
+    monkeypatch, delivered,
+):
+    """Codex repro "overlapping dispatcher": a second pass that starts while
+    the first is inside its transport call must not recover and re-send
+    the first pass's active claim. It is refused at the door — one
+    delivery, one record in sent/."""
+    entry = sender.schedule_email(
+        to="paris.moschovakos@cern.ch", subject="race", body="b",
+        send_at=_future(-1),
+    )
+    overdue = spool.utcnow() + timedelta(
+        minutes=2 * dispatcher.STALE_SENDING_MINUTES,
+    )
+    nested: list[dict] = []
+
+    def deliver(raw):
+        delivered.append(raw)
+        if len(delivered) == 1:
+            nested.append(dispatcher.run_once(now=overdue))
+
+    monkeypatch.setattr(sender, "_deliver_bytes", deliver)
+    summary = dispatcher.run_once(now=overdue)
+    assert summary["results"] == {entry.id: "sent"}
+    assert nested == [{
+        "checked_at": spool.iso(overdue), "due": 0, "results": {},
+        "skipped": "another dispatcher holds the spool",
+    }]
+    assert len(delivered) == 1
+    assert spool.load("sent", entry.id) is not None
+    assert spool.entries("sending") == [] and spool.entries("pending") == []
+
+
 def test_claim_race_single_winner(delivered):
     entry = sender.schedule_email(
         to="paris.moschovakos@cern.ch", subject="s", body="b",
