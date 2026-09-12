@@ -270,10 +270,10 @@ def _expected_state(actions: list[PlanAction], msg: PlanMessage,
 
 
 def _check_one(s: dict | None, exp: dict, msg: PlanMessage,
-               locate_fn, gmail_like: bool) -> bool:
+               relocated, gmail_like: bool) -> bool:
     """Does the fresh snapshot satisfy the expected state? A move first
-    resolves WHICH row to judge (locate_fn returns the snapshot of the row
-    reinserted in the target), then that row faces the same read/flag
+    resolves WHICH row to judge (`relocated` returns the snapshot of the
+    row reinserted in the target), then that row faces the same read/flag
     comparison as a message that never moved."""
     if "gone_from" in exp:
         return s is None or bool(s["deleted"]) \
@@ -292,7 +292,7 @@ def _check_one(s: dict | None, exp: dict, msg: PlanMessage,
             if not (left or gmail_like):  # labels: original row persists
                 return False
             s = None if msg.global_message_id is None \
-                else locate_fn(msg.global_message_id, tgt)
+                else relocated(msg.global_message_id, tgt)
     if s is None:
         return False
     for key in ("read", "flagged", "flag_color"):
