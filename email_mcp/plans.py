@@ -49,8 +49,11 @@ def _claim_path(plan_id: str) -> Path:
     return _path(plan_id).with_suffix(".json.applying")
 
 
-def _revive(data: dict) -> Plan:
-    data = dict(data)
+def _revive(data: dict, plan_id: str) -> Plan:
+    """A plan from its stored JSON. The name it was read under is its
+    identity: finish() renames by `plan.id`, so a file can never be
+    claimed under one name and released under another."""
+    data = dict(data, id=plan_id)
     data["actions"] = [PlanAction(**a) for a in data.get("actions", [])]
     data["messages"] = [PlanMessage(**m) for m in data.get("messages", [])]
     return Plan(**data)
@@ -65,14 +68,12 @@ def save(plan: Plan) -> None:
 
 
 def _read(plan_id: str, path: Path) -> Plan | None:
-    """The plan file at `path`, or None when it is not plan `plan_id`:
-    unparsable, or carrying another id under this name. FileNotFoundError
-    passes through — absence is the caller's branch."""
+    """The plan file at `path`, or None when it is unparsable.
+    FileNotFoundError passes through — absence is the caller's branch."""
     try:
-        plan = _revive(json.loads(path.read_bytes()))
+        return _revive(json.loads(path.read_bytes()), plan_id)
     except (json.JSONDecodeError, TypeError):
         return None
-    return plan if plan.id == plan_id else None
 
 
 def load(plan_id: str) -> Plan | None:
@@ -147,7 +148,7 @@ def all_plans() -> list[Plan]:
     out = []
     for path in sorted(config.plans_dir().glob("*.json")):
         try:
-            out.append(_revive(json.loads(path.read_bytes())))
+            out.append(_revive(json.loads(path.read_bytes()), path.stem))
         except (json.JSONDecodeError, TypeError, OSError):
             continue
     return out
@@ -171,7 +172,8 @@ def gc(now: datetime | None = None) -> int:
             removed += 1
         elif path.name.endswith(".applying") and mtime < stale:
             try:
-                plan = _revive(json.loads(path.read_bytes()))
+                plan = _revive(json.loads(path.read_bytes()),
+                               path.name.partition(".")[0])
             except (json.JSONDecodeError, TypeError):
                 plan = None
             if plan is not None:
@@ -179,5 +181,6 @@ def gc(now: datetime | None = None) -> int:
                 # write + plan_finish event as every other ending.
                 finish(plan, "failed",
                        {"error": "stale claim: apply crashed mid-flight"})
-            path.unlink(missing_ok=True)  # id/filename mismatch safety net
+            else:
+                path.unlink(missing_ok=True)
     return removed

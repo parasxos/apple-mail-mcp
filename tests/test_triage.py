@@ -1148,26 +1148,6 @@ def test_apply_refuses_unminted_plan_ids_before_touching_disk(src, tmp_path):
     assert list(tmp_path.glob("*.applying")) == []
 
 
-def test_apply_ignores_file_whose_stored_id_differs(src, db, fake_osa):
-    """A validly named file is only the plan it claims to be: a copy of a
-    draft under another minted name is never applied, and the real plan
-    stays untouched under its own id."""
-    plan = _plan(src, [{"action": "mark_read"}], unread_only=True)
-    alias = plans.new_id()
-    (config.plans_dir() / f"{alias}.json").write_bytes(
-        (config.plans_dir() / f"{plan.id}.json").read_bytes())
-    fake_osa.batch = lambda script: (_ for _ in ()).throw(
-        AssertionError("nothing may be applied under an alias"))
-
-    with pytest.raises(triage.TriageError) as ei:
-        triage.apply_plan(src, alias)
-    assert ei.value.code == "plan_not_found"
-    assert fake_osa.scripts == []
-    assert plans.load(alias) is None
-    assert plans.load(plan.id).status == "draft"
-    assert db.execute("SELECT read FROM messages WHERE ROWID=100").fetchone()[0] == 0
-
-
 def test_plan_not_found_refusal_threads_nothing(src):
     """The other half of the §2 rule: not_found is a CLAIM, not an
     artifact — no operation_id is ever minted for a failure."""
