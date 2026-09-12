@@ -110,6 +110,20 @@ checkpoint. An identity that *declares* a restriction — an `allowlist`, or
 own address, so a trial mistake can only reach you. A blocked send returns
 `{ok: false, error}` naming the address; it never leaves the machine.
 
+**Partial refusal.** An SMTP server may take some envelope recipients and
+refuse others in the same session (a `550` on a dead address, say). The
+receipt always carries the envelope truth: `accepted` (addresses the server
+took) and `refused` (address → the server's own line, e.g.
+`"550 5.1.1 no such user"`). When any *intended* recipient was refused the
+receipt is `{ok: false, code: "partial_delivery", error, message_id,
+accepted, refused, ...}` — the `message_id` did go out to `accepted`, so
+resend to the refused addresses only. The automatic Bcc-to-self copy is a
+record, not a delivery: a server refusing only that copy leaves the send
+`ok: true` with the refusal listed. The ledger records the same verdict
+(`send`/`reply` outcome `partial`), never `sent`. The `ssh_sendmail` and
+`pipe` lanes hand the envelope to an MTA, which turns refusals into bounces
+instead, so `refused` is always empty there.
+
 **Attachments.** Pass `attachments` as a list of local file paths. Each file
 is attached with a MIME type guessed from its name (fallback
 `application/octet-stream`); the plain+HTML body pair is wrapped in
@@ -333,7 +347,7 @@ MCP wire revisions too, so existing stdio registrations do not need to change.
 | `list_recent(mailbox?, account?, limit?)` | Newest messages first. |
 | `get_attachment(id, attachment_id)` | Materialises the attachment to a tmp file; returns the path. |
 | `refresh_mail(wait_seconds=5, timeout_seconds=30)` | Asks Mail.app to fetch new mail, waits, returns before/after snapshot + delta count. Launches Mail.app if it isn't running. Needs Automation permission (see above). |
-| `send_email(to, subject, body, cc?, bcc?, attachments?, from_identity?)` | Compose and send. Comma-separated address strings. `attachments` = list of local file paths (each entry ONE path), attached with guessed MIME types; total capped at `EMAIL_MCP_MAX_ATTACH_MB` (default 20). `from_identity` picks the sending identity (see [Identities & transports](#identities--transports)). Auto Bcc-to-self. A declared allowlist applies per identity. Returns `{ok, message_id, to, cc, bcc, subject, attachments}` or `{ok: false, error}`. |
+| `send_email(to, subject, body, cc?, bcc?, attachments?, from_identity?)` | Compose and send. Comma-separated address strings. `attachments` = list of local file paths (each entry ONE path), attached with guessed MIME types; total capped at `EMAIL_MCP_MAX_ATTACH_MB` (default 20). `from_identity` picks the sending identity (see [Identities & transports](#identities--transports)). Auto Bcc-to-self. A declared allowlist applies per identity. Returns `{ok, message_id, to, cc, bcc, subject, attachments, accepted, refused}` or `{ok: false, code, error}` — `code: "partial_delivery"` when the server refused an intended recipient after taking the rest (see [Sending mail](#sending-mail-send_email--reply_email)). |
 | `reply_email(id, body, reply_all?, cc?, bcc?, include_history?, attachments?, from_identity?)` | Reply with correct `In-Reply-To` / `References`, optional reply-all, quoted history and attachments. |
 | `create_draft(to, subject, body, cc?, in_reply_to?, from_identity?)` | Create and verify a draft in a Graph-enabled identity's real Exchange Drafts folder; never sends it. |
 | `schedule_email(to, subject, body, send_at, cc?, bcc?, attachments?, from_identity?)` | Compose and durably freeze now. Exchange identities can schedule server-side; other identities use the local background dispatcher. Returns `{ok, id, send_at, message_id, ...}`. |
@@ -403,6 +417,13 @@ database:
   the failed record until the replacement is confirmed. Atomic claim renames
   prevent overlapping dispatcher runs from owning the same record
   concurrently.
+- A **partial refusal** (the server took some recipients and refused
+  others — see [Sending mail](#sending-mail-send_email--reply_email)) parks
+  the record in `failed/` at once, never through the retry funnel: the
+  accepted recipients already hold the message and a whole resend would
+  duplicate it. The manifest keeps `code: "partial_delivery"`, `accepted`,
+  `refused` and the `message_id` that went out; the ledger line is
+  `deliver`/`partial`. Reschedule to the refused addresses only.
 - Local scheduled delivery is **at-least-once across the transport handoff**.
   If the process dies after the provider accepts the message but before the
   record moves from `sending/` to `sent/`, recovery cannot know the outcome

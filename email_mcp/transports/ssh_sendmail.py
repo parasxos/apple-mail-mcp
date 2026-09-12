@@ -125,11 +125,15 @@ class SshSendmailTransport:
     # MailTransport protocol                                            #
     # ----------------------------------------------------------------- #
 
-    def deliver(self, raw: bytes, mail_from: str, rcpt_to: list[str]) -> None:
+    def deliver(
+        self, raw: bytes, mail_from: str, rcpt_to: list[str],
+    ) -> dict[str, str]:
         """Pipe pre-serialised RFC-822 bytes to the remote delivery command.
 
         `rcpt_to` is deliberately unused: `sendmail -t` reads the recipients
-        from the message's own To/Cc/Bcc headers.
+        from the message's own To/Cc/Bcc headers, and owns the envelope
+        from there — a per-recipient refusal becomes a bounce, never a
+        return value.
         """
         from email.parser import BytesHeaderParser
 
@@ -174,6 +178,7 @@ class SshSendmailTransport:
                 code=codes.DELIVERY_FAILED,
             )
         _log.info("deliver ok: %s (%.1fs)", msgid, time.monotonic() - t0)
+        return {}
 
     def ensure(self) -> bool:
         """Socket alive → done; otherwise bootstrap and re-check."""

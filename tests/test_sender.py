@@ -504,6 +504,7 @@ class _FakeTransport:
 
     def deliver(self, raw, mail_from, rcpt_to):
         self.log.append((self.ident.name, raw, mail_from, rcpt_to))
+        return {}
 
     def healthcheck(self):
         return {"ok": True}
@@ -552,3 +553,91 @@ def test_unknown_identity_is_caller_fixable():
     msg = str(ei.value)
     assert "gmail" in msg      # names the unknown identity
     assert "default" in msg    # and lists what IS available
+
+
+# --------------------------------------------------------------------- #
+# partial recipient refusal (review F7)                                 #
+# --------------------------------------------------------------------- #
+#
+# smtplib's sendmail() returns the recipients the server refused while
+# accepting the rest. The receipt must say who got the message and who
+# did not; the sender's own Bcc copy is a record, not a delivery.
+
+
+def _smtp_default_identity(tmp_path, monkeypatch, refused: dict) -> None:
+    """A default smtp identity whose server refuses `refused` (smtplib's
+    own shape) and takes everyone else. Secret and socket are faked;
+    preflight is skipped exactly as the review reproduction did."""
+    from email_mcp.transports.smtp import SmtpTransport
+
+    p = tmp_path / "identities.toml"
+    p.write_text(textwrap.dedent("""\
+        default = "review"
+
+        [review]
+        from_addr = "sender@example.org"
+        driver = "smtp"
+        host = "smtp.example.org"
+        keychain = "unused"
+    """))
+    monkeypatch.setenv("EMAIL_MCP_IDENTITIES", str(p))
+
+    class PartialSMTP:
+        def login(self, *args):
+            pass
+
+        def sendmail(self, *args):
+            return dict(refused)
+
+        def quit(self):
+            pass
+
+    monkeypatch.setattr(sender, "preflight", lambda ident: (True, False))
+    monkeypatch.setattr(SmtpTransport, "_secret", lambda self: "fake-secret")
+    monkeypatch.setattr(SmtpTransport, "_connect",
+                        lambda self, timeout: PartialSMTP())
+
+
+def test_partial_refusal_is_a_failed_receipt_naming_who_got_it(
+    tmp_path, monkeypatch,
+):
+    """Codex repro "partial-refusal result": one of two addressees is
+    refused with a 550 — the old receipt said ok=True to both."""
+    _smtp_default_identity(tmp_path, monkeypatch, refused={
+        "refused@example.org": (550, b"5.1.1 no such user"),
+    })
+    res = sender.send_email(
+        to="accepted@example.org, refused@example.org",
+        subject="isolated partial delivery", body="test",
+    )
+    assert res.ok is False
+    assert res.code == "partial_delivery"
+    assert res.refused == {"refused@example.org": "550 5.1.1 no such user"}
+    # the self-Bcc copy was accepted too, and is listed as such
+    assert res.accepted == ["accepted@example.org", "sender@example.org"]
+    assert res.message_id                       # it DID go out to `accepted`
+    assert res.to == ["accepted@example.org", "refused@example.org"]
+    assert "[review/smtp]" in res.error
+    assert "refused@example.org (550 5.1.1 no such user)" in res.error
+
+
+def test_refused_self_copy_is_reported_but_does_not_fail_the_send(
+    tmp_path, monkeypatch,
+):
+    """The auto Bcc-to-self is a record, not a delivery: the server
+    refusing only that copy leaves the send ok, with the refusal on the
+    receipt for honesty."""
+    _smtp_default_identity(tmp_path, monkeypatch, refused={
+        "sender@example.org": (452, b"4.2.2 mailbox full"),
+    })
+    res = sender.send_email(to="accepted@example.org", subject="s", body="b")
+    assert res.ok is True and res.code is None and res.error is None
+    assert res.accepted == ["accepted@example.org"]
+    assert res.refused == {"sender@example.org": "452 4.2.2 mailbox full"}
+
+    # …but addressed To: myself, my own address IS an intended recipient
+    _smtp_default_identity(tmp_path, monkeypatch, refused={
+        "sender@example.org": (452, b"4.2.2 mailbox full"),
+    })
+    res = sender.send_email(to="sender@example.org", subject="s", body="b")
+    assert res.ok is False and res.code == "partial_delivery"

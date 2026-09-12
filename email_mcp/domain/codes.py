@@ -75,6 +75,7 @@ CREDENTIALS_UNAVAILABLE = "credentials_unavailable"
 IDENTITY_MISCONFIGURED = "identity_misconfigured"
 UNKNOWN_IDENTITY = "unknown_identity"
 DRAFT_UNSUPPORTED = "draft_unsupported"
+PARTIAL_DELIVERY = "partial_delivery"
 
 SEND_CODES_V011 = frozenset({
     HEADER_INJECTION, INVALID_RECIPIENT, RECIPIENT_NOT_ALLOWED,

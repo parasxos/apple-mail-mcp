@@ -137,6 +137,17 @@ EXPECTED_SKIPS = frozenset({
     # body-gap fix (2026-08-06): declared provenance on backfilled bodies
     "get_email.email.body_source",
     "get_emails_batch.emails[].body_source",
+    # partial refusal (2026-09-12): the receipt and the manifest carry
+    # envelope truth — accepted, refused, and the partial_delivery code
+    "send_email.accepted",
+    "send_email.refused",
+    "send_email.code",
+    "reply_email.accepted",
+    "reply_email.refused",
+    "reply_email.code",
+    "schedule_email.accepted",
+    "schedule_email.refused",
+    "schedule_email.code",
 })
 
 # oracle keys whose ABSENCE from the derived shape is expected (see above)
@@ -152,6 +163,17 @@ _WAIVED_ADDED = frozenset({
     # provenance — additive on the full view only
     "get_email.email.body_source",
     "get_emails_batch.emails[].body_source",
+    # partial refusal (2026-09-12): envelope truth on the send receipts
+    # and the scheduled-mail manifest — see docs/reference.md
+    "send_email.accepted",
+    "send_email.refused",
+    "send_email.code",
+    "reply_email.accepted",
+    "reply_email.refused",
+    "reply_email.code",
+    "schedule_email.accepted",
+    "schedule_email.refused",
+    "schedule_email.code",
 })
 
 
