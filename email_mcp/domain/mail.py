@@ -42,17 +42,45 @@ class EmailRef:
     thread_id: str
 
 
+class Headers(dict):
+    """Parsed message headers: keyed by wire spelling (what the caller
+    sees), looked up case-insensitively (RFC 5322 field names are). A
+    `reply-to` written lowercase routes a reply exactly like `Reply-To`."""
+
+    def __getitem__(self, name: str) -> str:
+        for k, v in self.items():
+            if k.lower() == name.lower():
+                return v
+        raise KeyError(name)
+
+    def get(self, name: str, default=None):
+        try:
+            return self[name]
+        except KeyError:
+            return default
+
+    def __contains__(self, name) -> bool:
+        return self.get(name) is not None
+
+
 @dataclass(frozen=True)
 class Email:
     """A complete message returned by a mailbox source."""
 
     ref: EmailRef
-    headers: dict[str, str]
+    headers: dict[str, str]  # the wire shape; a Headers at runtime
     body_text: str
     body_html: str
     attachments: list[AttachmentRef]
     flags: dict[str, bool]
     body_source: str | None = None
+
+    def __post_init__(self) -> None:
+        # Every source hands over a plain dict; the type stamps the
+        # lookup rule so no consumer can spell its way past it. The
+        # annotation stays dict[str, str]: that is what the MCP output
+        # schema is derived from, and what the caller receives.
+        object.__setattr__(self, "headers", Headers(self.headers))
 
 
 @dataclass(frozen=True)

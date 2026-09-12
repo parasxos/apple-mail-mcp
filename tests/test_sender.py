@@ -354,6 +354,44 @@ def test_reply_threads_and_prefixes_subject(monkeypatch, mail_fixture, capture_d
     assert "stefan.schlenker@cern.ch" in msg["To"]
 
 
+def test_reply_honors_lowercase_and_mixed_case_header_names(
+    monkeypatch, mail_fixture, capture_delivery
+):
+    """RFC 5322 field names are case-insensitive; a store that spells them
+    `reply-to` / `message-id` / `REFERENCES` must route and thread the
+    reply exactly as the canonical spelling does (Codex delivery repro
+    "lowercase-header reply"). Wire spelling is kept for the caller."""
+    monkeypatch.setenv("EMAIL_MCP_SEND_ALLOW_ALL", "1")
+    from email_mcp.sources.apple_mail import AppleMailSource
+
+    rfc = textwrap.dedent("""\
+        From: Stefan Schlenker <stefan.schlenker@cern.ch>
+        To: Paris Moschovakos <paris.moschovakos@cern.ch>
+        subject: I2C disclosure on April 20
+        reply-to: dcs-support@cern.ch
+        message-id: <i2c-2026-05-01@cern.ch>
+        REFERENCES: <ancestor@cern.ch>
+        Content-Type: text/plain; charset=utf-8
+
+        Paris, please answer via support.
+    """).encode()
+    emlx = (mail_fixture / "AAAAAAAA-0000-0000-0000-000000000001" / "Inbox.mbox"
+            / "CCCCCCCC-0000-0000-0000-000000000003" / "Data" / "Messages"
+            / "100.emlx")
+    emlx.write_bytes(f"{len(rfc):<10}\n".encode() + rfc)
+
+    src = AppleMailSource(mail_base=mail_fixture)
+    assert list(src.get("100").headers)[2:6] == [
+        "subject", "reply-to", "message-id", "REFERENCES"]
+    res = sender.reply_email(src, id="100", body="Understood.")
+    assert res.ok is True
+    msg = capture_delivery[0]
+    assert msg["To"] == "dcs-support@cern.ch"
+    assert msg["In-Reply-To"] == "<i2c-2026-05-01@cern.ch>"
+    assert msg["References"] == "<ancestor@cern.ch> <i2c-2026-05-01@cern.ch>"
+    assert msg["Subject"] == "Re: I2C disclosure on April 20"
+
+
 def test_reply_all_ccs_original_recipients_minus_self(monkeypatch, mail_fixture, capture_delivery):
     monkeypatch.setenv("EMAIL_MCP_SEND_ALLOW_ALL", "1")
     from email_mcp.sources.apple_mail import AppleMailSource

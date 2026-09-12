@@ -32,6 +32,7 @@ import argparse
 import json
 import os
 import sys
+import tempfile
 import time
 import urllib.error
 import urllib.parse
@@ -249,15 +250,17 @@ def _token_path(ident) -> Path:
 
 
 def _write_cache(path: Path, data: dict) -> None:
-    """Atomic 0600 rewrite: create the temp file already-restrictive (no
-    0644 window), then rename over the live cache."""
-    tmp = path.with_name(path.name + ".tmp")
-    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    """Atomic 0600 rewrite: a temp file of its own per writer (the
+    server, dispatcher and fts agent refresh concurrently — a shared
+    name would interleave their bytes), created already-restrictive (no
+    0644 window), then renamed over the live cache."""
+    fd, tmp = tempfile.mkstemp(
+        dir=path.parent, prefix=path.name + ".", suffix=".tmp")
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as f:
             json.dump(data, f, indent=2)
     except BaseException:
-        tmp.unlink(missing_ok=True)
+        os.unlink(tmp)
         raise
     os.replace(tmp, path)
     path.chmod(0o600)

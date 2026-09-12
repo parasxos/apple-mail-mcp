@@ -18,6 +18,7 @@ import email.policy
 import json
 import os
 import stat
+import threading
 import time
 from datetime import datetime, timedelta, timezone
 
@@ -161,6 +162,46 @@ def test_token_refresh_rewrites_cache_atomically_0600(monkeypatch):
     assert _mode(path) == 0o600
     assert _mode(path.parent) == 0o700
     assert list(path.parent.glob("*.tmp")) == []  # tmp+rename left no debris
+
+
+def test_write_cache_concurrent_writers_never_corrupt_the_cache(
+    monkeypatch, tmp_path
+):
+    """Two refreshes overlapping (server + dispatcher, say) each write
+    their own temp file: both succeed, the live cache is one writer's
+    complete payload, and no temp debris survives (Codex storage repro
+    CONCURRENT_TOKEN_CACHE — a shared .tmp interleaved bytes and lost
+    the rename)."""
+    path = tmp_path / "cern.token.json"
+    long_payload = {"access_token": "A" * 900, "refresh_token": "ra"}
+    short_payload = {"access_token": "b", "refresh_token": "rb"}
+    both_open = threading.Barrier(2, timeout=5)
+    real_dump = json.dump
+
+    def interleaved_dump(data, stream, **kw):
+        both_open.wait()  # both temp files exist before either is written
+        real_dump(data, stream, **kw)
+
+    failures: list[str] = []
+
+    def write(payload):
+        try:
+            graph._write_cache(path, payload)
+        except Exception as e:
+            failures.append(type(e).__name__)
+
+    monkeypatch.setattr(graph.json, "dump", interleaved_dump)
+    threads = [threading.Thread(target=write, args=(p,))
+               for p in (long_payload, short_payload)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=5)
+
+    assert failures == []
+    assert json.loads(path.read_text()) in (long_payload, short_payload)
+    assert _mode(path) == 0o600
+    assert list(tmp_path.glob("*.tmp")) == []
 
 
 def test_token_refresh_keeps_old_refresh_token_when_none_returned(
