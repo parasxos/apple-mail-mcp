@@ -7,7 +7,6 @@ from __future__ import annotations
 
 import os
 import subprocess
-import sys
 from pathlib import Path
 
 from . import config, spool, state
@@ -25,30 +24,10 @@ def log_path() -> Path:
 
 
 def plist_content() -> str:
-    path = os.environ.get("PATH", "/usr/bin:/bin:/usr/sbin:/sbin")
-    return f"""<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-<dict>
-    <key>Label</key><string>{LAUNCHD_LABEL}</string>
-    <key>ProgramArguments</key>
-    <array>
-        <string>{sys.executable}</string>
-        <string>-m</string>
-        <string>email_mcp.dispatcher</string>
-    </array>
-    <key>EnvironmentVariables</key>
-    <dict>
-        <key>PATH</key><string>{path}</string>
-    </dict>
-    <key>StartInterval</key><integer>60</integer>
-    <key>RunAtLoad</key><true/>
-    <key>ProcessType</key><string>Background</string>
-    <key>StandardOutPath</key><string>{log_path()}</string>
-    <key>StandardErrorPath</key><string>{log_path()}</string>
-</dict>
-</plist>
-"""
+    return config.launchd_plist(
+        LAUNCHD_LABEL, ["email_mcp.dispatcher"], log_path(),
+        StartInterval=60, RunAtLoad=True,
+    )
 
 
 def _remove_legacy_plists() -> list[str]:

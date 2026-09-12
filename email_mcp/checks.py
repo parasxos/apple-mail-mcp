@@ -233,7 +233,8 @@ def _plist_equivalent(installed: str, rendered: str) -> bool:
     those two fields: the interpreter must be a live python that carries
     this package (an `email-mcp` sibling, or this very interpreter by
     realpath); PATH is whatever shell installed it. Everything else —
-    args, schedule, label, ProcessType — must still match the render."""
+    args, schedule, label, ProcessType, the EMAIL_MCP_* settings the
+    agent runs under — must still match the render."""
     try:
         a = plistlib.loads(installed.encode("utf-8"))
         b = plistlib.loads(rendered.encode("utf-8"))
