@@ -286,6 +286,21 @@ def test_another_seats_plist_is_not_drift(home, writer):
     assert _finding(checks.PLIST_DRIFT) is None
 
 
+def test_bare_seat_leaves_installed_settings_alone(home, writer,
+                                                   monkeypatch):
+    """Codex F10: the plist carries the installing seat's EMAIL_MCP_*
+    settings. Doctor from a seat without any (a bare shell) must not read
+    them as drift — `--fix` would re-render the agent onto the default
+    tree and lose the configured root."""
+    from email_mcp import dispatcher
+
+    plist = dispatcher._plist_path()
+    plist.write_text(dispatcher._plist_content())  # installed with a root set
+    monkeypatch.delenv("EMAIL_MCP_STATE_DIR")
+    assert _finding(checks.PLIST_DRIFT) is None
+    assert "EMAIL_MCP_STATE_DIR" in plist.read_text()
+
+
 def test_dead_interpreter_and_drifted_schedule_are_drift(home, writer):
     """The teeth the seat-tolerance must not lose: an interpreter path
     that no longer exists (the moved-venv case the check was born for),

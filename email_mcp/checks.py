@@ -232,9 +232,12 @@ def _plist_equivalent(installed: str, rendered: str) -> bool:
     precondition unsatisfiable, found live 2026-08-03). Exempt exactly
     those two fields: the interpreter must be a live python that carries
     this package (an `email-mcp` sibling, or this very interpreter by
-    realpath); PATH is whatever shell installed it. Everything else —
-    args, schedule, label, ProcessType, the EMAIL_MCP_* settings the
-    agent runs under — must still match the render."""
+    realpath); PATH is whatever shell installed it; the EMAIL_MCP_*
+    block, and the log paths the render derives from it, are judged only
+    by a seat that carries settings of its own — a bare shell has no say
+    over the installed ones, or `doctor --fix` from it would re-render
+    the agent onto the default tree. Everything else — args, schedule,
+    label, ProcessType — must still match the render."""
     try:
         a = plistlib.loads(installed.encode("utf-8"))
         b = plistlib.loads(rendered.encode("utf-8"))
@@ -252,9 +255,16 @@ def _plist_equivalent(installed: str, rendered: str) -> bool:
     if not ((interp.parent / "email-mcp").exists()
             or os.path.realpath(interp) == os.path.realpath(sys.executable)):
         return False
-    (a.get("EnvironmentVariables") or {}).pop("PATH", None)
-    (b.get("EnvironmentVariables") or {}).pop("PATH", None)
-    return a == b
+    env_a = a.pop("EnvironmentVariables", None) or {}
+    env_b = b.pop("EnvironmentVariables", None) or {}
+    env_a.pop("PATH", None)
+    env_b.pop("PATH", None)
+    if not env_b:
+        for doc in (a, b):
+            doc.pop("StandardOutPath", None)
+            doc.pop("StandardErrorPath", None)
+        return a == b
+    return a == b and env_a == env_b
 
 
 def _probe_plist_drift(reader: StateReader) -> Finding | None:
