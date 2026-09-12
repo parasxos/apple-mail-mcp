@@ -491,7 +491,7 @@ def reply_email(
     ident = identities.get(from_identity)
     original = source.get(id)  # Email dataclass
     headers = original.headers
-    orig_msgid = headers.get("Message-ID") or headers.get("Message-Id") or ""
+    orig_msgid = headers.get("Message-ID", "")
     orig_refs = headers.get("References", "")
     # Store-supplied value: sanitize, don't refuse (provenance rule) — a
     # hostile subject in the mailbox must not make the message unanswerable.
