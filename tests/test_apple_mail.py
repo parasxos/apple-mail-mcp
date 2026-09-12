@@ -320,3 +320,117 @@ def test_parse_emlx_survives_a_header_that_crashes_cpython(tmp_path):
     assert "The body still matters." in parsed["body_text"]
     assert parsed["headers"]["Subject"] == "hostile message-id"
     assert "54f4c5ade" in parsed["headers"]["Message-ID"]  # raw, served
+
+
+# --------------------------------------------------------------------- #
+# attachments — the sender never names a path, attached mail stays mail #
+# --------------------------------------------------------------------- #
+
+
+def _replace_emlx(mail_fixture, rowid, msg):
+    from conftest import _make_emlx
+    next(mail_fixture.rglob(f"{rowid}.emlx")).write_bytes(_make_emlx(msg.as_bytes()))
+
+
+def test_get_attachment_filename_never_names_a_path(
+        mail_fixture, tmp_path, monkeypatch):
+    """Codex storage_repro ATTACHMENT_ABSOLUTE_PATH (2026-09-12): the
+    sender's MIME filename was joined onto the extraction dir, so an
+    absolute name discarded the dir and overwrote the victim, and `../`
+    escaped it. The local name is generated; the sender's stays in
+    `blob.name` as display metadata."""
+    from email.message import EmailMessage
+    from pathlib import Path
+
+    atts = tmp_path / "atts"
+    monkeypatch.setenv("EMAIL_MCP_ATTACH_DIR", str(atts))
+    victim = tmp_path / "outside-extraction-root.txt"
+    victim.write_text("original harmless fixture")
+    src = AppleMailSource(mail_base=mail_fixture)
+    cases = {
+        str(victim): "outside-extraction-root.txt",
+        "../../outside-extraction-root.txt": "outside-extraction-root.txt",
+        "..": "attachment",
+        ".hidden": "hidden",
+    }
+    for hostile, local in cases.items():
+        msg = EmailMessage()
+        msg.set_content("outer body")
+        msg.add_attachment(b"replaced by attachment", maintype="application",
+                           subtype="octet-stream", filename=hostile)
+        _replace_emlx(mail_fixture, 101, msg)
+        att = src.get("101").attachments[0]
+        blob = src.attachment("101", att.attachment_id)
+        out = Path(blob.path)
+        assert out.is_relative_to(atts)
+        assert out.name == local
+        assert out.read_bytes() == b"replaced by attachment"
+        assert blob.name == hostile
+    assert victim.read_text() == "original harmless fixture"
+
+
+def test_get_attachment_refuses_to_write_through_a_symlink(
+        mail_fixture, tmp_path, monkeypatch):
+    """A symlink planted at the (predictable) target path must not be
+    followed: the write is refused and the link's target untouched."""
+    from pathlib import Path
+
+    import pytest
+
+    monkeypatch.setenv("EMAIL_MCP_ATTACH_DIR", str(tmp_path / "atts"))
+    victim = tmp_path / "victim.txt"
+    victim.write_text("untouched")
+    src = AppleMailSource(mail_base=mail_fixture)
+    att_id = src.get("101").attachments[0].attachment_id
+    target = Path(src.attachment("101", att_id).path)
+    target.unlink()
+    target.symlink_to(victim)
+    with pytest.raises(OSError):
+        src.attachment("101", att_id)
+    assert victim.read_text() == "untouched"
+
+
+def test_attached_message_is_an_attachment_not_body(
+        mail_fixture, tmp_path, monkeypatch):
+    """Codex storage_repro RFC822_ATTACHMENT (2026-09-12): a message/rfc822
+    part is multipart under Python's model, so the walkers descended into
+    it — the attached mail vanished from the list and its text merged
+    into the enclosing body. It is one attachment, materialised as .eml."""
+    import email
+    import email.policy
+    from email.message import EmailMessage
+    from pathlib import Path
+
+    monkeypatch.setenv("EMAIL_MCP_ATTACH_DIR", str(tmp_path / "atts"))
+    outer = EmailMessage()
+    outer.set_content("outer body only")
+    inner = EmailMessage()
+    inner["Subject"] = "attached message"
+    inner.set_content("attached body should be downloadable")
+    outer.add_attachment(inner, filename="forwarded.eml")
+    _replace_emlx(mail_fixture, 101, outer)
+
+    src = AppleMailSource(mail_base=mail_fixture)
+    m = src.get("101")
+    assert [(a.name, a.mime) for a in m.attachments] == [
+        ("forwarded.eml", "message/rfc822")]
+    assert "outer body only" in m.body_text
+    assert "attached body should be downloadable" not in m.body_text
+
+    blob = src.attachment("101", m.attachments[0].attachment_id)
+    assert blob.name == "forwarded.eml"
+    assert blob.mime == "message/rfc822"
+    saved = email.message_from_bytes(Path(blob.path).read_bytes(),
+                                     policy=email.policy.default)
+    assert saved["Subject"] == "attached message"
+    assert "attached body should be downloadable" in saved.get_content()
+
+    # Without a filename the attached message still gets an .eml name.
+    outer = EmailMessage()
+    outer.set_content("outer body only")
+    outer.add_attachment(inner)
+    _replace_emlx(mail_fixture, 101, outer)
+    m = src.get("101")
+    assert [(a.name, a.mime) for a in m.attachments] == [
+        ("attachment-1.eml", "message/rfc822")]
+    assert "attached body should be downloadable" not in m.body_text

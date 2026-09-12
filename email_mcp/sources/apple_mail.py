@@ -672,8 +672,14 @@ class AppleMailSource:
         digest.update(part["name"].encode("utf-8"))
         base = attach_dir() / f"{rowid}-{digest.hexdigest()[:12]}"
         base.mkdir(parents=True, exist_ok=True)
-        out = base / part["name"]
-        out.write_bytes(part["bytes"])
+        # The sender's filename is display metadata (AttachmentBlob.name);
+        # on disk the name is generated, so no MIME filename can name a
+        # path. O_NOFOLLOW: a symlink planted at the target is refused by
+        # the kernel (ELOOP) instead of written through.
+        out = base / _local_name(part["name"])
+        fd = os.open(out, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o644)
+        with os.fdopen(fd, "wb") as f:
+            f.write(part["bytes"])
         return AttachmentBlob(
             name=part["name"],
             mime=part["mime"],
@@ -901,40 +907,23 @@ def _parse_emlx(path: Path, max_body: int) -> dict:
     body_html_parts: list[str] = []
     attachments: list[AttachmentRef] = []
 
-    counter = [0]  # for attachments with no Content-ID
-
-    def walk(part: email.message.Message, path_id: str) -> None:
-        ctype = (part.get_content_type() or "").lower()
-        disp = (part.get("Content-Disposition") or "").lower()
-        is_attachment = "attachment" in disp or (
-            part.get_filename() is not None and ctype not in ("text/plain", "text/html")
-        )
-
-        if part.is_multipart():
-            for i, sub in enumerate(part.iter_parts(), start=1):
-                walk(sub, f"{path_id}.{i}" if path_id else str(i))
-            return
-
-        if is_attachment:
-            counter[0] += 1
-            name = part.get_filename() or f"attachment-{counter[0]}"
-            payload = part.get_payload(decode=True) or b""
+    for path_id, part, att in _walk(msg):
+        if att is not None:
+            name, mime, payload = att
             attachments.append(
                 AttachmentRef(
                     name=name,
-                    mime=ctype or None,
+                    mime=mime,
                     size=len(payload),
-                    attachment_id=path_id or str(counter[0]),
+                    attachment_id=path_id,
                 )
             )
-            return
-
+            continue
+        ctype = part.get_content_type()
         if ctype == "text/plain":
             body_text_parts.append(_decode_part_text(part))
         elif ctype == "text/html":
             body_html_parts.append(_decode_part_text(part))
-
-    walk(msg, "")
 
     body_text = "\n\n".join(s for s in body_text_parts if s)
     body_html = "\n\n".join(s for s in body_html_parts if s)
@@ -959,27 +948,51 @@ def _parse_emlx_parts(path: Path) -> dict[str, dict]:
     raw = _read_emlx_bytes(path)
     msg = email.message_from_bytes(raw, policy=email.policy.default)
     out: dict[str, dict] = {}
-    counter = [0]
-
-    def walk(part: email.message.Message, path_id: str) -> None:
-        if part.is_multipart():
-            for i, sub in enumerate(part.iter_parts(), start=1):
-                walk(sub, f"{path_id}.{i}" if path_id else str(i))
-            return
-        ctype = (part.get_content_type() or "").lower()
-        disp = (part.get("Content-Disposition") or "").lower()
-        is_attachment = "attachment" in disp or (
-            part.get_filename() is not None and ctype not in ("text/plain", "text/html")
-        )
-        if not is_attachment:
-            return
-        counter[0] += 1
-        payload = part.get_payload(decode=True) or b""
-        out[path_id or str(counter[0])] = {
-            "bytes": payload,
-            "name": part.get_filename() or f"attachment-{counter[0]}",
-            "mime": ctype or "application/octet-stream",
-        }
-
-    walk(msg, "")
+    for path_id, _part, att in _walk(msg):
+        if att is not None:
+            name, mime, payload = att
+            out[path_id] = {"bytes": payload, "name": name, "mime": mime}
     return out
+
+
+def _walk(msg: email.message.Message):
+    """Depth-first (path_id, part, attachment) over a parsed message — the
+    one place that decides what an attachment is. `attachment` is
+    (name, mime, bytes), or None for body content. A message/rfc822 part
+    is decided BEFORE descending: it is one attachment serialised as .eml
+    and never walked into, so a forwarded message neither vanishes from
+    the list nor bleeds its text into the enclosing body."""
+    n = 0  # numbers attachments that carry no filename
+
+    def visit(part: email.message.Message, path_id: str):
+        nonlocal n
+        ctype = part.get_content_type()
+        disp = (part.get("Content-Disposition") or "").lower()
+        filename = part.get_filename()
+        if ctype == "message/rfc822":
+            n += 1
+            name = filename or f"attachment-{n}.eml"
+            yield path_id or str(n), part, (name, ctype, part.get_payload(0).as_bytes())
+        elif part.is_multipart():
+            for i, sub in enumerate(part.iter_parts(), start=1):
+                yield from visit(sub, f"{path_id}.{i}" if path_id else str(i))
+        elif "attachment" in disp or (
+            filename is not None and ctype not in ("text/plain", "text/html")
+        ):
+            n += 1
+            name = filename or f"attachment-{n}"
+            payload = part.get_payload(decode=True) or b""
+            yield path_id or str(n), part, (name, ctype, payload)
+        else:
+            yield path_id, part, None
+
+    yield from visit(msg, "")
+
+
+def _local_name(name: str) -> str:
+    """The on-disk name for an attachment, generated from the sender's
+    filename: basename only, word characters plus `.` and `-`, no leading
+    dot, at most 60 characters, "attachment" when nothing survives. No
+    input yields a name that resolves outside its directory."""
+    base = re.sub(r"[^\w.-]+", "_", name.replace("\\", "/").rsplit("/", 1)[-1])
+    return base.lstrip(".")[:60] or "attachment"

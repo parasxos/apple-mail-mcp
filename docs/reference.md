@@ -331,7 +331,7 @@ MCP wire revisions too, so existing stdio registrations do not need to change.
 | `get_thread(thread_id)` | All messages in the conversation, oldest first. |
 | `list_mailboxes()` | Every mailbox across every account, with counts. |
 | `list_recent(mailbox?, account?, limit?)` | Newest messages first. |
-| `get_attachment(id, attachment_id)` | Materialises the attachment to a tmp file; returns the path. |
+| `get_attachment(id, attachment_id)` | Materialises the attachment to a tmp file; returns the path. The file is written under a generated local name inside `EMAIL_MCP_ATTACH_DIR`; `name` carries the sender's filename as metadata only. An attached message (`message/rfc822`) is listed as one attachment and materialises as `.eml`. |
 | `refresh_mail(wait_seconds=5, timeout_seconds=30)` | Asks Mail.app to fetch new mail, waits, returns before/after snapshot + delta count. Launches Mail.app if it isn't running. Needs Automation permission (see above). |
 | `send_email(to, subject, body, cc?, bcc?, attachments?, from_identity?)` | Compose and send. Comma-separated address strings. `attachments` = list of local file paths (each entry ONE path), attached with guessed MIME types; total capped at `EMAIL_MCP_MAX_ATTACH_MB` (default 20). `from_identity` picks the sending identity (see [Identities & transports](#identities--transports)). Auto Bcc-to-self. A declared allowlist applies per identity. Returns `{ok, message_id, to, cc, bcc, subject, attachments}` or `{ok: false, error}`. |
 | `reply_email(id, body, reply_all?, cc?, bcc?, include_history?, attachments?, from_identity?)` | Reply with correct `In-Reply-To` / `References`, optional reply-all, quoted history and attachments. |
