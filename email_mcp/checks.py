@@ -261,10 +261,40 @@ def _plist_equivalent(installed: str, rendered: str) -> bool:
     env_b.pop("PATH", None)
     if not env_b:
         for doc in (a, b):
-            doc.pop("StandardOutPath", None)
-            doc.pop("StandardErrorPath", None)
+            for key in _SEAT_PATHS:
+                doc.pop(key, None)
         return a == b
     return a == b and env_a == env_b
+
+
+_SEAT_PATHS = ("StandardOutPath", "StandardErrorPath")
+
+
+def _repair_content(installed: str, rendered: str) -> str:
+    """The replacement for a stale plist: this render, except that a seat
+    without settings of its own keeps the installed EMAIL_MCP_* block and
+    the log paths derived from it — the fields _plist_equivalent lets such
+    a seat leave unjudged. A dead interpreter is repaired where the agent
+    was installed, not moved onto the default tree (Codex F10 verification,
+    2026-09-12)."""
+    try:
+        a = plistlib.loads(installed.encode("utf-8"))
+        b = plistlib.loads(rendered.encode("utf-8"))
+    except Exception:
+        return rendered
+    if not isinstance(a, dict) or not isinstance(b, dict):
+        return rendered
+    env_b = b.get("EnvironmentVariables") or {}
+    if len(env_b) > (1 if "PATH" in env_b else 0):
+        return rendered  # this seat speaks for the settings
+    env_a = dict(a.get("EnvironmentVariables") or {})
+    if "PATH" in env_b:
+        env_a["PATH"] = env_b["PATH"]
+    b["EnvironmentVariables"] = env_a
+    for key in _SEAT_PATHS:
+        if key in a:
+            b[key] = a[key]
+    return plistlib.dumps(b).decode()
 
 
 def _probe_plist_drift(reader: StateReader) -> Finding | None:
@@ -289,7 +319,12 @@ def _repair_plist_drift(writer: StateWriter, f: Finding) -> list[plan.Action]:
     rows: list[plan.Action] = []
     for label, plist, content in _agents():
         if plist in f.paths:
-            rows += [plan.WriteFile(plist, content(), mode=0o644),
+            try:
+                installed = plist.read_text(encoding="utf-8")
+            except OSError:
+                installed = ""
+            rows += [plan.WriteFile(plist, _repair_content(installed, content()),
+                                    mode=0o644),
                      plan.BootstrapAgent(label, plist)]
     return rows
 

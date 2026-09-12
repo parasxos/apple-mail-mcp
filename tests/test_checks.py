@@ -301,6 +301,33 @@ def test_bare_seat_leaves_installed_settings_alone(home, writer,
     assert "EMAIL_MCP_STATE_DIR" in plist.read_text()
 
 
+def test_bare_seat_repairs_drift_without_moving_the_agent(home, writer,
+                                                           launchctl,
+                                                           monkeypatch):
+    """Codex F10 verification: genuine drift (a dead interpreter) repaired
+    from a bare shell must keep the installed EMAIL_MCP_* block and the
+    log paths derived from it — only the interpreter is replaced."""
+    import plistlib
+    import sys
+    from email_mcp import dispatcher
+
+    plist = dispatcher._plist_path()
+    doc = plistlib.loads(dispatcher._plist_content().encode())
+    installed_root = doc["EnvironmentVariables"]["EMAIL_MCP_STATE_DIR"]
+    doc["ProgramArguments"][0] = str(home / "gone" / "bin" / "python")
+    plist.write_bytes(plistlib.dumps(doc))
+    monkeypatch.delenv("EMAIL_MCP_STATE_DIR")
+
+    assert _finding(checks.PLIST_DRIFT) is not None
+    results = _fix(checks.PLIST_DRIFT)
+    assert all(r.ok for r in results)
+    repaired = plistlib.loads(plist.read_bytes())
+    assert repaired["ProgramArguments"][0] == sys.executable
+    assert repaired["EnvironmentVariables"]["EMAIL_MCP_STATE_DIR"] == installed_root
+    assert repaired["StandardOutPath"] == doc["StandardOutPath"]
+    assert _finding(checks.PLIST_DRIFT) is None
+
+
 def test_dead_interpreter_and_drifted_schedule_are_drift(home, writer):
     """The teeth the seat-tolerance must not lose: an interpreter path
     that no longer exists (the moved-venv case the check was born for),
