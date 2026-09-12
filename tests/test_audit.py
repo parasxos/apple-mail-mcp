@@ -348,6 +348,17 @@ def test_query_calendar_prefixes_span_their_period(audit_dir_guard):
     assert _ops(since="2026-02-28", until="2026-02-28") == ["feb_last"]
 
 
+@pytest.mark.parametrize("bound", ["2026-00", "2026-09-00", "2026-09-31",
+                                   "2026-13"])
+def test_bound_with_impossible_calendar_value_is_rejected(bound):
+    """An explicit 00 is not an omitted component: it names no date
+    (Codex verification, 2026-09-12)."""
+    from email_mcp.domain import ids
+
+    with pytest.raises(ValueError):
+        ids.bound_interval(bound)
+
+
 def test_cli_rejects_malformed_bound(audit_dir_guard, capsys):
     with pytest.raises(SystemExit) as exc:
         audit.main(["--since", "2026-13"])

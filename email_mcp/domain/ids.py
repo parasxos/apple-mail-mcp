@@ -60,11 +60,14 @@ def bound_interval(value: str) -> tuple[datetime, datetime]:
                 "(prefixes allowed, e.g. 2026-07 or 2026-07-29)"
             )
         return instant, instant
-    year, month, day = (int(g) if g else 0 for g in match.groups())
-    start = datetime(year, month or 1, day or 1, tzinfo=timezone.utc)
-    if day:
+    year, month, day = (None if g is None else int(g) for g in match.groups())
+    # datetime() is the calendar validator: 2026-00 and 2026-09-31 raise
+    # here as ValueError like any other malformed bound.
+    start = datetime(year, 1 if month is None else month,
+                     1 if day is None else day, tzinfo=timezone.utc)
+    if day is not None:
         end = start + timedelta(days=1)
-    elif month:
+    elif month is not None:
         end = datetime(year + month // 12, month % 12 + 1, 1, tzinfo=timezone.utc)
     else:
         end = datetime(year + 1, 1, 1, tzinfo=timezone.utc)
