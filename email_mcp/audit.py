@@ -28,9 +28,10 @@ import fcntl
 import json
 import os
 import re
-from datetime import datetime
 
 from . import config, ids, state
+from .application.background import parse_timestamp
+from .application.operations import bound_interval
 from .log import get_logger
 
 _log = get_logger()
@@ -224,15 +225,6 @@ def _fit(record: dict) -> bytes:
 # ---------------------------------------------------------------------- #
 
 
-def _bound(value) -> str | None:
-    """Normalize a since/until bound to an ISO string (prefixes allowed)."""
-    if value is None:
-        return None
-    if isinstance(value, datetime):
-        return ids.iso(value)
-    return str(value)
-
-
 def query(
     since=None,
     until=None,
@@ -246,12 +238,18 @@ def query(
     "skipped_lines"}.
 
     since/until are ISO-8601 strings, prefixes allowed and inclusive
-    ("2026-07" means the whole month); they also prune monthly files by
-    name before any line is read. Torn or corrupt lines are counted and
-    skipped, never fatal. limit is clamped to 1..500. An absent ledger
-    directory is simply empty — read paths never create it.
+    ("2026-07" means the whole month); any offset is normalized to UTC
+    before comparing, so equivalent bounds select the same events. The
+    bounds also prune monthly files by name before any line is read.
+    Torn or corrupt lines are counted and skipped, never fatal. limit is
+    clamped to 1..500. An absent ledger directory is simply empty — read
+    paths never create it.
     """
-    since, until = _bound(since), _bound(until)
+    # Each bound is the closed UTC interval it denotes; since keeps its
+    # first instant, until its last. Malformed strings raise ValueError —
+    # the tool boundary has already coded them as invalid_input.
+    first = bound_interval(since)[0] if since else None
+    last = bound_interval(until)[1] if until else None
     try:
         limit = int(limit)
     except (TypeError, ValueError):
@@ -268,10 +266,11 @@ def query(
     for path in sorted(root.iterdir()):
         if not _MONTH_FILE.fullmatch(path.name):
             continue
+        # Files are named by the same slice of the event's UTC stamp.
         month = path.name[:7]
-        if since and month < since[:7]:
+        if first and month < ids.iso(first)[:7]:
             continue
-        if until and month > until[:7]:
+        if last and month > ids.iso(last)[:7]:
             continue
         try:
             text = path.read_text(encoding="utf-8", errors="replace")
@@ -290,11 +289,10 @@ def query(
             if not isinstance(rec, dict):
                 skipped += 1
                 continue
-            ts = str(rec.get("ts", ""))
-            if since and ts < since:
-                continue
-            if until and ts[: len(until)] > until:
-                continue
+            if first or last:
+                ts = parse_timestamp(rec.get("ts"))
+                if ts is None or (first and ts < first) or (last and ts > last):
+                    continue
             if tool is not None and rec.get("tool") != tool:
                 continue
             if event is not None and rec.get("event") != event:
@@ -345,6 +343,15 @@ def _print_status() -> None:
         print("last event: -")
 
 
+def _iso_bound(value: str) -> str:
+    """argparse type: reject a malformed bound at the CLI boundary."""
+    try:
+        bound_interval(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(str(exc)) from None
+    return value
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         prog="email_mcp.audit",
@@ -353,8 +360,10 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--tail", type=int, default=None, metavar="N",
                         help="print the last N events, oldest first")
     parser.add_argument("--since", default=None, metavar="ISO",
+                        type=_iso_bound,
                         help="lower bound; ISO-8601 prefixes OK (2026-07)")
     parser.add_argument("--until", default=None, metavar="ISO",
+                        type=_iso_bound,
                         help="upper bound, inclusive prefix (2026-07-29)")
     parser.add_argument("--tool", default=None, help="filter by tool name")
     parser.add_argument("--event", default=None, help="filter by event name")
