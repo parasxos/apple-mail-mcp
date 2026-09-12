@@ -105,7 +105,7 @@ def test_unexpected_exception_returns_internal_error_and_logs_traceback(
 
 
 def test_triage_apply_belt_carries_plan_id_operation_id(monkeypatch):
-    from email_mcp import ids
+    from email_mcp.domain import ids
 
     monkeypatch.setattr(
         bootstrap, "_application", bootstrap.build_application(source=object())

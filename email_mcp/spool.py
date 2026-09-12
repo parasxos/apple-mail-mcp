@@ -42,7 +42,8 @@ from contextlib import contextmanager
 from dataclasses import asdict
 from pathlib import Path
 
-from . import config, ids, state
+from . import config, state
+from .domain import ids
 from .domain.errors import SpoolBusy
 from .domain.models import (
     IntegrityIssue,

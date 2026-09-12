@@ -44,7 +44,8 @@ import types
 import typing
 from datetime import datetime
 
-from . import codes, ids, state
+from . import codes, state
+from .domain import ids
 from .domain.errors import InvalidInput, MailUnavailable, NotFound, ToolError
 from .log import get_logger
 

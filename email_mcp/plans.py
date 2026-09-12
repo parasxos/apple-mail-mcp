@@ -17,7 +17,8 @@ from dataclasses import asdict
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-from . import audit, config, ids, state
+from . import audit, config, state
+from .domain import ids
 from .domain.models import Plan, PlanAction, PlanMessage
 
 STATUSES = ("draft", "applied", "failed", "expired")

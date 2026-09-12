@@ -2,9 +2,10 @@
 from __future__ import annotations
 
 import urllib.parse
-from datetime import datetime, timezone
+from datetime import datetime
 
 from ..domain.errors import InvalidInput
+from ..domain.ids import parse_timestamp
 from ..domain.mail import Email, EmailSource, SearchQuery
 from .models import EmailMetadata, EmailMinimal
 
@@ -14,16 +15,9 @@ PAGE_MAX = 500
 
 
 def parse_datetime(value: str | None) -> datetime | None:
-    if not value:
-        return None
-    try:
-        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
-    except ValueError as error:
-        raise ValueError(
-            f"invalid ISO datetime: {value!r} ({error})"
-        ) from error
-    if parsed.tzinfo is None:
-        parsed = parsed.replace(tzinfo=timezone.utc)
+    parsed = parse_timestamp(value)
+    if value and parsed is None:
+        raise ValueError(f"invalid ISO datetime: {value!r}")
     return parsed
 
 

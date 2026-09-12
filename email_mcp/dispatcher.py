@@ -14,8 +14,8 @@ from .application.background import (
     STALE_SENDING_MINUTES,
     is_due,
     is_stale,
-    parse_timestamp,
 )
+from .domain.ids import parse_timestamp
 
 LAUNCHD_LABEL = dispatcher_runtime.LAUNCHD_LABEL
 LEGACY_LABELS = dispatcher_runtime.LEGACY_LABELS

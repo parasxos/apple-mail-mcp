@@ -6,10 +6,11 @@ the safety rules that prevent local and Exchange delivery from racing.
 """
 from __future__ import annotations
 
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timedelta
 from ..domain import codes
 from ..domain.errors import SpoolBusy
 from ..domain.events import EventPublisher
+from ..domain.ids import parse_timestamp
 from ..domain.models import DeliveryReport, ScheduledEntry
 from .base import ApplicationService
 from .models import DispatchSummary
@@ -34,19 +35,6 @@ RECORD_HELD = (
     "graph: record held elsewhere (schedule or cancel in flight) — skipped"
 )
 SUPERSEDED = "graph: record moved before this pass owned it — skipped"
-
-
-def parse_timestamp(stamp: str | None) -> datetime | None:
-    """Parse stored timestamps defensively; naive legacy values mean UTC."""
-    if not stamp:
-        return None
-    try:
-        value = datetime.fromisoformat(stamp)
-    except (TypeError, ValueError):
-        return None
-    return value if value.tzinfo is not None else value.replace(
-        tzinfo=timezone.utc,
-    )
 
 
 def is_due(entry: ScheduledEntry, now: datetime) -> bool:

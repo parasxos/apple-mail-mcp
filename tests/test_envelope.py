@@ -11,7 +11,8 @@ from dataclasses import dataclass
 
 import pytest
 
-from email_mcp import codes, envelope, ids
+from email_mcp import codes, envelope
+from email_mcp.domain import ids
 from email_mcp.envelope import (
     InvalidInput, MailUnavailable, NotFound, ToolError,
 )
@@ -273,7 +274,7 @@ def test_minted_id_vocabulary_is_ascii():
     """\\d matches Unicode digits, but strftime mints only ASCII — an id
     claim written in another script is not ours and never threads onto
     the wire as operation_id."""
-    from email_mcp import ids
+    from email_mcp.domain import ids
 
     assert ids.is_minted_id("20260801T123456Z-abcdefabcdef")
     assert not ids.is_minted_id("\u0662\u0660\u0662\u0666\u0660\u0668"

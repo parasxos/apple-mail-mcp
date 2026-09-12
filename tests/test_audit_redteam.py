@@ -25,8 +25,9 @@ from pathlib import Path
 import pytest
 
 from email_mcp import (
-    audit, bootstrap, ids, plans, sender, server, spool, state, triage,
+    audit, bootstrap, plans, sender, server, spool, state, triage,
 )
+from email_mcp.domain import ids
 from email_mcp.plans import PlanAction
 from email_mcp.sources.base import SearchQuery
 
@@ -156,9 +157,8 @@ def _frozen_hammer(dir_str: str, frozen_iso: str, tag: str,
                    count: int) -> None:
     os.environ["EMAIL_MCP_STATE_DIR"] = str(Path(dir_str).parent)
     from email_mcp import audit as aud
-    from email_mcp import ids as idm
     frozen = datetime.fromisoformat(frozen_iso)
-    idm.utcnow = lambda: frozen  # freeze the clock THIS process reads
+    ids.utcnow = lambda: frozen  # freeze the clock THIS process reads
     for i in range(count):
         if aud.emit("send", outcome="sent",
                     detail={"tag": tag, "i": i}) is None:
@@ -166,10 +166,9 @@ def _frozen_hammer(dir_str: str, frozen_iso: str, tag: str,
 
 
 def _mint_ids(out_path: str, count: int) -> None:
-    from email_mcp import ids as idm
     with open(out_path, "w", encoding="utf-8") as f:
         for _ in range(count):
-            f.write(idm.new_id() + "\n")
+            f.write(ids.new_id() + "\n")
 
 
 def _f6_schedule_then_die(state_root: str, identities: str,

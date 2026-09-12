@@ -496,7 +496,8 @@ def check_audit() -> dict:
     is side-effect free; a probe event would be a lie in the ledger). An
     absent directory is a fresh install, not a fault: emit() creates it
     on the first mutation. Reports the last recorded event via tail(1)."""
-    from . import audit, ids
+    from . import audit
+    from .domain import ids
 
     root = config.audit_dir()  # a path question: doctor never creates
     if root.exists() and not root.is_dir():

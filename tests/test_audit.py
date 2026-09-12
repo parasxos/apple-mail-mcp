@@ -1,4 +1,4 @@
-"""Audit ledger core (email_mcp.audit + email_mcp.ids) — v0.10 S1.
+"""Audit ledger core (email_mcp.audit + email_mcp.domain.ids) — v0.10 S1.
 
 The autouse fixture below shadows conftest's adopted-tree guard: it pins
 only EMAIL_MCP_STATE_DIR, so emit's own adoption path (dir creation,
