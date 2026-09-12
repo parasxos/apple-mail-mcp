@@ -227,7 +227,7 @@ def test_list_scheduled_returns_healthy_siblings_but_fails_visibly():
 def test_dispatcher_delivers_healthy_sibling_and_reports_corruption(monkeypatch):
     sent: list[bytes] = []
     monkeypatch.setattr(sender, "_socket_alive", lambda: True)
-    monkeypatch.setattr(sender, "_deliver_bytes", lambda raw: sent.append(raw))
+    monkeypatch.setattr(sender, "_deliver_bytes", lambda raw: (sent.append(raw), {})[1])
     monkeypatch.setattr(MacOSNotifier, "notify", lambda *a, **k: None)
 
     due = _entry("dispatch-good")

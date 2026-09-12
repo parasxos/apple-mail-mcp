@@ -58,7 +58,7 @@ def delivered(monkeypatch):
     """Mock the byte-level transport; record what would have been sent."""
     sent: list[bytes] = []
     monkeypatch.setattr(sender, "_socket_alive", lambda: True)
-    monkeypatch.setattr(sender, "_deliver_bytes", sent.append)
+    monkeypatch.setattr(sender, "_deliver_bytes", lambda raw: (sent.append(raw), {})[1])
     monkeypatch.setattr(MacOSNotifier, "notify", lambda *a, **k: None)
     return sent
 

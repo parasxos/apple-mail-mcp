@@ -135,11 +135,7 @@ class BackgroundUseCases(ApplicationService):
         entry.attempts += 1
         entry.next_attempt_at = None
         entry.code = codes.PARTIAL_DELIVERY
-        entry.accepted, entry.refused = report.accepted, report.refused
-        entry.last_error = (
-            f"the server refused {report.refusals} — the message reached "
-            "the rest; resend to the refused addresses only"
-        )
+        entry.last_error = report.verdict
         self._queue.move(entry, "sending", "failed")
         self._notifier.notify(
             "email-mcp: send PARTIAL",
@@ -438,13 +434,13 @@ class BackgroundUseCases(ApplicationService):
             except BackgroundDeliveryError as error:
                 results[entry.id] = self._fail_or_retry(entry, str(error), now)
                 continue
+            entry.accepted, entry.refused = report.accepted, report.refused
             if report.partial:
                 results[entry.id] = self._park_partial(entry, report)
                 continue
             entry.delivered_at = self._clock.format(self._clock.now())
             entry.next_attempt_at = None
             entry.last_error = None
-            entry.accepted, entry.refused = report.accepted, report.refused
             self._queue.move(entry, "sending", "sent")
             self._event(
                 "deliver", "sent", operation_id=entry.id,

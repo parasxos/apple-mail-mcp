@@ -70,9 +70,17 @@ class DeliveryReport:
     partial: bool
 
     @property
-    def refusals(self) -> str:
-        """The refused recipients with their server lines, as prose."""
-        return ", ".join(f"{a} ({why})" for a, why in self.refused.items())
+    def verdict(self) -> str:
+        """The one sentence a partial refusal is reported with, on the
+        wire and in the spool alike — the lanes cannot disagree because
+        neither composes its own."""
+        refusals = ", ".join(
+            f"{a} ({why})" for a, why in self.refused.items()
+        )
+        return (
+            f"the server refused {refusals} — the message reached the "
+            "rest; resend to the refused addresses only"
+        )
 
 
 @dataclass

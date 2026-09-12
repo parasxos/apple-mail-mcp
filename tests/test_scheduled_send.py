@@ -31,7 +31,7 @@ def delivered(monkeypatch):
     """Mock the byte-level transport; record what would have been sent."""
     sent: list[bytes] = []
     monkeypatch.setattr(sender, "_socket_alive", lambda: True)
-    monkeypatch.setattr(sender, "_deliver_bytes", lambda raw: sent.append(raw))
+    monkeypatch.setattr(sender, "_deliver_bytes", lambda raw: (sent.append(raw), {})[1])
     monkeypatch.setattr(MacOSNotifier, "notify", lambda *a, **k: None)
     return sent
 
@@ -239,6 +239,7 @@ def test_overlapping_dispatcher_is_refused_while_a_pass_holds_the_spool(
         delivered.append(raw)
         if len(delivered) == 1:
             nested.append(dispatcher.run_once(now=overdue))
+        return {}
 
     monkeypatch.setattr(sender, "_deliver_bytes", deliver)
     summary = dispatcher.run_once(now=overdue)
@@ -431,6 +432,7 @@ def test_fire_time_envelope_uses_frozen_from_not_current_env(monkeypatch):
 
         def deliver(self, raw, mail_from, rcpt_to):
             seen.append((raw, mail_from, rcpt_to))
+            return {}
 
         def healthcheck(self):
             return {"ok": True}

@@ -727,7 +727,8 @@ def local_delivery(monkeypatch):
     Any append here from a graph test is a double-send alarm."""
     delivered: list[bytes] = []
     monkeypatch.setattr(sender, "_socket_alive", lambda: True)
-    monkeypatch.setattr(sender, "_deliver_bytes", delivered.append)
+    monkeypatch.setattr(sender, "_deliver_bytes",
+                        lambda raw: (delivered.append(raw), {})[1])
     monkeypatch.setattr(MacOSNotifier, "notify", lambda *a, **k: None)
     return delivered
 

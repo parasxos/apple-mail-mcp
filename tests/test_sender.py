@@ -29,8 +29,13 @@ def capture_delivery(monkeypatch):
     """Mock the transport so we can inspect the composed message and assert
     it never gets sent when the guard fires."""
     sent: list = []
+
+    def deliver(msg):
+        sent.append(msg)
+        return {}  # the transport's word: nothing refused
+
     monkeypatch.setattr(sender, "_socket_alive", lambda: True)
-    monkeypatch.setattr(sender, "_deliver", lambda msg: sent.append(msg))
+    monkeypatch.setattr(sender, "_deliver", deliver)
     return sent
 
 

@@ -136,16 +136,12 @@ def _deliver_bytes(raw: bytes) -> dict[str, str]:
     )
 
 
-def delivery_report(
-    raw: bytes, refused: dict[str, str] | None,
-) -> DeliveryReport:
+def delivery_report(raw: bytes, refused: dict[str, str]) -> DeliveryReport:
     """The one verdict on a transport's refusals, read off the frozen
     bytes so the immediate and the scheduled lane cannot disagree: who
     got the message, and whether a refusal makes the delivery partial.
     The sender's own Bcc copy is a record, not a delivery — a copy the
-    server would not take is reported, never counted. (A seam replaced
-    by a recorder hands back None: nothing refused.)"""
-    refused = refused or {}
+    server would not take is reported, never counted."""
     hdr = BytesHeaderParser().parsebytes(raw, headersonly=True)
 
     def header(name: str) -> set[str]:
@@ -282,9 +278,7 @@ def send_email(
         bootstrapped=bootstrapped,
         # A partial refusal is a receipt, not an exception: the message_id
         # went out to `accepted`, and only the refused need a resend.
-        error=(f"[{ident.name}/{ident.driver}] the server refused "
-               f"{report.refusals} — the message reached the rest; resend "
-               "to the refused addresses only"
+        error=(f"[{ident.name}/{ident.driver}] {report.verdict}"
                if report.partial else None),
         accepted=report.accepted,
         refused=report.refused,
