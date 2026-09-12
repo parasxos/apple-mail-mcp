@@ -11,6 +11,7 @@ import re
 import sqlite3
 import subprocess
 from datetime import datetime, timedelta, timezone
+from types import SimpleNamespace
 
 import pytest
 
@@ -249,6 +250,82 @@ def test_apply_move_verifies_reinsert(src, db, fake_osa):
     assert res["verified"] == 1 and res["pending"] == []
 
 
+def test_compound_move_verifies_read_state_too(src, db, fake_osa):
+    """mark_read + move_to: the move landing is not enough — the moved row
+    must also carry read=1 (Codex T5, 2026-09-12: a moved row with read=0
+    counted as verified)."""
+    _add_mailbox(db, 3, f"local://{LOCAL_ACCT}/Filed")
+    plan = _plan(src, [{"action": "mark_read"},
+                       {"action": "move_to", "mailbox": "Filed"}],
+                 unread_only=True)
+
+    def batch(script):  # Mail moved the message but the read flag never took
+        db.execute("UPDATE messages SET mailbox=3, read=0 WHERE ROWID=100")
+        db.commit()
+        return subprocess.CompletedProcess([], 0, "OK 100\n", "")
+    fake_osa.batch = batch
+
+    res = triage.apply_plan(src, plan.id)
+    assert res["acted"] == 1 and res["verified"] == 0
+    (p,) = res["pending"]
+    assert p["expected"] == {"read": 1, "relocated_to": 3}
+    assert p["observed"]["mailbox_rowid"] == 3 and p["observed"]["read"] == 0
+
+
+def test_compound_move_verifies_when_both_land(src, db, fake_osa):
+    _add_mailbox(db, 3, f"local://{LOCAL_ACCT}/Filed")
+    plan = _plan(src, [{"action": "flag", "color": 2},
+                       {"action": "move_to", "mailbox": "Filed"}],
+                 unread_only=True)
+
+    def batch(script):
+        db.execute("UPDATE messages SET mailbox=3, flagged=1, flag_color=2"
+                   " WHERE ROWID=100")
+        db.commit()
+        return subprocess.CompletedProcess([], 0, "OK 100\n", "")
+    fake_osa.batch = batch
+
+    res = triage.apply_plan(src, plan.id)
+    assert res["verified"] == 1 and res["pending"] == []
+
+
+def test_compound_move_reinsert_judges_the_new_row(src, db, fake_osa):
+    """Reinserted under a fresh ROWID (gmail-like relocation): the NEW row
+    is the one whose read state is judged."""
+    _add_mailbox(db, 3, f"local://{LOCAL_ACCT}/Filed")
+    actions = [{"action": "mark_read"}, {"action": "move_to", "mailbox": "Filed"}]
+
+    def reinsert(read):
+        def batch(script):
+            db.execute("DELETE FROM messages WHERE ROWID=100")
+            db.execute(
+                "INSERT INTO messages(ROWID, subject, sender, summary,"
+                " date_sent, date_received, mailbox, read, flagged, deleted,"
+                " conversation_id, global_message_id, flag_color)"
+                " VALUES (9999, 1, 1, 1, 1714600000, 1714600100, 3, ?, 0, 0,"
+                " 7001, 9100, NULL)", (read,))
+            db.commit()
+            return subprocess.CompletedProcess([], 0, "OK 100\n", "")
+        return batch
+
+    plan = _plan(src, actions, unread_only=True)
+    fake_osa.batch = reinsert(read=0)
+    res = triage.apply_plan(src, plan.id)
+    assert res["verified"] == 0
+    (p,) = res["pending"]
+    assert p["expected"] == {"read": 1, "relocated_to": 3}
+    assert p["observed"] == {"row": "gone"}
+
+    # Same relocation with the read flag carried on the new row: verified.
+    db.execute("UPDATE messages SET ROWID=100, mailbox=1 WHERE ROWID=9999")
+    db.commit()
+    plan = _plan(src, actions, unread_only=True)
+    assert [m.rowid for m in plan.messages] == [100]
+    fake_osa.batch = reinsert(read=1)
+    res = triage.apply_plan(src, plan.id)
+    assert res["verified"] == 1 and res["pending"] == []
+
+
 def test_move_to_unsynced_mailbox_falls_back_to_mail_probe(src, db, fake_osa):
     """A freshly created mailbox may exist in Mail but not yet in the
     Envelope Index (observed live) — plan via the AppleScript existence
@@ -307,6 +384,44 @@ def test_delete_plan_cap_names_its_env_knob(src, monkeypatch):
     assert ei.value.code == "selection_too_large"
     assert "EMAIL_MCP_TRIAGE_DELETE_MAX" in str(ei.value)
     assert list(config.plans_dir().glob("*.json")) == []  # nothing staged
+
+
+def test_delete_plan_freezes_the_selection_it_vetted(monkeypatch):
+    """The delete cap and the single-account check judge the SAME read that
+    gets frozen (Codex T4, 2026-09-12: a second search let a message from
+    another account slip past both)."""
+    monkeypatch.setenv("EMAIL_MCP_TRIAGE_DELETE_MAX", "1")
+
+    def ref(rowid, account="A"):
+        return SimpleNamespace(
+            id=str(rowid), account=account, mailbox="Inbox",
+            subject=f"Message {rowid}", from_addr="a@example.com",
+            date=datetime.now(timezone.utc), unread=True,
+        )
+
+    class Source:
+        calls = 0
+
+        def search(self, query):  # account B's message lands between reads
+            self.calls += 1
+            return [ref(1)] if self.calls == 1 else [ref(1), ref(2, "B")]
+
+        def resolve_mailbox(self, *_):
+            return None
+
+        def triage_snapshot(self, rowids):
+            return {
+                rowid: dict(
+                    mailbox_url="imap://A/Inbox", mailbox_rowid=10,
+                    mid_header=f"{rowid}@example.com", gmid=rowid,
+                    read=0, flagged=0, flag_color=-1,
+                ) for rowid in rowids
+            }
+
+    source = Source()
+    plan = triage.build_delete_plan(source, SearchQuery(limit=2))
+    assert source.calls == 1
+    assert [(m.rowid, m.account) for m in plan.messages] == [(1, "A")]
 
 
 def test_delete_plan_never_selects_the_trash(src, db):

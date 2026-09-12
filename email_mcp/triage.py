@@ -266,7 +266,13 @@ def _expected_state(actions: list[PlanAction], msg: PlanMessage,
 
 def _check_one(s: dict | None, exp: dict, msg: PlanMessage,
                locate_fn, gmail_like: bool) -> bool:
-    """Does the fresh snapshot satisfy the expected state?"""
+    """Does the fresh snapshot satisfy the expected state? A move first
+    resolves WHICH row to judge (locate_fn returns the snapshot of the row
+    reinserted in the target), then that row faces the same read/flag
+    comparison as a message that never moved."""
+    if "gone_from" in exp:
+        return s is None or bool(s["deleted"]) \
+            or s["mailbox_rowid"] != exp["gone_from"]
     if "relocated_to" in exp:
         tgt = exp["relocated_to"]
         if tgt is None:
@@ -274,21 +280,14 @@ def _check_one(s: dict | None, exp: dict, msg: PlanMessage,
             # strongest checkable claim is "the message left its source".
             return s is None or bool(s["deleted"]) \
                 or s["mailbox_rowid"] != msg.mailbox_rowid
-        if s is not None and s["mailbox_rowid"] == tgt and not s["deleted"]:
-            return True  # outcome (a): same ROWID, new mailbox
-        reinserted = (
-            msg.global_message_id is not None
-            and locate_fn(msg.global_message_id, tgt) is not None
-        )
-        if not reinserted:
-            return False
-        if gmail_like:
-            return True  # label semantics: original row legitimately persists
-        return s is None or bool(s["deleted"]) \
-            or s["mailbox_rowid"] != msg.mailbox_rowid
-    if "gone_from" in exp:
-        return s is None or bool(s["deleted"]) \
-            or s["mailbox_rowid"] != exp["gone_from"]
+        moved = s is not None and s["mailbox_rowid"] == tgt and not s["deleted"]
+        if not moved:  # outcome (b): reinserted under a fresh ROWID
+            left = s is None or bool(s["deleted"]) \
+                or s["mailbox_rowid"] != msg.mailbox_rowid
+            if not (left or gmail_like):  # labels: original row persists
+                return False
+            s = None if msg.global_message_id is None \
+                else locate_fn(msg.global_message_id, tgt)
     if s is None:
         return False
     for key in ("read", "flagged", "flag_color"):
@@ -308,6 +307,12 @@ def _verify(source, plan: Plan, acted: set[int],
             window_s: float = 0.0) -> dict:
     locate_fn = getattr(source, "locate_by_gmid", lambda *_: None)
     snap_fn = source.triage_snapshot
+
+    def relocated(gmid: int, mailbox_rowid: int) -> dict | None:
+        """Snapshot of the row a move reinserted in the target mailbox."""
+        rowid = locate_fn(gmid, mailbox_rowid)
+        return None if rowid is None else snap_fn([rowid]).get(rowid)
+
     by_id = {m.rowid: m for m in plan.messages}
     unresolved = set(acted)
     verified: list[int] = []
@@ -333,7 +338,7 @@ def _verify(source, plan: Plan, acted: set[int],
             exp = _expected_state(plan.actions, msg, plan.target)
             gmail_like = "gmail" in (plan.target or {}).get("url", "").lower() \
                 or msg.scheme == "imap" and "gmail" in msg.mailbox.lower()
-            if _check_one(snap.get(rid), exp, msg, locate_fn, gmail_like):
+            if _check_one(snap.get(rid), exp, msg, relocated, gmail_like):
                 verified.append(rid)
                 unresolved.discard(rid)
         if not unresolved:
