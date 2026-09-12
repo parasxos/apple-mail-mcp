@@ -118,19 +118,9 @@ class TriagePlanner:
         actions: list[dict] | None,
         allowed: set[str] = ACTIONS,
     ) -> Plan:
-        plans.gc()
         parsed = parse_actions(actions, allowed=allowed)
-        snapshot = getattr(source, "triage_snapshot", None)
-        resolve_mailbox = getattr(source, "resolve_mailbox", None)
-        if snapshot is None or resolve_mailbox is None:
-            raise TriageError(
-                "unsupported_source", "this email source does not support triage.",
-            )
-
-        cap = config.triage_max_messages()
         references = source.search(query)
-        if not references:
-            raise TriageError("empty_selection", "no messages match the query.")
+        cap = config.triage_max_messages()
         if len(references) > cap:
             raise TriageError(
                 "selection_too_large",
@@ -138,6 +128,27 @@ class TriagePlanner:
                 "stopped there) — narrow the query, or raise "
                 "EMAIL_MCP_TRIAGE_MAX if the selection is genuinely intended.",
             )
+        return self._freeze(source, query, parsed, references)
+
+    def _freeze(
+        self,
+        source,
+        query: SearchQuery,
+        parsed: list[PlanAction],
+        references: list,
+    ) -> Plan:
+        """Freeze exactly the references the caller searched and vetted:
+        the selection is read once, so no cap or account check can be
+        outrun by mail arriving between two reads."""
+        plans.gc()
+        snapshot = getattr(source, "triage_snapshot", None)
+        resolve_mailbox = getattr(source, "resolve_mailbox", None)
+        if snapshot is None or resolve_mailbox is None:
+            raise TriageError(
+                "unsupported_source", "this email source does not support triage.",
+            )
+        if not references:
+            raise TriageError("empty_selection", "no messages match the query.")
 
         rowids = [int(reference.id) for reference in references]
         snapshots = snapshot(rowids)
@@ -261,6 +272,9 @@ class TriagePlanner:
         return config.triage_delete_max()
 
     def build_delete(self, source, query: SearchQuery) -> Plan:
+        parsed = parse_actions(
+            [{"action": "delete"}], allowed=ACTIONS | DESTRUCTIVE,
+        )
         narrowed = replace(query, exclude_trash=True, from_exact=True)
         references = source.search(narrowed)
         accounts = {reference.account for reference in references}
@@ -279,7 +293,4 @@ class TriagePlanner:
                 "narrow the query, or raise EMAIL_MCP_TRIAGE_DELETE_MAX if "
                 "the deletion is genuinely intended.",
             )
-        return self.build(
-            source, narrowed, [{"action": "delete"}],
-            allowed=ACTIONS | DESTRUCTIVE,
-        )
+        return self._freeze(source, narrowed, parsed, references)
