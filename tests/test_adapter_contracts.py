@@ -180,12 +180,12 @@ def test_spool_queue_contract_preserves_message_across_state_changes(
     assert [item.id for item in queue.entries("pending")] == [entry.id]
     assert queue.claim(entry.id) is True
     assert queue.read_message("sending", entry.id) == b"frozen-message"
-    claimed = queue.load("sending", entry.id)
-    assert claimed is not None
+    claimed = spool.load("sending", entry.id)
+    assert claimed is not None and claimed.claimed_at  # the claim's lease
     queue.move(claimed, "sending", "sent")
 
-    assert queue.load("pending", entry.id) is None
-    assert queue.load("sent", entry.id).id == entry.id
+    assert spool.load("pending", entry.id) is None
+    assert spool.load("sent", entry.id).id == entry.id
     assert queue.integrity().ok is True
 
 

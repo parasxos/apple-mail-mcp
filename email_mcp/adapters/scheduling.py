@@ -33,6 +33,9 @@ class FileScheduleStore:
     def claim(self, operation_id: str, old: str, new: str) -> bool:
         return spool.claim(operation_id, old, new)
 
+    def own(self, name: str):
+        return spool.own(name)
+
     def update(self, state: str, entry: ScheduledEntry) -> None:
         spool.update(state, entry)
 

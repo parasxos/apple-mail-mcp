@@ -23,8 +23,8 @@ class SpoolDispatchQueue:
     def entries(self, state: str):
         return spool.entries(state)
 
-    def load(self, state: str, operation_id: str):
-        return spool.load(state, operation_id)
+    def own(self, name: str):
+        return spool.own(name)
 
     def claim(self, operation_id: str) -> bool:
         return spool.claim(operation_id)

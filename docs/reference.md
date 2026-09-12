@@ -352,7 +352,7 @@ MCP wire revisions too, so existing stdio registrations do not need to change.
 | `create_draft(to, subject, body, cc?, in_reply_to?, from_identity?)` | Create and verify a draft in a Graph-enabled identity's real Exchange Drafts folder; never sends it. |
 | `schedule_email(to, subject, body, send_at, cc?, bcc?, attachments?, from_identity?)` | Compose and durably freeze now. Exchange identities can schedule server-side; other identities use the local background dispatcher. Returns `{ok, id, send_at, message_id, ...}`. |
 | `list_scheduled(state?, limit?)` | The "Send Later mailbox": pending / sending / sent / failed / cancelled. If an on-disk record is corrupt or incomplete, returns healthy records plus `{ok: false, code: "spool_integrity", integrity: ...}` instead of a false empty list. |
-| `cancel_scheduled(id)` | Cancel a pending scheduled message (sent/mid-flight cannot be recalled). |
+| `cancel_scheduled(id)` | Cancel a pending scheduled message (sent/mid-flight cannot be recalled). While another process is arming the record (`schedule_email` in flight) or reconciling it (the dispatcher), the call is refused with `{ok: false, code: "spool_busy"}` and must be repeated; it never reports `cancelled` while a deferred draft may still be armed. If the Exchange revoke fails, the refusal carries `graph_draft_id` so you can discard the draft in Outlook/OWA. |
 | `triage_plan(filters..., actions)` | Stage a mailbox operation: same filters as `search_emails` + a list of dispositions. Mutates nothing; returns `{plan_id, count, summary, messages}` for review. |
 | `triage_plan_delete(filters...)` | Stage a Trash move through the separate destructive door and tighter 50-message cap; still mutates nothing until apply. |
 | `triage_apply(plan_id)` | Execute a staged plan (one batched AppleScript, by-ROWID addressing) + verify against the index. Per-message failures are data. |
@@ -414,9 +414,13 @@ database:
   attempts, default 5), then park in `failed/` with the error + a macOS
   notification. `email-mcp status` lists each parked message and its actual
   error. Fix the reported cause, reschedule it from the MCP client, and keep
-  the failed record until the replacement is confirmed. Atomic claim renames
-  prevent overlapping dispatcher runs from owning the same record
-  concurrently.
+  the failed record until the replacement is confirmed. A dispatcher pass
+  holds an exclusive lock on the spool (`spool/locks/`) for recovery,
+  reconcile and dispatch together: an overlapping pass is refused with
+  `skipped: "another dispatcher holds the spool"` instead of interleaving.
+  Each claim stamps its own lease (`claimed_at` on the record); a claim in
+  `sending/` counts as stranded only 10 minutes after that stamp, never
+  because `send_at` is old.
 - A **partial refusal** (the server took some recipients and refused
   others — see [Sending mail](#sending-mail-send_email--reply_email)) parks
   the record in `failed/` at once, never through the retry funnel: the
@@ -427,8 +431,11 @@ database:
 - Local scheduled delivery is **at-least-once across the transport handoff**.
   If the process dies after the provider accepts the message but before the
   record moves from `sending/` to `sent/`, recovery cannot know the outcome
-  and may deliver it again after 10 minutes. The frozen `Message-ID` is the
-  deduplication key. Graph schedules reconcile against Exchange Drafts/Sent.
+  and may deliver it again 10 minutes after the claim. The frozen
+  `Message-ID` is the deduplication key. Graph schedules reconcile against
+  Exchange Drafts/Sent; schedule creation, cancellation and the reconcile
+  pass each hold the record's lock for their whole read-arm-rewrite, so a
+  record is never cancelled under the process arming it.
 - Authorization happens at **schedule time** (inside the MCP server, where
   your config lives); the dispatcher deliberately does not re-check — it
   runs under launchd's bare environment where identity policy is not loaded.

@@ -148,6 +148,8 @@ EXPECTED_SKIPS = frozenset({
     "schedule_email.accepted",
     "schedule_email.refused",
     "schedule_email.code",
+    # claim lease (2026-09-12): when a dispatcher claim last took the record
+    "schedule_email.claimed_at",
 })
 
 # oracle keys whose ABSENCE from the derived shape is expected (see above)
@@ -174,6 +176,8 @@ _WAIVED_ADDED = frozenset({
     "schedule_email.accepted",
     "schedule_email.refused",
     "schedule_email.code",
+    # claim lease (2026-09-12): when a dispatcher claim last took the record
+    "schedule_email.claimed_at",
 })
 
 

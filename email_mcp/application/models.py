@@ -304,6 +304,7 @@ class DispatchSummary:
     due: int
     results: dict[str, str]
     integrity: QueueIntegrity | None = None
+    skipped: str | None = None  # why this pass did no work at all
 
     def to_wire(self) -> dict:
         out = {
@@ -313,4 +314,6 @@ class DispatchSummary:
         }
         if self.integrity is not None:
             out["integrity"] = self.integrity.to_wire()
+        if self.skipped is not None:
+            out["skipped"] = self.skipped
         return out

@@ -116,9 +116,10 @@ class StateWriter:
     @property
     def spool(self) -> Path:
         d = _ensure_dir(self.root / "spool")
-        for name in SPOOL_STATES:
+        for name in SPOOL_STATES + ("locks",):
             _ensure_dir(d / name)
         return d
+
 
     @property
     def plans(self) -> Path:

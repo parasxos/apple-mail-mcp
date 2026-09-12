@@ -366,7 +366,7 @@ def check_spool_plans() -> dict:
     by doctor), per-state counts, and no delivery claims stranded in
     sending/."""
     from . import spool
-    from .dispatcher import STALE_SENDING_MINUTES
+    from .dispatcher import is_stale
 
     problems: list[str] = []
     fixes: list[str] = []
@@ -382,17 +382,9 @@ def check_spool_plans() -> dict:
     scans = spool.scan_all()
     integrity = spool.integrity(scans)
     counts = integrity["counts"]
-    stranded: list[str] = []
     now = spool.utcnow()
     sending = next(result for result in scans if result.state == "sending")
-    for e in sending.entries:
-        try:
-            ref = datetime.fromisoformat(e.next_attempt_at or e.send_at)
-        except ValueError:
-            stranded.append(e.id)
-            continue
-        if (now - ref).total_seconds() / 60 >= STALE_SENDING_MINUTES:
-            stranded.append(e.id)
+    stranded = [e.id for e in sending.entries if is_stale(e, now)]
     if not integrity["ok"]:
         problems.append(
             f"{len(integrity['issues'])} scheduled-record integrity "

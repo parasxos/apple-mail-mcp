@@ -1405,61 +1405,123 @@ def test_reconcile_malformed_backoff_stamp_does_not_kill_the_pass(
     assert local_delivery == []
 
 
-def test_reconcile_concurrent_flip_not_clobbered_by_terminal_move(
+# --------------------------------------------------------------------- #
+# ownership: cancel vs schedule-time arming, cancel vs reconcile         #
+# --------------------------------------------------------------------- #
+
+
+def _pending_ids() -> list[str]:
+    return sorted(
+        p.stem for p in (config.spool_dir() / "pending").glob("*.json")
+    )
+
+
+def test_cancel_while_creator_owns_the_record_is_refused_then_revokes(
+    monkeypatch, tmp_path,
+):
+    """Codex repro "cancel during create" + "after schedule returns": a
+    cancel that lands while schedule_email is arming the Exchange draft is
+    refused (spool_busy) — never reported cancelled — so the record ends in
+    exactly one state (pending, armed) and the next cancel revokes the
+    draft it finds there. No armed draft ever survives a cancelled receipt.
+    """
+    _write_graph_toml(tmp_path, monkeypatch)
+    _seed_token()
+    inner = FakeHttp((201, {"id": "D1"}), (200, {}), (202, {}), (204, {}))
+    during: list[dict] = []
+
+    def racing(method, url, ident, body=None, headers=None):
+        if not inner.calls:  # first wire call: manifest on disk, unarmed
+            during.append(server.tool_cancel_scheduled(_pending_ids()[0]))
+        return inner(method, url, ident, body=body, headers=headers)
+
+    monkeypatch.setattr(graph, "_http", racing)
+    entry = sender.schedule_email(
+        to="someone@example.org", subject="cancel race", body="b",
+        send_at=_future(60), from_identity="cern",
+    )
+    refused, = during
+    assert refused["ok"] is False and refused["code"] == "spool_busy"
+    assert "cancel again" in refused["error"]
+    assert refused["operation_id"] == entry.id
+    # after schedule returns: one state, armed, nothing resurrected
+    assert spool.load("cancelled", entry.id) is None
+    stored = spool.load("pending", entry.id)
+    assert stored.executor == "graph" and stored.graph_draft_id == "D1"
+
+    res = server.tool_cancel_scheduled(entry.id)
+    assert res["ok"] is True and res["status"] == "cancelled"
+    assert inner.calls[-1][0] == "DELETE" and "D1" in inner.calls[-1][1]
+    assert spool.load("cancelled", entry.id) is not None
+    assert spool.load("pending", entry.id) is None
+
+
+def test_cancel_during_reconcile_is_refused_not_interleaved(
     monkeypatch, tmp_path, local_delivery,
 ):
-    """Race fence: while OUR pass has its status probe in flight, ANOTHER
-    pass revokes the draft and flips the entry to launchd. Our stale
-    'cancelled_externally' verdict must NOT move the flipped entry to
-    cancelled/ — that would silently drop the mail."""
+    """While the dispatcher's reconcile pass owns a record (status probe in
+    flight) cancel is refused with spool_busy, and the pass completes on a
+    record nobody moved under it."""
     _write_graph_toml(tmp_path, monkeypatch)
     _seed_token()
     entry = _spool_entry()
-    inner = FakeHttp((404, {}), (200, {"value": []}))
+    inner = FakeHttp((404, {}), (200, {"value": [{"id": "S1"}]}))
+    during: list[dict] = []
 
     def racing(method, url, ident, body=None, headers=None):
-        if not inner.calls:  # first wire call: the other pass wins the flip
-            other = spool.load("pending", entry.id)
-            other.executor = "launchd"
-            other.graph_draft_id = None
-            other.next_attempt_at = spool.iso(spool.utcnow())
-            spool.update("pending", other)
+        if not inner.calls:  # first wire call: the pass owns the record
+            during.append(server.tool_cancel_scheduled(entry.id))
         return inner(method, url, ident, body=body, headers=headers)
 
     monkeypatch.setattr(graph, "_http", racing)
     summary = dispatcher.run_once()
-    assert summary["results"][entry.id] == dispatcher._SUPERSEDED
-    got = spool.load("pending", entry.id)
-    assert got is not None and got.executor == "launchd"  # flip preserved
+    refused, = during
+    assert refused["ok"] is False and refused["code"] == "spool_busy"
+    assert "Exchange" in summary["results"][entry.id]
+    assert spool.load("sent", entry.id) is not None
     assert spool.load("cancelled", entry.id) is None
     assert local_delivery == []
 
 
-def test_reconcile_concurrent_adopt_not_clobbered_by_stale_leave(
-    monkeypatch, tmp_path, local_delivery,
+def test_cancel_after_ambiguous_send_revokes_or_names_the_armed_draft(
+    monkeypatch, tmp_path,
 ):
-    """Race fence for _graph_leave: our drafts lookup fails, but another
-    pass adopted the orphan draft mid-flight. Writing our stale entry
-    (graph_draft_id=None) back would erase the adoption."""
+    """An ambiguous /send at schedule time (wire death, cleanup DELETE dies
+    too) leaves the record pending with the draft id recorded. A later
+    cancel goes through the revoke: while the DELETE fails the refusal
+    names the draft so the user can discard it — never "cancelled"; once
+    the DELETE succeeds the receipt says cancelled and no armed draft
+    survives."""
     _write_graph_toml(tmp_path, monkeypatch)
     _seed_token()
-    entry = _spool_entry(draft_id=None)
+    _fake(
+        monkeypatch,
+        (201, {"id": "D1"}),
+        (200, {}),
+        graph.GraphTransportError("[cern/graph] network error mid-/send"),
+        graph.GraphTransportError("[cern/graph] network error on DELETE"),
+    )
+    entry = sender.schedule_email(
+        to="someone@example.org", subject="s", body="b",
+        send_at=_future(60), from_identity="cern",
+    )
+    stored = spool.load("pending", entry.id)
+    assert stored.executor == "graph" and stored.graph_draft_id == "D1"
 
-    calls = []
+    _fake(monkeypatch, (503, {"error": {
+        "code": "ErrorServerBusy", "message": "later"}}))
+    res = server.tool_cancel_scheduled(entry.id)
+    assert res["ok"] is False
+    assert "D1" in res["error"] and res["graph_draft_id"] == "D1"
+    assert spool.load("pending", entry.id).graph_draft_id == "D1"
+    assert spool.load("cancelled", entry.id) is None
 
-    def racing(method, url, ident, body=None, headers=None):
-        calls.append(url)
-        other = spool.load("pending", entry.id)
-        other.graph_draft_id = "D9"  # the other pass adopts
-        spool.update("pending", other)
-        raise GraphError("[cern/graph] network error")
-
-    monkeypatch.setattr(graph, "_http", racing)
-    summary = dispatcher.run_once()
-    assert summary["results"][entry.id] == dispatcher._SUPERSEDED
-    got = spool.load("pending", entry.id)
-    assert got.graph_draft_id == "D9"  # adoption preserved
-    assert local_delivery == []
+    fake = _fake(monkeypatch, (204, {}))
+    res = server.tool_cancel_scheduled(entry.id)
+    assert res["ok"] is True and res["status"] == "cancelled"
+    assert fake.calls[0][0] == "DELETE" and "D1" in fake.calls[0][1]
+    assert spool.load("cancelled", entry.id) is not None
+    assert spool.load("pending", entry.id) is None
 
 
 def test_no_token_material_ever_logged(monkeypatch, tmp_path):

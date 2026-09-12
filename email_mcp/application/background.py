@@ -8,6 +8,7 @@ from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
 from ..domain import codes
+from ..domain.errors import SpoolBusy
 from ..domain.events import EventPublisher
 from ..domain.models import DeliveryReport, ScheduledEntry
 from .base import ApplicationService
@@ -27,7 +28,11 @@ from .ports import (
 BACKOFF_MINUTES = (2, 5, 15, 45, 120)
 STALE_SENDING_MINUTES = 10
 GRAPH_GRACE_MINUTES = 10
-SUPERSEDED = "graph: entry changed under us — skipped (another pass won)"
+DISPATCHER = "dispatcher"  # the ownership name of the whole run
+SPOOL_HELD = "another dispatcher holds the spool"
+RECORD_HELD = (
+    "graph: record held elsewhere (schedule or cancel in flight) — skipped"
+)
 
 
 def parse_timestamp(stamp: str | None) -> datetime | None:
@@ -49,6 +54,18 @@ def is_due(entry: ScheduledEntry, now: datetime) -> bool:
         return False
     next_attempt = parse_timestamp(entry.next_attempt_at)
     return next_attempt is None or next_attempt <= now
+
+
+def is_stale(entry: ScheduledEntry, now: datetime) -> bool:
+    """A sending/ claim is stranded once its lease is STALE_SENDING_MINUTES
+    old. The lease is the stamp the claim itself wrote, never the schedule
+    time: an overdue message that was just claimed is active, not
+    abandoned. A manifest without a stamp predates the lease and the run
+    that took it is long over."""
+    claimed = parse_timestamp(entry.claimed_at)
+    return claimed is None or now - claimed >= timedelta(
+        minutes=STALE_SENDING_MINUTES,
+    )
 
 
 class BackgroundUseCases(ApplicationService):
@@ -140,15 +157,7 @@ class BackgroundUseCases(ApplicationService):
     def recover_stranded(self, now: datetime) -> list[str]:
         recovered: list[str] = []
         for entry in self._queue.entries("sending"):
-            reference = (
-                parse_timestamp(entry.next_attempt_at)
-                or parse_timestamp(entry.send_at)
-            )
-            age = (
-                (now - reference).total_seconds() / 60
-                if reference else float("inf")
-            )
-            if age < STALE_SENDING_MINUTES:
+            if not is_stale(entry, now):
                 continue
             entry.attempts += 1
             entry.last_error = entry.last_error or (
@@ -172,20 +181,7 @@ class BackgroundUseCases(ApplicationService):
                 recovered.append(entry.id)
         return recovered
 
-    def graph_current(self, entry: ScheduledEntry) -> bool:
-        try:
-            current = self._queue.load("pending", entry.id)
-        except Exception:
-            return False
-        return (
-            current is not None
-            and current.executor == "graph"
-            and current.graph_draft_id == entry.graph_draft_id
-        )
-
     def graph_mark_sent(self, entry: ScheduledEntry, now: datetime) -> str:
-        if not self.graph_current(entry):
-            return SUPERSEDED
         entry.delivered_at = self._clock.format(now)
         entry.next_attempt_at = None
         entry.last_error = None
@@ -198,8 +194,6 @@ class BackgroundUseCases(ApplicationService):
         return "sent (delivered by Exchange)"
 
     def graph_adopt(self, entry: ScheduledEntry, draft_id: str) -> str:
-        if not self.graph_current(entry):
-            return SUPERSEDED
         entry.graph_draft_id = draft_id
         entry.last_error = None
         self._queue.update("pending", entry)
@@ -217,8 +211,6 @@ class BackgroundUseCases(ApplicationService):
         reason: str,
         clear_draft: bool,
     ) -> str:
-        if not self.graph_current(entry):
-            return SUPERSEDED
         entry.executor = "launchd"
         if clear_draft:
             entry.graph_draft_id = None
@@ -238,8 +230,6 @@ class BackgroundUseCases(ApplicationService):
         error: str,
         note: str,
     ) -> str:
-        if not self.graph_current(entry):
-            return SUPERSEDED
         entry.last_error = error
         self._queue.update("pending", entry)
         return note
@@ -253,8 +243,6 @@ class BackgroundUseCases(ApplicationService):
         if status == "sent":
             return self.graph_mark_sent(entry, now)
         if status == "cancelled_externally":
-            if not self.graph_current(entry):
-                return SUPERSEDED
             entry.next_attempt_at = None
             entry.last_error = (
                 "deferred draft was discarded outside the spool (e.g. in "
@@ -270,105 +258,111 @@ class BackgroundUseCases(ApplicationService):
         return f"graph: status {status} — left for next pass"
 
     def reconcile_deferred(self, now: datetime) -> dict[str, str]:
-        entries = [
-            entry for entry in self._queue.entries("pending")
-            if entry.executor == "graph"
-        ]
         results: dict[str, str] = {}
         grace = timedelta(minutes=GRAPH_GRACE_MINUTES)
-        for entry in entries:
+        for entry in self._queue.entries("pending"):
+            if entry.executor != "graph":
+                continue
             send_at = parse_timestamp(entry.send_at) or now - grace
             if now < send_at + grace:
                 continue
             next_attempt = parse_timestamp(entry.next_attempt_at)
             if next_attempt is not None and next_attempt > now:
                 continue
+            # Ownership spans probe → rewrite, so a cancel cannot move the
+            # record under this pass and this pass cannot overwrite a
+            # cancel; a record someone else holds waits for the next pass.
             try:
-                identity = self._identities.resolve(entry.identity)
-            except BackgroundIdentityError as error:
-                results[entry.id] = self._fail_or_retry(
-                    entry, str(error), now, source="pending",
-                )
-                continue
-
-            if not entry.graph_draft_id:
-                try:
-                    draft_id = self._deferred.find_draft(
-                        identity, entry.message_id,
-                    )
-                except BackgroundProviderError as error:
-                    results[entry.id] = self.graph_leave(
-                        entry, str(error),
-                        "graph: drafts lookup failed — retrying",
-                    )
-                    continue
-                if draft_id is not None:
-                    results[entry.id] = self.graph_adopt(entry, draft_id)
-                    continue
-                try:
-                    sent = self._deferred.was_sent(
-                        identity, entry.message_id,
-                    )
-                except BackgroundProviderError as error:
-                    results[entry.id] = self.graph_leave(
-                        entry, str(error),
-                        "graph: sent-items lookup failed — retrying",
-                    )
-                    continue
-                if sent:
-                    results[entry.id] = self.graph_mark_sent(entry, now)
-                    continue
-                results[entry.id] = self.graph_flip_to_local(
-                    entry, now, "no draft found", clear_draft=False,
-                )
-                continue
-
-            try:
-                status = self._deferred.status(
-                    identity, entry.graph_draft_id, entry.message_id,
-                )
-            except BackgroundProviderError as error:
-                results[entry.id] = self.graph_leave(
-                    entry, str(error),
-                    "graph: unreachable — retrying next pass",
-                )
-                continue
-            if status != "held":
-                results[entry.id] = self.graph_apply_status(entry, status, now)
-                continue
-
-            try:
-                outcome = self._deferred.delete_draft(
-                    identity, entry.graph_draft_id,
-                )
-            except BackgroundProviderError as error:
-                results[entry.id] = self.graph_leave(
-                    entry, str(error),
-                    "graph: draft revoke failed — retrying",
-                )
-                continue
-            if outcome == "deleted":
-                results[entry.id] = self.graph_flip_to_local(
-                    entry, now, "draft revoked", clear_draft=True,
-                )
-                continue
-            try:
-                status = self._deferred.status(
-                    identity, entry.graph_draft_id, entry.message_id,
-                )
-            except BackgroundProviderError as error:
-                results[entry.id] = self.graph_leave(
-                    entry, str(error),
-                    "graph: draft gone, outcome ambiguous — retrying",
-                )
-                continue
-            results[entry.id] = self.graph_apply_status(entry, status, now)
+                with self._queue.own(entry.id):
+                    results[entry.id] = self._reconcile_one(entry, now)
+            except SpoolBusy:
+                results[entry.id] = RECORD_HELD
         return results
+
+    def _reconcile_one(self, entry: ScheduledEntry, now: datetime) -> str:
+        try:
+            identity = self._identities.resolve(entry.identity)
+        except BackgroundIdentityError as error:
+            return self._fail_or_retry(
+                entry, str(error), now, source="pending",
+            )
+
+        if not entry.graph_draft_id:
+            try:
+                draft_id = self._deferred.find_draft(
+                    identity, entry.message_id,
+                )
+            except BackgroundProviderError as error:
+                return self.graph_leave(
+                    entry, str(error),
+                    "graph: drafts lookup failed — retrying",
+                )
+            if draft_id is not None:
+                return self.graph_adopt(entry, draft_id)
+            try:
+                sent = self._deferred.was_sent(identity, entry.message_id)
+            except BackgroundProviderError as error:
+                return self.graph_leave(
+                    entry, str(error),
+                    "graph: sent-items lookup failed — retrying",
+                )
+            if sent:
+                return self.graph_mark_sent(entry, now)
+            return self.graph_flip_to_local(
+                entry, now, "no draft found", clear_draft=False,
+            )
+
+        try:
+            status = self._deferred.status(
+                identity, entry.graph_draft_id, entry.message_id,
+            )
+        except BackgroundProviderError as error:
+            return self.graph_leave(
+                entry, str(error), "graph: unreachable — retrying next pass",
+            )
+        if status != "held":
+            return self.graph_apply_status(entry, status, now)
+
+        try:
+            outcome = self._deferred.delete_draft(
+                identity, entry.graph_draft_id,
+            )
+        except BackgroundProviderError as error:
+            return self.graph_leave(
+                entry, str(error), "graph: draft revoke failed — retrying",
+            )
+        if outcome == "deleted":
+            return self.graph_flip_to_local(
+                entry, now, "draft revoked", clear_draft=True,
+            )
+        try:
+            status = self._deferred.status(
+                identity, entry.graph_draft_id, entry.message_id,
+            )
+        except BackgroundProviderError as error:
+            return self.graph_leave(
+                entry, str(error),
+                "graph: draft gone, outcome ambiguous — retrying",
+            )
+        return self.graph_apply_status(entry, status, now)
 
     def dispatch_scheduled(
         self, now: datetime | None = None,
     ) -> DispatchSummary:
         now = now or self._clock.now()
+        # One pass per spool: recovery, reconcile and dispatch run under
+        # one ownership, so an overlapping pass can never judge this
+        # pass's fresh claims stranded — it is refused, not interleaved.
+        try:
+            with self._queue.own(DISPATCHER):
+                return self._dispatch(now)
+        except SpoolBusy:
+            return DispatchSummary(
+                checked_at=self._clock.format(now), due=0, results={},
+                skipped=SPOOL_HELD,
+            )
+
+    def _dispatch(self, now: datetime) -> DispatchSummary:
         self.recover_stranded(now)
         due = [
             entry for entry in self._queue.entries("pending")

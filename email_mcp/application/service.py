@@ -268,9 +268,6 @@ class EmailApplication:
     def recover_stranded(self, now: datetime) -> list[str]:
         return self._background.recover_stranded(now)
 
-    def graph_current(self, entry: ScheduledEntry) -> bool:
-        return self._background.graph_current(entry)
-
     def graph_mark_sent(self, entry: ScheduledEntry, now: datetime) -> str:
         return self._background.graph_mark_sent(entry, now)
 

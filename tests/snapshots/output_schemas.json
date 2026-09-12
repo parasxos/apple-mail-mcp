@@ -316,6 +316,7 @@
     "cc": [
       "str"
     ],
+    "claimed_at": "str|null",
     "code": "str|null",
     "created_at": "str",
     "delivered_at": "str|null",

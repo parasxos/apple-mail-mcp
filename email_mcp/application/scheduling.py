@@ -1,7 +1,8 @@
 """Scheduled-mail listing and cancellation use cases."""
 from __future__ import annotations
 
-from ..domain.errors import InvalidInput, NotFound, ToolError
+from ..domain import codes
+from ..domain.errors import InvalidInput, NotFound, SpoolBusy, ToolError
 from ..domain.events import EventPublisher
 from .base import ApplicationService
 from .models import CancelReceipt, ScheduleListing
@@ -56,6 +57,23 @@ class SchedulingUseCases(ApplicationService):
         )
 
     def cancel_scheduled(self, id: str) -> CancelReceipt:
+        # Ownership is the whole cancel: a record being armed by
+        # schedule_email or probed by the dispatcher is never moved under
+        # its owner, and its owner's final rewrite can never resurrect a
+        # record this cancel moved. Held elsewhere means "cancel again",
+        # never "cancelled".
+        try:
+            with self._schedules.own(id):
+                return self._cancel_owned(id)
+        except SpoolBusy as error:
+            self._cancel_event(id, "failed", reason="held_elsewhere")
+            raise ToolError(
+                f"cannot cancel {id}: another process is arming or "
+                "reconciling it right now — cancel again in a moment",
+                code=codes.SPOOL_BUSY, operation_id=id,
+            ) from error
+
+    def _cancel_owned(self, id: str) -> CancelReceipt:
         found = self._schedules.find(id)
         if found is None:
             self._cancel_event(id, "failed", reason="not_found")
@@ -99,11 +117,14 @@ class SchedulingUseCases(ApplicationService):
                     id, "failed", reason="revoke_failed",
                     subject=entry.subject,
                 )
+                held = f" {draft_id}" if draft_id else ""
                 raise ToolError(
-                    f"cannot cancel {id}: Exchange still holds the deferred "
-                    f"draft and the revoke failed ({error}). Retry, or discard "
-                    "the draft in Outlook/OWA yourself, then cancel again.",
+                    f"cannot cancel {id}: Exchange may still hold the armed "
+                    f"deferred draft{held} and the revoke failed ({error}). "
+                    "Retry, or discard the draft in Outlook/OWA yourself, "
+                    "then cancel again.",
                     code=error.code, operation_id=id,
+                    data={"graph_draft_id": draft_id},
                 ) from error
             if outcome == "gone":
                 try:

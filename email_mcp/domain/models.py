@@ -170,10 +170,14 @@ class ScheduledEntry:
     accepted: list[str] = field(default_factory=list)
     refused: dict[str, str] = field(default_factory=dict)
     code: str | None = None
+    # The lease: stamped by the claim that last took this record (spool
+    # .claim). Stranded-claim recovery reads only this, never send_at.
+    claimed_at: str | None = None
 
 
 @dataclass(frozen=True)
 class IntegrityIssue:
+
     code: str
     state: str
     id: str | None
