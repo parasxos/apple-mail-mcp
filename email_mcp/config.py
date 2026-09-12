@@ -9,7 +9,9 @@ resolution refuses (retired vars, home-directory roots, ...).
 from __future__ import annotations
 
 import os
+import plistlib
 import re
+import sys
 from pathlib import Path
 
 from . import state
@@ -194,6 +196,51 @@ def dispatcher_plist() -> Path:
     )
 
 
+# The settings whose value names a file or directory. A relative one is
+# anchored to the cwd of the process reading it (state.py for the root,
+# the getters above for the rest), and launchd's cwd is not ours.
+_PATH_VARS = frozenset({
+    "EMAIL_MCP_STATE_DIR", "EMAIL_MCP_IDENTITIES", "EMAIL_MCP_MAIL_DIR",
+    "EMAIL_MCP_LOG_FILE", "EMAIL_MCP_ATTACH_DIR", "EMAIL_MCP_SSH_SOCKET",
+})
+_LOG_OFF = frozenset({"off", "none", "0"})
+
+
+def launchd_environment() -> dict[str, str]:
+    """The environment a launch agent must carry to read THIS
+    configuration: PATH plus every EMAIL_MCP_* setting in force, path
+    values spelled where they resolve from here. launchd starts agents
+    with a bare environment, so an agent carrying PATH alone worked the
+    default tree while the operator scheduled into a custom one
+    (2026-09-12)."""
+    env = {"PATH": os.environ.get("PATH", "/usr/bin:/bin:/usr/sbin:/sbin")}
+    for key, value in sorted(os.environ.items()):
+        value = value.strip()
+        if not key.startswith("EMAIL_MCP_") or not value:
+            continue  # blank reads as unset everywhere; carry nothing
+        if key in _PATH_VARS and not (
+            key == "EMAIL_MCP_LOG_FILE" and value.lower() in _LOG_OFF
+        ):
+            value = str(Path.cwd() / Path(value).expanduser())
+        env[key] = value
+    return env
+
+
+def launchd_plist(label: str, arguments: list[str], log: Path,
+                  **schedule) -> str:
+    """Render a per-user launch agent running `python -m <arguments>`
+    with this interpreter and this configuration, output to `log`."""
+    return plistlib.dumps({
+        "Label": label,
+        "ProgramArguments": [sys.executable, "-m", *arguments],
+        "EnvironmentVariables": launchd_environment(),
+        **schedule,
+        "ProcessType": "Background",
+        "StandardOutPath": str(log),
+        "StandardErrorPath": str(log),
+    }).decode()
+
+
 def graph_dir() -> Path:
     """Path of the Graph executor state (per-identity OAuth token caches):
     <state root>/graph. A path question only — never creates."""
@@ -314,7 +361,7 @@ def log_file() -> Path | None:
     visible in Console.app).
     """
     raw = os.environ.get("EMAIL_MCP_LOG_FILE", "").strip()
-    if raw.lower() in {"off", "none", "0"}:
+    if raw.lower() in _LOG_OFF:
         return None
     if raw:
         return Path(raw).expanduser()

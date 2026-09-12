@@ -444,7 +444,10 @@ database:
   Its direct operational commands are `email-mcp dispatcher --status`,
   `email-mcp dispatcher --install-launchd` and
   `email-mcp dispatcher --uninstall-launchd`; the log is at
-  `~/.email-mcp/dispatcher.log`.
+  `~/.email-mcp/dispatcher.log`. Both agents carry the `EMAIL_MCP_*`
+  settings in force when they were installed (paths made absolute), so a
+  custom state root is the root the worker reads; change a setting and
+  `email-mcp doctor --fix` re-renders them.
   Install and uninstall also boot out and
   remove any pre-v0.8 agent (`com.paris.email-mcp-dispatcher`), so
   upgrading never leaves two dispatchers ticking over the same spool.

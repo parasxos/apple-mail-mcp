@@ -8,14 +8,16 @@ from __future__ import annotations
 
 import json
 import os
+import plistlib
 import stat
 import subprocess
 import textwrap
 from pathlib import Path
+from unittest import mock
 
 import pytest
 
-from email_mcp import checks, dispatcher, fts, lifecycle, plan, state
+from email_mcp import checks, config, dispatcher, fts, lifecycle, plan, state
 
 
 @pytest.fixture
@@ -551,6 +553,62 @@ def test_setup_skips_the_build_prompt_when_the_index_is_ready(
     ])
     assert lifecycle.setup() == 0
     assert "already built — kept" in capsys.readouterr().out
+
+
+# ---------------------------------------------------------------------- #
+# the agents carry the configuration they were installed under            #
+# ---------------------------------------------------------------------- #
+
+
+def _worker_env(content: str) -> dict[str, str]:
+    """What launchd hands the agent: the plist's environment, none of
+    the installing shell's EMAIL_MCP_* settings."""
+    doc = plistlib.loads(content.encode())
+    base = {k: v for k, v in os.environ.items()
+            if not k.startswith("EMAIL_MCP_")}
+    return base | doc["EnvironmentVariables"]
+
+
+@pytest.mark.parametrize("module", [dispatcher, fts])
+def test_agent_reads_the_root_it_was_installed_under(home, module,
+                                                     monkeypatch, tmp_path):
+    """Codex LAUNCHD_STATE_ROOT: a custom root took the schedules while
+    the worker, whose plist carried PATH alone, read ~/.email-mcp
+    (2026-09-12)."""
+    monkeypatch.setenv("EMAIL_MCP_STATE_DIR", str(tmp_path / "custom-state"))
+    configured = config.state_dir()
+    with mock.patch.dict(os.environ, _worker_env(module._plist_content()),
+                         clear=True):
+        assert config.state_dir() == configured
+
+
+def test_agent_root_is_anchored_to_the_installing_cwd(home, monkeypatch,
+                                                      tmp_path):
+    """A relative override resolves against the installer's cwd; copied
+    literally it would resolve against launchd's."""
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("EMAIL_MCP_STATE_DIR", "state")
+    env = plistlib.loads(dispatcher._plist_content().encode())
+    assert env["EnvironmentVariables"]["EMAIL_MCP_STATE_DIR"] == \
+        str(tmp_path / "state")
+
+
+def test_agent_carries_every_setting_with_markup_intact(home, monkeypatch,
+                                                        tmp_path):
+    idents = tmp_path / "ids & <co>" / "identities.toml"
+    monkeypatch.setenv("EMAIL_MCP_IDENTITIES", str(idents))
+    monkeypatch.setenv("EMAIL_MCP_FROM_NAME", "Ops <a&b>")
+    monkeypatch.setenv("EMAIL_MCP_LOG_FILE", "off")   # a switch, not a path
+    monkeypatch.setenv("EMAIL_MCP_SOURCE", "   ")     # blank reads as unset
+    content = fts._plist_content()
+    env = plistlib.loads(content.encode())["EnvironmentVariables"]
+    assert env["EMAIL_MCP_IDENTITIES"] == str(idents)
+    assert env["EMAIL_MCP_FROM_NAME"] == "Ops <a&b>"
+    assert env["EMAIL_MCP_LOG_FILE"] == "off"
+    assert "EMAIL_MCP_SOURCE" not in env
+    with mock.patch.dict(os.environ, _worker_env(content), clear=True):
+        assert config.identities_file() == idents
+        assert config.log_file() is None
 
 
 # ---------------------------------------------------------------------- #
