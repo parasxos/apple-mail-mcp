@@ -434,3 +434,41 @@ def test_attached_message_is_an_attachment_not_body(
     assert [(a.name, a.mime) for a in m.attachments] == [
         ("attachment-1.eml", "message/rfc822")]
     assert "attached body should be downloadable" not in m.body_text
+
+
+def test_source_usable_from_any_thread(mail_fixture):
+    """The MCP SDK runs sync tool handlers on anyio's worker pool, whose
+    threads are pruned after 10 s idle and respawned under load. A single
+    cached sqlite3 connection is bound to the thread that opened it, so
+    the first call from a different worker used to raise ProgrammingError
+    ("SQLite objects created in a thread can only be used in that same
+    thread") and every later call kept failing until restart. Reads must
+    succeed from whichever thread happens to serve the request."""
+    import threading
+
+    src = AppleMailSource(mail_base=mail_fixture)
+    # Warm the creator thread's connection first, as the server does.
+    assert [r.id for r in src.recent(None, None, limit=10)] == ["101", "100", "200", "300"]
+
+    results: list[list[str]] = []
+    errors: list[BaseException] = []
+
+    def worker() -> None:
+        try:
+            results.append([r.id for r in src.recent(None, None, limit=10)])
+            results.append([r.id for r in src.search(SearchQuery(query="I2C"))])
+            results.append(sorted(b.name for b in src.mailboxes()))
+        except BaseException as exc:  # noqa: BLE001 — surface everything
+            errors.append(exc)
+
+    threads = [threading.Thread(target=worker) for _ in range(3)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=10)
+
+    assert errors == []
+    assert results.count(["101", "100", "200", "300"]) == 3
+    assert results.count(["100"]) == 3
+    # And the creator thread still works after the others have run.
+    assert [r.id for r in src.search(SearchQuery(query="I2C"))] == ["100"]

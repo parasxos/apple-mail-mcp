@@ -18,6 +18,7 @@ import html.parser
 import os
 import re
 import sqlite3
+import threading
 import urllib.parse
 from datetime import datetime, timezone
 from pathlib import Path
@@ -117,10 +118,32 @@ class AppleMailSource:
                 f"Either Mail.app isn't set up, or the process running this "
                 f"server lacks Full Disk Access for ~/Library/Mail."
             )
-        self._conn = _connect_readonly(index)
+        self._index = index
+        self._local = threading.local()
         self._columns = self._probe_columns()
         self._fts_index = None  # lazy — see _fts()
         self._last_fts: dict | None = None  # stash from the latest search()
+
+    @property
+    def _conn(self) -> sqlite3.Connection:
+        """Read-only Envelope Index connection, one per thread.
+
+        Tool handlers run on anyio's worker pool, whose threads come and
+        go (idle workers are pruned after 10 s; a busy pool spawns new
+        ones). sqlite3 connections are bound to the thread that opened
+        them, so a single cached connection wedges the process for good
+        the first time a call lands on a different worker — every later
+        call raises "SQLite objects created in a thread can only be used
+        in that same thread" until restart. A thread-local connection
+        removes the affinity problem without a lock: the file is opened
+        mode=ro and SQLite serves concurrent readers natively. A pruned
+        worker takes its connection with it.
+        """
+        conn = getattr(self._local, "conn", None)
+        if conn is None:
+            conn = _connect_readonly(self._index)
+            self._local.conn = conn
+        return conn
 
     # ------------------------------------------------------------------ #
     # schema probing                                                     #
