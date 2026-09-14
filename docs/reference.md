@@ -188,6 +188,18 @@ you work off-site, `ssh_sendmail` through a login host you can always
 reach is the sturdier lane; the smtp driver reports an unresolvable host
 as a DNS failure, verbatim, so the two cases are easy to tell apart.
 
+**Trust store.** Both TLS lanes (`smtp`, Graph) verify the peer — certificate
+required, hostname checked — through one rule (`email_mcp/tls.py`): a bundle
+you set in `SSL_CERT_FILE` / `SSL_CERT_DIR` is honoured as is; otherwise the
+interpreter's own store when it exists; otherwise `certifi`'s bundle (a direct
+dependency), which is what python.org framework builds need — they ship no
+root-CA bundle, and a bare `ssl.create_default_context()` holds zero anchors,
+so every handshake fails with `CERTIFICATE_VERIFY_FAILED` on every retry. The
+smtp driver's preflight (`ensure`) performs the verified handshake without
+AUTH, so a broken store surfaces as `transport_unavailable` with the OpenSSL
+verdict and the store that judged it, before any password or message is
+spoken; `doctor` prints the same under `trust_store` per identity.
+
 A complete `~/.email-mcp/identities.toml` (chmod 600). The known keys
 (`from_addr`, `from_name`, `driver`, `allowlist`, `allow_all`, `bcc_self`)
 configure the identity; every other key in a block is a parameter for its

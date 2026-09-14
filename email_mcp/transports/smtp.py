@@ -16,7 +16,7 @@ import ssl
 import subprocess
 import time
 
-from .. import codes
+from .. import codes, tls
 from ..log import get_logger
 from . import SendError
 
@@ -138,6 +138,7 @@ class SmtpTransport:
         self.identity = identity
         self.from_addr = from_addr
         self.last_ensure_error: str | None = None
+        self._ctx: ssl.SSLContext | None = None
         self._prefix = f"[{identity}/{self.name}]"
 
     def _secret(self) -> str:
@@ -155,20 +156,58 @@ class SmtpTransport:
     def _secret_ref(self) -> str:
         return self.op or self.keychain
 
+    def _context(self) -> ssl.SSLContext:
+        """The verifying context, from the shared trust-store rule
+        (email_mcp.tls). Refuses up front when it holds no anchors at
+        all: the handshake would fail identically on every retry, and
+        naming the local remedy beats a CERTIFICATE_VERIFY_FAILED that
+        reads like the peer's fault."""
+        ctx = tls.client_context()
+        self._ctx = ctx  # the one that judges this handshake, kept for
+        #                  the failure line and healthcheck's trust_store
+        if tls.empty(ctx):
+            raise SendError(
+                f"{self._prefix} cannot verify {self.host}:{self.port}: "
+                f"{tls.remedy(ctx)}",
+                code=codes.TRANSPORT_UNAVAILABLE,
+            )
+        return ctx
+
     def _connect(self, timeout: float) -> smtplib.SMTP:
         """Port 465 → implicit TLS; anything else → plain + STARTTLS.
 
-        One default context on both paths: certificate required, hostname
-        checked. smtplib's own default verifies nothing on Python 3.11, so
+        One verifying context on both paths: certificate required,
+        hostname checked, trust store populated (tls.client_context).
+        smtplib's own default verifies nothing on Python 3.11, so
         without it the app password would go to any impersonator."""
-        context = ssl.create_default_context()
+        context = self._context()
         if self.port == 465:
             return smtplib.SMTP_SSL(
                 self.host, self.port, timeout=timeout, context=context,
             )
         server = smtplib.SMTP(self.host, self.port, timeout=timeout)
-        server.starttls(context=context)
+        try:
+            server.starttls(context=context)
+        except BaseException:
+            # The caller never sees this object when we raise, so its
+            # cleanup cannot close it; do it here.
+            try:
+                server.close()
+            except Exception:
+                pass
+            raise
         return server
+
+    def _cert_error(self, e: ssl.SSLCertVerificationError) -> SendError:
+        """The peer's chain did not verify: no secret was spoken, nothing
+        was sent, and retrying the same handshake cannot help. Say which
+        trust store judged it and what to do about it."""
+        ctx = getattr(self, "_ctx", None) or tls.client_context()
+        return SendError(
+            f"{self._prefix} TLS certificate verification of "
+            f"{self.host}:{self.port} failed: {tls.failure(ctx, e)}",
+            code=codes.TRANSPORT_UNAVAILABLE,
+        )
 
     # ----------------------------------------------------------------- #
     # MailTransport protocol                                            #
@@ -207,6 +246,10 @@ class SmtpTransport:
                 f"holds a wrong or expired app password: {e}",
                 code=codes.AUTH_FAILED,
             ) from e
+        except ssl.SSLCertVerificationError as e:
+            _log.error("smtp tls verification failed for %s:%d: %s",
+                       self.host, self.port, e)
+            raise self._cert_error(e) from e
         except (smtplib.SMTPException, OSError) as e:
             _log.error("smtp deliver failed (%.1fs): %s",
                        time.monotonic() - t0, e)
@@ -227,20 +270,35 @@ class SmtpTransport:
                 for addr, (code, resp) in refused.items()}
 
     def ensure(self) -> bool:
-        """Cheap readiness: the secret source reads and the port answers.
-        No AUTH — providers throttle repeated logins."""
+        """Readiness without AUTH (providers throttle repeated logins):
+        the secret source reads, and the port answers a VERIFIED TLS
+        handshake. The handshake is what catches a missing or wrong
+        trust store here, at preflight, instead of as a delivery failure
+        after the message was composed (2026-09-14, Gmail)."""
         self.last_ensure_error = None
         try:
             self._secret()
         except SendError as e:
             self.last_ensure_error = str(e)
             return False
+        server = None
         try:
-            with socket.create_connection((self.host, self.port), timeout=10):
-                pass
-        except OSError as e:
+            server = self._connect(timeout=10)
+        except SendError as e:
+            self.last_ensure_error = str(e)
+            return False
+        except ssl.SSLCertVerificationError as e:
+            self.last_ensure_error = str(self._cert_error(e))
+            return False
+        except (smtplib.SMTPException, OSError) as e:
             self.last_ensure_error = f"cannot reach {self.host}:{self.port}: {e}"
             return False
+        finally:
+            if server is not None:
+                try:
+                    server.quit()
+                except Exception:
+                    pass
         return True
 
     def healthcheck(self) -> dict:
@@ -254,18 +312,28 @@ class SmtpTransport:
             "secret_source": "op" if self.op else "keychain",
         }
         server = None
+        self._ctx = None
         try:
             password = self._secret()
             server = self._connect(timeout=30)
             server.ehlo()
             server.login(self.username, password)
         except (SendError, smtplib.SMTPException, OSError) as e:
+            # Describe the context that judged the peer (a directory
+            # store shows what the handshake loaded), else a fresh one.
+            info["trust_store"] = tls.describe(
+                self._ctx or tls.client_context())
             info["ok"] = False
             info["error"] = str(e)
             # The driver owns its own remedy (RC P03): a failing lane must
-            # say what to do, and the three ways this lane fails have
-            # three different answers.
-            if isinstance(e, SendError):
+            # say what to do, and the four ways this lane fails have
+            # four different answers.
+            if isinstance(e, ssl.SSLCertVerificationError):
+                info["error"] = str(self._cert_error(e))
+                info["fix"] = tls.failure(self._ctx or tls.client_context(), e)
+            elif isinstance(e, SendError) and e.code == codes.TRANSPORT_UNAVAILABLE:
+                info["fix"] = tls.remedy(self._ctx or tls.client_context())
+            elif isinstance(e, SendError):
                 info["fix"] = (f"store the password: security "
                                f"add-generic-password -a {self.username} "
                                f"-s {self._secret_ref} -w")
@@ -285,5 +353,6 @@ class SmtpTransport:
                     server.quit()
                 except Exception:
                     pass
+        info["trust_store"] = tls.describe(self._ctx)
         info["ok"] = True
         return info

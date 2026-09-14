@@ -1638,8 +1638,10 @@ def test_no_token_material_ever_logged(monkeypatch, tmp_path):
 
 
 def test_ssl_context_prefers_certifi_and_caches(monkeypatch):
-    """The venv's framework Python has no root-CA bundle; graph must wire
-    certifi when available (launchd-safe TLS) and build the context once."""
+    """The venv's framework Python has no root-CA bundle; graph must end
+    up with a populated store (certifi's, via the shared email_mcp.tls
+    rule — an operator's SSL_CERT_FILE/SSL_CERT_DIR now wins over it)
+    and build the context once."""
     from email_mcp import graph as g
     monkeypatch.setattr(g, "_SSL_CTX", None)
     ctx1 = g._ssl_context()

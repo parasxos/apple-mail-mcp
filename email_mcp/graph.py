@@ -36,7 +36,6 @@ import tempfile
 import time
 import urllib.error
 import urllib.parse
-import ssl
 import urllib.request
 from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
@@ -96,17 +95,14 @@ def _name(ident) -> str:
 
 def _ssl_context():
     """TLS context that works everywhere the venv runs (launchd included):
-    python.org framework builds ship without a root-CA bundle wired, so
-    prefer certifi's when importable; fall back to system defaults."""
+    the shared trust-store rule in email_mcp.tls — an operator's
+    SSL_CERT_FILE/SSL_CERT_DIR is honoured, the interpreter's own store
+    when it exists, certifi's bundle when python.org's framework build
+    ships none. Built once."""
     global _SSL_CTX
     if _SSL_CTX is None:
-        cafile = None
-        try:
-            import certifi
-            cafile = certifi.where()
-        except ImportError:
-            pass
-        _SSL_CTX = ssl.create_default_context(cafile=cafile)
+        from . import tls
+        _SSL_CTX = tls.client_context()
     return _SSL_CTX
 
 

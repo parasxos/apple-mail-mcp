@@ -127,8 +127,8 @@ def test_smtp_default_reports_dns_truth_not_ssh_session(monkeypatch, tmp_path):
     monkeypatch.setattr(smtp_mod, "_read_keychain",
                         lambda item, account: "pw")
 
-    def _no_dns(addr, timeout=None):
-        raise socket_mod.gaierror(
+    def _no_dns(*args, **kwargs):  # smtplib's own call shape, since
+        raise socket_mod.gaierror(   # ensure() now handshakes via smtplib
             8, "nodename nor servname provided, or not known")
 
     monkeypatch.setattr(smtp_mod.socket, "create_connection", _no_dns)

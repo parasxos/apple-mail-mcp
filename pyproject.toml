@@ -21,6 +21,7 @@ classifiers = [
     "Topic :: Communications :: Email",
 ]
 dependencies = [
+    "certifi>=2024.2.2",
     "mcp>=1.27.1,<3",
     "pydantic>=2,<3",
 ]
