@@ -477,7 +477,17 @@ def pki(tmp_path_factory):
 class _TlsSmtpServer:
     """Just enough SMTP to reach the handshake: greets, EHLO, STARTTLS (or
     implicit TLS), then 250s everything and 221s QUIT. Records the
-    commands it saw so a test can prove no AUTH ever happened."""
+    commands it saw so a test can prove no AUTH ever happened.
+
+    Patient on purpose (60 s): smtplib calls socket.getfqdn() between the
+    greeting and the first command, and on some hosts (GitHub's macOS
+    runners) reverse DNS makes that take tens of seconds. A 10 s server
+    timeout there closed the conversation under the client — and a kept
+    traceback then pinned the socket open, so the client saw a timeout
+    rather than EOF. The error is stored as text, and the socket is shut
+    down explicitly, so a failure is always visible as one."""
+
+    TIMEOUT = 60
 
     def __init__(self, pki: dict, *, implicit: bool) -> None:
         self.ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
@@ -486,10 +496,10 @@ class _TlsSmtpServer:
         self.sock = socket.socket()
         self.sock.bind(("127.0.0.1", 0))
         self.sock.listen(1)
-        self.sock.settimeout(10)
+        self.sock.settimeout(self.TIMEOUT)
         self.port = self.sock.getsockname()[1]
         self.commands: list[bytes] = []
-        self.handshake_error: BaseException | None = None
+        self.handshake_error: str | None = None
         self.thread = threading.Thread(target=self._serve, daemon=True)
         self.thread.start()
 
@@ -498,7 +508,8 @@ class _TlsSmtpServer:
             conn, _ = self.sock.accept()
         except OSError:
             return
-        conn.settimeout(10)
+        conn.settimeout(self.TIMEOUT)
+        f = None
         try:
             if self.implicit:
                 conn = self.ctx.wrap_socket(conn, server_side=True)
@@ -515,6 +526,7 @@ class _TlsSmtpServer:
                                  b"250 AUTH PLAIN LOGIN\r\n")
                 elif cmd == b"STARTTLS":
                     conn.sendall(b"220 go ahead\r\n")
+                    f.close()
                     conn = self.ctx.wrap_socket(conn, server_side=True)
                     f = conn.makefile("rb")
                 elif cmd == b"QUIT":
@@ -523,16 +535,20 @@ class _TlsSmtpServer:
                 else:
                     conn.sendall(b"250 ok\r\n")
         except BaseException as e:  # noqa: BLE001 — a rejected handshake
-            self.handshake_error = e
+            self.handshake_error = repr(e)  # text: never pin the frame
         finally:
-            try:
-                conn.close()
-            except Exception:
-                pass
+            for closer in ((f.close if f is not None else None),
+                           lambda: conn.shutdown(socket.SHUT_RDWR),
+                           conn.close):
+                try:
+                    if closer is not None:
+                        closer()
+                except OSError:
+                    pass
 
     def close(self) -> None:
         self.sock.close()
-        self.thread.join(timeout=10)
+        self.thread.join(timeout=self.TIMEOUT)
 
 
 @pytest.fixture
@@ -557,6 +573,10 @@ def live(monkeypatch, pki):
         return t, srv
 
     monkeypatch.setattr(smtp_mod, "_read_keychain", lambda item, account: "pw")
+    # smtplib names this host in EHLO via socket.getfqdn(), which can
+    # take tens of seconds of reverse DNS on CI hosts; the name is
+    # irrelevant to every assertion here, so pin it and keep CI fast.
+    monkeypatch.setattr(socket, "getfqdn", lambda name="": "localhost")
     yield run
     for s in servers:
         s.close()
