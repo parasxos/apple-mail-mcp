@@ -18,6 +18,7 @@ import html.parser
 import os
 import re
 import sqlite3
+import threading
 import urllib.parse
 from datetime import datetime, timezone
 from pathlib import Path
@@ -90,7 +91,7 @@ def _html_to_text(s: str) -> str:
     return p.text()
 
 
-def _connect_readonly(db_path: Path) -> sqlite3.Connection:
+def _connect_readonly(db_path: Path, *, check_same_thread: bool = True) -> sqlite3.Connection:
     """Open the Envelope Index read-only, honoring WAL.
 
     Plain `mode=ro` takes a shared lock and reads the latest committed
@@ -100,9 +101,38 @@ def _connect_readonly(db_path: Path) -> sqlite3.Connection:
     disk image is malformed" whenever Mail.app has pending WAL frames.)
     """
     uri = "file:" + urllib.parse.quote(str(db_path)) + "?mode=ro"
-    conn = sqlite3.connect(uri, uri=True)
+    conn = sqlite3.connect(uri, uri=True, check_same_thread=check_same_thread)
     conn.row_factory = sqlite3.Row
     return conn
+
+
+class _WorkerSlot:
+    """One worker thread's Envelope Index connection and request stash.
+
+    Deliberately cycle-free (two plain attributes, no back-references),
+    so when the owning thread exits and its thread-local storage is
+    released, the slot's refcount hits zero and ``__del__`` closes the
+    connection deterministically — no wait for cyclic garbage collection.
+    The reverse teardown (the SOURCE released on another thread while
+    this worker is alive) closes the connection cross-thread, which is
+    why it is opened with ``check_same_thread=False``; the slot itself
+    is reachable only through the thread-local, so no other thread can
+    ever use it.
+    """
+
+    __slots__ = ("conn", "last_fts")
+
+    def __init__(self, conn: sqlite3.Connection) -> None:
+        self.conn: sqlite3.Connection | None = conn
+        self.last_fts: dict | None = None
+
+    def close(self) -> None:
+        conn, self.conn = self.conn, None
+        if conn is not None:
+            conn.close()
+
+    def __del__(self) -> None:
+        self.close()
 
 
 class AppleMailSource:
@@ -117,10 +147,65 @@ class AppleMailSource:
                 f"Either Mail.app isn't set up, or the process running this "
                 f"server lacks Full Disk Access for ~/Library/Mail."
             )
-        self._conn = _connect_readonly(index)
+        self._index = index
+        self._local = threading.local()
         self._columns = self._probe_columns()
         self._fts_index = None  # lazy — see _fts()
-        self._last_fts: dict | None = None  # stash from the latest search()
+
+    # ------------------------------------------------------------------ #
+    # per-worker state                                                   #
+    # ------------------------------------------------------------------ #
+
+    def _slot(self) -> "_WorkerSlot":
+        """This thread's slot, opened on first use.
+
+        Tool handlers run on anyio's worker pool, whose threads come and
+        go (idle workers are pruned after 10 s; a busy pool spawns new
+        ones). sqlite3 connections are bound to the thread that opened
+        them, so a single cached connection breaks the first time a
+        call lands on a different worker — "SQLite objects created in a
+        thread can only be used in that same thread" — and keeps
+        failing for as long as the pool keeps serving calls off the
+        creator thread, which can persist after idle-worker pruning.
+        One connection per worker
+        removes the affinity problem without a lock: the file is opened
+        mode=ro and SQLite serves concurrent readers natively.
+
+        The slot, not the bare connection, lives in the thread-local: a
+        sqlite3.Connection carries reference cycles, so dropping the
+        thread-local reference alone would leave its file descriptor to
+        the cyclic collector — a retired worker's handle could linger
+        indefinitely (and pile up under a low fd limit). The slot is
+        cycle-free and closes the connection in __del__ the moment the
+        thread's local storage is torn down. The slot also carries the
+        per-request search stash, so two workers' searches never read
+        each other's index report.
+        """
+        slot = getattr(self._local, "slot", None)
+        if slot is None:
+            # check_same_thread=False ONLY so teardown may close it from
+            # another thread (the source released while this worker is
+            # idle); it is still private to this worker by construction.
+            slot = _WorkerSlot(_connect_readonly(
+                self._index, check_same_thread=False))
+            self._local.slot = slot
+        return slot
+
+    @property
+    def _conn(self) -> sqlite3.Connection:
+        """Read-only Envelope Index connection, one per thread."""
+        return self._slot().conn
+
+    @property
+    def _last_fts(self) -> dict | None:
+        """Stash from this thread's latest search() — per worker, since
+        the application reads it right after search() on the same
+        thread and a neighbouring worker's search must not overwrite it."""
+        return self._slot().last_fts
+
+    @_last_fts.setter
+    def _last_fts(self, report: dict | None) -> None:
+        self._slot().last_fts = report
 
     # ------------------------------------------------------------------ #
     # schema probing                                                     #

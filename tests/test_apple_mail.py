@@ -434,3 +434,191 @@ def test_attached_message_is_an_attachment_not_body(
     assert [(a.name, a.mime) for a in m.attachments] == [
         ("attachment-1.eml", "message/rfc822")]
     assert "attached body should be downloadable" not in m.body_text
+
+
+def test_source_usable_from_any_thread(mail_fixture):
+    """The MCP SDK runs sync tool handlers on anyio's worker pool, whose
+    threads are pruned after 10 s idle and respawned under load. A single
+    cached sqlite3 connection is bound to the thread that opened it, so
+    the first call from a different worker used to raise ProgrammingError
+    ("SQLite objects created in a thread can only be used in that same
+    thread") and every later call kept failing until restart. Reads must
+    succeed from whichever thread happens to serve the request."""
+    import threading
+
+    src = AppleMailSource(mail_base=mail_fixture)
+    # Warm the creator thread's connection first, as the server does.
+    assert [r.id for r in src.recent(None, None, limit=10)] == ["101", "100", "200", "300"]
+
+    results: list[list[str]] = []
+    errors: list[BaseException] = []
+
+    def worker() -> None:
+        try:
+            results.append([r.id for r in src.recent(None, None, limit=10)])
+            results.append([r.id for r in src.search(SearchQuery(query="I2C"))])
+            results.append(sorted(b.name for b in src.mailboxes()))
+        except BaseException as exc:  # noqa: BLE001 — surface everything
+            errors.append(exc)
+
+    threads = [threading.Thread(target=worker) for _ in range(3)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=10)
+
+    assert errors == []
+    assert results.count(["101", "100", "200", "300"]) == 3
+    assert results.count(["100"]) == 3
+    # And the creator thread still works after the others have run.
+    assert [r.id for r in src.search(SearchQuery(query="I2C"))] == ["100"]
+
+
+def _open_fds() -> int:
+    import os
+    for d in ("/dev/fd", "/proc/self/fd"):
+        try:
+            return len(os.listdir(d))
+        except OSError:
+            continue
+    pytest.skip("no per-process fd listing on this platform")
+
+
+def test_retired_workers_close_their_connections_without_gc(mail_fixture):
+    """anyio prunes idle workers; each one's Envelope Index connection
+    must go with it AT ONCE. A sqlite3.Connection carries reference
+    cycles, so a bare thread-local reference would leave the descriptor
+    to the cyclic collector — retired workers' handles lingering, and
+    under a low fd limit "unable to open database file". The slot owns
+    the connection and closes it deterministically; measured here with
+    cyclic GC disabled, so nothing but refcounting can be doing it."""
+    import gc
+    import threading
+
+    src = AppleMailSource(mail_base=mail_fixture)
+    assert [r.id for r in src.recent(None, None, limit=1)] == ["101"]
+
+    gc.disable()
+    try:
+        gc.collect()
+        baseline = _open_fds()
+        workers = [threading.Thread(
+            target=lambda: src.recent(None, None, limit=1)) for _ in range(20)]
+        for t in workers:
+            t.start()
+        for t in workers:
+            t.join(timeout=10)
+        assert _open_fds() == baseline
+    finally:
+        gc.enable()
+    # And the creator thread's own connection is untouched.
+    assert [r.id for r in src.recent(None, None, limit=1)] == ["101"]
+
+
+def test_concurrent_searches_keep_their_own_fts_report(mail_fixture):
+    """Two workers search at once; the application reads the index
+    report (fts hits, body_match) right after search() on its own
+    thread. That report used to be one attribute on the shared source:
+    worker A's search returns, worker B's search overwrites the stash,
+    A's response then says hits=0 / body_match=False for a hit it did
+    find. Deterministic interleaving via events, asserted on the
+    application response — the thing the client sees."""
+    import threading
+
+    from email_mcp.application.reads import ReadUseCases
+    from email_mcp.fts import FtsIndex
+
+    FtsIndex(mail_base=mail_fixture).build()
+    src = AppleMailSource(mail_base=mail_fixture)
+
+    class Provider:
+        def get(self):
+            return src
+
+    class Classifier:
+        @staticmethod
+        def classify(error):
+            return "internal_error"
+
+    reads = ReadUseCases(source=Provider(), refresh=object(),
+                         classifier=Classifier())
+
+    a_searched = threading.Event()   # A's source.search() has returned
+    b_finished = threading.Event()   # B's whole search_emails() is done
+    real_search = src.search
+
+    def interleaved_search(q):
+        hits = real_search(q)
+        if q.query == "retracted":
+            a_searched.set()         # ...now let B run to completion
+            assert b_finished.wait(10)
+        return hits
+
+    src.search = interleaved_search  # instance seam, this test only
+    pages: dict[str, object] = {}
+    errors: list[BaseException] = []
+
+    def worker(name, query, gate=None):
+        try:
+            if gate is not None:
+                assert gate.wait(10)
+            pages[name] = reads.search_emails(query=query, limit=10)
+        except BaseException as exc:  # noqa: BLE001 — surface everything
+            errors.append(exc)
+        finally:
+            if name == "B":
+                b_finished.set()
+
+    a = threading.Thread(target=worker, args=("A", "retracted"))
+    b = threading.Thread(target=worker, args=("B", "doesnotexistunique", a_searched))
+    a.start()
+    b.start()
+    a.join(timeout=15)
+    b.join(timeout=15)
+
+    assert errors == []
+    page_a, page_b = pages["A"], pages["B"]
+    assert [h.id for h in page_a.results] == ["100"]
+    assert page_a.fts["hits"] == 1 and page_a.results[0].body_match is True
+    assert page_b.results == [] and page_b.fts["hits"] == 0
+
+
+def test_source_disposed_from_another_thread_closes_quietly(mail_fixture):
+    """The teardown boundary: when the source (and with it the thread-
+    local) is released on one thread while a worker that used it is
+    still alive but idle, that worker's slot is destroyed on the
+    releasing thread — its connection is closed cross-thread. That must
+    neither raise an unraisable ProgrammingError in __del__ nor leave
+    the descriptor open. (Per-worker connections are opened with
+    check_same_thread=False precisely for this: the slot already makes
+    cross-thread USE impossible, so the flag only permits teardown.)"""
+    import gc
+    import sys
+    import threading
+
+    holder = {"src": AppleMailSource(mail_base=mail_fixture)}
+    used = threading.Event()
+    release = threading.Event()
+
+    def worker():
+        holder["src"].recent(None, None, limit=1)
+        used.set()          # holds no reference to the source from here
+        release.wait(10)    # ...but stays alive, idle
+
+    t = threading.Thread(target=worker)
+    t.start()
+    assert used.wait(10)
+
+    unraisable: list = []
+    hook, sys.unraisablehook = sys.unraisablehook, unraisable.append
+    try:
+        gc.collect()
+        baseline = _open_fds()
+        del holder["src"]           # last reference: source torn down here,
+        gc.collect()                # on the main thread, worker still alive
+        assert _open_fds() < baseline
+        assert unraisable == [], [u.exc_value for u in unraisable]
+    finally:
+        sys.unraisablehook = hook
+        release.set()
+        t.join(timeout=10)
