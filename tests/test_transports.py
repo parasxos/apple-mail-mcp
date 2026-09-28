@@ -286,7 +286,8 @@ def test_smtp_data_uses_crlf_and_dot_stuffing(monkeypatch, line_ending):
     assert b"\r\n..line\r\n" in payload
     assert payload.endswith(b"\r\n.\r\n")
     assert b"Bcc:" not in payload
-    assert "rcpt TO:<g@example.org>\r\n" in wire
+    commands = [line.lower() for line in wire if isinstance(line, str)]
+    assert "rcpt to:<g@example.org>\r\n" in commands
 
 
 def test_smtp_port_465_is_ssl_else_starttls(monkeypatch):
