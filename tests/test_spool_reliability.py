@@ -158,6 +158,45 @@ def test_scan_counts_corrupt_manifest_instead_of_hiding_it():
     assert {issue.code for issue in scan.issues} >= {"manifest_invalid"}
 
 
+@pytest.mark.parametrize(("field", "value"), [
+    ("identity", []), ("to", "self@example.org"), ("cc", [None]),
+    ("attempts", "0"), ("attempts", True), ("attempts", -1),
+    ("refused", []), ("refused", {"self@example.org": 550}),
+    ("claimed_at", {}), ("send_at", []),
+    ("status", "unknown"), ("executor", "unknown"),
+])
+def test_scan_reports_invalid_manifest_fields(field, value):
+    entry = _entry("invalid-field")
+    spool.save(b"Subject: test\r\n\r\nbody", entry)
+    manifest = _manifest("pending", entry.id)
+    data = json.loads(manifest.read_bytes())
+    data[field] = value
+    manifest.write_text(json.dumps(data))
+
+    scan = spool.scan("pending")
+
+    assert scan.manifest_files == 1
+    assert scan.entries == []
+    assert [(issue.code, issue.id) for issue in scan.issues] == [
+        ("manifest_invalid", entry.id),
+    ]
+
+
+def test_legacy_manifest_keeps_defaults_for_optional_fields():
+    entry = _entry("legacy-fields")
+    spool.save(b"Subject: test\r\n\r\nbody", entry)
+    manifest = _manifest("pending", entry.id)
+    data = json.loads(manifest.read_bytes())
+    required = ("id", "send_at", "created_at", "to", "cc", "bcc", "subject",
+                "attachments", "message_id")
+    manifest.write_text(json.dumps({name: data[name] for name in required}))
+
+    loaded = spool.load("pending", entry.id)
+
+    assert loaded == entry
+    assert spool.scan("pending").ok
+
+
 def test_scan_detects_broken_pairs_and_interrupted_temp_files():
     pending = state.State.resolve().adopt().spool / "pending"
     (pending / "manifest-only.json").write_text("{}")
@@ -244,6 +283,35 @@ def test_dispatcher_delivers_healthy_sibling_and_reports_corruption(monkeypatch)
     assert spool.load("sent", due.id) is not None
     assert _manifest("pending", bad.id).read_bytes() == b'{"id":'
     assert out["integrity"]["ok"] is False
+
+
+def test_invalid_recovery_record_does_not_block_dispatch(monkeypatch):
+    sent = []
+    monkeypatch.setattr(sender, "_socket_alive", lambda: True)
+    monkeypatch.setattr(sender, "_deliver_bytes", lambda raw: sent.append(raw) or {})
+    now = spool.utcnow()
+    bad = _entry("recovery-bad")
+    spool.save(b"Subject: bad\r\n\r\nbody", bad)
+    spool.claim(bad.id)
+    manifest = _manifest("sending", bad.id)
+    data = json.loads(manifest.read_bytes())
+    data.update(attempts="0", claimed_at=spool.iso(now - timedelta(minutes=30)))
+    malformed = json.dumps(data)
+    manifest.write_text(malformed)
+
+    for attempt in range(2):
+        good = _entry(f"dispatch-good-{attempt}")
+        good.send_at = spool.iso(now - timedelta(minutes=1))
+        spool.save(b"Subject: good\r\n\r\nbody", good)
+
+        out = dispatcher.run_once(now)
+
+        assert out["results"][good.id] == "sent"
+        assert out["integrity"]["readable_counts"]["sending"] == 0
+        assert any(issue["code"] == "manifest_invalid" and issue["id"] == bad.id
+                   for issue in out["integrity"]["issues"])
+        assert manifest.read_text() == malformed
+    assert len(sent) == 2
 
 
 def test_dispatcher_status_is_nonzero_when_counts_are_incomplete(capsys):

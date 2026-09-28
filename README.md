@@ -27,7 +27,7 @@ and let Exchange deliver scheduled messages even while your Mac is asleep.
 ![tools](https://img.shields.io/badge/MCP%20tools-21-brightgreen)
 ![platform](https://img.shields.io/badge/platform-macOS%20%2B%20Mail.app-orange)
 ![python](https://img.shields.io/badge/Python-3.11%E2%80%933.14-blue)
-![mcp](https://img.shields.io/badge/MCP%20SDK-1.x%20%2B%202.x-purple)
+![mcp](https://img.shields.io/badge/MCP%20SDK-2.2%2B-purple)
 ![contract](https://img.shields.io/badge/wire%20contract-frozen%20v1-blue)
 
 </div>
@@ -114,7 +114,7 @@ If the benchmarks hold up on your mailbox, a ⭐ helps others find this.
 - 🤝 **Clear to every MCP client.** All 21 tools identify what they do, explain
   every input, and declare whether they read, change or can remove data. Newer
   clients receive structured results; older clients keep the same JSON text.
-  Both the maintained MCP 1.x line and current MCP 2.x are tested.
+  MCP SDK 2.2 and newer 2.x releases are tested, with support for older clients.
 - 🧱 **Built to evolve without breaking your workflow.** Email rules are
   isolated from MCP, Mail.app, Exchange, delivery, and local storage. Provider
   or SDK changes stay at the edge while the 21-tool contract remains stable.

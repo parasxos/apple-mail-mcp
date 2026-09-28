@@ -60,12 +60,16 @@ def confirm_and_run(rows: list[plan.Row], *, verb: str, yes: bool = False,
 # ---------------------------------------------------------------------- #
 
 
-def _listed(d: Path, consequence: str) -> tuple[list[str], plan.Row | None]:
+def _listed(d: Path, consequence: str,
+            root: Path | None = None) -> tuple[list[str], plan.Row | None]:
     """Names in `d`, or the PrintOnly row saying the plan cannot see them.
     Path.glob swallows PermissionError, so a plan built over it silently
     under-describes; a plan that cannot enumerate must say so instead —
     one rule for every directory a plan builder walks."""
     try:
+        if root is not None:
+            with state.open_directory(root, d) as fd:
+                return sorted(os.listdir(fd)), None
         return sorted(os.listdir(d)), None
     except FileNotFoundError:
         return [], None
@@ -117,10 +121,11 @@ def plan_uninstall(purge: bool = False) -> list[plan.Row]:
         rows.append(plan.RemoveTree.state_root())
     else:
         reader = r.reader()
-        names, cannot = _listed(reader.graph, "token caches not removed")
+        names, cannot = _listed(reader.graph, "token caches not removed",
+                                root=reader.root)
         if cannot:
             rows.append(cannot)
-        rows += [plan.UnlinkFile(reader.graph / n) for n in names
+        rows += [plan.UnlinkFile(reader.graph / n, root=reader.root) for n in names
                  if n.endswith(".token.json")]
         rows.append(plan.Kept(r.root, "state kept — pass --purge to remove")
                     if os.path.isdir(r.root)
@@ -373,8 +378,7 @@ def _agent_rows() -> list[plan.Row]:
 # the exact pane and revealing the exact binary to drag in — then
 # verifying with a real run, because a probe spawned from this terminal
 # inherits the terminal's TCC identity and proves nothing about launchd.
-_FDA_PANE = ("x-apple.systempreferences:com.apple.preference.security"
-             "?Privacy_AllFiles")
+from .store_health import FDA_PANE as _FDA_PANE
 
 _VERIFY_POLL = 2.0     # seconds between launchctl looks
 _VERIFY_GRACE = 8.0    # running this long ⇒ crawling, not crashing

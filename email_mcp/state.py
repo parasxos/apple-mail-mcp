@@ -29,6 +29,7 @@ from __future__ import annotations
 
 import os
 import stat
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -123,7 +124,9 @@ class StateWriter:
 
     @property
     def plans(self) -> Path:
-        return _ensure_dir(self.root / "plans")
+        directory = _ensure_dir(self.root / "plans")
+        _ensure_dir(directory / "locks")
+        return directory
 
     @property
     def graph(self) -> Path:
@@ -176,6 +179,33 @@ def default_root() -> Path:
     it — resolve itself, the purge fence, identities' default home — asks
     here, so the root's location has exactly one owner."""
     return Path.home() / ".email-mcp"
+
+
+@contextmanager
+def open_directory(root: Path, directory: Path):
+    """Open below an accepted root without following child directory links."""
+    parts = directory.relative_to(root).parts
+    if ".." in parts:
+        raise RefusedError(f"{directory} escapes state root {root}")
+    flags = os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC
+    fd = os.open(root, flags)
+    try:
+        for name in parts:
+            child = os.open(name, flags | os.O_NOFOLLOW, dir_fd=fd)
+            os.close(fd)
+            fd = child
+        yield fd
+    finally:
+        os.close(fd)
+
+
+def stat_path(root: Path, path: Path):
+    """Inspect a managed path without traversing links below its root."""
+    if path == root:
+        with open_directory(root, root) as fd:
+            return os.fstat(fd)
+    with open_directory(root, path.parent) as fd:
+        return os.stat(path.name, dir_fd=fd, follow_symlinks=False)
 
 
 class State:

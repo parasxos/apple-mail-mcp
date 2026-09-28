@@ -34,6 +34,7 @@ import re
 import threading
 
 from .transports.smtp import _read_keychain, _read_op
+from .mime_parts import walk_parts
 
 
 class ImapError(Exception):
@@ -215,11 +216,8 @@ def _extract_body(raw: bytes) -> dict:
     msg = email_mod.message_from_bytes(raw)
     plains: list[str] = []
     htmls: list[str] = []
-    for part in msg.walk():
-        if part.get_content_maintype() != "text":
-            continue
-        if str(part.get("Content-Disposition", "")
-               ).lower().startswith("attachment"):
+    for _, part, attached in walk_parts(msg):
+        if attached or part.get_content_maintype() != "text":
             continue
         try:
             payload = part.get_payload(decode=True)

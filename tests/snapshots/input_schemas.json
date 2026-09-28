@@ -716,6 +716,21 @@
   },
   "triage_apply": {
     "properties": {
+      "exclude_ids": {
+        "anyOf": [
+          {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          {
+            "type": "null"
+          }
+        ],
+        "default": null,
+        "title": "Exclude Ids"
+      },
       "plan_id": {
         "title": "Plan Id",
         "type": "string"

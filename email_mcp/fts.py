@@ -2,13 +2,15 @@
 
 The Envelope Index only carries first-line snippets, so search silently
 misses message bodies. This module maintains a private SQLite database
-(<state root>/fts/fts.db, 0700) with three tables:
+(<state root>/fts/fts.db, 0700) with these tables:
 
   meta      key/value: schema_version, last_rowid high-water mark, timestamps
   docs      per-message ledger: status indexed|partial|missing|error,
             attempts, last_attempt, bytes,
             source local|graph|graph_miss|graph_none|imap|imap_miss
   body_fts  plain FTS5 over extracted body text, rowid == messages.ROWID
+  absence   repeated absence observations before reconciliation removes a doc
+  backfill_reasons  locally recorded reasons a provider lookup is unavailable
 
 Source is the evidence ledger of the backfill lanes (Graph for ews://
 mailboxes, IMAP for imap:// mailboxes whose identity declares an
@@ -53,7 +55,7 @@ CLI:
   python -m email_mcp.fts --sync               # catch up + retries (+ weekly reconcile + backfill)
   python -m email_mcp.fts --backfill           # server-side bodies for local holes
   python -m email_mcp.fts --reconcile          # full rowid-set diff
-  python -m email_mcp.fts --rebuild            # fresh build; server-fetched bodies carried over
+  python -m email_mcp.fts --rebuild            # fresh build; useful cached bodies carried over
   python -m email_mcp.fts --status [--json]
   python -m email_mcp.fts --install-launchd    # com.email-mcp.fts, 03:30 daily --sync
   python -m email_mcp.fts --uninstall-launchd
@@ -63,6 +65,7 @@ from __future__ import annotations
 import os
 import re
 import sqlite3
+import tempfile
 import time
 import urllib.parse
 from datetime import datetime, timezone
@@ -71,16 +74,17 @@ from pathlib import Path
 from . import config, state
 from . import fts_runtime
 from .log import get_logger
+from .fts_reporting import coverage_report
 from .sources.apple_mail_paths import find_emlx_path, mailbox_data_dir
 
-SCHEMA_VERSION = 2  # v2: docs.source column; values grew imap|imap_miss
-                    # 2026-08-24 (TEXT column — no structural change)
+SCHEMA_VERSION = 3
 LAUNCHD_LABEL = "com.email-mcp.fts"
 
 _DB_NAME = "fts.db"
 _BUSY_TIMEOUT_MS = 5000
 _BATCH_SIZE = 2000
 _MAX_ATTEMPTS = 6
+_ABSENCE_GRACE_SECONDS = 24 * 3600
 _TRANSLATE_CHUNK = 100  # EWS ids per translateExchangeIds call
 # Per-pass identity health (backfill): an identity that keeps erroring
 # and has answered NOTHING is dead for the pass (revoked token, outage);
@@ -103,6 +107,16 @@ CREATE TABLE IF NOT EXISTS docs (
     source       TEXT NOT NULL DEFAULT 'local'
 );
 CREATE INDEX IF NOT EXISTS docs_status ON docs(status);
+CREATE TABLE IF NOT EXISTS absence (
+    rowid INTEGER PRIMARY KEY,
+    first_absent REAL NOT NULL,
+    last_absent REAL NOT NULL,
+    observations INTEGER NOT NULL
+);
+CREATE TABLE IF NOT EXISTS backfill_reasons (
+    rowid INTEGER PRIMARY KEY,
+    reason TEXT NOT NULL
+);
 CREATE VIRTUAL TABLE IF NOT EXISTS body_fts USING fts5(
     body,
     tokenize = 'unicode61 remove_diacritics 2'
@@ -177,7 +191,7 @@ class FtsIndex:
         return (self._db or db_path()).exists()
 
     def status(self) -> dict:
-        path = db_path()
+        path = self._db or db_path()
         out: dict = {
             "state": "absent",
             "db": str(path),
@@ -185,7 +199,21 @@ class FtsIndex:
             "schema_version": None,
             "last_rowid": 0,
             "docs": {"indexed": 0, "partial": 0, "missing": 0, "error": 0,
-                     "total": 0, "backfilled": 0},
+                     "total": 0, "backfilled": 0, "local_retry_exhausted": 0},
+            "backlog": None,
+            "recovery": {
+                "state": "not_attempted", "last_attempt_at": None,
+                "last_error": None, "no_lane": 0, "no_message_id": 0,
+                "no_remote_id": 0, "unavailable_mailbox": 0, "unclassified_unavailable": 0,
+                "confirmed_misses": 0,
+            },
+            "cleanup": {
+                "grace_seconds": _ABSENCE_GRACE_SECONDS, "pending_removal": 0,
+                "removed_total": 0, "last_removed_at": None,
+                "recovered_total": 0, "last_recovered_at": None,
+                "reappeared_total": 0, "last_reappeared_at": None,
+                "retry_deferred_total": 0,
+            },
             "built_at": None,
             "last_sync_at": None,
             "last_reconcile_at": None,
@@ -194,14 +222,17 @@ class FtsIndex:
         }
         if not path.exists():
             out["remedy"] = "python -m email_mcp.fts --build"
+            out.update(coverage_report(out))
             return out
         try:
             conn = self._open_ro()
         except sqlite3.Error as e:
             out["state"] = "error"
             out["error"] = str(e)
+            out.update(coverage_report(out))
             return out
         try:
+            conn.execute("BEGIN")
             counts = {
                 r["status"]: int(r["n"])
                 for r in conn.execute(
@@ -211,13 +242,47 @@ class FtsIndex:
             for key in ("indexed", "partial", "missing", "error"):
                 out["docs"][key] = counts.get(key, 0)
             out["docs"]["total"] = sum(counts.values())
+            out["docs"]["local_retry_exhausted"] = int(conn.execute(
+                "SELECT COUNT(*) FROM docs WHERE status IN "
+                "('missing', 'partial', 'error') AND attempts >= ?",
+                (_MAX_ATTEMPTS,),
+            ).fetchone()[0])
             try:
-                out["docs"]["backfilled"] = int(conn.execute(
-                    "SELECT COUNT(*) AS n FROM docs "
-                    "WHERE source IN ('graph', 'imap')"
-                ).fetchone()["n"])
+                sources = {r[0]: int(r[1]) for r in conn.execute(
+                    "SELECT source, COUNT(*) FROM docs GROUP BY source")}
+                out["docs"]["backfilled"] = sum(
+                    sources.get(key, 0) for key in ("graph", "imap"))
             except sqlite3.OperationalError:  # pre-v2 db: no source column
-                out["docs"]["backfilled"] = 0
+                sources = {}
+            tables = {r[0] for r in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table'")}
+            recovery = out["recovery"]
+            reasons = {}
+            if "backfill_reasons" in tables:
+                reasons = {r[0]: int(r[1]) for r in conn.execute(
+                    "SELECT r.reason, COUNT(*) FROM backfill_reasons r "
+                    "JOIN docs d ON d.rowid=r.rowid WHERE d.status != 'indexed' "
+                    "GROUP BY r.reason")}
+            for reason in ("no_lane", "no_message_id", "no_remote_id", "unavailable_mailbox"):
+                recovery[reason] = reasons.get(reason, 0)
+            recovery["unclassified_unavailable"] = max(
+                0, sources.get("graph_none", 0)
+                - recovery["no_lane"] - recovery["no_message_id"])
+            recovery["confirmed_misses"] = sum(
+                sources.get(key, 0) for key in ("graph_miss", "imap_miss"))
+            recovery["last_attempt_at"] = self._meta_get(conn, "last_backfill_attempt_at")
+            recovery["state"] = self._meta_get(conn, "last_backfill_state", "not_attempted")
+            if "absence" in tables:
+                out["cleanup"]["pending_removal"] = int(conn.execute(
+                    "SELECT COUNT(*) FROM absence a JOIN docs d ON d.rowid=a.rowid"
+                ).fetchone()[0])
+            for name in ("removed", "recovered", "reappeared"):
+                out["cleanup"][f"{name}_total"] = int(self._meta_get(
+                    conn, f"{name}_total", "0"))
+                out["cleanup"][f"last_{name}_at"] = self._meta_get(
+                    conn, f"last_{name}_at")
+            out["cleanup"]["retry_deferred_total"] = int(self._meta_get(
+                conn, "retry_deferred_total", "0"))
             out["state"] = "ready"
             out["db_bytes"] = path.stat().st_size
             raw_version = self._meta_get(conn, "schema_version")
@@ -229,11 +294,20 @@ class FtsIndex:
             out["last_backfill_at"] = self._meta_get(conn, "last_backfill_at")
             out["last_backfill_error"] = self._meta_get(
                 conn, "last_backfill_error")
+            recovery["last_error"] = out["last_backfill_error"]
+            if recovery["last_error"]:
+                recovery["state"] = "error"
         except sqlite3.Error as e:
             out["state"] = "error"
             out["error"] = str(e)
         finally:
             conn.close()
+        if out["state"] == "ready":
+            try:
+                out["backlog"] = self._envelope_backlog(out["last_rowid"])
+            except (OSError, ValueError, sqlite3.Error):
+                pass
+        out.update(coverage_report(out))
         return out
 
     def rowids_matching(self, query: str, limit: int | None = None) -> list[int]:
@@ -318,16 +392,12 @@ class FtsIndex:
         return stats
 
     def reconcile(self) -> dict:
-        """Full rowid-set diff against the Envelope Index (hygiene, not
-        correctness — stale rowids cannot surface phantoms because hits
-        re-enter search through `m.ROWID IN (…)` against the live index).
-
-        Vanished rowids are dropped; envelope rows missing below the
-        high-water mark (anomalies — crawl covers everything above it)
-        are re-indexed."""
+        """Repair gaps and prune only repeated absence across the grace period."""
         t0 = time.monotonic()
         conn = self._open_rw()
         try:
+            if not self._begin_immediate(conn):
+                return {"skipped": "busy"}
             envelope = self._envelope_rowid_set()
             hwm = int(self._meta_get(conn, "last_rowid", "0"))
             ours = {
@@ -336,12 +406,28 @@ class FtsIndex:
             }
             vanished = sorted(ours - envelope)
             holes = sorted(r for r in (envelope - ours) if r <= hwm)
-            if not self._begin_immediate(conn):
-                return {"skipped": "busy"}
             cur = conn.cursor()
+            pending = {int(r["rowid"]): r for r in conn.execute(
+                "SELECT rowid, first_absent, last_absent, observations FROM absence")}
+            reappeared = 0
+            for rowid in pending.keys() & envelope:
+                cur.execute("DELETE FROM absence WHERE rowid=?", (rowid,))
+                reappeared += 1
+            now = time.time()
+            removed = 0
             for rowid in vanished:
-                cur.execute("DELETE FROM docs WHERE rowid = ?", (rowid,))
-                cur.execute("DELETE FROM body_fts WHERE rowid = ?", (rowid,))
+                previous = pending.get(rowid)
+                if (previous is not None
+                        and now - previous["first_absent"] >= _ABSENCE_GRACE_SECONDS
+                        and now > previous["last_absent"]):
+                    for table in ("docs", "body_fts", "absence", "backfill_reasons"):
+                        cur.execute(f"DELETE FROM {table} WHERE rowid=?", (rowid,))
+                    removed += 1
+                else:
+                    cur.execute(
+                        "INSERT INTO absence VALUES (?, ?, ?, 1) "
+                        "ON CONFLICT(rowid) DO UPDATE SET last_absent=excluded.last_absent, "
+                        "observations=absence.observations+1", (rowid, now, now))
             recovered = 0
             if holes:
                 urls = self._envelope_urls_for(holes)
@@ -349,14 +435,20 @@ class FtsIndex:
                     if rowid in urls:
                         self._index_one(cur, rowid, urls[rowid])
                         recovered += 1
+            for name, count in (("removed", removed), ("recovered", recovered),
+                                ("reappeared", reappeared)):
+                self._count_event(cur, name, count)
             self._meta_set(cur, "last_reconcile_at", _iso_now())
+            waiting = int(cur.execute("SELECT COUNT(*) FROM absence").fetchone()[0])
             conn.commit()
         finally:
             conn.close()
         return {
             "checked": len(envelope),
-            "removed": len(vanished),
+            "removed": removed,
             "recovered": recovered,
+            "reappeared": reappeared,
+            "pending_removal": waiting,
             "elapsed": round(time.monotonic() - t0, 3),
         }
 
@@ -403,10 +495,18 @@ class FtsIndex:
         stats = {"candidates": 0, "backfilled": 0, "misses": 0,
                  "no_message_id": 0, "no_remote_id": 0,
                  "no_lane": 0, "deferred": 0}
+        self._backfill_config_error = None
         idents = self._graph_identities()
         imap_idents = self._imap_identities()
         if not idents and not imap_idents:
             stats["skipped"] = "no_backfill_identity"
+            if self.available():
+                conn = self._open_rw()
+                try:
+                    self._note_backfill_health(
+                        conn, self._backfill_config_error, state="no_identities")
+                finally:
+                    conn.close()
             return stats
         conn = self._open_rw()
         try:
@@ -429,6 +529,7 @@ class FtsIndex:
                 cur.execute("UPDATE docs SET source = 'local' "
                             "WHERE source IN ('graph_miss', 'imap_miss', "
                             "'graph_none')")
+                cur.execute("DELETE FROM backfill_reasons")
                 self._meta_set(cur, "backfill_identities", fingerprint)
                 conn.commit()
             try:
@@ -442,15 +543,27 @@ class FtsIndex:
             except sqlite3.OperationalError:  # pre-v2 db mid-migration
                 stats["skipped"] = "schema_not_migrated"
                 return stats
+            expected = {rid: status for status, rowids in classes.items() for rid in rowids}
+
+            def _eligible(rid: int) -> bool:
+                row = conn.execute("SELECT status, source FROM docs WHERE rowid=?", (rid,)).fetchone()
+                return (row is not None and row["source"] == "local"
+                        and row["status"] == expected[rid]
+                        and self._meta_get(conn, "backfill_identities") == fingerprint)
+
             meta = self._envelope_backfill_meta(
                 classes["partial"] + classes["missing"])
             p_graph: list[tuple[int, str]] = []      # (rowid, mailbox url)
             p_imap: list[tuple[int, str]] = []       # (rowid, mailbox url)
             m_todo: list[tuple[int, str]] = []       # (rowid, ews id)
             no_lane: list[int] = []
+            no_remote: list[int] = []
+            unavailable: list[int] = []
             for rid in classes["partial"]:
                 url, _ = meta.get(rid, ("", None))
-                if url.startswith("ews://") and idents:
+                if not url:
+                    unavailable.append(rid)
+                elif url.startswith("ews://") and idents:
                     p_graph.append((rid, url))
                 elif url.startswith("imap://") and imap_idents:
                     p_imap.append((rid, url))
@@ -458,14 +571,16 @@ class FtsIndex:
                     no_lane.append(rid)
             for rid in classes["missing"]:
                 url, remote_id = meta.get(rid, ("", None))
-                if not (url.startswith("ews://") and idents):
+                if not url:
+                    unavailable.append(rid)
+                elif not (url.startswith("ews://") and idents):
                     no_lane.append(rid)
                 elif not remote_id:
-                    stats["no_remote_id"] += 1
+                    no_remote.append(rid)
                 else:
                     m_todo.append((rid, remote_id))
-            stats["no_lane"] = len(no_lane)
-            if no_lane:
+            resolved = [rid for rid, _ in p_graph + p_imap + m_todo]
+            if no_lane or no_remote or resolved or unavailable:
                 # No configured lane's to answer: stamp once (one
                 # set-based txn), so no later pass re-derives the whole
                 # estate to re-conclude it — revocable, like every
@@ -474,12 +589,35 @@ class FtsIndex:
                     stats["skipped"] = "busy"
                     return stats
                 cur = conn.cursor()
+                eligible = {int(r[0]) for r in cur.execute(
+                    "SELECT rowid, status FROM docs WHERE source='local' "
+                    "AND status IN ('partial', 'missing')") if expected.get(int(r[0])) == r[1]}
+                if self._meta_get(conn, "backfill_identities") != fingerprint:
+                    eligible.clear()
+                stats["deferred"] += len(set(no_lane + no_remote + resolved) - eligible) + len(unavailable)
+                no_lane = [rid for rid in no_lane if rid in eligible]
+                no_remote = [rid for rid in no_remote if rid in eligible]
+                unavailable = [rid for rid in unavailable if rid in eligible]
+                resolved = [rid for rid in resolved if rid in eligible]
+                p_graph = [(rid, url) for rid, url in p_graph if rid in eligible]
+                p_imap = [(rid, url) for rid, url in p_imap if rid in eligible]
+                m_todo = [(rid, remote) for rid, remote in m_todo if rid in eligible]
+                cur.executemany("DELETE FROM backfill_reasons WHERE rowid=?",
+                                [(rid,) for rid in resolved])
                 for i in range(0, len(no_lane), 500):
                     chunk = no_lane[i:i + 500]
                     marks = ",".join("?" * len(chunk))
                     cur.execute(f"UPDATE docs SET source = 'graph_none' "
                                 f"WHERE rowid IN ({marks})", chunk)
+                for reason, rowids in (("no_lane", no_lane), ("no_remote_id", no_remote),
+                                      ("unavailable_mailbox", unavailable)):
+                    cur.executemany(
+                        "INSERT INTO backfill_reasons VALUES (?, ?) "
+                        "ON CONFLICT(rowid) DO UPDATE SET reason=excluded.reason",
+                        [(rid, reason) for rid in rowids])
                 conn.commit()
+            stats["no_lane"] = len(no_lane)
+            stats["no_remote_id"] = len(no_remote)
             if max_docs is not None:
                 budget = max(0, max_docs)
                 p_graph = p_graph[:budget]
@@ -540,6 +678,10 @@ class FtsIndex:
                 if not self._begin_immediate(conn):
                     stats["skipped"] = "busy"
                     return False
+                if not _eligible(rid):
+                    conn.rollback()
+                    stats["deferred"] += 1
+                    return True
                 cur = conn.cursor()
                 cur.execute("DELETE FROM body_fts WHERE rowid = ?", (rid,))
                 cur.execute(
@@ -559,9 +701,20 @@ class FtsIndex:
                 return True
 
             def _stamp_doc(rid: int, source: str, counter: str) -> bool:
-                if not self._stamp_source(conn, rid, source):
+                reason = "no_message_id" if counter == "no_message_id" else None
+                if not self._begin_immediate(conn):
                     stats["skipped"] = "busy"
                     return False
+                if not _eligible(rid):
+                    conn.rollback()
+                    stats["deferred"] += 1
+                    return True
+                conn.execute("UPDATE docs SET source=?, last_attempt=? WHERE rowid=?",
+                             (source, time.time(), rid))
+                conn.execute("DELETE FROM backfill_reasons WHERE rowid=?", (rid,))
+                if reason:
+                    conn.execute("INSERT INTO backfill_reasons VALUES (?, ?)", (rid, reason))
+                conn.commit()
                 stats[counter] += 1
                 return True
 
@@ -654,7 +807,7 @@ class FtsIndex:
                                     for n, m in sorted(last_error.items()))
             summary = "; ".join(
                 f"identity {n!r}: {errors[n]} error(s), last: {last_error[n]}"
-                for n in sorted(errors)) or None
+                for n in sorted(errors)) or self._backfill_config_error
             self._note_backfill_health(conn, summary)
             if stats["backfilled"] or stats["misses"] \
                     or stats["no_message_id"]:
@@ -665,7 +818,7 @@ class FtsIndex:
         return stats
 
     def _note_backfill_health(self, conn: sqlite3.Connection,
-                              summary: str | None) -> None:
+                              summary: str | None, state: str = "ready") -> None:
         """Record (or clear) the pass's identity trouble in meta — the
         one place status() and doctor read, so a backfill that silently
         does nothing every night is a visible state, not a log line."""
@@ -676,6 +829,8 @@ class FtsIndex:
             cur.execute("DELETE FROM meta WHERE key = 'last_backfill_error'")
         else:
             self._meta_set(cur, "last_backfill_error", summary)
+        self._meta_set(cur, "last_backfill_state", "error" if summary else state)
+        self._meta_set(cur, "last_backfill_attempt_at", _iso_now())
         conn.commit()
 
     def backfilled_text(self, rowid: int) -> str | None:
@@ -700,133 +855,154 @@ class FtsIndex:
             conn.close()
 
     def rebuild(self, limit: int | None = None) -> dict:
-        """Fresh build BESIDE the live index, then one atomic promote —
-        REUSING the server-fetched bodies the live index holds.
+        """Build beside the live index, then merge in one SQLite transaction.
 
-        Server-sourced (graph/imap) rows are not derived state: the
-        local store never had those bodies, and re-fetching ~95k of
-        them is an overnight of server traffic. So the fresh build runs
-        at <db>.rebuild, salvages every server body (and stamp)
-        straight from the LIVE db
-        — read through SQLite, so WAL-resident rows are included — and
-        only then replaces it, under the live writer lock so no
-        concurrent commit is swapped out mid-flight. The live index is
-        never the casualty: interruption at ANY point leaves it exactly
-        as it was, plus a scratch file the next attempt overwrites. A
-        corrupt live db — the usual reason to rebuild — fails the
-        salvage, and the fresh build is promoted clean, exactly as
-        before."""
-        base = db_path()
+        The writer lock covers salvage and promotion. Updating the existing
+        database preserves connections opened by a concurrent backfill.
+        Only an unreadable, corrupt database needs file replacement.
+        """
+        base = self._db or db_path()
         if not base.exists():
             return self.build(limit=limit)
-        scratch = base.with_name(base.name + ".rebuild")
-        for suffix in ("", "-wal", "-shm"):  # void any interrupted attempt
-            Path(f"{scratch}{suffix}").unlink(missing_ok=True)
-        fresh = FtsIndex(mail_base=self._mail_base, db=scratch)
-        out = fresh.build(limit=limit)
-        try:
-            out["salvaged"] = fresh._salvage_graph_rows(base)
-        except Exception as e:  # corrupt live db: rebuild stays clean
-            get_logger().warning("fts rebuild: salvage skipped: %s", e)
-            out["salvage_skipped"] = str(e)
-        conn = sqlite3.connect(scratch)
-        try:  # fold the scratch WAL so ONE complete file is promoted
-            conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
-        finally:
-            conn.close()
-        live = sqlite3.connect(base)
-        try:
-            live.execute(f"PRAGMA busy_timeout={_BUSY_TIMEOUT_MS}")
+        with tempfile.TemporaryDirectory(
+            dir=base.parent, prefix=f".{base.name}.rebuild-",
+        ) as directory:
+            scratch = Path(directory) / _DB_NAME
+            fresh = FtsIndex(mail_base=self._mail_base, db=scratch)
+            out = fresh.build(limit=limit)
             try:
-                locked = self._begin_immediate(live)
-            except sqlite3.Error:  # not a database — nothing to lock
-                locked = True
-            if not locked:
-                # A writer would not survive the swap; every writer here
-                # treats busy as skip, so the promote does too — the
-                # fresh build waits at .rebuild for the next attempt.
-                out["skipped"] = "busy"
+                live = self._open_rw()
+            except sqlite3.DatabaseError as exc:
+                code = getattr(exc, "sqlite_errorcode", 0) & 0xff
+                if code in (sqlite3.SQLITE_BUSY, sqlite3.SQLITE_LOCKED):
+                    out["skipped"] = "busy"
+                    return out
+                if code not in (sqlite3.SQLITE_CORRUPT, sqlite3.SQLITE_NOTADB):
+                    raise
+                out["salvage_skipped"] = str(exc)
+                with sqlite3.connect(scratch) as checkpoint:
+                    checkpoint.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+                checkpoint.close()
+                os.replace(scratch, base)
+                for suffix in ("-wal", "-shm"):
+                    Path(f"{base}{suffix}").unlink(missing_ok=True)
                 return out
-            os.replace(scratch, base)
-        finally:
-            live.close()
-        for suffix in ("-wal", "-shm"):  # dead names once the file swapped
-            Path(f"{base}{suffix}").unlink(missing_ok=True)
-        return out
+            try:
+                live.execute("ATTACH DATABASE ? AS rebuilt", (str(scratch),))
+                if not self._begin_immediate(live):
+                    out["skipped"] = "busy"
+                    return out
+                live.execute("SAVEPOINT salvage")
+                try:
+                    live.execute(
+                        "INSERT INTO rebuilt.absence SELECT a.* FROM main.absence a "
+                        "WHERE NOT EXISTS (SELECT 1 FROM rebuilt.docs d WHERE d.rowid=a.rowid)")
+                    out["salvaged"] = self._salvage_graph_rows(live)
+                except sqlite3.DatabaseError as exc:
+                    if getattr(exc, "sqlite_errorcode", 0) & 0xff not in (
+                        sqlite3.SQLITE_CORRUPT, sqlite3.SQLITE_NOTADB,
+                    ):
+                        raise
+                    live.execute("ROLLBACK TO salvage")
+                    out["salvage_skipped"] = str(exc)
+                live.execute("RELEASE salvage")
+                self._carry_diagnostics(live)
+                live.execute("DELETE FROM rebuilt.absence WHERE rowid NOT IN "
+                             "(SELECT rowid FROM rebuilt.docs)")
+                reappeared = int(live.execute(
+                    "SELECT COUNT(*) FROM main.absence a JOIN rebuilt.docs d ON d.rowid=a.rowid "
+                    "WHERE a.rowid NOT IN (SELECT rowid FROM rebuilt.absence)").fetchone()[0])
+                if reappeared:
+                    live.execute(
+                        "INSERT INTO rebuilt.meta VALUES ('reappeared_total', ?) "
+                        "ON CONFLICT(key) DO UPDATE SET value=CAST(value AS INTEGER)+excluded.value",
+                        (str(reappeared),))
+                    live.execute(
+                        "INSERT INTO rebuilt.meta VALUES ('last_reappeared_at', ?) "
+                        "ON CONFLICT(key) DO UPDATE SET value=excluded.value", (_iso_now(),))
+                live.execute("DROP TABLE main.body_fts")
+                live.execute("CREATE VIRTUAL TABLE main.body_fts USING fts5("
+                             "body, tokenize='unicode61 remove_diacritics 2')")
+                for table, columns in (
+                    ("body_fts", "rowid, body"),
+                    ("docs", "rowid, status, attempts, last_attempt, bytes, source"),
+                    ("meta", "key, value"),
+                    ("backfill_reasons", "rowid, reason"),
+                    ("absence", "rowid, first_absent, last_absent, observations"),
+                ):
+                    live.execute(f"DELETE FROM main.{table}")
+                    live.execute(
+                        f"INSERT INTO main.{table} ({columns}) "
+                        f"SELECT {columns} FROM rebuilt.{table}")
+                live.commit()
+            finally:
+                live.close()
+            return out
 
-    def _salvage_graph_rows(self, old: Path) -> int:
-        """Carry server-fetched (graph/imap) bodies and
-        graph_miss/imap_miss/graph_none stamps from the live db into
-        the fresh one — set-based, never through Python memory. A rowid
-        the new build indexed from a full local file keeps the local
-        text (local truth wins); everything the old db knew from a
-        server and the new build could not read from disk is
-        reinstated, under its original source. The identity fingerprint
-        the stamps are scoped to rides along — carried stamps must stay
-        revocable by the same rule that placed them."""
-        conn = self._open_rw()
-        try:
-            conn.execute("ATTACH DATABASE ? AS old", (str(old),))
-            if not self._begin_immediate(conn):
-                raise sqlite3.OperationalError("index writer busy")
-            cur = conn.cursor()
-            cur.execute(
-                """
-                CREATE TEMP TABLE salv AS
-                SELECT o.rowid AS rowid, o.attempts AS attempts,
-                       o.last_attempt AS last_attempt, o.bytes AS bytes,
-                       o.source AS source
-                  FROM old.docs o
-                  LEFT JOIN main.docs n ON n.rowid = o.rowid
-                 WHERE o.source IN ('graph', 'imap')
-                   AND COALESCE(n.status, '') != 'indexed'
-                """)
-            cur.execute("DELETE FROM body_fts WHERE rowid IN "
-                        "(SELECT rowid FROM salv)")
-            cur.execute(
-                """
-                INSERT INTO body_fts(rowid, body)
-                SELECT s.rowid, ob.body
-                  FROM salv s JOIN old.body_fts ob ON ob.rowid = s.rowid
-                """)
-            cur.execute(
-                """
-                INSERT INTO docs(rowid, status, attempts, last_attempt,
-                                 bytes, source)
-                SELECT rowid, 'indexed', attempts, last_attempt, bytes,
-                       source
-                  FROM salv
-                 WHERE 1  -- disambiguates ON CONFLICT from a join clause
-                ON CONFLICT(rowid) DO UPDATE SET
-                    status = 'indexed', bytes = excluded.bytes,
-                    source = excluded.source
-                """)
-            cur.execute(
-                """
-                UPDATE docs SET source = (
-                        SELECT o.source FROM old.docs o
-                         WHERE o.rowid = docs.rowid)
-                 WHERE source = 'local' AND status IN ('partial', 'missing')
-                   AND rowid IN (SELECT rowid FROM old.docs
-                                  WHERE source IN ('graph_miss',
-                                                   'imap_miss',
-                                                   'graph_none'))
-                """)
-            cur.execute(
-                """
-                INSERT INTO meta(key, value)
-                SELECT key, value FROM old.meta
-                 WHERE key = 'backfill_identities'
-                ON CONFLICT(key) DO UPDATE SET value = excluded.value
-                """)
-            salvaged = int(cur.execute(
-                "SELECT COUNT(*) FROM salv").fetchone()[0])
-            cur.execute("DROP TABLE salv")
-            conn.commit()
-            conn.execute("DETACH DATABASE old")
-            return salvaged
-        finally:
-            conn.close()
+    def _salvage_graph_rows(self, conn: sqlite3.Connection) -> int:
+        """Retain useful cached records when a fresh scan cannot replace them."""
+        cur = conn.cursor()
+        cur.execute(
+            """
+            CREATE TEMP TABLE salv AS
+            SELECT o.rowid AS rowid, o.attempts AS attempts,
+                   o.last_attempt AS last_attempt, o.bytes AS bytes,
+                   o.source AS source, o.status AS status
+              FROM main.docs o
+              LEFT JOIN rebuilt.docs n ON n.rowid = o.rowid
+             WHERE n.rowid IS NULL
+                OR (n.status != 'indexed' AND o.source IN ('graph', 'imap'))
+                OR (n.status IN ('missing', 'error') AND o.status IN ('indexed', 'partial'))
+                OR (n.status = 'partial' AND o.status = 'indexed')
+            """)
+        cur.execute("DELETE FROM rebuilt.body_fts WHERE rowid IN "
+                    "(SELECT rowid FROM salv)")
+        cur.execute(
+            """
+            INSERT INTO rebuilt.body_fts(rowid, body)
+            SELECT s.rowid, ob.body
+              FROM salv s JOIN main.body_fts ob ON ob.rowid = s.rowid
+            """)
+        cur.execute(
+            """
+            INSERT INTO rebuilt.docs(rowid, status, attempts, last_attempt,
+                                     bytes, source)
+            SELECT rowid, status, attempts, last_attempt, bytes, source
+              FROM salv
+             WHERE 1
+            ON CONFLICT(rowid) DO UPDATE SET
+                status = excluded.status, bytes = excluded.bytes,
+                source = excluded.source
+            """)
+        cur.execute(
+            """
+            UPDATE rebuilt.docs SET source = (
+                SELECT o.source FROM main.docs o
+                 WHERE o.rowid = rebuilt.docs.rowid)
+             WHERE source = 'local' AND status IN ('partial', 'missing')
+               AND rowid IN (SELECT rowid FROM main.docs
+                              WHERE source IN ('graph_miss', 'imap_miss',
+                                               'graph_none'))
+            """)
+        salvaged = int(cur.execute("SELECT COUNT(*) FROM salv").fetchone()[0])
+        cur.execute("DROP TABLE salv")
+        return salvaged
+
+    @staticmethod
+    def _carry_diagnostics(conn: sqlite3.Connection) -> None:
+        keys = ["backfill_identities", "last_backfill_attempt_at", "last_backfill_state",
+                "last_backfill_error", "last_backfill_at"]
+        for name in ("removed", "recovered", "reappeared", "retry_deferred"):
+            keys.extend((f"{name}_total", f"last_{name}_at"))
+        marks = ",".join("?" * len(keys))
+        conn.execute(
+            f"INSERT INTO rebuilt.meta SELECT key, value FROM main.meta WHERE key IN ({marks}) "
+            "ON CONFLICT(key) DO UPDATE SET value=excluded.value", keys)
+        conn.execute(
+            "INSERT INTO rebuilt.backfill_reasons SELECT r.rowid, r.reason "
+            "FROM main.backfill_reasons r JOIN rebuilt.docs d ON d.rowid=r.rowid "
+            "WHERE d.status != 'indexed' "
+            "ON CONFLICT(rowid) DO UPDATE SET reason=excluded.reason")
 
     # ------------------------------------------------------------------ #
     # internals: our db                                                  #
@@ -843,44 +1019,48 @@ class FtsIndex:
     def _open_rw(self) -> sqlite3.Connection:
         """Open (creating on first use) the index db. The ONLY fts write
         seam: the directory comes from state adoption (the one door); a
-        rebuild's scratch instance overrides the file name only — same
-        directory, promoted atomically."""
+        rebuild's scratch instance uses a temporary file under that
+        directory before transactional promotion."""
         path = self._db or (state.State.resolve().adopt().fts / _DB_NAME)
         conn = sqlite3.connect(path)
-        conn.row_factory = sqlite3.Row
-        conn.isolation_level = None  # explicit BEGIN IMMEDIATE / COMMIT
-        conn.execute(f"PRAGMA busy_timeout={_BUSY_TIMEOUT_MS}")
-        conn.execute("PRAGMA journal_mode=WAL")
-        conn.executescript(_SCHEMA)
-        # v1 → v2 in place: docs gains `source` (ADD COLUMN backfills
-        # 'local' onto every existing row — exactly right, they all came
-        # from .emlx). CREATE IF NOT EXISTS above leaves a v1 table
-        # untouched, so the column check is the actual migration gate.
-        cols = {r[1] for r in conn.execute("PRAGMA table_info(docs)")}
-        if "source" not in cols and self._begin_immediate(conn):
-            conn.execute("ALTER TABLE docs ADD COLUMN source TEXT "
-                         "NOT NULL DEFAULT 'local'")
-            self._meta_set(conn.cursor(), "schema_version",
-                           str(SCHEMA_VERSION))
-            conn.commit()
-        # Not in _SCHEMA: on a v1 db the column above must land first.
-        # status() counts backfilled docs by source on every search — a
-        # 300k-row scan per call without this index. Busy writer: skip,
-        # the next write-open creates it.
-        have_idx = conn.execute(
-            "SELECT 1 FROM sqlite_master WHERE type = 'index' "
-            "AND name = 'docs_source'").fetchone()
-        if not have_idx and self._begin_immediate(conn):
-            conn.execute("CREATE INDEX IF NOT EXISTS docs_source "
-                         "ON docs(source)")
-            conn.commit()
-        if self._meta_get(conn, "schema_version") is None:
-            if self._begin_immediate(conn):
+        try:
+            conn.row_factory = sqlite3.Row
+            conn.isolation_level = None  # explicit BEGIN IMMEDIATE / COMMIT
+            conn.execute(f"PRAGMA busy_timeout={_BUSY_TIMEOUT_MS}")
+            conn.execute("PRAGMA journal_mode=WAL")
+            conn.executescript(_SCHEMA)
+            # v1 → v2 in place: docs gains `source` (ADD COLUMN backfills
+            # 'local' onto every existing row — exactly right, they all came
+            # from .emlx). CREATE IF NOT EXISTS above leaves a v1 table
+            # untouched, so the column check is the actual migration gate.
+            cols = {r[1] for r in conn.execute("PRAGMA table_info(docs)")}
+            if "source" not in cols and self._begin_immediate(conn):
+                conn.execute("ALTER TABLE docs ADD COLUMN source TEXT "
+                             "NOT NULL DEFAULT 'local'")
                 self._meta_set(conn.cursor(), "schema_version",
                                str(SCHEMA_VERSION))
                 conn.commit()
-        os.chmod(path, 0o600)
-        return conn
+            # Not in _SCHEMA: on a v1 db the column above must land first.
+            # status() counts backfilled docs by source on every search — a
+            # 300k-row scan per call without this index. Busy writer: skip,
+            # the next write-open creates it.
+            have_idx = conn.execute(
+                "SELECT 1 FROM sqlite_master WHERE type = 'index' "
+                "AND name = 'docs_source'").fetchone()
+            if not have_idx and self._begin_immediate(conn):
+                conn.execute("CREATE INDEX IF NOT EXISTS docs_source "
+                             "ON docs(source)")
+                conn.commit()
+            if int(self._meta_get(conn, "schema_version", "0")) < SCHEMA_VERSION:
+                if self._begin_immediate(conn):
+                    self._meta_set(conn.cursor(), "schema_version",
+                                   str(SCHEMA_VERSION))
+                    conn.commit()
+            os.chmod(path, 0o600)
+            return conn
+        except BaseException:
+            conn.close()
+            raise
 
     @staticmethod
     def _begin_immediate(conn: sqlite3.Connection) -> bool:
@@ -914,6 +1094,14 @@ class FtsIndex:
         if self._begin_immediate(conn):
             self._meta_set(conn.cursor(), key, _iso_now())
             conn.commit()
+
+    @classmethod
+    def _count_event(cls, cur: sqlite3.Cursor, name: str, count: int) -> None:
+        if not count:
+            return
+        previous = int(cls._meta_get(cur.connection, f"{name}_total", "0"))
+        cls._meta_set(cur, f"{name}_total", str(previous + count))
+        cls._meta_set(cur, f"last_{name}_at", _iso_now())
 
     # ------------------------------------------------------------------ #
     # internals: envelope index (read-only, fresh connection per query)  #
@@ -993,6 +1181,16 @@ class FtsIndex:
         finally:
             conn.close()
 
+    def _envelope_backlog(self, hwm: int) -> int:
+        conn = self._envelope_conn()
+        try:
+            return int(conn.execute(
+                "SELECT COUNT(*) FROM messages m WHERE m.ROWID > ? "
+                f"{self._deleted_filter(conn)}", (hwm,),
+            ).fetchone()[0])
+        finally:
+            conn.close()
+
     # ------------------------------------------------------------------ #
     # internals: indexing                                                #
     # ------------------------------------------------------------------ #
@@ -1002,7 +1200,7 @@ class FtsIndex:
         """Keyset-paginated pass over rowids above the high-water mark.
         One BEGIN IMMEDIATE txn per batch; hwm advances with each commit."""
         stats = {"scanned": 0, "indexed": 0, "partial": 0, "missing": 0,
-                 "errors": 0, "retried": 0, "removed": 0}
+                 "errors": 0, "retried": 0, "removed": 0, "deferred": 0}
         hwm = int(self._meta_get(conn, "last_rowid", "0"))
         while True:
             if max_docs is not None and stats["scanned"] >= max_docs:
@@ -1036,9 +1234,7 @@ class FtsIndex:
 
     def _retry_missing(self, conn: sqlite3.Connection, stats: dict,
                        max_docs: int | None, deadline: float | None) -> None:
-        """Re-stat `missing`, `error` and `partial` docs whose backoff has
-        elapsed. A rowid that also vanished from the Envelope Index is
-        dropped (mini-reconcile)."""
+        """Retry local files; unresolved mailbox metadata never proves deletion."""
         now = time.time()
         rows = conn.execute(
             # 'error' retries too: an extraction error can be as transient
@@ -1083,15 +1279,16 @@ class FtsIndex:
             if deadline is not None and time.monotonic() >= deadline:
                 break
             url = urls.get(rowid)
-            if url is None:
-                cur.execute("DELETE FROM docs WHERE rowid = ?", (rowid,))
-                cur.execute("DELETE FROM body_fts WHERE rowid = ?", (rowid,))
-                stats["removed"] += 1
+            if not url:
+                cur.execute("UPDATE docs SET attempts=attempts+1, last_attempt=? "
+                            "WHERE rowid=?", (now, rowid))
+                stats["deferred"] += 1
                 continue
             outcome = self._index_one(cur, rowid, url)
             if outcome != "missing":
                 stats["errors" if outcome == "error" else outcome] += 1
             stats["retried"] += 1
+        self._count_event(cur, "retry_deferred", stats["deferred"])
         conn.commit()
 
     def _index_one(self, cur: sqlite3.Cursor, rowid: int, url: str) -> str:
@@ -1154,6 +1351,10 @@ class FtsIndex:
                 now: float, nbytes: int, source: str = "local") -> str:
         if status in ("missing", "error"):
             cur.execute("DELETE FROM body_fts WHERE rowid = ?", (rowid,))
+        cur.execute("DELETE FROM absence WHERE rowid=?", (rowid,))
+        FtsIndex._count_event(cur, "reappeared", cur.rowcount)
+        if status == "indexed":
+            cur.execute("DELETE FROM backfill_reasons WHERE rowid=?", (rowid,))
         cur.execute(
             """
             INSERT INTO docs(rowid, status, attempts, last_attempt, bytes,
@@ -1200,7 +1401,9 @@ class FtsIndex:
 
         try:
             idents, default = ident_mod.load()
-        except Exception:  # noqa: BLE001 — soft by contract, like status()
+        except Exception as exc:
+            if not str(exc).startswith("no sending identity configured"):
+                self._backfill_config_error = f"backfill identity configuration: {exc}"
             return []
         names = sorted(idents, key=lambda n: (n != default, n))
         return [idents[n] for n in names
@@ -1215,7 +1418,9 @@ class FtsIndex:
 
         try:
             idents, default = ident_mod.load()
-        except Exception:  # noqa: BLE001 — soft by contract, like status()
+        except Exception as exc:
+            if not str(exc).startswith("no sending identity configured"):
+                self._backfill_config_error = f"backfill identity configuration: {exc}"
             return []
         names = sorted(idents, key=lambda n: (n != default, n))
         return [idents[n] for n in names
@@ -1318,18 +1523,6 @@ class FtsIndex:
         if cap and len(content) > cap:
             content = content[:cap] + "\n[…body truncated…]"
         return content
-
-    def _stamp_source(self, conn: sqlite3.Connection, rowid: int,
-                      source: str) -> bool:
-        """Short own-transaction source stamp; False when the writer is
-        busy (caller stops the pass, next nightly resumes)."""
-        if not self._begin_immediate(conn):
-            return False
-        conn.execute("UPDATE docs SET source = ?, last_attempt = ? "
-                     "WHERE rowid = ?", (source, time.time(), rowid))
-        conn.commit()
-        return True
-
 
 # ---------------------------------------------------------------------- #
 # launchd install and CLI compatibility facade                           #

@@ -142,6 +142,42 @@ def test_get_email_fallback_when_emlx_missing(mail_fixture):
     assert m.attachments == []
 
 
+def test_get_email_reads_available_partial_body(mail_fixture):
+    path = next(mail_fixture.rglob("100.emlx"))
+    path.rename(path.with_name("100.partial.emlx"))
+
+    message = AppleMailSource(mail_fixture).get("100")
+    assert message.headers["Message-ID"] == "<i2c-2026-05-01@cern.ch>"
+    assert "should be retracted" in message.body_text
+    assert message.body_source is None
+
+
+def test_partial_keeps_headers_and_prefers_recovered_body(
+        mail_fixture, monkeypatch):
+    from types import SimpleNamespace
+
+    path = next(mail_fixture.rglob("300.emlx"))
+    path.rename(path.with_name("300.partial.emlx"))
+    source = AppleMailSource(mail_fixture)
+    monkeypatch.setattr(source, "_fts", lambda: SimpleNamespace(
+        backfilled_text=lambda _: "Complete recovered body"))
+
+    message = source.get("300")
+    assert message.headers["Message-ID"] == "<archived@example.com>"
+    assert message.body_text == "Complete recovered body"
+    assert message.body_html == ""
+    assert message.body_source == "server_backfill"
+
+
+def test_partial_does_not_advertise_incomplete_attachments(mail_fixture):
+    path = next(mail_fixture.rglob("101.emlx"))
+    path.rename(path.with_name("101.partial.emlx"))
+
+    message = AppleMailSource(mail_fixture).get("101")
+    assert "See attached production figures" in message.body_text
+    assert message.attachments == []
+
+
 def test_get_attachment_materialises_file(mail_fixture, tmp_path, monkeypatch):
     monkeypatch.setenv("EMAIL_MCP_ATTACH_DIR", str(tmp_path / "atts"))
     src = AppleMailSource(mail_base=mail_fixture)
@@ -434,6 +470,36 @@ def test_attached_message_is_an_attachment_not_body(
     assert [(a.name, a.mime) for a in m.attachments] == [
         ("attachment-1.eml", "message/rfc822")]
     assert "attached body should be downloadable" not in m.body_text
+
+
+def test_multipart_attachment_preserves_downloadable_content(
+        mail_fixture, tmp_path, monkeypatch):
+    import email
+    import email.policy
+    from email.message import EmailMessage
+    from pathlib import Path
+
+    monkeypatch.setenv("EMAIL_MCP_ATTACH_DIR", str(tmp_path / "atts"))
+    outer = EmailMessage()
+    outer.set_content("Outer body")
+    outer.make_mixed()
+    attached = EmailMessage()
+    attached.set_content("Attached plain text")
+    attached.add_alternative("<p>Attached HTML</p>", subtype="html")
+    attached["Content-Disposition"] = 'attachment; filename="parts.mime"'
+    outer.attach(attached)
+    _replace_emlx(mail_fixture, 101, outer)
+
+    source = AppleMailSource(mail_fixture)
+    message = source.get("101")
+    assert message.body_text.strip() == "Outer body"
+    assert message.body_html == ""
+    assert [a.name for a in message.attachments] == ["parts.mime"]
+    blob = source.attachment("101", message.attachments[0].attachment_id)
+    saved = email.message_from_bytes(
+        Path(blob.path).read_bytes(), policy=email.policy.default)
+    assert saved.get_content_type() == "multipart/alternative"
+    assert saved.get_payload(0).get_content().strip() == "Attached plain text"
 
 
 def test_source_usable_from_any_thread(mail_fixture):

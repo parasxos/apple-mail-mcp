@@ -151,6 +151,7 @@ class Plan:
     messages: list[PlanMessage]
     summary: str
     result: dict | None = None
+    excluded_ids: list[str] | None = None
 
 
 @dataclass

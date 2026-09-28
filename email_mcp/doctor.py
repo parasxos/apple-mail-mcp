@@ -25,25 +25,21 @@ from __future__ import annotations
 import json
 import os
 import re
-import sqlite3
 import subprocess
 import time
-import urllib.parse
 from datetime import datetime, timezone
 from pathlib import Path
 
 from . import applescript, config, identities
 from .log import get_logger
+from .store_health import fda_fix
 from .transports import SendError, get_transport
 
 _log = get_logger()
 
 _OSA_TIMEOUT = 15.0
 
-_FDA_FIX = (
-    "Grant Full Disk Access to the app running this server: System Settings "
-    "→ Privacy & Security → Full Disk Access, then restart it."
-)
+_FDA_FIX = fda_fix()
 _AUTOMATION_FIX = (
     "Authorise Mail.app automation for the app running this server: System "
     "Settings → Privacy & Security → Automation → <your terminal> → Mail."
@@ -69,34 +65,10 @@ def _osascript(line: str, timeout: float = _OSA_TIMEOUT) -> subprocess.Completed
 
 
 def check_mail_store() -> dict:
-    """Can we resolve and read the Envelope Index? Failure = missing Mail
-    setup or (far more often) missing Full Disk Access."""
-    try:
-        base = config.mail_dir()
-    except (FileNotFoundError, PermissionError) as e:
-        # PermissionError is the TCC case (config.py documents it): the
-        # directory exists but macOS refuses the read. Uncaught it became
-        # "check crashed" with no structured fix — RC P14's revoked-side
-        # check refused exactly that (live, 2026-08-03).
-        return {"ok": False, "detail": str(e), "fix": _FDA_FIX}
-    index = base / "MailData" / "Envelope Index"
-    if not index.exists():
-        return {"ok": False,
-                "detail": f"Envelope Index not found at {index}.",
-                "fix": _FDA_FIX}
-    uri = "file:" + urllib.parse.quote(str(index)) + "?mode=ro"
-    try:
-        conn = sqlite3.connect(uri, uri=True)
-        try:
-            total = conn.execute(
-                "SELECT COUNT(*) FROM messages").fetchone()[0]
-        finally:
-            conn.close()
-    except sqlite3.Error as e:
-        return {"ok": False,
-                "detail": f"cannot read {index}: {e}",
-                "fix": _FDA_FIX}
-    return {"ok": True, "detail": f"{total} messages in {index}"}
+    """Observe this process's access without querying private TCC state."""
+    from .store_health import check
+
+    return check()
 
 
 def check_automation() -> dict:
@@ -417,77 +389,62 @@ def check_spool_plans() -> dict:
 
 
 def check_fts() -> dict:
-    """SOFT hook on the body index — index trouble must not redden the
-    doctor beyond what the search envelope already reports. An absent
-    index is a fresh install, not a fault."""
+    """Report index availability separately from global body coverage."""
+    from .fts_reporting import coverage_report
+
     if not config.fts_enabled():
-        return {"ok": True,
-                "detail": "body index disabled (EMAIL_MCP_FTS_ENABLED=0)"}
+        st = {"state": "disabled"}
+        return {"ok": True, "detail": "body index disabled (EMAIL_MCP_FTS_ENABLED=0)",
+                "status": st, **coverage_report(st)}
     try:
         from . import fts
         st = fts.status()
-    except Exception as e:  # soft by contract: never let fts crash doctor
-        return {"ok": True, "detail": f"index status unavailable: {e}"}
-    # The nightly agent is estate machinery, not index state: a sync that
-    # dies every run must redden the doctor even while the index still
-    # serves — it silently failed every night until RC P04 caught it
-    # (FDA missing on the agent's python, live 2026-08-03). Same for an
-    # installed-but-unloaded agent: it runs nothing at all.
-    if fts._plist_path().exists() \
-            and _agent_loaded(fts.LAUNCHD_LABEL) is False:
-        return {"ok": False,
-                "detail": "nightly sync agent installed but NOT loaded — "
-                          "it will not run",
-                "fix": "email-mcp doctor --fix   # re-bootstraps "
-                       "installed agents",
-                "status": st}
+    except Exception as exc:
+        st = {"state": "error", "error": str(exc)}
+        return {"ok": True, "detail": f"index status unavailable: {exc}",
+                "status": st, **coverage_report(st)}
+    report = coverage_report(st)
+
+    def result(ok: bool, detail: str, **extra) -> dict:
+        out = {"ok": ok, "detail": detail, "status": st, **report, **extra}
+        if "fix" not in out and report["remedies"]:
+            out["fix"] = " ".join(item["action"] for item in report["remedies"])
+        return out
+
+    if fts._plist_path().exists() and _agent_loaded(fts.LAUNCHD_LABEL) is False:
+        return result(False, "nightly sync agent installed but NOT loaded — it will not run",
+                      fix="email-mcp doctor --fix   # re-bootstraps installed agents")
     last_exit = _agent_last_exit(fts.LAUNCHD_LABEL)
     if last_exit not in (None, 0):
-        return {"ok": False,
-                "detail": f"nightly sync agent last exited {last_exit}",
-                "fix": _FTS_AGENT_EXIT_FIX.format(log=fts._log_path()),
-                "status": st}
+        return result(False, f"nightly sync agent last exited {last_exit}",
+                      fix=_FTS_AGENT_EXIT_FIX.format(log=fts._log_path()))
     state = st.get("state")
     if state == "absent":
-        return {"ok": True, "detail": "not built",
-                "fix": "python -m email_mcp.fts --build", "status": st}
+        return result(True, "not built")
     if state == "error":
-        return {"ok": False, "detail": f"index error: {st.get('error')}",
-                "fix": "python -m email_mcp.fts --rebuild", "status": st}
-    # The backfill records its identity trouble as state (meta), exactly
-    # so a lane that silently does nothing every night is visible here
-    # instead of only in a log nobody reads.
-    backfill_err = st.get("last_backfill_error")
-    if backfill_err:
-        return {"ok": False, "advisory": True,
-                "detail": f"server backfill in trouble: {backfill_err}",
-                "fix": "re-login the named identity (python -m "
-                       "email_mcp.graph --login <name>), then "
-                       "python -m email_mcp.fts --backfill",
-                "status": st}
-    d = st.get("docs", {})
-    detail = (f"ready: {d.get('indexed', 0)} indexed, "
-              f"{d.get('partial', 0)} partial, "
-              f"{d.get('missing', 0)} missing, "
-              f"{d.get('error', 0)} error"
-              + (f", {d['backfilled']} backfilled"
-                 if d.get("backfilled") else ""))
-    total = d.get("total", 0)
-    gap = d.get("partial", 0) + d.get("missing", 0)
+        return result(False, f"index error: {st.get('error')}")
+    backfill_error = st.get("last_backfill_error")
+    if backfill_error:
+        return result(False, f"server backfill in trouble: {backfill_error}", advisory=True,
+                      fix="Inspect the named provider's authentication and configuration, then "
+                          "run python -m email_mcp.fts --backfill.")
+    docs = st.get("docs", {})
+    detail = (f"ready: {docs.get('indexed', 0)} indexed, "
+              f"{docs.get('partial', 0)} partial, {docs.get('missing', 0)} missing, "
+              f"{docs.get('error', 0)} error")
+    if docs.get("backfilled"):
+        detail += f", {docs['backfilled']} backfilled"
+    if docs.get("local_retry_exhausted"):
+        detail += f", {docs['local_retry_exhausted']} local retries exhausted"
+    pending = st.get("cleanup", {}).get("pending_removal", 0)
+    if pending:
+        detail += f", {pending} awaiting confirmation of absence"
+    total = docs.get("total", 0)
+    gap = sum(docs.get(key, 0) for key in ("partial", "missing", "error"))
     if total > _GAP_MIN_TOTAL and gap / total > _GAP_WARN_RATIO:
-        return {"ok": False, "advisory": True,
-                "detail": detail + f" — {gap} of {total} bodies are not "
-                          "in Mail's local store, so body search cannot "
-                          "see them",
-                "fix": "in Mail ▸ Settings ▸ Accounts, set the account "
-                       "to download all messages (and disable 'Optimize "
-                       "Mac Storage' where offered) — bodies index "
-                       "automatically as they arrive; Exchange accounts "
-                       "with a graph identity backfill themselves "
-                       "nightly (500/night), or in one pass with: "
-                       "python -m email_mcp.fts --backfill",
-                "status": st}
-    return {"ok": True, "detail": detail, "status": st}
+        return result(False, detail + f" — {gap} of {total} bodies have incomplete "
+                      "indexed coverage; partial text may still be searchable", advisory=True)
+    return result(True, detail)
 
 
 def check_audit() -> dict:

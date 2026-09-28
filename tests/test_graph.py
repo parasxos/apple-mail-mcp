@@ -795,6 +795,42 @@ def test_schedule_graph_freezes_base64_text_parts(monkeypatch, tmp_path):
     assert body in wire.get_body(("plain",)).get_content()
 
 
+@pytest.mark.parametrize("fallback", [False, True])
+def test_graph_schedule_preserves_text_attachments(monkeypatch, tmp_path, fallback):
+    _write_graph_toml(tmp_path, monkeypatch)
+    _seed_token()
+    responses = ((503, {}),) if fallback else (
+        (201, {"id": "D1"}), (200, {}), (202, {}),
+    )
+    http = _fake(monkeypatch, *responses)
+    contents = {
+        "notes.txt": "café\r\n".encode(),
+        "page.html": b"<p>caf\xe9</p>\r\n",
+    }
+    for name, data in contents.items():
+        (tmp_path / name).write_bytes(data)
+    entry = sender.schedule_email(
+        to="someone@example.org", subject="attachments", body="à demain",
+        send_at=_future(30), from_identity="cern",
+        attachments=[str(tmp_path / name) for name in contents],
+    )
+
+    frozen = spool.read_eml("pending", entry.id)
+    assert base64.b64decode(http.calls[0][2]) == frozen
+    assert entry.executor == ("launchd" if fallback else "graph")
+    assert entry.attachments == list(contents)
+    wire = email.message_from_bytes(frozen, policy=email.policy.default)
+    attachments = list(wire.iter_attachments())
+    assert {part.get_filename(): part.get_payload(decode=True)
+            for part in attachments} == contents
+    assert all(part.get_content_disposition() == "attachment"
+               for part in attachments)
+    for subtype in ("plain", "html"):
+        body = wire.get_body((subtype,))
+        assert body["Content-Transfer-Encoding"] == "base64"
+        assert "à demain" in body.get_content()
+
+
 def test_schedule_graph_error_falls_back_to_launchd(monkeypatch, tmp_path):
     """F5/F8: token refusal or 5xx at schedule time → entry flips to the
     launchd executor, frozen .eml intact, no exception to the caller."""

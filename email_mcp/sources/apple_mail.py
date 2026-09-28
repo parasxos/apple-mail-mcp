@@ -33,9 +33,13 @@ from ..config import (
     max_body_bytes,
 )
 from ..log import get_logger
+from ..fts_reporting import coverage_report
+from ..mime_parts import walk_parts
 from .apple_mail_paths import (
     account_label,
     build_emlx_path,
+    find_emlx_path,
+    mailbox_data_dir,
     mailbox_name,
 )
 from .base import (
@@ -280,25 +284,31 @@ class AppleMailSource:
             "state": "disabled",
             "indexed": 0,
             "missing": 0,
+            "errors": 0,
             "partial": 0,
             "backfilled": 0,
             "backlog": 0,
             "hits": len(rowids),
             "hits_capped": capped,
             "rowids": rowids,
+            "local_retry_exhausted": 0,
         }
         if idx is None:
             if fts_enabled():
                 out["state"] = "absent"
                 out["remedy"] = "python -m email_mcp.fts --build"
+            out.update(coverage_report(out))
             return out
         st = idx.status()
         out["state"] = st["state"]
         if st["state"] == "error":
             out["error"] = st.get("error")
+            out.update(coverage_report(st))
             return out
         out["indexed"] = st["docs"]["indexed"]
         out["missing"] = st["docs"]["missing"]
+        out["errors"] = st["docs"]["error"]
+        out["local_retry_exhausted"] = st["docs"].get("local_retry_exhausted", 0)
         # Bodies Mail never downloaded (headers-only partials) are a
         # coverage hole exactly like missing files — reporting only
         # `missing` let a 15k-doc gap read as full coverage (first-user
@@ -307,8 +317,11 @@ class AppleMailSource:
         out["partial"] = st["docs"]["partial"]
         out["backfilled"] = st["docs"].get("backfilled", 0)
         out["backlog"] = self._fts_backlog(st["last_rowid"])
-        if out["backlog"] > 0:
-            out["remedy"] = "python -m email_mcp.fts --sync"
+        out["recovery"] = st.get("recovery", {})
+        out["cleanup"] = st.get("cleanup", {})
+        out.update(coverage_report({**st, "backlog": out["backlog"]}))
+        if out["remedies"]:
+            out["remedy"] = " ".join(item["action"] for item in out["remedies"])
         return out
 
     def _fts_backlog(self, hwm: int) -> int:
@@ -435,8 +448,7 @@ class AppleMailSource:
             if r["rtype"] == _RECIPIENT_CC:
                 cc_list.append(display)
             elif r["rtype"] == _RECIPIENT_BCC:
-                # We don't surface bcc separately — fold into cc for the ref.
-                cc_list.append(display)
+                continue
             else:  # _RECIPIENT_TO and anything else (defensive default)
                 to_list.append(display)
         return to_list, cc_list
@@ -681,11 +693,12 @@ class AppleMailSource:
             cur.execute("SELECT flagged FROM messages WHERE ROWID = ?", (rowid,)).fetchone()[0]
         ) if self._have("messages", "flagged") else False
 
-        # Body comes from .emlx
         try:
-            emlx_path = build_emlx_path(self._mail_dir, mailbox_url, rowid)
+            emlx_path = find_emlx_path(
+                mailbox_data_dir(self._mail_dir, mailbox_url), rowid)
         except FileNotFoundError:
             emlx_path = None
+        partial = emlx_path is not None and emlx_path.name.endswith(".partial.emlx")
 
         body_text = ""
         body_html = ""
@@ -693,12 +706,12 @@ class AppleMailSource:
         headers: dict[str, str] = {}
         attachments: list[AttachmentRef] = []
 
-        if emlx_path and emlx_path.exists():
+        if emlx_path is not None:
             parsed = _parse_emlx(emlx_path, max_body_bytes())
             headers = parsed["headers"]
             body_text = parsed["body_text"]
             body_html = parsed["body_html"]
-            attachments = parsed["attachments"]
+            attachments = [] if partial else parsed["attachments"]
         else:
             headers = {
                 "Subject": ref.subject,
@@ -706,6 +719,9 @@ class AppleMailSource:
                 "Date": ref.date.isoformat(),
             }
             body_text = ref.snippet
+
+        if emlx_path is None or partial:
+            body_text = body_text or ref.snippet
             idx = self._fts()
             if idx is not None:
                 try:
@@ -714,6 +730,7 @@ class AppleMailSource:
                     filled = None
                 if filled:
                     body_text = filled
+                    body_html = ""
                     body_source = "server_backfill"
 
         flags = {"read": not ref.unread, "flagged": flagged}
@@ -1041,37 +1058,23 @@ def _parse_emlx_parts(path: Path) -> dict[str, dict]:
 
 
 def _walk(msg: email.message.Message):
-    """Depth-first (path_id, part, attachment) over a parsed message — the
-    one place that decides what an attachment is. `attachment` is
-    (name, mime, bytes), or None for body content. A message/rfc822 part
-    is decided BEFORE descending: it is one attachment serialised as .eml
-    and never walked into, so a forwarded message neither vanishes from
-    the list nor bleeds its text into the enclosing body."""
-    n = 0  # numbers attachments that carry no filename
-
-    def visit(part: email.message.Message, path_id: str):
-        nonlocal n
-        ctype = part.get_content_type()
-        disp = (part.get("Content-Disposition") or "").lower()
-        filename = part.get_filename()
-        if ctype == "message/rfc822":
-            n += 1
-            name = filename or f"attachment-{n}.eml"
-            yield path_id or str(n), part, (name, ctype, part.get_payload(0).as_bytes())
-        elif part.is_multipart():
-            for i, sub in enumerate(part.iter_parts(), start=1):
-                yield from visit(sub, f"{path_id}.{i}" if path_id else str(i))
-        elif "attachment" in disp or (
-            filename is not None and ctype not in ("text/plain", "text/html")
-        ):
-            n += 1
-            name = filename or f"attachment-{n}"
-            payload = part.get_payload(decode=True) or b""
-            yield path_id or str(n), part, (name, ctype, payload)
-        else:
+    """Yield MIME leaves and decoded attachments with stable part ids."""
+    n = 0
+    for path_id, part, attached in walk_parts(msg):
+        if not attached:
             yield path_id, part, None
-
-    yield from visit(msg, "")
+            continue
+        n += 1
+        ctype = part.get_content_type()
+        suffix = ".eml" if ctype == "message/rfc822" else ""
+        name = part.get_filename() or f"attachment-{n}{suffix}"
+        if ctype == "message/rfc822":
+            payload = part.get_payload(0).as_bytes()
+        elif part.is_multipart():
+            payload = part.as_bytes()
+        else:
+            payload = part.get_payload(decode=True) or b""
+        yield path_id or str(n), part, (name, ctype, payload)
 
 
 def _local_name(name: str) -> str:

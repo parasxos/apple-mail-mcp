@@ -47,8 +47,8 @@ jobs:
       - name: run test suite
         run: python -m pytest -q tests
 
-  mcp-v1:
-    name: MCP SDK 1.x compatibility
+  mcp-floor:
+    name: MCP SDK minimum supported version
     runs-on: macos-latest
     timeout-minutes: 20
     steps:
@@ -58,9 +58,9 @@ jobs:
           python-version: "3.11"
           cache: pip
           cache-dependency-path: pyproject.toml
-      - name: install the supported MCP 1.x floor
-        run: python -m pip install -e ".[dev]" "mcp==1.27.1"
-      - name: run test suite against MCP 1.x
+      - name: install the supported MCP SDK floor
+        run: python -m pip install -e ".[dev]" "mcp==2.2.0"
+      - name: run test suite against the minimum SDK
         run: python -m pytest -q tests
 
   package:

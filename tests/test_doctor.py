@@ -84,7 +84,7 @@ def test_run_shape_and_all_green(tmp_path):
     for name, check in report["checks"].items():
         assert isinstance(check["ok"], bool), name
         assert isinstance(check["detail"], str) and check["detail"], name
-    assert "4 messages" in report["checks"]["mail_store"]["detail"]
+    assert "readable" in report["checks"]["mail_store"]["detail"]
     assert report["checks"]["graph"]["ok"] is True
     # Absent index is a fresh install, not a fault — and doctor is a pure
     # reader: running it must not create ANY of the state tree.
@@ -171,11 +171,12 @@ def test_non_advisory_failure_still_reddens_through_the_advisory_gate(
     assert any(ln.startswith("warn accessibility") for ln in lines)
 
 
-def test_mail_store_unreadable_maps_to_fda_fix(monkeypatch, tmp_path):
+def test_missing_mail_store_names_setup_without_claiming_fda(monkeypatch, tmp_path):
     monkeypatch.setenv("EMAIL_MCP_MAIL_DIR", str(tmp_path / "no-such-V10"))
     check = doctor.check_mail_store()
     assert check["ok"] is False
-    assert "Full Disk Access" in check["fix"]
+    assert check["reason"] == "store_missing"
+    assert "EMAIL_MCP_MAIL_DIR" in check["fix"]
 
 
 def test_failing_agent_reddens_dispatcher_and_fts_checks(monkeypatch):
@@ -565,8 +566,10 @@ def test_fts_body_gap_warns_with_the_mail_side_lever(monkeypatch):
     assert check["advisory"] is True
     assert "600 of 1100 bodies" in check["detail"]
     assert "25 backfilled" in check["detail"]
-    assert "download all messages" in check["fix"]
-    assert "graph identity backfill themselves nightly" in check["fix"]
+    assert "download the bodies in Mail" in check["fix"]
+    assert "--backfill" in check["fix"]
+    assert "partial text may still be searchable" in check["detail"]
+    assert check["coverage"]["state"] == "incomplete"
     report = doctor.run()
     assert report["ok"] is True                      # warn, not a red
 

@@ -99,6 +99,10 @@ Rules:
   crash.
 - **Consumers must tolerate unknown keys** — the envelope grows additively
   (§8).
+- **Mail access health:** MCP sessions add observed store health to both
+  successful and failed tool responses. Degraded access does not change an
+  independent operation's `ok` result. Host attribution is best effort, and
+  restart guidance does not claim that a permission grant has been verified.
 
 ## 3. The error-code namespace
 
@@ -124,7 +128,7 @@ failure dicts (no exception class behind them):
 | `destructive_action` | triage_plan | `delete` attempted through triage_plan — it has its own tool |
 | `conflicting_actions` | triage_plan | duplicate or mutually exclusive actions in one plan |
 | `unsupported_source` | triage_plan, mailbox_create, mailbox_delete | the email source lacks triage capabilities |
-| `empty_selection` | triage_plan | no messages match, or all vanished before planning |
+| `empty_selection` | triage_plan, triage_apply | no messages match, all vanished before planning, or exclusions leave no selected messages |
 | `selection_too_large` | triage_plan, triage_plan_delete | selection over the cap (200 / 50, §5) — rejected, never truncated |
 | `cross_account` | triage_plan (move_to), triage_plan_delete | selection spans accounts; add `account=` |
 | `noop_move` | triage_plan | every selected message is already in the target mailbox |
@@ -134,6 +138,7 @@ failure dicts (no exception class behind them):
 | `plan_already_applied` | triage_apply | plan status is applied/failed — single-shot |
 | `plan_expired` | triage_apply | TTL lapsed (600 s, §5) — re-run triage_plan |
 | `plan_claimed` | triage_apply | another process holds the apply claim |
+| `invalid_exclusion` | triage_apply | exclusions are malformed or contain IDs outside the reviewed plan; the draft stays usable |
 | `osascript_unavailable` | triage_apply | osascript not found — macOS-only tool |
 | `mail_unresponsive` | triage_apply, mailbox_create, mailbox_delete | Mail.app did not answer within the timeout |
 | `automation_denied` | triage_apply, mailbox_create, mailbox_delete | Apple Events not authorised (osa −1743, §3.3) |
@@ -287,7 +292,7 @@ Caps REJECT, never truncate. Values below are the v1.3 defaults from
 | delete plan size | 50 messages | `EMAIL_MCP_TRIAGE_DELETE_MAX` |
 | plan TTL (draft → applicable) | 600 s | `EMAIL_MCP_TRIAGE_TTL` |
 | plan GC horizon | 7 days | fixed |
-| stale apply-claim finalised as failed | 2 × TTL | fixed |
+| abandoned apply claim finalised as failed | 2 × TTL, only when no process holds its owner lock | fixed |
 | apply chunk size | 10 messages per sub-script; a timeout kills one chunk and banks the rest | fixed (`_CHUNK_SIZE`) |
 | apply script timeout (per chunk) | auto: max(60, 30 + 12·chunk) s — 12 s/msg is the worst per-message cost measured live (2026-08-01, 71k-message Exchange store) | `EMAIL_MCP_TRIAGE_TIMEOUT` (>0 overrides, per chunk) |
 | apply/mailbox verify | 3 polls × 2.0 s; after a killed chunk, polls stretch to cover one chunk-budget of async drain | `EMAIL_MCP_TRIAGE_VERIFY_POLLS` / `…_VERIFY_INTERVAL` |
@@ -347,7 +352,7 @@ at the point it becomes durable):
 | `graph_cancelled_external` | dispatcher | draft discarded outside the spool (OWA/Outlook) |
 | `cancel` | server tool layer | cancelled / too_late_sent / failed … |
 | `plan_create` | library (build_plan) | carries the plan summary |
-| `plan_finish` | library (`plans.finish` — the one seam covering apply success, all failure sites, expiry AND gc's stale-claim finalisation) | applied / failed / expired; carries `Plan.summary` + compact per-message outcomes (`{id, code}` + pending ids) — this **outlives plan GC** |
+| `plan_finish` | library (`plans.finish` — the one seam covering apply success, all failure sites, expiry AND gc's stale-claim finalisation) | applied / failed / expired; carries the original summary, `planned`, accepted `selected` and `excluded` where available, and compact failure/pending outcomes. This outlives plan GC. |
 | `mailbox_create` | server tool layer | emitted only when actually created (idempotent no-op emits nothing) |
 | `mailbox_delete` | server tool layer | emitted only when a deletion was actually issued |
 | `draft` | server tool layer | additive 2026-08-02: create_draft's both terminals — records COMPOSITION, not transmission (detail: draft_id, account; recipients on the event so the ledger is never blind to what was composed) |
@@ -362,7 +367,7 @@ addresses and summaries are allowed; body text is not, ever.
 
 **16 KB truncation order.** An event is capped at 16 384 bytes
 (`MAX_EVENT_BYTES`). When over, fields are shed in this order:
-per-message lists first (`failures`/`pending` collapse to counts), then
+per-message lists first (`failures`/`pending`/`excluded` collapse to counts), then
 `detail` wholesale. The envelope fields and `summary` ALWAYS survive — a
 truncated event still says what happened, to how many, with which outcome.
 
@@ -430,12 +435,16 @@ gains an `audit` check (dir exists, perms, writability).
   removed. A breaking change means v2.
 - **Codes**: the namespace in §3 only grows. Dispatching on a code is safe
   forever; dispatching on error prose is not (prose may be reworded).
-- **inputSchema: accepted parameters frozen at v0.10.** The Python call
-  signatures remain unchanged. On 2026-08-24 the advertised snapshot was
+- **inputSchema: existing parameters retain their v0.10 meanings.** New
+  optional parameters are additive. On 2026-08-24 the advertised snapshot was
   deliberately regenerated to publish descriptions plus constraints and
   vocabularies that the implementation already enforced or bounded (page
   caps, views, scheduled states, refresh limits, triage actions). This changes
   client guidance, not the v1 parameters or envelope behavior.
+  On 2026-09-28, `triage_apply` adds optional `exclude_ids`. The input snapshot
+  is deliberately updated. Omitted or empty exclusions apply the full plan.
+  Receipts retain `planned` as the original count and add `selected` and
+  `excluded`; intentional exclusions never become failures or pending items.
 - **outputSchema: frozen at v0.11**, after the bare shapes (§1, tools
   2, 4–7) take their one allowed break into envelopes. That break is the
   known normalization debt named in the roadmap and happens exactly once.
@@ -461,8 +470,8 @@ gains an `audit` check (dir exists, perms, writability).
     common failure envelope. Previously they were enforced only by the local
     derived snapshot. The response itself is unchanged and remains available
     as legacy text as well as identical structured content.
-- **SDK compatibility:** CI exercises the maintained MCP SDK 1.x floor and
-  current MCP SDK 2.x. The v2 server continues to negotiate earlier protocol
+- **SDK compatibility:** CI exercises the MCP SDK 2.2.0 floor and
+  current MCP SDK 2.x. The server continues to negotiate earlier protocol
   revisions, and the stdio command and server name remain unchanged.
 - **Audit schema**: `v` is bumped only for breaking changes to the event
   envelope; adding optional fields does not bump it. Readers must ignore

@@ -194,12 +194,13 @@ def prepare_transmission(
 
 
 def reencode_text_base64(message: EmailMessage) -> None:
-    """Protect text parts from Exchange's quoted-printable importer bug."""
-    for part in message.walk():
-        if part.get_content_type() in ("text/plain", "text/html"):
+    """Protect message bodies from Exchange's quoted-printable importer bug."""
+    for subtype in ("plain", "html"):
+        part = message.get_body((subtype,))
+        if part is not None:
             part.set_content(
                 part.get_content(),
-                subtype=part.get_content_subtype(),
+                subtype=subtype,
                 charset="utf-8",
                 cte="base64",
             )

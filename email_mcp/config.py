@@ -45,23 +45,17 @@ def mail_dir() -> Path:
         return Path(override).expanduser()
 
     base = Path.home() / "Library" / "Mail"
-    if not base.exists():
-        raise FileNotFoundError(
-            f"{base} does not exist. Apple Mail is not configured on this Mac, "
-            f"or grant Full Disk Access to the app running Claude Code."
-        )
     try:
         entries = list(base.iterdir())
     except PermissionError as e:
-        # The TCC case: macOS denies access with the directory very much
-        # existing, so the not-exists branch above never fires — its remedy
-        # was written for exactly this failure and was unreachable for it.
-        # The first user read a 10-frame traceback out of `setup` instead
-        # of the words "Full Disk Access" (2026-08-01).
+        from .store_health import fda_fix
+
         raise PermissionError(
-            f"{base} exists but cannot be read ({e.strerror or e}) — grant "
-            f"Full Disk Access to the app running Claude Code (System "
-            f"Settings → Privacy & Security → Full Disk Access)."
+            e.errno, f"{base} cannot be read. {fda_fix()}", str(base)
+        ) from e
+    except FileNotFoundError as e:
+        raise FileNotFoundError(
+            f"{base} does not exist. Finish Apple Mail setup or set EMAIL_MCP_MAIL_DIR."
         ) from e
     versioned = [
         p for p in entries
@@ -69,8 +63,8 @@ def mail_dir() -> Path:
     ]
     if not versioned:
         raise FileNotFoundError(
-            f"No V<N> directory found under {base}. "
-            f"Grant Full Disk Access to the app running Claude Code."
+            f"No V<N> directory found under {base}. Finish Apple Mail setup "
+            "or set EMAIL_MCP_MAIL_DIR."
         )
     # Highest version number wins (V10 > V9 > V8 …).
     return max(versioned, key=lambda p: int(p.name[1:]))

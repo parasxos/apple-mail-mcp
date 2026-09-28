@@ -3,7 +3,8 @@
 The accepted parameters were frozen at v0.10.  The 2026-08-24 snapshot adds
 machine-readable constraints for behavior already enforced or bounded by the
 tools (docs/v1-contract.md §8). Descriptions remain excluded: prose may evolve,
-but properties, types, defaults, constraints, and required fields may not.
+but properties, types, defaults, constraints, and required fields require
+an explicit snapshot update. 2026-09-28 adds optional triage exclusions.
 """
 from __future__ import annotations
 
@@ -68,7 +69,7 @@ def test_input_schemas_match_snapshot(monkeypatch):
     frozen = json.loads(SNAPSHOT.read_text(encoding="utf-8"))
     assert current == frozen, (
         "inputSchema drift against tests/snapshots/input_schemas.json — "
-        "tool inputs are FROZEN at v0.10 (docs/v1-contract.md §8). If the "
+        "tool inputs follow the v1 additive contract (docs/v1-contract.md §8). If the "
         "change is genuinely intended, regenerate the snapshot and say so "
         "explicitly in the change description."
     )

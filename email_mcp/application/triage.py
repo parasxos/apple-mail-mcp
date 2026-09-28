@@ -110,8 +110,8 @@ class TriageUseCases(ApplicationService):
             self._triage.build_delete(self.source, query)
         )
 
-    def triage_apply(self, plan_id: str) -> TriageApplyResult:
-        return self._triage.apply(self.source, plan_id)
+    def triage_apply(self, plan_id: str, exclude_ids: list[str] | None = None) -> TriageApplyResult:
+        return self._triage.apply(self.source, plan_id, exclude_ids)
 
     def mailbox_create(self, account: str, path: str) -> MailboxCreateResult:
         result = self._triage.create_mailbox(self.source, account, path)

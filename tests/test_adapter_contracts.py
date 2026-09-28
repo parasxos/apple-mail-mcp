@@ -227,11 +227,13 @@ def test_operations_adapter_returns_typed_reports_and_audit(monkeypatch):
 
 
 def test_triage_adapter_converts_legacy_dictionary_at_the_edge(monkeypatch):
-    monkeypatch.setattr(triage, "apply_plan", lambda source, plan_id: {
+    monkeypatch.setattr(triage, "apply_plan", lambda source, plan_id, exclude_ids=None: {
         "ok": True,
         "plan_id": plan_id,
         "status": "applied",
         "planned": 1,
+        "selected": 1,
+        "excluded": [],
         "acted": 1,
         "failures": [],
         "verified": 1,
@@ -249,6 +251,8 @@ def test_triage_adapter_converts_legacy_dictionary_at_the_edge(monkeypatch):
         "plan_id": "plan-1",
         "status": "applied",
         "planned": 1,
+        "selected": 1,
+        "excluded": [],
         "acted": 1,
         "failures": [],
         "verified": 1,

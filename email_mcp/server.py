@@ -131,21 +131,13 @@ _schedule_for_mcp.__name__ = "schedule_email"
 
 def _build_mcp_server():
     """Build the full 21-tool server, or the 11-tool read-only surface."""
-    try:
-        from mcp.server.mcpserver import MCPServer as FastMCP  # type: ignore
-    except ImportError:
-        from mcp.server.fastmcp import FastMCP  # type: ignore
+    from mcp.server import MCPServer
 
     from .config import read_only
     from .mcp_compat import enrich_input_schemas, register_tool
 
     from email_mcp import __version__ as _pkg_version
-    try:
-        # Newer SDKs surface the version in initialize serverInfo.
-        mcp = FastMCP("apple-mail", version=_pkg_version)
-    except TypeError:
-        # MCP SDK 1.x FastMCP has no version kwarg.
-        mcp = FastMCP("apple-mail")
+    mcp = MCPServer("apple-mail", version=_pkg_version)
     for function in _READ_TOOLS:
         register_tool(mcp, function, function)
     if not read_only():
@@ -276,6 +268,9 @@ def main(argv: list[str] | None = None) -> int:
             args.attach,
             from_identity=args.from_identity,
         )
+    from . import store_health
+
+    store_health.start()
     _build_mcp_server().run()
     return 0
 

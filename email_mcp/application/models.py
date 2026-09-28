@@ -202,6 +202,8 @@ class TriageApplyResult:
     plan_id: str
     status: str
     planned: int
+    selected: int
+    excluded: list[str]
     acted: int
     failures: list[TriageFailure]
     verified: int

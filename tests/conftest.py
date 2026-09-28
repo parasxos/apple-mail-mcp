@@ -10,6 +10,13 @@ import pytest
 from email_mcp import bootstrap
 
 
+@pytest.fixture
+def monkeypatch(home_guard, state_dir_guard, no_host_launchd, no_host_launchctl):
+    """Keep the host guards alive until every test override is restored."""
+    with pytest.MonkeyPatch.context() as patch:
+        yield patch
+
+
 @pytest.fixture(autouse=True)
 def reset_composed_application(monkeypatch):
     """Every test receives a fresh composition root and lazy source."""
@@ -268,19 +275,19 @@ def mail_fixture(tmp_path: Path) -> Path:
 
 
 @pytest.fixture(autouse=True)
-def no_host_launchd(monkeypatch):
+def no_host_launchd():
     """Doctor consults launchctl for the agents' last exit codes; unit
     tests must never read the host's real agents (the dev Mac's fts
     agent can be legitimately red). Tests exercising the check override
     this stub explicitly."""
-    monkeypatch.setattr(
-        "email_mcp.doctor._agent_last_exit", lambda label: None)
-    monkeypatch.setattr(
-        "email_mcp.doctor._agent_loaded", lambda label: None)
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr("email_mcp.doctor._agent_last_exit", lambda label: None)
+        patch.setattr("email_mcp.doctor._agent_loaded", lambda label: None)
+        yield
 
 
 @pytest.fixture(autouse=True)
-def home_guard(tmp_path_factory, monkeypatch) -> Path:
+def home_guard(tmp_path_factory):
     """Pin HOME to a fresh per-test directory. Path.home() decides where
     launchd plists and log files live, so an unpinned suite reads — and
     on the wizard paths WRITES — the developer's real LaunchAgents (a
@@ -290,12 +297,13 @@ def home_guard(tmp_path_factory, monkeypatch) -> Path:
     home = tmp_path_factory.mktemp("home")
     (home / "Library" / "LaunchAgents").mkdir(parents=True)
     (home / "Library" / "Logs").mkdir()
-    monkeypatch.setenv("HOME", str(home))
-    return home
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setenv("HOME", str(home))
+        yield home
 
 
 @pytest.fixture(autouse=True)
-def no_host_launchctl(monkeypatch):
+def no_host_launchctl():
     """plan._launchctl is THE launchctl seam; the suite must never drive
     the host's real launchd. The neutral stand-in succeeds with an empty
     dump: bootstraps 'work', and run-verification honestly reports
@@ -303,21 +311,24 @@ def no_host_launchctl(monkeypatch):
     launchctl behavior override this stub explicitly."""
     import subprocess
 
-    monkeypatch.setattr(
-        "email_mcp.plan._launchctl",
-        lambda *args: subprocess.CompletedProcess(
-            ["launchctl", *args], 0, stdout="", stderr=""))
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(
+            "email_mcp.plan._launchctl",
+            lambda *args: subprocess.CompletedProcess(
+                ["launchctl", *args], 0, stdout="", stderr=""))
+        yield
 
 
 @pytest.fixture(autouse=True)
-def state_dir_guard(tmp_path_factory, monkeypatch) -> Path:
+def state_dir_guard(tmp_path_factory):
     """Pin the managed state tree (spool/plans/graph/fts/audit) to a fresh
     per-test root for EVERY test — nothing in the suite may ever resolve,
     adopt, or write ~/.email-mcp. Module fixtures that wipe every
     EMAIL_MCP_* variable re-pin this same root themselves."""
     root = tmp_path_factory.mktemp("state-root")
-    monkeypatch.setenv("EMAIL_MCP_STATE_DIR", str(root))
-    return root
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setenv("EMAIL_MCP_STATE_DIR", str(root))
+        yield root
 
 
 @pytest.fixture

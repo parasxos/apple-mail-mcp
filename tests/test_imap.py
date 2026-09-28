@@ -6,6 +6,8 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 
+import pytest
+
 from email_mcp import imap
 
 
@@ -48,6 +50,40 @@ def test_extract_skips_text_attachments():
     out = imap._extract_body(raw)
     assert "real body" in out["content"]
     assert "attached log" not in out["content"]
+
+
+@pytest.mark.parametrize("subtype", ["plain", "html"])
+@pytest.mark.parametrize("filename", [None, "forwarded.eml"])
+def test_extract_never_descends_into_attached_messages(subtype, filename):
+    from email.message import EmailMessage
+
+    message = EmailMessage()
+    body = "Outer body" if subtype == "plain" else "<p>Outer body</p>"
+    message.set_content(body, subtype=subtype)
+    attached = EmailMessage()
+    attached.set_content("Text belonging to the attached email")
+    message.add_attachment(attached, filename=filename)
+
+    out = imap._extract_body(message.as_bytes())
+    assert out["contentType"] == ("text" if subtype == "plain" else "html")
+    assert out["content"].strip() == body
+
+
+def test_extract_skips_multipart_attachment_children():
+    from email.message import EmailMessage
+
+    message = EmailMessage()
+    message.set_content("<p>Outer body</p>", subtype="html")
+    message.make_mixed()
+    attached = EmailMessage()
+    attached.set_content("Attached plain text")
+    attached.add_alternative("<p>Attached HTML</p>", subtype="html")
+    attached["Content-Disposition"] = 'attachment; filename="parts.mime"'
+    message.attach(attached)
+
+    out = imap._extract_body(message.as_bytes())
+    assert out["contentType"] == "html"
+    assert out["content"].strip() == "<p>Outer body</p>"
 
 
 def test_extract_simple_singlepart_message():

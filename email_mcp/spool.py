@@ -158,7 +158,32 @@ def _read_manifest(path: Path) -> Entry:
     data = json.loads(path.read_bytes())
     if not isinstance(data, dict):
         raise TypeError("manifest root is not an object")
-    return Entry(**data)
+    entry = Entry(**data)
+    for name in ("id", "send_at", "created_at", "subject", "message_id",
+                 "status", "identity", "executor"):
+        if not isinstance(getattr(entry, name), str):
+            raise TypeError(f"manifest {name} must be a string")
+    for name in ("next_attempt_at", "last_error", "delivered_at",
+                 "graph_draft_id", "code", "claimed_at"):
+        value = getattr(entry, name)
+        if value is not None and not isinstance(value, str):
+            raise TypeError(f"manifest {name} must be a string or null")
+    for name in ("to", "cc", "bcc", "attachments", "accepted"):
+        value = getattr(entry, name)
+        if not isinstance(value, list) or not all(
+                isinstance(item, str) for item in value):
+            raise TypeError(f"manifest {name} must be a list of strings")
+    if type(entry.attempts) is not int or entry.attempts < 0:
+        raise ValueError("manifest attempts must be a nonnegative integer")
+    if not isinstance(entry.refused, dict) or not all(
+            isinstance(key, str) and isinstance(value, str)
+            for key, value in entry.refused.items()):
+        raise TypeError("manifest refused must map strings to strings")
+    if entry.status not in STATES:
+        raise ValueError(f"unknown manifest status {entry.status!r}")
+    if entry.executor not in ("launchd", "graph"):
+        raise ValueError(f"unknown manifest executor {entry.executor!r}")
+    return entry
 
 
 def load(state: str, id: str) -> Entry | None:

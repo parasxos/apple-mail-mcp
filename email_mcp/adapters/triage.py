@@ -23,12 +23,14 @@ class AppleMailTriageGateway:
     def build_delete(self, source, query):
         return triage.build_delete_plan(source, query)
 
-    def apply(self, source, plan_id: str) -> TriageApplyResult:
-        value = triage.apply_plan(source, plan_id)
+    def apply(self, source, plan_id: str, exclude_ids: list[str] | None = None) -> TriageApplyResult:
+        value = triage.apply_plan(source, plan_id, exclude_ids)
         return TriageApplyResult(
             plan_id=value["plan_id"],
             status=value["status"],
             planned=value["planned"],
+            selected=value["selected"],
+            excluded=value["excluded"],
             acted=value["acted"],
             failures=[TriageFailure(**item) for item in value["failures"]],
             verified=value["verified"],

@@ -188,6 +188,27 @@ def test_chmod_never_chases_a_symlink(tmp_path):
     assert _mode(secret) == 0o644  # the target was never touched
 
 
+@pytest.mark.parametrize("operation", ["unlink", "chmod"])
+def test_managed_actions_reject_links_in_intermediate_directories(tmp_path, operation):
+    root = tmp_path / "state"
+    root.mkdir()
+    outside = tmp_path / "outside"
+    (outside / "pending").mkdir(parents=True)
+    target = outside / "pending" / "message.json"
+    target.write_text("private")
+    target.chmod(0o644)
+    (root / "spool").symlink_to(outside, target_is_directory=True)
+    path = root / "spool" / "pending" / target.name
+    action = (UnlinkFile(path, root=root) if operation == "unlink"
+              else Chmod(path, 0o600, root=root))
+
+    result, = plan.execute([action], verb="doctor_fix")
+
+    assert result.failed
+    assert target.read_text() == "private"
+    assert _mode(target) == 0o644
+
+
 def test_write_file_is_atomic_and_restrictive(tmp_path):
     f = tmp_path / "meta.json"
     (r,) = plan.execute([WriteFile(f, '{"state_version": 1}\n', mode=0o600)],

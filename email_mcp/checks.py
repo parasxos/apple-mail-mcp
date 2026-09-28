@@ -78,23 +78,25 @@ def _secret_files(reader: StateReader) -> list[Path]:
     """The files whose bytes are worth protecting: the marker + meta +
     identities at the root, graph token caches, audit months."""
     files = [reader.marker, reader.root / META,
-             reader.root / "identities.toml"]
+             reader.root / "identities.toml", reader.root / "health.json",
+             reader.root / "health.lock"]
     for d, suffix in ((reader.graph, ".token.json"),
                       (reader.audit, ".jsonl")):
         try:
-            names = sorted(os.listdir(d))  # listdir raises; glob would swallow
+            with state.open_directory(reader.root, d) as fd:
+                names = sorted(os.listdir(fd))
         except OSError:
             names = []
         files += [d / n for n in names if n.endswith(suffix)]
     return files
 
 
-def _mode_offenders(paths: list[Path], want: int,
+def _mode_offenders(root: Path, paths: list[Path], want: int,
                     kind: Callable[[int], bool]) -> list[Path]:
     out = []
     for p in paths:
         try:
-            lst = os.lstat(p)
+            lst = state.stat_path(root, p)
         except OSError:
             continue  # absent (fresh install) or unreachable — not a mode fault
         if not kind(lst.st_mode) or stat.S_ISLNK(lst.st_mode):
@@ -141,7 +143,7 @@ def _meta_stamp() -> str:
 
 
 def _probe_tree_modes(reader: StateReader) -> Finding | None:
-    bad = _mode_offenders(_managed_dirs(reader), 0o700, stat.S_ISDIR)
+    bad = _mode_offenders(reader.root, _managed_dirs(reader), 0o700, stat.S_ISDIR)
     if not bad:
         return None
     return Finding(TREE_MODES,
@@ -151,11 +153,11 @@ def _probe_tree_modes(reader: StateReader) -> Finding | None:
 
 
 def _repair_tree_modes(writer: StateWriter, f: Finding) -> list[plan.Action]:
-    return [plan.Chmod(p, 0o700) for p in f.paths]
+    return [plan.Chmod(p, 0o700, root=writer.root) for p in f.paths]
 
 
 def _probe_secret_modes(reader: StateReader) -> Finding | None:
-    bad = _mode_offenders(_secret_files(reader), 0o600, stat.S_ISREG)
+    bad = _mode_offenders(reader.root, _secret_files(reader), 0o600, stat.S_ISREG)
     if not bad:
         return None
     return Finding(SECRET_MODES,
@@ -165,7 +167,7 @@ def _probe_secret_modes(reader: StateReader) -> Finding | None:
 
 
 def _repair_secret_modes(writer: StateWriter, f: Finding) -> list[plan.Action]:
-    return [plan.Chmod(p, 0o600) for p in f.paths]
+    return [plan.Chmod(p, 0o600, root=writer.root) for p in f.paths]
 
 
 def _probe_audit_squat(reader: StateReader) -> Finding | None:

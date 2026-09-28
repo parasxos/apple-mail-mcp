@@ -155,6 +155,54 @@ def test_symlinked_leaf_is_not_a_mode_finding(home, writer, tmp_path):
     assert _finding(checks.TREE_MODES) is None
 
 
+@pytest.mark.parametrize("leaf", ["graph", "audit", "spool", "spool/pending"])
+def test_mode_repairs_do_not_traverse_directory_links(home, writer, tmp_path, leaf):
+    outside = tmp_path / "outside"
+    outside.mkdir(mode=0o755)
+    token = outside / "main.token.json"
+    token.write_text("token")
+    month = outside / "2026-09.jsonl"
+    month.write_text("event")
+    token.chmod(0o644)
+    month.chmod(0o644)
+    for name in state.SPOOL_STATES:
+        (outside / name).mkdir(mode=0o755)
+    before = _snapshot(outside)
+    path = writer.root / leaf
+    path.rename(path.with_name(path.name + "-original"))
+    path.symlink_to(outside, target_is_directory=True)
+    (writer.root / state.MARKER).chmod(0o644)
+
+    rows = checks.plan_fix(only=frozenset({checks.TREE_MODES, checks.SECRET_MODES}))
+    plan.execute(rows, verb="doctor_fix")
+
+    assert _snapshot(outside) == before
+    assert not any(isinstance(row, plan.Chmod)
+                   and row.path.is_relative_to(path) for row in rows)
+
+
+def test_mode_repair_refuses_directory_link_substituted_after_planning(
+    home, writer, tmp_path,
+):
+    graph = writer.graph
+    (graph / "main.token.json").write_text("managed")
+    (graph / "main.token.json").chmod(0o644)
+    rows = checks.plan_fix(only=frozenset({checks.SECRET_MODES}))
+    graph.rename(writer.root / "graph-original")
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    token = outside / "main.token.json"
+    token.write_text("private")
+    token.chmod(0o644)
+    graph.symlink_to(outside, target_is_directory=True)
+
+    results = plan.execute(rows, verb="doctor_fix")
+
+    assert stat.S_IMODE(token.stat().st_mode) == 0o644
+    assert any(result.failed and isinstance(result.row, plan.Chmod)
+               for result in results)
+
+
 # ---------------------------------------------------------------------- #
 # audit-path squat → rename-aside                                         #
 # ---------------------------------------------------------------------- #

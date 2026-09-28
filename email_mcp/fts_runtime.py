@@ -106,6 +106,16 @@ def print_status(status: dict, as_json: bool) -> None:
         f"{docs['missing']} missing, {docs['error']} error "
         f"(hwm rowid {status['last_rowid']})"
     )
+    coverage = status.get("coverage", {})
+    print(f"coverage: {coverage.get('state', 'unknown')} (all accounts)")
+    print(f"local retries exhausted: {docs.get('local_retry_exhausted', 0)}")
+    cleanup = status.get("cleanup", {})
+    print(f"cleanup: {cleanup.get('pending_removal', 0)} pending, "
+          f"{cleanup.get('removed_total', 0)} removed, "
+          f"{cleanup.get('recovered_total', 0)} recovered, "
+          f"{cleanup.get('reappeared_total', 0)} reappeared")
+    for remedy in status.get("remedies", []):
+        print(f"{remedy['cause']}: {remedy['action']}")
     print(
         f"built: {status['built_at'] or '-'}  "
         f"synced: {status['last_sync_at'] or '-'}  "

@@ -171,8 +171,8 @@ def tool_triage_plan_delete(
 
 
 @envelope.tool(op_from="plan_id")
-def tool_triage_apply(plan_id: str) -> dict:
-    return get_application().triage_apply(plan_id=plan_id).to_wire()
+def tool_triage_apply(plan_id: str, exclude_ids: list[str] | None = None) -> dict:
+    return get_application().triage_apply(plan_id=plan_id, exclude_ids=exclude_ids).to_wire()
 
 
 @envelope.tool

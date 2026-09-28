@@ -44,7 +44,7 @@ import types
 import typing
 from datetime import datetime
 
-from . import codes, state
+from . import codes, state, store_health
 from .domain import ids
 from .domain.errors import InvalidInput, MailUnavailable, NotFound, ToolError
 from .log import get_logger
@@ -178,6 +178,11 @@ def tool(fn=None, *, op_from: str | None = None):
 
         @functools.wraps(fn)
         def wrapper(*args, **kwargs):
+            health = store_health._active
+            try:
+                generation = health.generation if health is not None else 0
+            except Exception:
+                generation = 0
             try:
                 value = fn(*args, **kwargs)
             except ToolError as e:
@@ -201,6 +206,11 @@ def tool(fn=None, *, op_from: str | None = None):
                     out["operation_id"] = minted
             else:
                 out = {"ok": True, **to_jsonable(value)}
+            if health is not None:
+                try:
+                    out = health.decorate(out.copy(), fn.__name__, generation)
+                except Exception:
+                    out = store_health.unavailable_result(out)
             return _bounded(out)
 
         return wrapper

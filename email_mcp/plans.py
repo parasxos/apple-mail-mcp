@@ -7,12 +7,18 @@ enough because plans are single-shot and short-lived (TTL ~10 min).
 Lifecycle:  draft  --claim-->  (applying)  --finish-->  applied | failed
             draft  --TTL lapse at apply time-->  expired
 
-The claim is the atomic rename <id>.json -> <id>.json.applying: whichever
-process wins the rename owns the apply; the loser sees FileNotFoundError.
+Apply holds a stable lock under plans/locks through atomic manifest updates.
+Housekeeping takes the same lock; process exit releases abandoned ownership.
 """
 from __future__ import annotations
 
+import errno
+import fcntl
 import json
+import os
+import stat
+import uuid
+from contextlib import contextmanager
 from dataclasses import asdict
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -62,9 +68,43 @@ def _revive(data: dict, plan_id: str) -> Plan:
 def save(plan: Plan) -> None:
     # The one plan write seam: the store comes to exist via state adoption.
     path = state.State.resolve().adopt().plans / f"{plan.id}.json"
-    tmp = path.with_suffix(path.suffix + ".tmp")
-    tmp.write_bytes(json.dumps(asdict(plan), indent=2).encode())
-    tmp.rename(path)
+    _atomic_write(path, json.dumps(asdict(plan), indent=2).encode())
+
+
+def _sync_dir(directory: Path) -> None:
+    fd = os.open(directory, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+    try:
+        try:
+            os.fsync(fd)
+        except OSError as error:
+            if error.errno not in (errno.EINVAL, getattr(errno, "ENOTSUP", errno.EINVAL)):
+                raise
+    finally:
+        os.close(fd)
+
+
+def _write_all(fd: int, payload: bytes) -> None:
+    remaining = memoryview(payload)
+    while remaining:
+        count = os.write(fd, remaining)
+        if count <= 0:
+            raise OSError(errno.EIO, "zero-byte plan write")
+        remaining = remaining[count:]
+
+
+def _atomic_write(path: Path, payload: bytes) -> None:
+    tmp = path.with_name(f".{path.name}.tmp-{uuid.uuid4().hex}")
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0)
+    fd = os.open(tmp, flags, 0o600)
+    try:
+        with os.fdopen(fd, "wb") as stream:
+            os.fchmod(stream.fileno(), 0o600)
+            _write_all(stream.fileno(), payload)
+            os.fsync(stream.fileno())
+        os.replace(tmp, path)
+        _sync_dir(path.parent)
+    finally:
+        tmp.unlink(missing_ok=True)
 
 
 def _read(plan_id: str, path: Path) -> Plan | None:
@@ -102,12 +142,70 @@ def claim(plan_id: str) -> Plan | None:
     return plan
 
 
+@contextmanager
+def _own(plan_id: str):
+    _path(plan_id)
+    path = state.State.resolve().adopt().plans / "locks" / plan_id
+    flags = (os.O_RDWR | os.O_CREAT | os.O_NONBLOCK
+             | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0))
+    fd = os.open(path, flags, 0o600)
+    try:
+        info = os.fstat(fd)
+        if (not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid()
+                or info.st_mode & 0o077):
+            raise PermissionError("Plan lock must be a private regular file owned by this user")
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            yield False
+            return
+        yield True
+    finally:
+        os.close(fd)
+
+
+@contextmanager
+def claim_owned(plan_id: str, prepare=None):
+    """Validate under ownership, then publish the complete accepted selection."""
+    path = _path(plan_id)
+    if not path.exists():
+        yield None
+        return
+    with _own(plan_id) as owned:
+        if not owned:
+            yield None
+            return
+        try:
+            plan = _read(plan_id, path)
+        except FileNotFoundError:
+            plan = None
+        if plan is None or plan.status != "draft":
+            yield None
+            return
+        if prepare is not None:
+            prepare(plan)
+        claimed = _claim_path(plan_id)
+        path.rename(claimed)
+        _sync_dir(path.parent)
+        if prepare is not None:
+            _atomic_write(claimed, json.dumps(asdict(plan), indent=2).encode())
+        yield plan
+
+
+def selection_detail(plan: Plan) -> dict:
+    if plan.excluded_ids is None:
+        return {}
+    return {"planned": len(plan.messages),
+            "selected": len(plan.messages) - len(plan.excluded_ids),
+            "excluded": plan.excluded_ids}
+
+
 def _finish_detail(result: dict | None) -> dict | None:
     """Compact, GC-surviving extract of a finish result: counts, per-message
     failure codes and pending ids — never the full dicts, never bodies."""
     if not result:
         return None
-    detail: dict = {k: result[k] for k in ("planned", "acted", "verified")
+    detail: dict = {k: result[k] for k in ("planned", "selected", "excluded", "acted", "verified")
                     if k in result}
     if "failures" in result:
         detail["failures"] = [{"id": f.get("id"), "code": f.get("code")}
@@ -126,11 +224,13 @@ def finish(plan: Plan, status: str, result: dict | None) -> None:
     event carries the plan summary and compact outcomes, so the story
     outlives the plan file's 7-day GC."""
     plan.status = status
-    plan.result = result
+    selection = selection_detail(plan)
+    plan.result = {**(result or {}), **selection} if selection else result
     save(plan)
     _claim_path(plan.id).unlink(missing_ok=True)
+    _sync_dir(_path(plan.id).parent)
     try:
-        detail = _finish_detail(result)
+        detail = _finish_detail(plan.result)
     except Exception:  # noqa: BLE001 — detail is best-effort; a shaped-data
         # surprise must never turn a finished apply into an error or lose
         # the plan_finish event (audit finding F5: this expression used to
@@ -163,24 +263,36 @@ def gc(now: datetime | None = None) -> int:
     horizon = now - timedelta(days=7)
     stale = now - timedelta(seconds=2 * config.triage_ttl_seconds())
     for path in config.plans_dir().glob("*.json*"):
-        try:
-            mtime = datetime.fromtimestamp(path.stat().st_mtime, tz=timezone.utc)
-        except OSError:
+        plan_id = path.name.lstrip(".").partition(".")[0]
+        if not ids.is_minted_id(plan_id):
             continue
-        if mtime < horizon:
-            path.unlink(missing_ok=True)
-            removed += 1
-        elif path.name.endswith(".applying") and mtime < stale:
+        with _own(plan_id) as owned:
+            if not owned:
+                continue
             try:
-                plan = _revive(json.loads(path.read_bytes()),
-                               path.name.partition(".")[0])
-            except (json.JSONDecodeError, TypeError):
-                plan = None
-            if plan is not None:
-                # Through finish(): the stale claim gets the same terminal
-                # write + plan_finish event as every other ending.
-                finish(plan, "failed",
-                       {"error": "stale claim: apply crashed mid-flight"})
-            else:
+                mtime = datetime.fromtimestamp(path.stat().st_mtime, tz=timezone.utc)
+            except FileNotFoundError:
+                continue
+            if ".tmp-" in path.name:
+                if mtime < stale:
+                    path.unlink(missing_ok=True)
+                    removed += 1
+            elif mtime < horizon:
                 path.unlink(missing_ok=True)
+                removed += 1
+            elif path.name.endswith(".applying") and mtime < stale:
+                terminal = load(plan_id)
+                if terminal is not None and terminal.status != "draft":
+                    path.unlink(missing_ok=True)
+                    _sync_dir(path.parent)
+                    continue
+                try:
+                    plan = _read(plan_id, path)
+                except (json.JSONDecodeError, TypeError):
+                    plan = None
+                if plan is not None:
+                    finish(plan, "failed",
+                           {"error": "stale claim: apply crashed mid-flight"})
+                else:
+                    path.unlink(missing_ok=True)
     return removed

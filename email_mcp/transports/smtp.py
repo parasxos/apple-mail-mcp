@@ -10,6 +10,7 @@ password is spoken.
 from __future__ import annotations
 
 import email
+import email.policy
 import smtplib
 import socket
 import ssl
@@ -236,7 +237,9 @@ class SmtpTransport:
         try:
             server = self._connect(timeout=60)
             server.login(self.username, password)
-            refused = server.sendmail(mail_from, rcpt_to, msg.as_bytes())
+            refused = server.sendmail(
+                mail_from, rcpt_to, msg.as_bytes(policy=email.policy.SMTP),
+            )
         except smtplib.SMTPAuthenticationError as e:
             _log.error("smtp auth failed for %s at %s:%d", self.username,
                        self.host, self.port)

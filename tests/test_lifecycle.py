@@ -113,6 +113,59 @@ def test_uninstall_plan_installed_keeps_state(home, installed):
     assert not any("Logs" in str(getattr(r, "path", "")) for r in rows)
 
 
+def test_uninstall_does_not_traverse_linked_graph_directory(home, tmp_path):
+    writer = state.State.resolve().adopt()
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    token = outside / "unrelated.token.json"
+    token.write_text("private")
+    (writer.root / "graph").symlink_to(outside, target_is_directory=True)
+
+    rows = lifecycle.plan_uninstall()
+    plan.execute(rows, verb="uninstall")
+
+    assert token.read_text() == "private"
+    assert any(isinstance(row, plan.PrintOnly)
+               and "token caches not removed" in row.text for row in rows)
+    assert not any(isinstance(row, plan.UnlinkFile)
+                   and row.path.name == token.name for row in rows)
+
+
+def test_uninstall_refuses_graph_link_substituted_after_planning(home, tmp_path):
+    writer = state.State.resolve().adopt()
+    graph = writer.graph
+    (graph / "main.token.json").write_text("managed")
+    rows = lifecycle.plan_uninstall()
+    graph.rename(writer.root / "graph-original")
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    token = outside / "main.token.json"
+    token.write_text("private")
+    graph.symlink_to(outside, target_is_directory=True)
+
+    results = plan.execute(rows, verb="uninstall")
+
+    assert token.read_text() == "private"
+    assert any(result.failed and isinstance(result.row, plan.UnlinkFile)
+               for result in results)
+
+
+def test_uninstall_accepts_deliberately_relocated_state_root(home, tmp_path):
+    relocated = tmp_path / "relocated-state"
+    relocated.mkdir()
+    state.default_root().symlink_to(relocated, target_is_directory=True)
+    writer = state.State.resolve().adopt()
+    token = writer.graph / "main.token.json"
+    token.write_text("managed")
+
+    results = plan.execute(lifecycle.plan_uninstall(), verb="uninstall")
+
+    assert all(result.ok for result in results)
+    assert not token.exists()
+    assert state.default_root().is_symlink()
+    assert relocated.is_dir()
+
+
 def test_uninstall_plan_purge_adds_tree_and_logs(home, installed):
     rows = lifecycle.plan_uninstall(purge=True)
     trees = [r for r in rows if isinstance(r, plan.RemoveTree)]

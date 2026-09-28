@@ -20,6 +20,20 @@ class TriageError(ToolError):
         super().__init__(message, code=code)
 
 
+def exclusions(plan: Plan, raw: list[str] | None) -> list[str]:
+    if raw is None:
+        return []
+    if not isinstance(raw, list) or any(not isinstance(value, str) for value in raw):
+        raise TriageError("invalid_exclusion", "exclude_ids must be a list of message ID strings.")
+    requested = set(raw)
+    frozen = [str(message.rowid) for message in plan.messages]
+    if requested - set(frozen):
+        raise TriageError("invalid_exclusion", "Every excluded ID must belong to this plan.")
+    if requested and len(requested) == len(frozen):
+        raise TriageError("empty_selection", "Exclusions leave no messages to apply.")
+    return [message_id for message_id in frozen if message_id in requested]
+
+
 def parse_actions(
     raw: list[dict] | None,
     allowed: set[str] = ACTIONS,

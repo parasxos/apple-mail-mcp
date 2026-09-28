@@ -260,6 +260,35 @@ def test_smtp_strips_bcc_header_but_keeps_envelope_rcpt(monkeypatch):
     assert ("quit",) in srv.calls
 
 
+@pytest.mark.parametrize("line_ending", [b"\n", b"\r\n"])
+def test_smtp_data_uses_crlf_and_dot_stuffing(monkeypatch, line_ending):
+    server = smtplib.SMTP(local_hostname="fixture")
+    server.helo_resp = b"ready"
+    replies = iter([
+        (250, b"sender accepted"), (250, b"recipient accepted"),
+        (250, b"bcc accepted"), (354, b"send data"),
+        (250, b"queued"), (221, b"bye"),
+    ])
+    wire = []
+    monkeypatch.setattr(server, "send", wire.append)
+    monkeypatch.setattr(server, "getreply", lambda: next(replies))
+    monkeypatch.setattr(server, "login", lambda *args: None)
+    transport = _smtp()
+    monkeypatch.setattr(transport, "_connect", lambda timeout: server)
+    monkeypatch.setattr(transport, "_secret", lambda: "fixture")
+    raw = _RAW_WITH_BCC.replace(b"body\r\n", b"body\r\n.line\r\n")
+    raw = raw.replace(b"\r\n", line_ending)
+
+    transport.deliver(raw, "g@example.org", ["a@example.org", "g@example.org"])
+
+    payload, = [data for data in wire if isinstance(data, bytes)]
+    assert b"\n" not in payload.replace(b"\r\n", b"")
+    assert b"\r\n..line\r\n" in payload
+    assert payload.endswith(b"\r\n.\r\n")
+    assert b"Bcc:" not in payload
+    assert "rcpt TO:<g@example.org>\r\n" in wire
+
+
 def test_smtp_port_465_is_ssl_else_starttls(monkeypatch):
     FakeSSL, FakePlain = _fake_smtp_cls(), _fake_smtp_cls()
     monkeypatch.setattr(smtp_mod.smtplib, "SMTP_SSL", FakeSSL)

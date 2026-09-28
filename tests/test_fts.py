@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import sqlite3
 import textwrap
+import threading
 from pathlib import Path
 
 import pytest
@@ -115,7 +116,7 @@ def test_build_indexes_bodies_but_not_missing_emlx(mail_fixture):
     assert st["docs"]["indexed"] == 3
     assert st["docs"]["missing"] == 1
     assert st["last_rowid"] == 300
-    assert st["schema_version"] == 2
+    assert st["schema_version"] == 3
     assert st["built_at"] is not None
 
 
@@ -326,7 +327,7 @@ def test_partial_retry_keeps_a_miss_stamp_while_still_partial(mail_fixture):
     assert idx.rowids_matching("partial") == [500]
 
 
-def test_reconcile_removes_vanished_rowid(mail_fixture):
+def test_reconcile_removes_vanished_rowid(mail_fixture, monkeypatch):
     idx = FtsIndex(mail_base=mail_fixture)
     idx.build()
     assert idx.rowids_matching("retracted") == [100]
@@ -336,6 +337,12 @@ def test_reconcile_removes_vanished_rowid(mail_fixture):
     env.commit()
     env.close()
 
+    now = fts.time.time()
+    out = idx.reconcile()
+    assert out["removed"] == 0
+    assert out["pending_removal"] == 1
+    assert idx.rowids_matching("retracted") == [100]
+    monkeypatch.setattr(fts.time, "time", lambda: now + fts._ABSENCE_GRACE_SECONDS + 1)
     out = idx.reconcile()
     assert out["removed"] == 1
     assert 100 not in _doc_statuses()
@@ -1118,7 +1125,7 @@ def test_partial_recrawl_never_clobbers_a_graph_body(mail_fixture,
     assert idx.backfilled_text(505) is None          # provenance moved on
 
 
-def test_v1_db_migrates_in_place_to_v2(mail_fixture):
+def test_v1_db_migrates_in_place_to_v3(mail_fixture):
     """An existing index gains docs.source without a rebuild; every
     pre-migration row reads 'local' — exactly where its text came from."""
     from email_mcp import state
@@ -1143,7 +1150,7 @@ def test_v1_db_migrates_in_place_to_v2(mail_fixture):
     idx = FtsIndex(mail_base=mail_fixture)
     idx.incremental()
     st = idx.status()
-    assert st["schema_version"] == 2
+    assert st["schema_version"] == 3
     assert _doc_sources()[100] == "local"
 
 
@@ -1295,3 +1302,119 @@ def test_rebuild_promote_defers_to_a_busy_writer(mail_fixture, monkeypatch):
     assert "skipped" not in out
     assert out["salvaged"] == 1
     assert idx.backfilled_text(524) == "busy text"
+
+
+def test_rebuild_preserves_backfill_from_an_already_open_connection(
+    mail_fixture, monkeypatch,
+):
+    idx = _backfill_one(mail_fixture, monkeypatch, 525, "before rebuild")
+    opened = threading.Event()
+    salvaged = threading.Event()
+    attempted = threading.Event()
+    promoted = threading.Event()
+    blocked = []
+    errors = []
+
+    def backfill():
+        try:
+            conn = idx._open_rw()
+            try:
+                conn.execute("PRAGMA busy_timeout=25")
+                assert conn.execute(
+                    "SELECT body FROM body_fts WHERE rowid=525",
+                ).fetchone()["body"] == "before rebuild"
+                opened.set()
+                assert salvaged.wait(5)
+                try:
+                    conn.execute("BEGIN IMMEDIATE")
+                except sqlite3.OperationalError as exc:
+                    blocked.append("locked" in str(exc))
+                else:
+                    conn.rollback()
+                    blocked.append(False)
+                attempted.set()
+                assert promoted.wait(5)
+                conn.execute("BEGIN IMMEDIATE")
+                conn.execute("UPDATE body_fts SET body=? WHERE rowid=525",
+                             ("after rebuild",))
+                conn.commit()
+            finally:
+                conn.close()
+        except BaseException as exc:
+            errors.append(exc)
+            attempted.set()
+
+    real_salvage = FtsIndex._salvage_graph_rows
+
+    def during_promotion(self, conn):
+        count = real_salvage(self, conn)
+        salvaged.set()
+        assert attempted.wait(5)
+        assert blocked == [True]
+        return count
+
+    worker = threading.Thread(target=backfill)
+    worker.start()
+    try:
+        assert opened.wait(5)
+        monkeypatch.setattr(FtsIndex, "_salvage_graph_rows", during_promotion)
+        assert idx.rebuild()["salvaged"] == 1
+    finally:
+        promoted.set()
+        worker.join(timeout=5)
+    assert not worker.is_alive()
+    assert not errors
+    assert idx.backfilled_text(525) == "after rebuild"
+
+
+def test_rebuild_rolls_back_after_partial_table_replacement(
+    mail_fixture, monkeypatch,
+):
+    idx = _backfill_one(mail_fixture, monkeypatch, 526, "keep this body")
+    with sqlite3.connect(fts.db_path()) as conn:
+        conn.execute("""
+            CREATE TRIGGER fail_rebuild BEFORE INSERT ON docs
+            BEGIN SELECT RAISE(ABORT, 'rebuild interrupted'); END
+        """)
+    conn.close()
+    with pytest.raises(sqlite3.IntegrityError, match="rebuild interrupted"):
+        idx.rebuild()
+    assert idx.backfilled_text(526) == "keep this body"
+    assert idx.rowids_matching("keep") == [526]
+
+
+@pytest.mark.parametrize("damage", [
+    "DELETE FROM body_fts_data WHERE id=1",
+    "UPDATE body_fts_data SET block=x'00' WHERE id=10",
+])
+def test_rebuild_repairs_damaged_fts_metadata(mail_fixture, monkeypatch, damage):
+    idx = _backfill_one(mail_fixture, monkeypatch, 527, "preserved remote body")
+    inode = fts.db_path().stat().st_ino
+    with sqlite3.connect(fts.db_path()) as conn:
+        assert conn.execute(damage).rowcount > 0
+    conn.close()
+
+    out = idx.rebuild()
+
+    assert out["salvaged"] == 1
+    assert idx.rowids_matching("retracted") == [100]
+    assert idx.rowids_matching("preserved") == [527]
+    assert idx.backfilled_text(527) == "preserved remote body"
+    assert fts.db_path().stat().st_ino == inode
+
+
+def test_rebuild_recreates_missing_fts_term_segments(mail_fixture, monkeypatch):
+    idx = _backfill_one(mail_fixture, monkeypatch, 528, "preserved remote body")
+    inode = fts.db_path().stat().st_ino
+    with sqlite3.connect(fts.db_path()) as conn:
+        assert conn.execute("DELETE FROM body_fts_data WHERE id>10").rowcount > 0
+    conn.close()
+    assert idx.rowids_matching("retracted") == []
+
+    out = idx.rebuild()
+
+    assert out["salvaged"] == 1
+    assert idx.rowids_matching("retracted") == [100]
+    assert idx.rowids_matching("preserved") == [528]
+    assert idx.backfilled_text(528) == "preserved remote body"
+    assert fts.db_path().stat().st_ino == inode

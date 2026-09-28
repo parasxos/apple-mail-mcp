@@ -74,13 +74,29 @@ not a secret; SMTP credentials belong in Keychain or 1Password, never here.
 
 ## macOS Full-Disk-Access
 
-`~/Library/Mail` is gated by macOS. Grant **Full Disk Access** to whichever terminal app starts Claude Code (Terminal / iTerm / VS Code / Cursor):
+`~/Library/Mail` is gated by macOS. At startup the MCP server attempts a
+small read of the Envelope Index. Every tool response carries the observed
+`health.mail_store` status. If the probe fails, responses also carry
+`degraded: ["no-store-access"]`, including successful operations that do not
+need the store. Store-dependent failures and subsequent calls recheck access.
 
-System Settings → Privacy & Security → Full Disk Access → toggle the app on.
+The health report distinguishes access denial, a missing store, a busy
+database and other read failures. It includes a host candidate and the
+server executable, with `attribution: "unverified"`. These are clues for
+finding the responsible app, not proof of its macOS permission identity.
 
-You'll likely need to fully quit and relaunch the terminal app after toggling.
+For denied access, open **System Settings → Privacy & Security → Full Disk
+Access**, enable the app that launches the server, then fully quit and
+relaunch that app if access still fails. The report includes the Settings
+link and, when a bundle is available, an `open -R` command. macOS provides
+no supported query that lets this server distinguish an absent grant from
+a grant that needs a restart, so the guidance states that uncertainty.
 
-Without FDA the server returns a clear error from `list_mailboxes` on first call, so the failure mode is obvious.
+Small, bounded observations can persist in `health.json` when the managed
+state root already exists and is private. Startup does not create a state
+root just to record health. `history_available` tells whether persistence
+worked; CLI `doctor` reads this history without changing it. History contains
+host candidates, status and timestamps, never message content.
 
 ## macOS Automation (needed only for `refresh_mail`)
 
@@ -346,7 +362,7 @@ Every call carries the same envelope twice: JSON text for existing clients and
 `structuredContent` for clients that can consume typed results. Both contain
 the identical `{ok: true, ...}` or `{ok: false, code, error, ...}` object;
 application failures remain normal envelopes rather than protocol crashes.
-The server is tested against MCP SDK 1.27.1+ and 2.x. SDK 2.x negotiates older
+The server requires MCP SDK 2.2.0 or newer in the 2.x line. It negotiates older
 MCP wire revisions too, so existing stdio registrations do not need to change.
 
 | Tool | Purpose |
@@ -367,7 +383,7 @@ MCP wire revisions too, so existing stdio registrations do not need to change.
 | `cancel_scheduled(id)` | Cancel a pending scheduled message (sent/mid-flight cannot be recalled). While another process is arming the record (`schedule_email` in flight) or reconciling it (the dispatcher), the call is refused with `{ok: false, code: "spool_busy"}` and must be repeated; it never reports `cancelled` while a deferred draft may still be armed. If the Exchange revoke fails, the refusal carries `graph_draft_id` so you can discard the draft in Outlook/OWA. |
 | `triage_plan(filters..., actions)` | Stage a mailbox operation: same filters as `search_emails` + a list of dispositions. Mutates nothing; returns `{plan_id, count, summary, messages}` for review. |
 | `triage_plan_delete(filters...)` | Stage a Trash move through the separate destructive door and tighter 50-message cap; still mutates nothing until apply. |
-| `triage_apply(plan_id)` | Execute a staged plan (one batched AppleScript, by-ROWID addressing) + verify against the index. Per-message failures are data. |
+| `triage_apply(plan_id, exclude_ids?)` | Apply the retained messages from a reviewed plan and verify their state. Excluded envelope IDs remain untouched. Per-message failures are data. |
 | `mailbox_create(account, path)` | Create a (nested) mailbox; idempotent. |
 | `mailbox_delete(account, path)` | Delete an EMPTY LEAF mailbox; idempotent. Refuses `not_empty` (holds messages) and `not_leaf` (holds child mailboxes — Mail would delete the subtree). Outcome decided by live re-probe (Mail's delete verb lies); a probe Mail does not answer is `mail_unresponsive`, never absence (`mail_verified: false` when it happens after the verb). Escalates to UI scripting when the verb verifiably has no effect (needs Accessibility permission). |
 | `doctor()` | Full installation, permission, transport, queue and index diagnostics with concrete fixes. |
@@ -482,7 +498,16 @@ index verifies the mutations landed (write-through ≤2 s).
 - **Plan/apply is two calls by design** — review the returned plan before
   applying. Plans live in `~/.email-mcp/plans/` (0700), expire after 10 min,
   cap at 200 messages (larger selections are rejected, never truncated).
-  Double-apply and concurrent applies are safe (atomic claim).
+  An atomic claim prevents concurrent applies. The active process holds
+  an owner lock, so housekeeping cannot expire an apply still running.
+- Pass `exclude_ids` to leave particular messages from the reviewed plan
+  untouched. Unknown IDs and an all-excluded selection are refused before
+  Mail runs, leaving the draft usable. The original plan and expiry stay
+  fixed. A valid apply consumes the whole plan once; processing excluded
+  messages later requires a new plan.
+- Apply receipts retain `planned` as the original count and add `selected`
+  and `excluded`. The accepted selection is saved before Mail runs and
+  retained in the plan result and best-effort audit detail, including failures.
 - Before mutating, each message's RFC Message-ID is re-checked against the
   plan — a message that moved or a recycled database id fails safe.
 - Failures are per-message data (`failures[]`), not call errors; `pending[]`
@@ -495,6 +520,32 @@ index verifies the mutations landed (write-through ≤2 s).
 - Requires Mail.app Automation permission (same as `refresh_mail`). The
   Envelope Index itself is **never opened writable** — all mutations go
   through Mail.app, which owns server sync.
+
+## Body search coverage and recovery
+
+Search responses, `email-mcp fts --status --json`, and `doctor` expose the
+same coverage guidance. Counts cover all accounts, even when a particular
+search is filtered. `coverage.state` is `incomplete` when known body gaps or
+uncrawled rows remain, `unknown` when backlog cannot be checked, and
+`no_known_gaps` when neither is observed. The last state does not prove an
+exhaustive search: document size and result limits still apply.
+
+`partial` documents may contain searchable text, but some body content may be
+absent. `missing` and extraction errors require different recovery steps
+from an uncrawled backlog. `docs.local_retry_exhausted` exposes documents
+that reached the local retry limit. `remedies` distinguishes local sync,
+local rebuild after restoring files, provider backfill, missing provider
+configuration or identifiers, and provider errors. Graph and IMAP recovery
+use explicitly configured identities. Reporting itself contacts no provider.
+
+An unresolved mailbox lookup during retry preserves the existing document
+and cached body. Reconciliation takes the index writer lock before reading
+the Envelope Index, repairs ledger holes below the crawl high-water mark,
+and removes a record only after two complete absence observations at least
+24 hours apart. Reappearance clears the pending removal. Rebuild preserves
+cached bodies and pending absence evidence where fresh local data cannot
+replace them. `cleanup` exposes pending removals and cumulative removals,
+repaired ledger holes, reappearances and deferred retries.
 
 ## Extension points
 

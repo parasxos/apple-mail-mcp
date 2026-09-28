@@ -98,6 +98,7 @@ class UnlinkFile(Action):
     An already-absent path is the goal state, not an error."""
 
     path: Path
+    root: Path | None = None
     wants: ClassVar[str] = "absent"
 
     def target(self) -> Path:
@@ -107,7 +108,14 @@ class UnlinkFile(Action):
         return f"remove file {self.path}"
 
     def _run(self) -> None:
-        Path(self.path).unlink(missing_ok=True)
+        if self.root is None:
+            self.path.unlink(missing_ok=True)
+            return
+        try:
+            with state.open_directory(self.root, self.path.parent) as fd:
+                os.unlink(self.path.name, dir_fd=fd)
+        except FileNotFoundError:
+            pass
 
 
 @dataclass(frozen=True)
@@ -200,6 +208,7 @@ class Chmod(Action):
 
     path: Path
     mode: int
+    root: Path | None = None
     wants: ClassVar[str] = "present"
 
     def target(self) -> Path:
@@ -209,7 +218,18 @@ class Chmod(Action):
         return f"chmod {self.mode:o} {self.path}"
 
     def _run(self) -> None:
-        os.chmod(self.path, self.mode, follow_symlinks=False)
+        if self.root is None:
+            os.chmod(self.path, self.mode, follow_symlinks=False)
+        elif self.path == self.root:
+            with state.open_directory(self.root, self.root) as fd:
+                os.fchmod(fd, self.mode)
+        else:
+            with state.open_directory(self.root, self.path.parent) as fd:
+                if stat.S_ISLNK(os.stat(
+                        self.path.name, dir_fd=fd, follow_symlinks=False).st_mode):
+                    raise state.RefusedError(f"{self.path} is a symlink")
+                os.chmod(self.path.name, self.mode, dir_fd=fd,
+                         follow_symlinks=False)
 
 
 @dataclass(frozen=True)

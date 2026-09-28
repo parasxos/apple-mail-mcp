@@ -16,6 +16,7 @@ from __future__ import annotations
 import math
 import subprocess
 import time
+from dataclasses import replace
 from datetime import datetime
 
 from . import applescript, audit, config, plans
@@ -28,6 +29,7 @@ from .triage_planning import (
     RELOCATING,
     TriageError,
     TriagePlanner,
+    exclusions,
     parse_actions as _parse_actions,
     scheme as _scheme,
     summary as _summary,
@@ -367,27 +369,34 @@ def _verify(source, plan: Plan, acted: set[int],
             "polls_used": polls}
 
 
-def apply_plan(source, plan_id: str) -> dict:
-    """Wraps _apply_plan with the §2 threading rule, in ONE place: every
-    refusal about an EXISTING plan carries the plan id as operation_id
-    (the durable artifact was minted before the failure — the envelope
-    threads to its ledger events). plan_not_found carries nothing: the
-    caller's claim is not proof an artifact exists. Found by RC P10
-    (2026-08-02): typed refusals dropped the id the contract promises."""
+def apply_plan(source, plan_id: str, exclude_ids: list[str] | None = None) -> dict:
+    """Attach operation_id to refusals about existing plans, as §2 requires.
+    Unknown plans carry no id because no durable artifact was found."""
     try:
-        return _apply_plan(source, plan_id)
+        return _apply_plan(source, plan_id, exclude_ids)
     except TriageError as e:
         if e.code != "plan_not_found" and not e.operation_id:
             e.operation_id = plan_id
         raise
 
 
-def _apply_plan(source, plan_id: str) -> dict:
+def _prepare_apply(plan: Plan, exclude_ids: list[str] | None) -> None:
+    if plans.utcnow() > datetime.fromisoformat(plan.expires_at):
+        plans.expire(plan)
+        raise TriageError("plan_expired", f"plan {plan.id} expired at {plan.expires_at}; re-run triage_plan.")
+    plan.excluded_ids = exclusions(plan, exclude_ids)
+
+
+def _apply_plan(source, plan_id: str, exclude_ids: list[str] | None) -> dict:
     plans.gc()
     try:
-        plan = plans.claim(plan_id)
+        with plans.claim_owned(plan_id, lambda p: _prepare_apply(p, exclude_ids)) as plan:
+            return _apply_claimed_plan(source, plan_id, plan)
     except plans.UnknownPlanId:
         raise TriageError("plan_not_found", f"no plan with id {plan_id!r}.")
+
+
+def _apply_claimed_plan(source, plan_id: str, plan: Plan | None) -> dict:
     if plan is None:
         existing = plans.load(plan_id)
         if existing is None:
@@ -401,17 +410,8 @@ def _apply_plan(source, plan_id: str) -> dict:
                           f"plan {plan_id} is being applied by another process.")
 
     started = time.monotonic()
-    now = plans.utcnow()
-    if now > datetime.fromisoformat(plan.expires_at):
-        plans.expire(plan)
-        raise TriageError(
-            "plan_expired",
-            f"plan {plan_id} expired at {plan.expires_at} (TTL "
-            f"{config.triage_ttl_seconds()}s) — re-run triage_plan.",
-        )
-
-    # Pre-flight: enumerate Mail's account ids (launches Mail as a side
-    # effect); abort BEFORE any mutation if a plan account is missing.
+    selected = [m for m in plan.messages if str(m.rowid) not in plan.excluded_ids]
+    execution = replace(plan, messages=selected)
     try:
         pre = _run_osascript(_render_preflight(), timeout=15)
     except FileNotFoundError:
@@ -436,7 +436,7 @@ def _apply_plan(source, plan_id: str) -> dict:
         raise TriageError("script_error",
                           f"pre-flight failed: {(pre.stderr or '').strip()[:200]}")
     known = {line.strip() for line in (pre.stdout or "").splitlines() if line.strip()}
-    needed = {m.account for m in plan.messages if m.scheme != "local"}
+    needed = {m.account for m in selected if m.scheme != "local"}
     if plan.target and _scheme(plan.target["url"]) != "local":
         needed.add(plan.target["account"])
     missing = needed - known
@@ -448,21 +448,17 @@ def _apply_plan(source, plan_id: str) -> dict:
             f"account id(s) {sorted(missing)} not present in Mail.app.",
         )
 
-    # ACT — the plan runs as sub-scripts of _CHUNK_SIZE messages, each with
-    # its own time budget: a timeout kills one chunk, the chunks already
-    # done stay banked, and everything the batch never reached is reported
-    # honestly instead of riding a wholesale kill.
     planned_ids = [m.rowid for m in plan.messages]
     results: dict[int, tuple[str, str]] = {}
     killed: list[PlanMessage] = []  # the one chunk a timeout hit
     killed_budget = 0.0
     osa_ms = 0
-    for start in range(0, len(plan.messages), _CHUNK_SIZE):
-        chunk = plan.messages[start:start + _CHUNK_SIZE]
+    for start in range(0, len(selected), _CHUNK_SIZE):
+        chunk = selected[start:start + _CHUNK_SIZE]
         budget = _auto_timeout(len(chunk))
         osa_started = time.monotonic()
         try:
-            proc = _run_osascript(_render_script(plan, chunk), timeout=budget)
+            proc = _run_osascript(_render_script(execution, chunk), timeout=budget)
         except subprocess.TimeoutExpired:
             osa_ms += int((time.monotonic() - osa_started) * 1000)
             killed, killed_budget = chunk, budget
@@ -494,7 +490,7 @@ def _apply_plan(source, plan_id: str) -> dict:
                     "applescript", f"chunk script failed wholesale: {err}")
             break
         results.update(_parse_batch_output(stdout, [m.rowid for m in chunk]))
-    for m in plan.messages:  # chunks after a break were never attempted
+    for m in selected:  # chunks after a break were never attempted
         results.setdefault(m.rowid, (
             "not_attempted",
             "an earlier chunk stopped the batch before this message was "
@@ -512,7 +508,7 @@ def _apply_plan(source, plan_id: str) -> dict:
     # deletes landed AFTER the kill), so its ids get a drain-sized window
     # and confirmed ones are upgraded from batch_timeout to acted.
     killed_ids = {m.rowid for m in killed}
-    ver = _verify(source, plan, acted | killed_ids, window_s=killed_budget)
+    ver = _verify(source, execution, acted | killed_ids, window_s=killed_budget)
     rescued = set(ver["verified"]) & killed_ids
     if rescued:
         acted |= rescued
@@ -534,6 +530,8 @@ def _apply_plan(source, plan_id: str) -> dict:
         "plan_id": plan.id,
         "status": status,
         "planned": len(planned_ids),
+        "selected": len(selected),
+        "excluded": plan.excluded_ids,
         "acted": len(acted),
         "failures": failures,
         "verified": len(ver["verified"]),

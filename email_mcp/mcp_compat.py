@@ -89,7 +89,7 @@ TOOL_SPECS: dict[str, ToolSpec] = {
 }
 
 _TOOL_DESCRIPTIONS = {
-    "search_emails": "Search local envelope data and full bodies; sender filters are case-insensitive substring matches.",
+    "search_emails": "Search local envelope data and indexed body content. Check the returned FTS coverage before treating no matches as proof that no email exists. Sender filters are case-insensitive substring matches.",
     "get_email": "Read one email by envelope ID at full, metadata, or minimal detail.",
     "get_emails_batch": "Read up to 50 emails in one bounded request, with per-ID errors.",
     "get_thread": "Return the messages in one conversation in chronological order.",
@@ -107,7 +107,7 @@ _TOOL_DESCRIPTIONS = {
     "cancel_scheduled": "Revoke a pending scheduled email locally and, when needed, in Exchange.",
     "triage_plan": "Prepare a reviewable bulk-change plan; sender filters use case-insensitive substring matching.",
     "triage_plan_delete": "Prepare a capped Trash plan whose sender filter is exact, never a broad substring match.",
-    "triage_apply": "Apply one reviewed plan and verify each resulting mailbox state.",
+    "triage_apply": "Apply one reviewed plan, optionally excluding selected envelope IDs, and verify the retained messages. A successful claim consumes the whole plan once.",
     "mailbox_create": "Create a mailbox idempotently and report live and index verification.",
     "mailbox_delete": "Delete an empty mailbox only, with live verification and safe fallback.",
 }
@@ -138,6 +138,7 @@ _PARAMETER_HELP = {
     "tool": "Only return activity emitted by this tool name.",
     "event": "Only return activity with this event name.",
     "plan_id": "Triage plan ID returned by a planning tool.",
+    "exclude_ids": "Envelope IDs from this reviewed plan to leave untouched. Omit or pass an empty list to apply the full plan. At least one message must remain selected.",
     "operation_id": "Operation ID that joins related activity across processes.",
     "to": "Comma-separated primary recipients, including optional display names.",
     "subject": "Email subject line.",
@@ -395,7 +396,7 @@ def register_tool(mcp, function, implementation):
     def wrapped(*args, **kwargs):
         return _call_result(function(*args, **kwargs))
 
-    # Avoid __wrapped__: FastMCP intentionally follows it and would rediscover
+    # Avoid __wrapped__: MCPServer intentionally follows it and would rediscover
     # the nested function's old -> dict annotation instead of CallToolResult.
     wrapped.__name__ = name
     wrapped.__qualname__ = name
@@ -423,10 +424,10 @@ def _branch(schema: dict, wanted_type: str) -> dict:
 
 
 def enrich_input_schemas(mcp) -> None:
-    """Add client guidance to FastMCP's generated schemas in one place.
+    """Add client guidance to MCPServer's generated schemas in one place.
 
     These are advertised constraints, matching validation already performed by
-    the core functions.  The FastMCP argument model is deliberately unchanged,
+    the core functions.  The MCPServer argument model is deliberately unchanged,
     so an older or non-validating client still receives the stable ok:false
     envelope instead of a framework exception.
     """

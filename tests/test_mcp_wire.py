@@ -30,7 +30,9 @@ import sys
 import threading
 from pathlib import Path
 
-from mcp import ClientSession, StdioServerParameters
+import pytest
+
+from mcp import Client, ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
 from jsonschema import Draft202012Validator
 from tests._mcp_sdk import sdk_attr
@@ -159,6 +161,30 @@ def test_read_only_wire_surface_is_exactly_the_eleven_read_tools(
     names = _talk(env, body)
     assert names == READ_ONLY_TOOLS
     assert not names & MUTATING_TOOLS
+
+
+@pytest.mark.parametrize("mode", ["auto", "2026-07-28"])
+@pytest.mark.parametrize("read_only", [False, True])
+def test_latest_protocol_discovers_and_reads_over_stdio(
+    tmp_path, mail_fixture, mode, read_only,
+):
+    cmd = _server_command()
+    env = _server_env(
+        tmp_path, mail_fixture, EMAIL_MCP_READ_ONLY=str(int(read_only)))
+
+    async def talk():
+        params = StdioServerParameters(command=cmd[0], args=cmd[1:], env=env)
+        async with Client(params, mode=mode) as client:
+            assert client.protocol_version == "2026-07-28"
+            tools = {tool.name: tool for tool in (await client.list_tools()).tools}
+            assert set(tools) == (READ_ONLY_TOOLS if read_only else ALL_TOOLS)
+            result = await client.call_tool("list_mailboxes", {})
+            payload = _envelope(result)
+            Draft202012Validator(tools["list_mailboxes"].output_schema).validate(payload)
+            assert payload["ok"] is True
+            assert len(payload["mailboxes"]) == 3
+
+    asyncio.run(asyncio.wait_for(talk(), WIRE_TIMEOUT))
 
 
 # --------------------------------------------------------------------- #

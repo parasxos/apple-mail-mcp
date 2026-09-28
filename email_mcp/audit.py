@@ -182,7 +182,7 @@ def _dumps(record: dict) -> bytes:
 
 def _fit(record: dict) -> bytes:
     """Serialize compactly, shedding fields in the contract's order until
-    the line fits MAX_EVENT_BYTES: detail's failures/pending lists collapse
+    the line fits MAX_EVENT_BYTES: detail's outcome lists collapse
     to counts first, then detail drops wholesale; the envelope and summary
     always survive — a truncated event still says what happened, to how
     many, with which outcome."""
@@ -193,7 +193,7 @@ def _fit(record: dict) -> bytes:
     if isinstance(detail, dict):
         collapsed = {
             k: len(v)
-            if k in ("failures", "pending") and isinstance(v, list) else v
+            if k in ("failures", "pending", "excluded") and isinstance(v, list) else v
             for k, v in detail.items()
         }
         if collapsed != detail:

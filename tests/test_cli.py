@@ -279,7 +279,7 @@ def test_packaging_single_sources_the_version():
     assert py["project"]["requires-python"] == ">=3.11"
     assert py["project"]["dependencies"] == [
         "certifi>=2024.2.2",   # the TLS trust store where the interpreter ships none (email_mcp.tls)
-        "mcp>=1.27.1,<3",
+        "mcp>=2.2.0,<3",
         "pydantic>=2,<3",
     ]
 

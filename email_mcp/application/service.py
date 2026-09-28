@@ -222,8 +222,8 @@ class EmailApplication:
             limit=limit,
         )
 
-    def triage_apply(self, plan_id: str) -> TriageApplyResult:
-        return self._triage.triage_apply(plan_id)
+    def triage_apply(self, plan_id: str, exclude_ids: list[str] | None = None) -> TriageApplyResult:
+        return self._triage.triage_apply(plan_id, exclude_ids)
 
     def mailbox_create(
         self, account: str, path: str,
