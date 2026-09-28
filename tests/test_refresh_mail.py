@@ -170,3 +170,99 @@ def test_refresh_mail_skips_wait_on_failure(apple_source):
     # No sleep should have happened on the failure path.
     assert sleeps == []
     _ = real_sleep  # keep import used for clarity
+
+
+SYNC_ACCOUNT = "BBBBBBBB-0000-0000-0000-000000000002"
+
+
+def test_synchronize_account_scopes_native_command_and_keeps_refresh_snapshots(apple_source):
+    with patch.object(refresh_adapter.subprocess, "run",
+                      return_value=_fake_completed(0)) as run:
+        result = refresh_adapter.synchronize_account(
+            apple_source, SYNC_ACCOUNT.lower(), wait_seconds=0, timeout_seconds=5)
+
+    assert result.ok is True
+    assert result.before["total"] == result.after["total"] == 4
+    assert result.new_messages == 0
+    assert result.waited_seconds == 0
+    args, options = run.call_args
+    assert args[0][:2] == ["osascript", "-e"]
+    script = args[0][2]
+    assert f'exists account id "{SYNC_ACCOUNT}"' in script
+    assert f'set targetAccount to account id "{SYNC_ACCOUNT}"' in script
+    assert "if (account type of targetAccount) is not imap then" in script
+    assert script.index("exists account id") < script.index("synchronize with targetAccount")
+    assert script.index("account type of targetAccount") < script.index("synchronize with targetAccount")
+    assert "check for new mail" not in script
+    assert options == {"capture_output": True, "text": True, "timeout": 5.0}
+
+
+@pytest.mark.parametrize("account", [
+    "", "Gmail", "BBBBBBBB000000000000000000000002", None, 123,
+    SYNC_ACCOUNT + '"\n do shell script "unexpected"',
+    " " + SYNC_ACCOUNT, SYNC_ACCOUNT + "\n",
+])
+def test_synchronize_account_rejects_invalid_ids_before_native_access(apple_source, account):
+    with patch.object(refresh_adapter.subprocess, "run") as run:
+        with pytest.raises(ValueError, match="canonical UUID"):
+            refresh_adapter.synchronize_account(apple_source, account, wait_seconds=0)
+    run.assert_not_called()
+
+
+@pytest.mark.parametrize("reason", [
+    "Requested Mail account does not exist.",
+    "Requested Mail account is not IMAP.",
+])
+def test_synchronize_account_native_refusal_skips_wait(apple_source, reason):
+    with patch.object(refresh_adapter.subprocess, "run", return_value=_fake_completed(
+        1, stderr=f"execution error: {reason} (-2700)"
+    )):
+        with patch.object(refresh_adapter.time, "sleep") as sleep:
+            result = refresh_adapter.synchronize_account(
+                apple_source, SYNC_ACCOUNT, wait_seconds=5, timeout_seconds=5)
+    assert result.ok is False
+    assert result.error_code == -2700
+    assert reason in result.error
+    assert result.waited_seconds == 0
+    assert result.before["total"] == result.after["total"] == 4
+    sleep.assert_not_called()
+
+
+def test_synchronize_account_uses_existing_permission_mapping(apple_source):
+    with patch.object(refresh_adapter.subprocess, "run", return_value=_fake_completed(
+        1, stderr="Not authorized to send Apple events to Mail. (-1743)"
+    )):
+        result = refresh_adapter.synchronize_account(
+            apple_source, SYNC_ACCOUNT, wait_seconds=0)
+    assert result.ok is False
+    assert result.error_code == -1743
+    assert "Privacy & Security" in result.error
+
+
+def test_synchronize_account_clamps_wait_and_timeout(apple_source):
+    with patch.object(refresh_adapter.subprocess, "run",
+                      return_value=_fake_completed(0)) as run:
+        with patch.object(refresh_adapter.time, "sleep") as sleep:
+            result = refresh_adapter.synchronize_account(
+                apple_source, SYNC_ACCOUNT, wait_seconds=900, timeout_seconds=900)
+    assert run.call_args.kwargs["timeout"] == 120.0
+    assert result.waited_seconds == 60.0
+    sleep.assert_called_once_with(60.0)
+
+
+def test_synchronize_account_retains_refresh_read_only_semantics(apple_source, monkeypatch):
+    monkeypatch.setenv("EMAIL_MCP_READ_ONLY", "1")
+    with patch.object(refresh_adapter.subprocess, "run",
+                      return_value=_fake_completed(0)) as run:
+        result = refresh_adapter.synchronize_account(
+            apple_source, SYNC_ACCOUNT, wait_seconds=0)
+    assert result.ok is True
+    run.assert_called_once()
+
+
+def test_regular_refresh_keeps_its_original_native_command(apple_source):
+    with patch.object(refresh_adapter.subprocess, "run",
+                      return_value=_fake_completed(0)) as run:
+        srv.tool_refresh_mail(wait_seconds=0, timeout_seconds=5)
+    assert run.call_args.args[0] == [
+        "osascript", "-e", 'tell application "Mail" to check for new mail']

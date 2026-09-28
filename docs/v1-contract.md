@@ -164,9 +164,10 @@ tool-level code:
 | `ok` | the batched script confirmed the action for this message (internal success marker; **never appears in `failures[]`**) |
 | `mid_mismatch` | the Message-ID guard tripped — the ROWID points at a different message than planned; nothing was done to it |
 | `applescript` | Mail returned an AppleScript error for this one message (detail carries the number + text) |
+| `bulk_move` | Mail returned an error for a guarded local move batch and verification could not confirm this message moved; the batch may have partly succeeded, so inspect `verified` and `pending` before making a new plan |
 | `no_result` | the script produced no line for this id |
 | `batch_timeout` | osascript was killed at its chunk's deadline; verification (over a drain-sized window) may still confirm the message — the detail names the escape hatches (`EMAIL_MCP_TRIAGE_TIMEOUT`, `EMAIL_MCP_TRIAGE_DELETE_MAX`) |
-| `not_attempted` | an earlier chunk stopped the batch (timeout or wholesale script failure) before this message's chunk ran; nothing was done to it — re-plan to retry |
+| `not_attempted` | an earlier chunk stopped the batch, or another message failed the current local move chunk's identity guard; no action was issued for this message, so re-plan to retry |
 
 `get_emails_batch`'s `errors[]` entries are `{id, error}` prose today; they
 gain an `errors[].code` (from `not_found`/`invalid_input`) at v0.11.

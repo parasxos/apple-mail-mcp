@@ -16,7 +16,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from email_mcp import config, plans, triage
+from email_mcp import codes, config, plans, triage
 from email_mcp.plans import Plan, PlanAction, PlanMessage
 from email_mcp.sources.apple_mail import AppleMailSource
 from email_mcp.sources.base import SearchQuery
@@ -713,6 +713,195 @@ def test_apply_chunks_the_batch(src, db, fake_osa):
     assert res["failures"] == [] and res["pending"] == []
 
 
+def _local_move_plan(src, db, count):
+    _add_mailbox(db, 3, f"local://{LOCAL_ACCT}/Filed")
+    seeded = _seed_bulk(db, count)
+    plan = _plan(src, [{"action": "move_to", "mailbox": "Filed"}],
+                 from_addr="ops-bot", unread_only=True, limit=count)
+    assert {m.rowid for m in plan.messages} == seeded
+    return plan
+
+
+def test_local_moves_are_guarded_then_moved_once_per_chunk(src, db, fake_osa):
+    plan = _local_move_plan(src, db, 52)
+
+    def batch(script):
+        ids = _script_ids(script)
+        predicate = " or ".join(f"id is {rid}" for rid in ids)
+        assert script.count('move (every «class mssg» of mailbox "Inbox" '
+                            f'whose {predicate}) to mailbox "Filed"') == 1
+        assert "move msgRef" not in script
+        assert script.count("message id of msgRef") == len(ids)
+        for rid in ids:
+            guard = script.index(f'"ERR {rid} mid_mismatch')
+            collect = script.index(f'set end of moveIds to {rid}', guard)
+            assert guard < collect < script.index("move (every")
+        assert f"if (count of moveIds) is {len(ids)} then" in script
+        assert "not_attempted chunk_guard_failed" in script
+        db.executemany("UPDATE messages SET mailbox=3 WHERE ROWID=?", [(i,) for i in ids])
+        db.commit()
+        return subprocess.CompletedProcess([], 0, "".join(f"OK {i}\n" for i in ids), "")
+
+    fake_osa.batch = batch
+    res = triage.apply_plan(src, plan.id)
+    assert [len(_script_ids(s)) for s in fake_osa.batch_scripts] == [50, 2]
+    assert res["acted"] == res["verified"] == 52
+    assert res["failures"] == res["pending"] == []
+
+
+def test_local_bulk_error_verifies_partial_moves_without_retry(src, db, fake_osa):
+    plan = _local_move_plan(src, db, 3)
+    ids = [m.rowid for m in plan.messages]
+
+    def batch(script):
+        db.execute("UPDATE messages SET mailbox=3 WHERE ROWID=?", (ids[0],))
+        db.execute("UPDATE messages SET ROWID=ROWID+10000,mailbox=3 WHERE ROWID=?", (ids[1],))
+        db.commit()
+        return subprocess.CompletedProcess([], 0, "".join(
+            f"ERR {rid} bulk_move -10000 partial failure\n" for rid in ids), "")
+
+    fake_osa.batch = batch
+    res = triage.apply_plan(src, plan.id)
+    assert len(fake_osa.batch_scripts) == 1
+    assert res["acted"] == res["verified"] == 2
+    assert [(f["id"], f["code"]) for f in res["failures"]] == [(str(ids[2]), codes.BULK_MOVE)]
+    assert all(f["code"] in codes.ITEM_CODES for f in res["failures"])
+    assert [p["id"] for p in res["pending"]] == [str(ids[2])]
+    assert plans.load(plan.id).status == "applied"
+
+
+def test_local_bulk_error_does_not_rescue_rejected_guards(src, db, fake_osa):
+    plan = _local_move_plan(src, db, 3)
+    ids = [m.rowid for m in plan.messages]
+
+    def batch(script):
+        # The first two changed independently after their validation failed.
+        db.executemany("UPDATE messages SET mailbox=3 WHERE ROWID=?", [(i,) for i in ids])
+        db.commit()
+        return subprocess.CompletedProcess([], 0,
+            f"ERR {ids[0]} mid_mismatch other-id\n"
+            f"ERR {ids[1]} applescript -1728 missing\n"
+            f"ERR {ids[2]} bulk_move -10000 partial\n", "")
+
+    fake_osa.batch = batch
+    res = triage.apply_plan(src, plan.id)
+    assert res["acted"] == res["verified"] == 1
+    assert {f["code"] for f in res["failures"]} == {"mid_mismatch", "applescript"}
+    assert {int(f["id"]) for f in res["failures"]} == set(ids[:2])
+
+
+def test_local_bulk_error_existing_target_copy_is_not_success(src, db, fake_osa):
+    plan = _local_move_plan(src, db, 1)
+    (message,) = plan.messages
+    db.execute("""INSERT INTO messages
+        (ROWID,subject,sender,summary,date_sent,date_received,mailbox,read,
+         flagged,deleted,conversation_id,global_message_id,flag_color)
+        SELECT ROWID+10000,subject,sender,summary,date_sent,date_received,3,read,
+         flagged,deleted,conversation_id,global_message_id,flag_color
+        FROM messages WHERE ROWID=?""", (message.rowid,))
+    db.commit()
+    fake_osa.batch = lambda _: subprocess.CompletedProcess(
+        [], 0, f"ERR {message.rowid} bulk_move -10000 failed\n", "")
+    res = triage.apply_plan(src, plan.id)
+    assert res["status"] == "failed"
+    assert res["acted"] == res["verified"] == 0
+    assert len(res["failures"]) == len(res["pending"]) == 1
+
+
+@pytest.mark.parametrize("variant", ["remote_target", "mixed_sources", "compound",
+                                    "multiple_mailboxes", "headerless"])
+def test_local_bulk_move_fast_path_excludes_other_plans(variant):
+    target = {"account": LOCAL_ACCT, "mailbox": "Filed", "mailbox_rowid": 3,
+              "url": f"local://{LOCAL_ACCT}/Filed"}
+    messages = [_msg(11, "local", "Inbox", account=LOCAL_ACCT),
+                _msg(22, "local", "Inbox", account=LOCAL_ACCT)]
+    actions = [PlanAction("move_to", mailbox="Filed")]
+    if variant == "remote_target":
+        target["url"] = f"imap://{LOCAL_ACCT}/Filed"
+    elif variant == "mixed_sources":
+        messages[1].scheme = "imap"
+    elif variant == "multiple_mailboxes":
+        messages[1].mailbox = "Other"
+    elif variant == "headerless":
+        messages[1].message_id_header = ""
+    else:
+        actions.insert(0, PlanAction("mark_read"))
+    plan = _synthetic_plan(messages, actions, target)
+    # The first chunk alone is local even when the whole plan is mixed.
+    chunk = messages if variant == "multiple_mailboxes" else messages[:1]
+    script = triage._render_script(plan, chunk)
+    assert "moveIds" not in script
+    assert "move msgRef to" in script
+
+
+def test_local_bulk_guard_failure_skips_other_members(src, db, fake_osa):
+    plan = _local_move_plan(src, db, 2)
+    ids = [m.rowid for m in plan.messages]
+    fake_osa.batch = lambda _: subprocess.CompletedProcess([], 0,
+        f"ERR {ids[0]} mid_mismatch other-id\n"
+        f"ERR {ids[1]} not_attempted chunk_guard_failed\n", "")
+    res = triage.apply_plan(src, plan.id)
+    assert res["acted"] == res["verified"] == 0
+    assert res["pending"] == []
+    assert {f["code"] for f in res["failures"]} == {"mid_mismatch", "not_attempted"}
+
+
+def test_local_bulk_timeout_preserves_exclusions_and_partial_drain(
+    src, db, fake_osa, monkeypatch,
+):
+    plan = _local_move_plan(src, db, 104)
+    excluded = plan.messages[25].rowid
+    selected = [m.rowid for m in plan.messages if m.rowid != excluded]
+    batches = []
+
+    def batch(script):
+        ids = _script_ids(script)
+        batches.append(ids)
+        assert excluded not in ids
+        assert "move (every" in script
+        if len(batches) == 1:
+            db.executemany("UPDATE messages SET mailbox=3 WHERE ROWID=?",
+                           [(rid,) for rid in ids])
+            db.commit()
+            return subprocess.CompletedProcess(
+                [], 0, "".join(f"OK {rid}\n" for rid in ids), "")
+        raise subprocess.TimeoutExpired(["osascript"], 630)
+
+    snapshot = src.triage_snapshot
+    probes = 0
+
+    def draining_snapshot(ids):
+        nonlocal probes
+        probes += 1
+        if probes == 2:
+            db.execute("UPDATE messages SET ROWID=ROWID+10000,mailbox=3 WHERE ROWID=?",
+                       (selected[50],))
+            db.executemany("UPDATE messages SET mailbox=3 WHERE ROWID=?",
+                           [(rid,) for rid in selected[51:53]])
+            db.commit()
+        return snapshot(ids)
+
+    fake_osa.batch = batch
+    monkeypatch.setattr(src, "triage_snapshot", draining_snapshot)
+    result = triage.apply_plan(src, plan.id, [str(excluded)])
+
+    assert batches == [selected[:50], selected[50:100]]
+    assert (result["planned"], result["selected"], result["acted"], result["verified"]) == (104, 103, 53, 53)
+    assert result["excluded"] == [str(excluded)]
+    assert {int(f["id"]) for f in result["failures"]
+            if f["code"] == codes.BATCH_TIMEOUT} == set(selected[53:100])
+    assert {int(f["id"]) for f in result["failures"]
+            if f["code"] == codes.NOT_ATTEMPTED} == set(selected[100:])
+    assert len(result["failures"]) == 50
+    assert all(f["code"] in codes.ITEM_CODES for f in result["failures"])
+    assert {int(p["id"]) for p in result["pending"]} == set(selected[53:100])
+    untouched = snapshot([excluded, *selected[100:]])
+    assert all(message["mailbox_rowid"] == 1 for message in untouched.values())
+    stored = plans.load(plan.id)
+    assert stored.status == "applied" and stored.result == result
+    assert len(stored.messages) == 104 and stored.excluded_ids == [str(excluded)]
+
+
 def test_chunk_timeout_banks_earlier_chunks_acted(src, db, fake_osa):
     """The banking pin: chunk 1's OKs survive a chunk-2 kill even before
     write-through confirms them — a monolithic batch would have relabelled
@@ -919,13 +1108,17 @@ def test_script_render_escaping_and_structure():
 
 def test_parse_batch_output_shapes():
     out = triage._parse_batch_output(
-        "OK 1\nERR 2 mid_mismatch <other@x>\nERR 3 applescript -1728 nope\ngarbage\n",
-        [1, 2, 3, 4],
+        "OK 1\nERR 2 mid_mismatch <other@x>\nERR 3 applescript -1728 nope\ngarbage\n"
+        "ERR 5 bulk_move -10000 partial\nERR 6 not_attempted chunk_guard_failed\n",
+        [1, 2, 3, 4, 5, 6],
     )
     assert out[1] == ("ok", "")
     assert out[2][0] == "mid_mismatch"
     assert out[3][0] == "applescript"
     assert out[4][0] == "no_result"
+    assert out[5][0] == codes.BULK_MOVE
+    assert out[6][0] == codes.NOT_ATTEMPTED
+    assert all(code in codes.ITEM_CODES for code, _ in out.values())
 
 
 # --------------------------------------------------------------------- #

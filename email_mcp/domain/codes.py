@@ -40,12 +40,13 @@ TRIAGE_CODES = frozenset({
 OK = "ok"
 MID_MISMATCH = "mid_mismatch"
 APPLESCRIPT = "applescript"
+BULK_MOVE = "bulk_move"
 NO_RESULT = "no_result"
 BATCH_TIMEOUT = "batch_timeout"
 NOT_ATTEMPTED = "not_attempted"
 
 ITEM_CODES = frozenset({
-    OK, MID_MISMATCH, APPLESCRIPT, NO_RESULT, BATCH_TIMEOUT, NOT_ATTEMPTED,
+    OK, MID_MISMATCH, APPLESCRIPT, BULK_MOVE, NO_RESULT, BATCH_TIMEOUT, NOT_ATTEMPTED,
 })
 
 INTERNAL_ERROR = "internal_error"

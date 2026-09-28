@@ -37,9 +37,7 @@ from .triage_planning import (
 
 _log = get_logger()
 
-# --------------------------------------------------------------------- #
 # plan side                                                             #
-# --------------------------------------------------------------------- #
 
 
 def _planner() -> TriagePlanner:
@@ -64,9 +62,7 @@ def build_delete_plan(source, q: SearchQuery) -> Plan:
     return _planner().build_delete(source, q)
 
 
-# --------------------------------------------------------------------- #
 # AppleScript generation
-# --------------------------------------------------------------------- #
 
 
 def _as_literal(s: str) -> str:
@@ -142,58 +138,67 @@ def _render_preflight() -> str:
     )
 
 
+def _bulk_local_move(plan: Plan) -> bool:
+    return (len(plan.actions) == 1 and plan.actions[0].action == "move_to"
+            and plan.target is not None and _scheme(plan.target["url"]) == "local"
+            and all(m.scheme == "local" and m.message_id_header for m in plan.messages)
+            and len({(m.account, m.mailbox) for m in plan.messages}) == 1)
+
+
 def _render_script(plan: Plan, messages: list[PlanMessage]) -> str:
+    bulk = _bulk_local_move(plan)
     blocks: list[str] = []
     for m in messages:
-        spec = (f"«class mssg» id {m.rowid} of "
-                f"{_mailbox_specifier(m.scheme, m.account, m.mailbox)}")
-        acts = []
-        for a in plan.actions:
-            acts += _action_lines(a, plan.target, m.scheme, m.account)
+        spec = f"«class mssg» id {m.rowid} of {_mailbox_specifier(m.scheme, m.account, m.mailbox)}"
+        acts = ([f"set end of moveIds to {m.rowid}"] if bulk else [
+            line for a in plan.actions for line in _action_lines(a, plan.target, m.scheme, m.account)])
+        acts += [] if bulk else [f'set end of out to "OK {m.rowid}"']
         act_src = "\n".join(f"                {line}" for line in acts)
         if m.message_id_header:
-            guard_open = (
-                f"            set theMid to message id of msgRef\n"
-                f"            if theMid does not contain "
-                f"{_as_literal(m.message_id_header)} then\n"
-                f'                set end of out to "ERR {m.rowid} mid_mismatch " & theMid\n'
-                f"            else\n"
-            )
-            guard_close = (
-                f'                set end of out to "OK {m.rowid}"\n'
-                f"            end if\n"
-            )
-        else:  # 18-in-305k rows without a header: act without the recheck
-            guard_open = ""
-            guard_close = f'            set end of out to "OK {m.rowid}"\n'
-            act_src = "\n".join(f"            {line}" for line in acts)
-        blocks.append(
-            f"        try\n"
-            f"            set msgRef to {spec}\n"
-            f"{guard_open}"
-            f"{act_src}\n"
-            f"{guard_close}"
-            f"        on error eMsg number eNum\n"
-            f'            set end of out to "ERR {m.rowid} applescript " '
-            f'& (eNum as text) & " " & eMsg\n'
-            f"        end try"
-        )
+            act_src = f'''            set theMid to message id of msgRef
+            if theMid does not contain {_as_literal(m.message_id_header)} then
+                set end of out to "ERR {m.rowid} mid_mismatch " & theMid
+            else
+{act_src}
+            end if'''
+        blocks.append(f'''        try
+            set msgRef to {spec}
+{act_src}
+        on error eMsg number eNum
+            set end of out to "ERR {m.rowid} applescript " & (eNum as text) & " " & eMsg
+        end try''')
+    if bulk:
+        target = _mailbox_specifier("local", plan.target["account"], plan.target["mailbox"])
+        source = _mailbox_specifier("local", messages[0].account, messages[0].mailbox)
+        predicate = " or ".join(f"id is {m.rowid}" for m in messages)
+        blocks.append(f'''        if (count of moveIds) is {len(messages)} then
+            try
+                move (every «class mssg» of {source} whose {predicate}) to {target}
+                repeat with movedId in moveIds
+                    set end of out to "OK " & (movedId as text)
+                end repeat
+            on error eMsg number eNum
+                repeat with movedId in moveIds
+                    set end of out to "ERR " & (movedId as text) & " bulk_move " & (eNum as text) & " " & eMsg
+                end repeat
+            end try
+        else
+            repeat with movedId in moveIds
+                set end of out to "ERR " & (movedId as text) & " not_attempted chunk_guard_failed"
+            end repeat
+        end if''')
     body = "\n".join(blocks)
-    return (
-        "on run\n"
-        "    set out to {}\n"
-        '    tell application "Mail"\n'
-        f"{body}\n"
-        "    end tell\n"
-        "    set AppleScript's text item delimiters to linefeed\n"
-        "    return out as text\n"
-        "end run\n"
-    )
+    setup = "    set moveIds to {}\n" if bulk else ""
+    return f'''    set out to {{}}
+{setup}    tell application "Mail"
+{body}
+    end tell
+    set AppleScript's text item delimiters to linefeed
+    return out as text
+'''
 
 
-# --------------------------------------------------------------------- #
 # act + verify                                                          #
-# --------------------------------------------------------------------- #
 
 
 def _run_osascript(script: str, timeout: float) -> subprocess.CompletedProcess:
@@ -205,11 +210,10 @@ def _run_osascript(script: str, timeout: float) -> subprocess.CompletedProcess:
     )
 
 
-# Apply runs the plan in sub-scripts of this many messages: small enough
-# that a killed chunk forfeits at most ten messages' stdout (and the
-# post-kill drain window in _verify stays ~2.5 min), large enough that
-# per-script startup does not dominate. A timeout banks the chunks done.
+# Remote/compound work stays in tens; guarded local moves use one event for fifty.
+# A timeout banks completed chunks and verifies the bounded uncertain chunk.
 _CHUNK_SIZE = 10
+_LOCAL_MOVE_CHUNK_SIZE = 50
 
 
 def _auto_timeout(n: int) -> float:
@@ -240,7 +244,7 @@ def _parse_batch_output(stdout: str, planned: list[int]) -> dict[int, tuple[str,
             else:
                 detail = parts[2] if len(parts) > 2 else ""
                 code = detail.split(None, 1)[0] if detail else "applescript"
-                if code not in ("mid_mismatch",):
+                if code not in ("mid_mismatch", "bulk_move", "not_attempted"):
                     code = "applescript"
                 results[rid] = (code, detail)
     for rid in planned:
@@ -453,8 +457,9 @@ def _apply_claimed_plan(source, plan_id: str, plan: Plan | None) -> dict:
     killed: list[PlanMessage] = []  # the one chunk a timeout hit
     killed_budget = 0.0
     osa_ms = 0
-    for start in range(0, len(selected), _CHUNK_SIZE):
-        chunk = selected[start:start + _CHUNK_SIZE]
+    chunk_size = _LOCAL_MOVE_CHUNK_SIZE if _bulk_local_move(execution) else _CHUNK_SIZE
+    for start in range(0, len(selected), chunk_size):
+        chunk = selected[start:start + chunk_size]
         budget = _auto_timeout(len(chunk))
         osa_started = time.monotonic()
         try:
@@ -503,13 +508,11 @@ def _apply_claimed_plan(source, plan_id: str, plan: Plan | None) -> dict:
         for rid, (code, detail) in sorted(results.items()) if code != "ok"
     ]
 
-    # VERIFY — acted messages, plus the killed chunk: the kill does not
-    # cancel work Mail already queued (observed live 2026-08-01: four
-    # deletes landed AFTER the kill), so its ids get a drain-sized window
-    # and confirmed ones are upgraded from batch_timeout to acted.
-    killed_ids = {m.rowid for m in killed}
-    ver = _verify(source, execution, acted | killed_ids, window_s=killed_budget)
-    rescued = set(ver["verified"]) & killed_ids
+    # Verify uncertain bulk/timeout outcomes, excluding known guard failures.
+    uncertain = {m.rowid for m in killed} | {
+        rid for rid, (code, _) in results.items() if code == "bulk_move"}
+    ver = _verify(source, execution, acted | uncertain, window_s=killed_budget)
+    rescued = set(ver["verified"]) & uncertain
     if rescued:
         acted |= rescued
         failures = [f for f in failures if int(f["id"]) not in rescued]
@@ -547,9 +550,7 @@ def _apply_claimed_plan(source, plan_id: str, plan: Plan | None) -> dict:
     return result
 
 
-# --------------------------------------------------------------------- #
 # mailbox_create                                                        #
-# --------------------------------------------------------------------- #
 
 
 def _mailbox_census(spec: str) -> tuple[int, int] | None:
