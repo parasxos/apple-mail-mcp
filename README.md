@@ -55,9 +55,11 @@ from scratch as clean, standards-correct email that renders everywhere,
 Outlook is the reason this project exists).
 
 ⏰ **Schedule like "Send Later", but scriptable.** A scheduled message is
-frozen in full — attachments, identity, exact text. Exchange can execute it
-server-side at the requested time, lid closed; other providers use a local
-background sender and deliver on its next pass (or just after the Mac wakes).
+frozen in full — attachments, identity, exact text, and since 1.8.2 the
+threading headers, so a scheduled reply lands in the conversation it answers.
+Exchange can execute it server-side at the requested time, lid closed; other
+providers use a local background sender and deliver on its next pass (or just
+after the Mac wakes).
 
 🗂️ **Triage at scale, without fear.** *"File these 40 newsletters"* becomes a
 reviewable plan: nothing moves until it is approved, every message is
@@ -242,7 +244,7 @@ Point it at `uvx apple-mailbox-mcp`. The wire contract is additive-only since v1
 | Group | Tools |
 |---|---|
 | 🔍 **Read** (8) | `search_emails` (full-body search) · `get_email` · `get_emails_batch` · `get_thread` · `list_mailboxes` · `list_recent` · `get_attachment` · `refresh_mail` |
-| ✉️ **Send** (6) | `send_email` · `reply_email` (threaded, quoted) · `create_draft` · `schedule_email` · `list_scheduled` · `cancel_scheduled` |
+| ✉️ **Send** (6) | `send_email` · `reply_email` (threaded, quoted) · `create_draft` · `schedule_email` (threaded on request) · `list_scheduled` · `cancel_scheduled` |
 | 🗂️ **Triage** (5) | `triage_plan` · `triage_plan_delete` · `triage_apply` · `mailbox_create` · `mailbox_delete` |
 | 🩺 **Meta** (2) | `doctor` (full diagnostics with fix-it strings) · `audit` (the local ledger) |
 
