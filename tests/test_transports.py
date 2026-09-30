@@ -468,3 +468,42 @@ def test_read_op_missing_cli_and_failure_messages(monkeypatch):
         smtp_mod._read_op("op://v/i/password")
     s = str(ei.value)
     assert "no item found" in s and "op://v/i/password" in s
+
+
+def test_smtp_data_keeps_long_threading_ids_unencoded(monkeypatch):
+    """The composer folds long Message-IDs without RFC 2047; the SMTP seam
+    reparses the frozen bytes and must not refold them on the way out.
+    Asserted on the raw DATA payload: parsing with policy.default would
+    decode an encoded word and hide the regression."""
+    parent = "<" + "p" * 80 + "@mail.example.invalid>"
+    root = "<" + "r" * 80 + "@mail.example.invalid>"
+    raw = (
+        b"From: g@example.org\r\nTo: a@example.org\r\n"
+        b"Bcc: g@example.org\r\nSubject: s\r\nMessage-ID: <m@x>\r\n"
+        b"In-Reply-To: " + parent.encode() + b"\r\n"
+        b"References: " + root.encode() + b"\r\n " + parent.encode() + b"\r\n"
+        b"\r\nbody\r\n"
+    )
+    server = smtplib.SMTP(local_hostname="fixture")
+    server.helo_resp = b"ready"
+    replies = iter([
+        (250, b"sender accepted"), (250, b"recipient accepted"),
+        (354, b"send data"), (250, b"queued"), (221, b"bye"),
+    ])
+    wire = []
+    monkeypatch.setattr(server, "send", wire.append)
+    monkeypatch.setattr(server, "getreply", lambda: next(replies))
+    monkeypatch.setattr(server, "login", lambda *args: None)
+    transport = _smtp()
+    monkeypatch.setattr(transport, "_connect", lambda timeout: server)
+    monkeypatch.setattr(transport, "_secret", lambda: "fixture")
+
+    transport.deliver(raw, "g@example.org", ["a@example.org"])
+
+    payload, = [data for data in wire if isinstance(data, bytes)]
+    headers = payload.split(b"\r\n\r\n", 1)[0] + b"\r\n"
+    assert b"=?" not in headers
+    assert b"In-Reply-To: " + parent.encode() + b"\r\n" in headers
+    assert b"References: " + root.encode() + b"\r\n " + parent.encode() + b"\r\n" in headers
+    assert b"Bcc:" not in payload
+    assert b"\n" not in payload.replace(b"\r\n", b"")

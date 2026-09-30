@@ -21,6 +21,14 @@ from .. import codes, tls
 from ..log import get_logger
 from . import SendError
 
+# The frozen bytes were composed and folded once, by the compose policy that
+# keeps long Message-IDs intact. The wire policy must not fold them again:
+# `email.policy.SMTP` refolds every source header and would RFC 2047 encode
+# a long In-Reply-To on the way out, undoing the composer. `refold_source`
+# "none" keeps the frozen header lines, and still normalizes CRLF and drops
+# the Bcc deleted above.
+_WIRE_POLICY = email.policy.SMTP.clone(refold_source="none")
+
 _log = get_logger()
 
 _KEYCHAIN_TIMEOUT = 30  # seconds; a hang means a GUI permission prompt
@@ -238,7 +246,7 @@ class SmtpTransport:
             server = self._connect(timeout=60)
             server.login(self.username, password)
             refused = server.sendmail(
-                mail_from, rcpt_to, msg.as_bytes(policy=email.policy.SMTP),
+                mail_from, rcpt_to, msg.as_bytes(policy=_WIRE_POLICY),
             )
         except smtplib.SMTPAuthenticationError as e:
             _log.error("smtp auth failed for %s at %s:%d", self.username,

@@ -88,6 +88,10 @@ def quote_html(
     )
 
 
+# RFC 5322 2.1.1: the hard limit for a line, excluding CRLF.
+_HARD_LINE_LIMIT = 998
+
+
 class _MessageIDListHeader(UnstructuredHeader):
     """In-Reply-To / References: a whitespace separated list of msg-ids.
 
@@ -96,19 +100,39 @@ class _MessageIDListHeader(UnstructuredHeader):
     encoded on output, `=?utf-8?q?=3CZRAP...?=`, and the reply falls out of
     the thread in any client that matches References literally. Fold at the
     whitespace between ids, never encode, keep every id intact.
+
+    Only the msg-ids are serialized. RFC 5322 allows comments between them
+    (`<id> (=?utf-8?q?Jos=C3=A9?=)`); the parser decodes those to Unicode,
+    which a non-encoding folder could not emit, and they carry nothing a
+    threading client reads, so they are dropped. If a value holds no angle
+    bracketed id at all, or an id that is not ASCII, the stdlib folder
+    takes over rather than emitting a line this class cannot vouch for.
     """
 
+    _MSG_ID = re.compile(r"<[^<>]*>")
+
     def fold(self, *, policy):
-        limit = policy.max_line_length or 998
+        value = str(self)
+        ids = self._MSG_ID.findall(value) or value.split()
+        if any(not token.isascii() for token in ids):
+            return super().fold(policy=policy)
+        soft = policy.max_line_length or _HARD_LINE_LIMIT
+        name_line = f"{self.name}:"
         lines = []
-        current = f"{self.name}:"
-        for token in str(self).split():
+        current = name_line
+        for token in ids:
             candidate = f"{current} {token}"
-            if len(candidate) > limit and current != f"{self.name}:":
-                lines.append(current)
-                current = f" {token}"
-            else:
+            if len(candidate) <= soft or (
+                current == name_line and len(candidate) <= _HARD_LINE_LIMIT
+            ):
                 current = candidate
+                continue
+            # Fold before the id. The first id normally stays on the name
+            # line even past the soft limit (a reparse keeps the value
+            # cleaner); only when it would break the hard limit does it move
+            # whole to a continuation line. Never split, never encoded.
+            lines.append(current)
+            current = f" {token}"
         lines.append(current)
         return policy.linesep.join(lines) + policy.linesep
 

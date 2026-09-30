@@ -88,6 +88,51 @@ def test_compose_keeps_long_message_ids_intact_in_threading_headers():
     assert back["References"].split() == refs.split() + [LONG_MSGID]
 
 
+@pytest.mark.parametrize("comment", [
+    "(=?utf-8?q?Jos=C3=A9?=)",  # as a source header carries it
+    "(Jos\u00e9)",               # as get_email hands it back, decoded
+])
+def test_compose_drops_comments_from_references_and_keeps_ids(comment):
+    # RFC 5322 3.6.4 allows CFWS between msg-ids. The unstructured parser
+    # decodes an encoded-word comment to Unicode, which a non-encoding
+    # folder cannot emit; the ids are what threading clients read, the
+    # comment is dropped rather than crashing the compose.
+    refs = f"<orig@example.org> {comment} <second@example.org>"
+    msg = sender.compose(
+        to=["x@example.org"], subject="Re: s", body="b",
+        in_reply_to="<parent@example.org>", references=refs,
+    )
+    raw = msg.as_bytes()
+    headers = raw.split(b"\n\n", 1)[0]
+    assert b"=?" not in headers and b"Jos" not in headers
+    back = email.message_from_bytes(raw, policy=email.policy.default)
+    assert back["References"].split() == [
+        "<orig@example.org>", "<second@example.org>", "<parent@example.org>",
+    ]
+    assert back["In-Reply-To"] == "<parent@example.org>"
+
+
+def test_compose_moves_an_id_that_fills_the_line_to_a_continuation():
+    # RFC 5322 2.1.1: 998 characters per line, hard. A 986 character id is
+    # a legal Message-ID line but does not fit after "In-Reply-To:"; it
+    # moves whole to a continuation line, never split, never encoded.
+    huge = "<" + "h" * 963 + "@mail.example.invalid>"
+    assert len(huge) == 986
+    msg = sender.compose(
+        to=["x@example.org"], subject="Re: s", body="b", in_reply_to=huge,
+    )
+    raw = msg.as_bytes()
+    headers = raw.split(b"\n\n", 1)[0]
+    assert b"=?" not in headers
+    assert all(len(line) <= 998 for line in headers.splitlines())
+    assert b"In-Reply-To:\n " + huge.encode() + b"\n" in headers
+    # compat32 unfolds like a client does (leading WSP dropped); policy
+    # .default keeps the space of an empty first line, hence the strip.
+    back = email.message_from_bytes(raw)
+    assert back["In-Reply-To"].strip() == huge
+    assert back["References"].strip() == huge
+
+
 def test_compose_html_escapes_body():
     msg = sender.compose(
         to=["paris.moschovakos@cern.ch"], subject="x", body="a < b & c",
