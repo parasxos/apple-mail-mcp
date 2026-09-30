@@ -207,12 +207,15 @@ class DeliveryUseCases(ApplicationService):
             in_reply_to=in_reply_to,
             references=references,
         )
+        # A threaded schedule is audited as such, the parent's Message-ID in
+        # detail; a plain schedule keeps its detail unchanged.
+        reply_detail = {"in_reply_to": in_reply_to} if in_reply_to else {}
         try:
             entry = self._delivery.schedule(request)
         except ToolError as error:
             self._failed_delivery(
                 "schedule", "schedule_email", error,
-                subject=subject,
+                subject=subject, detail=reply_detail or None,
             )
             raise
         requested = (
@@ -230,6 +233,7 @@ class DeliveryUseCases(ApplicationService):
                 "send_at": entry.send_at,
                 "draft_id": entry.graph_draft_id,
                 "graph_fallback": requested == "graph",
+                **reply_detail,
             },
         )
         return entry

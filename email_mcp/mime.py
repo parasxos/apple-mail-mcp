@@ -5,6 +5,8 @@ import html
 import re
 from dataclasses import dataclass
 from email.message import EmailMessage
+from email.headerregistry import HeaderRegistry, UnstructuredHeader
+from email.policy import default as _default_policy
 from email.utils import formataddr, make_msgid
 
 from . import codes, identities
@@ -86,6 +88,39 @@ def quote_html(
     )
 
 
+class _MessageIDListHeader(UnstructuredHeader):
+    """In-Reply-To / References: a whitespace separated list of msg-ids.
+
+    Python's registry treats these two as unstructured text, so a msg-id
+    longer than the line limit (every Outlook Message-ID is) gets RFC 2047
+    encoded on output, `=?utf-8?q?=3CZRAP...?=`, and the reply falls out of
+    the thread in any client that matches References literally. Fold at the
+    whitespace between ids, never encode, keep every id intact.
+    """
+
+    def fold(self, *, policy):
+        limit = policy.max_line_length or 998
+        lines = []
+        current = f"{self.name}:"
+        for token in str(self).split():
+            candidate = f"{current} {token}"
+            if len(candidate) > limit and current != f"{self.name}:":
+                lines.append(current)
+                current = f" {token}"
+            else:
+                current = candidate
+        lines.append(current)
+        return policy.linesep.join(lines) + policy.linesep
+
+
+_HEADERS = HeaderRegistry()
+_HEADERS.map_to_type("in-reply-to", _MessageIDListHeader)
+_HEADERS.map_to_type("references", _MessageIDListHeader)
+# One policy for every composed message: the default folding rules for
+# everything, msg-id aware folding for the two threading headers.
+COMPOSE_POLICY = _default_policy.clone(header_factory=_HEADERS)
+
+
 def compose(
     *,
     to: list[str],
@@ -113,7 +148,7 @@ def compose(
         "from_addr": from_addr,
         "from_name": selected.from_name,
     })
-    message = EmailMessage()
+    message = EmailMessage(policy=COMPOSE_POLICY)
     try:
         message["From"] = formataddr((selected.from_name, from_addr))
         message["To"] = ", ".join(to)

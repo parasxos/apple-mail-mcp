@@ -140,6 +140,32 @@ def test_schedule_email_emits_schedule_threaded_by_spool_id(
     assert "past" in evs[1]["detail"]["error"]
 
 
+def test_threaded_schedule_names_its_parent_in_the_audit_detail(
+    send_env, audit_dir_guard
+):
+    """A threaded schedule is audited as such: the parent's Message-ID
+    rides in detail on success and on failure. A plain schedule keeps the
+    detail shape frozen above."""
+    parent = "<parent@example.org>"
+    ok = server.tool_schedule_email(
+        to="paris@example.org", subject="Re: later", body="b",
+        send_at=_iso_in(60), in_reply_to=parent, references="<root@example.org>",
+    )
+    assert ok["ok"] is True
+    failed = server.tool_schedule_email(
+        to="paris@example.org", subject="Re: later", body="b",
+        send_at="2020-01-01T00:00:00+00:00", in_reply_to=parent,
+    )
+    assert failed["ok"] is False
+
+    evs = [e for e in _events(audit_dir_guard) if e["event"] == "schedule"]
+    assert [e["outcome"] for e in evs] == ["scheduled", "failed"]
+    assert evs[0]["detail"]["in_reply_to"] == parent
+    assert evs[0]["detail"]["executor"] == "launchd"  # rest of the shape kept
+    assert evs[1]["detail"]["in_reply_to"] == parent
+    assert "past" in evs[1]["detail"]["error"]
+
+
 def test_schedule_email_records_graph_fallback(
     send_env, audit_dir_guard, monkeypatch
 ):

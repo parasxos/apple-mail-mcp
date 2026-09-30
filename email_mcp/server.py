@@ -105,6 +105,8 @@ def _schedule_for_mcp(
     bcc: str | None = None,
     attachments: list[str] | None = None,
     from_identity: str | None = None,
+    in_reply_to: str = "",
+    references: str = "",
 ) -> dict:
     """Add the MCP-only dispatcher readiness hint to a stable result."""
     result = tool_schedule_email(
@@ -116,6 +118,8 @@ def _schedule_for_mcp(
         bcc=bcc,
         attachments=attachments,
         from_identity=from_identity,
+        in_reply_to=in_reply_to,
+        references=references,
     )
     if result.get("ok"):
         if not get_application().dispatcher_installed():

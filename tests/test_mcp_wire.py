@@ -374,3 +374,111 @@ def test_over_cap_page_cannot_kill_the_server(tmp_path, mail_fixture):
     assert "500" in reject["error"]
     alive = _envelope(second)
     assert alive["ok"] is True  # the server survived to answer again
+
+
+# --------------------------------------------------------------------- #
+# schedule_email threading, over the wire                                #
+# --------------------------------------------------------------------- #
+#
+# The Python-level tests call tool_schedule_email directly. Over stdio the
+# SDK builds the tool's input schema from the *registered* function, and
+# silently drops any argument that function does not declare. server.py
+# wraps schedule_email in `_schedule_for_mcp`; when that wrapper lagged the
+# tool's signature, a client could pass `in_reply_to` and get `ok: true`
+# back for a mail that was frozen without a single threading header. Only
+# a real tools/call can catch that class of drift.
+
+
+def _schedule_env(tmp_path, mail_fixture) -> dict[str, str]:
+    return _server_env(
+        tmp_path, mail_fixture,
+        EMAIL_MCP_FROM_ADDR="probe@example.invalid",
+        EMAIL_MCP_FROM_NAME="Fixture Sender",
+        EMAIL_MCP_IDENTITIES=str(tmp_path / "absent-identities.toml"),
+        EMAIL_MCP_SEND_ALLOW_ALL="0",
+    )
+
+
+def _frozen_headers(env: dict[str, str], spool_id: str) -> dict[str, str | None]:
+    import email
+    import email.policy
+
+    state = Path(env["EMAIL_MCP_STATE_DIR"])
+    frozen = list(state.rglob(f"{spool_id}.eml"))
+    assert len(frozen) == 1, f"expected one frozen .eml for {spool_id}, got {frozen}"
+    msg = email.message_from_bytes(frozen[0].read_bytes(), policy=email.policy.default)
+    return {
+        name: (str(msg[name]) if msg[name] else None)
+        for name in ("In-Reply-To", "References")
+    }
+
+
+def _tomorrow() -> str:
+    from datetime import datetime, timedelta, timezone
+    return (datetime.now(timezone.utc) + timedelta(days=1)).isoformat()
+
+
+def test_schedule_email_threading_arguments_survive_the_wire(
+    tmp_path, mail_fixture,
+):
+    """§ tools/call: `in_reply_to` and `references` are declared on the wire
+    schema as optional strings, and a threaded schedule freezes both
+    headers verbatim (long Message-IDs intact, never RFC 2047 encoded).
+    A schedule without them is unchanged: no threading headers at all."""
+    env = _schedule_env(tmp_path, mail_fixture)
+    parent = "<" + "p" * 80 + "@mail.example.invalid>"   # past the 78-col fold
+    root = "<root@example.invalid>"
+    base = {
+        "to": "probe@example.invalid", "subject": "Re: fixture topic",
+        "body": "fixture body", "send_at": _tomorrow(),
+    }
+
+    async def body(session, init):
+        tools = {t.name: t for t in (await session.list_tools()).tools}
+        schema = sdk_attr(tools["schedule_email"], "inputSchema", "input_schema")
+        plain = _envelope(await session.call_tool("schedule_email", base))
+        threaded = _envelope(await session.call_tool(
+            "schedule_email",
+            base | {"in_reply_to": parent, "references": root},
+        ))
+        return schema, plain, threaded
+
+    schema, plain, threaded = _talk(env, body)
+
+    props = schema["properties"]
+    for name in ("in_reply_to", "references"):
+        assert name in props, f"{name} missing from the wire schema"
+        assert props[name].get("type") == "string"
+        assert name not in schema.get("required", [])
+
+    assert plain["ok"] is True and threaded["ok"] is True
+    assert _frozen_headers(env, plain["id"]) == {
+        "In-Reply-To": None, "References": None,
+    }
+    assert _frozen_headers(env, threaded["id"]) == {
+        "In-Reply-To": parent, "References": f"{root} {parent}",
+    }
+
+
+def test_schedule_email_rejects_header_injection_in_threading_over_the_wire(
+    tmp_path, mail_fixture,
+):
+    """A CR/LF smuggled into `in_reply_to` is refused as an envelope
+    (`header_injection`) and nothing is frozen."""
+    env = _schedule_env(tmp_path, mail_fixture)
+    hostile = "<parent@example.invalid>\r\nBcc: attack@example.invalid"
+
+    async def body(session, init):
+        return await session.call_tool("schedule_email", {
+            "to": "probe@example.invalid", "subject": "Re: fixture topic",
+            "body": "fixture body", "send_at": _tomorrow(),
+            "in_reply_to": hostile,
+        })
+
+    result = _talk(env, body)
+    assert sdk_attr(result, "isError", "is_error") is False
+    envelope = _envelope(result)
+    assert envelope["ok"] is False
+    assert envelope["code"] == "header_injection"
+    state = Path(env["EMAIL_MCP_STATE_DIR"])
+    assert list(state.rglob("*.eml")) == []

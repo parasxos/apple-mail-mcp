@@ -505,6 +505,16 @@
         "default": null,
         "title": "From Identity"
       },
+      "in_reply_to": {
+        "default": "",
+        "title": "In Reply To",
+        "type": "string"
+      },
+      "references": {
+        "default": "",
+        "title": "References",
+        "type": "string"
+      },
       "send_at": {
         "title": "Send At",
         "type": "string"

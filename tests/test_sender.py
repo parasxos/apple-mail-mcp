@@ -64,6 +64,30 @@ def test_compose_is_clean_multipart_no_apple_wrapper():
     assert msg["Message-ID"]
 
 
+LONG_MSGID = ("<ZRAP278MB03333BE4970730425C12E3E2AC8B2"
+              "@ZRAP278MB0333.CHEP278.PROD.OUTLOOK.COM>")
+
+
+def test_compose_keeps_long_message_ids_intact_in_threading_headers():
+    # An Outlook Message-ID is longer than the 78-column fold limit; the
+    # stdlib treats In-Reply-To / References as unstructured text and would
+    # RFC 2047 encode it, which breaks threading in References based clients.
+    refs = "<a@example.org> <b@example.org> " + LONG_MSGID.replace("3BE4", "C101")
+    msg = sender.compose(
+        to=["x@example.org"], subject="Re: s", body="b",
+        in_reply_to=LONG_MSGID, references=refs,
+    )
+    raw = msg.as_bytes()
+    headers = raw.split(b"\n\n", 1)[0]
+    assert b"=?" not in headers
+    lines = headers.splitlines()
+    ref_lines = [l for l in lines if l.lower().startswith(b"references:")]
+    assert ref_lines and all(len(l) <= 92 for l in lines if l.startswith(b" "))
+    back = email.message_from_bytes(raw, policy=email.policy.default)
+    assert back["In-Reply-To"] == LONG_MSGID
+    assert back["References"].split() == refs.split() + [LONG_MSGID]
+
+
 def test_compose_html_escapes_body():
     msg = sender.compose(
         to=["paris.moschovakos@cern.ch"], subject="x", body="a < b & c",
