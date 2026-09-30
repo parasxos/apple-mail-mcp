@@ -92,6 +92,43 @@ def quote_html(
 _HARD_LINE_LIMIT = 998
 
 
+def _msg_ids(value: str) -> list[str] | None:
+    """The msg-ids of a References / In-Reply-To value, in order, or None
+    when the value does not read as a list of msg-ids.
+
+    Uses the stdlib's own msg-id grammar (private module, isolated here,
+    present since 3.8 and unchanged through 3.13): it walks comments,
+    including nested ones and quoted pairs, quoted-string local parts and
+    domain literals, so `(note <fake@x>)` yields nothing and `<a@[b>c]>`
+    stays whole. Must run on the raw value, before the header parser
+    decodes encoded words: a decoded comment can contain what looks like
+    syntax. Each id is rebuilt from its lexical tokens minus CFWS, never
+    from `.value`, which would strip the quotes of `<"a b"@x>`.
+    Obsolete forms are kept (they are still ids); an invalid id (missing
+    `>` or id-right) or text that is not a msg-id at all returns None and
+    the caller falls back to the stdlib folder.
+    """
+    try:
+        from email import errors
+        from email._header_value_parser import CFWS_LEADER, get_cfws, get_msg_id
+    except ImportError:  # pragma: no cover - stdlib private surface moved
+        return None
+    ids: list[str] = []
+    rest = value
+    while rest:
+        if rest[0] in CFWS_LEADER:
+            _, rest = get_cfws(rest)
+            continue
+        try:
+            token, rest = get_msg_id(rest)
+        except errors.HeaderParseError:
+            return None
+        if any(isinstance(d, errors.InvalidHeaderDefect) for d in token.all_defects):
+            return None
+        ids.append("".join(str(t) for t in token if t.token_type != "cfws"))
+    return ids or None
+
+
 class _MessageIDListHeader(UnstructuredHeader):
     """In-Reply-To / References: a whitespace separated list of msg-ids.
 
@@ -104,17 +141,24 @@ class _MessageIDListHeader(UnstructuredHeader):
     Only the msg-ids are serialized. RFC 5322 allows comments between them
     (`<id> (=?utf-8?q?Jos=C3=A9?=)`); the parser decodes those to Unicode,
     which a non-encoding folder could not emit, and they carry nothing a
-    threading client reads, so they are dropped. If a value holds no angle
-    bracketed id at all, or an id that is not ASCII, the stdlib folder
-    takes over rather than emitting a line this class cannot vouch for.
+    threading client reads, so they are dropped. A value that does not
+    parse as a msg-id list is left to the stdlib folder rather than
+    emitting a line this class cannot vouch for.
     """
 
-    _MSG_ID = re.compile(r"<[^<>]*>")
+    @classmethod
+    def parse(cls, value, kwds):
+        # Before super().parse decodes encoded words (see _msg_ids).
+        kwds["msg_ids"] = _msg_ids(value)
+        super().parse(value, kwds)
+
+    def init(self, *args, msg_ids=None, **kw):
+        self._msg_ids = msg_ids
+        super().init(*args, **kw)
 
     def fold(self, *, policy):
-        value = str(self)
-        ids = self._MSG_ID.findall(value) or value.split()
-        if any(not token.isascii() for token in ids):
+        ids = self._msg_ids
+        if not ids or any(not token.isascii() for token in ids):
             return super().fold(policy=policy)
         soft = policy.max_line_length or _HARD_LINE_LIMIT
         name_line = f"{self.name}:"

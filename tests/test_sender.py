@@ -112,6 +112,50 @@ def test_compose_drops_comments_from_references_and_keeps_ids(comment):
     assert back["In-Reply-To"] == "<parent@example.org>"
 
 
+@pytest.mark.parametrize("refs, expected", [
+    # a comment carrying something id-shaped is not an ancestor
+    ("<root@example.invalid> (note <fake@example.invalid>) <middle@example.invalid>",
+     ["<root@example.invalid>", "<middle@example.invalid>"]),
+    # nested comment, same
+    ("<root@example.invalid> (outer (inner <fake@example.invalid>)) <middle@example.invalid>",
+     ["<root@example.invalid>", "<middle@example.invalid>"]),
+    # encoded comment whose decoded text is an id: parsed before decoding
+    ("<root@example.invalid> (=?utf-8?q?=3Cfake=40example.invalid=3E?=) <middle@example.invalid>",
+     ["<root@example.invalid>", "<middle@example.invalid>"]),
+    # angle brackets inside a domain literal do not end or start an id
+    ("<real@[abc>def]> <other@[abc<def]>",
+     ["<real@[abc>def]>", "<other@[abc<def]>"]),
+    # quoted local part keeps its quotes and inner spaces
+    ('<"foo  bar"@example.org> <plain@example.org>',
+     ['<"foo  bar"@example.org>', "<plain@example.org>"]),
+])
+def test_compose_reads_references_with_the_msg_id_grammar(refs, expected):
+    parent = "<parent@example.invalid>"
+    msg = sender.compose(
+        to=["x@example.org"], subject="Re: s", body="b",
+        in_reply_to=parent, references=refs,
+    )
+    raw = msg.as_bytes()
+    headers = raw.split(b"\n\n", 1)[0]
+    assert b"=?" not in headers and b"fake" not in headers
+    # asserted on the unfolded wire bytes, not a lenient reparse that could
+    # hide a broken id; the folder may break the line between ids
+    unfolded = headers.replace(b"\n ", b" ").splitlines()
+    ref_line = [l for l in unfolded if l.startswith(b"References:")][0]
+    assert ref_line == b"References: " + " ".join(expected + [parent]).encode()
+
+
+def test_compose_leaves_a_value_that_is_not_a_msg_id_list_to_the_stdlib():
+    # No angle bracketed id at all: not this class's business. The stdlib
+    # folder takes it, unchanged when short, and nothing crashes.
+    msg = sender.compose(
+        to=["x@example.org"], subject="Re: s", body="b",
+        in_reply_to="bare-id-without-brackets",
+    )
+    back = email.message_from_bytes(msg.as_bytes(), policy=email.policy.default)
+    assert back["In-Reply-To"] == "bare-id-without-brackets"
+
+
 def test_compose_moves_an_id_that_fills_the_line_to_a_continuation():
     # RFC 5322 2.1.1: 998 characters per line, hard. A 986 character id is
     # a legal Message-ID line but does not fit after "In-Reply-To:"; it
