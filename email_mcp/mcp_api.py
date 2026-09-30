@@ -122,11 +122,13 @@ def tool_schedule_email(
     cc: str | None = None, bcc: str | None = None,
     attachments: list[str] | None = None,
     from_identity: str | None = None,
+    in_reply_to: str = "", references: str = "",
 ) -> ScheduledEntry:
     return get_application().schedule_email(
         to=to, subject=subject, body=body, send_at=send_at,
         cc=cc, bcc=bcc, attachments=attachments,
         from_identity=from_identity,
+        in_reply_to=in_reply_to, references=references,
     )
 
 

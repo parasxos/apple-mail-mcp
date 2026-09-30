@@ -377,6 +377,8 @@ def schedule_email(
     bcc: str | list[str] | None = None,
     attachments: str | list[str] | None = None,
     from_identity: str | None = None,
+    in_reply_to: str = "",
+    references: str = "",
 ):
     """Compose NOW, deliver LATER: the message is validated, attachments
     embedded, Bcc-to-self added and a Message-ID minted immediately, then
@@ -401,8 +403,13 @@ def schedule_email(
             code=codes.SEND_AT_IN_PAST,
         )
 
+    # Threading headers ride along exactly as in send_email, so a scheduled
+    # message can be a real reply: In-Reply-To plus References, frozen with
+    # the rest of the RFC-822 (a reply that goes out tomorrow must still
+    # land in the thread it answers).
     prepared = _prepare_transmission(
         ident, to=to, subject=subject, body=body, cc=cc, bcc=bcc,
+        in_reply_to=in_reply_to, references=references,
         attachments=attachments,
     )
     entry = spool.Entry(

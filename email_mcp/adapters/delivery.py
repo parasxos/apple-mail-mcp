@@ -60,6 +60,8 @@ class DefaultDeliveryGateway:
             bcc=request.bcc,
             attachments=list(request.attachments) or None,
             from_identity=request.from_identity,
+            in_reply_to=request.in_reply_to,
+            references=request.references,
         )
 
     def requested_executor(self, identity: str) -> str | None:

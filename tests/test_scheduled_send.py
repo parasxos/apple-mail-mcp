@@ -69,6 +69,20 @@ def test_schedule_freezes_message_with_attachment(tmp_path, delivered):
     assert list(wire.iter_attachments())[0].get_content() == b"%PDF-1.4 frozen"
 
 
+def test_schedule_freezes_threading_headers(delivered):
+    entry = sender.schedule_email(
+        to="paris.moschovakos@cern.ch", subject="Re: s", body="b",
+        send_at=_future(-1),
+        in_reply_to="<orig@example.org>",
+        references="<root@example.org>",
+    )
+    raw = spool.read_eml("pending", entry.id)
+    msg = email.message_from_bytes(raw, policy=email.policy.default)
+    assert msg["In-Reply-To"] == "<orig@example.org>"
+    assert msg["References"].split() == [
+        "<root@example.org>", "<orig@example.org>"]
+
+
 def test_schedule_naive_send_at_means_local_time():
     naive = (datetime.now() + timedelta(hours=2)).replace(microsecond=0)
     entry = sender.schedule_email(

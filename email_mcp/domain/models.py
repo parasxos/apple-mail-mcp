@@ -55,6 +55,8 @@ class ScheduleRequest:
     bcc: str | None = None
     attachments: tuple[str, ...] = ()
     from_identity: str | None = None
+    in_reply_to: str = ""
+    references: str = ""
 
 
 @dataclass(frozen=True)

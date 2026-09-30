@@ -192,6 +192,8 @@ class DeliveryUseCases(ApplicationService):
         bcc: str | None = None,
         attachments: list[str] | None = None,
         from_identity: str | None = None,
+        in_reply_to: str = "",
+        references: str = "",
     ) -> ScheduledEntry:
         request = ScheduleRequest(
             to=to,
@@ -202,6 +204,8 @@ class DeliveryUseCases(ApplicationService):
             bcc=bcc,
             attachments=tuple(attachments or ()),
             from_identity=from_identity,
+            in_reply_to=in_reply_to,
+            references=references,
         )
         try:
             entry = self._delivery.schedule(request)

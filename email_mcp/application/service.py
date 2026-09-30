@@ -163,9 +163,12 @@ class EmailApplication:
         bcc: str | None = None,
         attachments: list[str] | None = None,
         from_identity: str | None = None,
+        in_reply_to: str = "",
+        references: str = "",
     ) -> ScheduledEntry:
         return self._delivery.schedule_email(
             to, subject, body, send_at, cc, bcc, attachments, from_identity,
+            in_reply_to=in_reply_to, references=references,
         )
 
     def list_scheduled(
