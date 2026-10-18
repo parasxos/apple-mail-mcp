@@ -8,7 +8,7 @@ import textwrap
 
 import pytest
 
-from email_mcp import identities
+from email_mcp import config, identities
 from email_mcp.identities import Identity, IdentityError
 from email_mcp.transports import SendError
 
@@ -44,8 +44,22 @@ def test_absent_file_without_from_addr_names_the_remedy():
         identities.load()
     s = str(ei.value)
     assert "no sending identity configured" in s
-    assert "identities.toml" in s
+    # the remedy names the file this install actually reads, not the
+    # default spelling (three release testers were told to create
+    # ~/.email-mcp/identities.toml while EMAIL_MCP_STATE_DIR pointed away)
+    assert str(config.identities_file()) in s
+    assert "no-identities.toml" in s and "~/.email-mcp" not in s
     assert "EMAIL_MCP_FROM_ADDR" in s
+
+
+def test_absent_file_remedy_follows_the_state_root(monkeypatch, tmp_path):
+    monkeypatch.delenv("EMAIL_MCP_IDENTITIES", raising=False)
+    root = tmp_path / "state"
+    root.mkdir()
+    monkeypatch.setenv("EMAIL_MCP_STATE_DIR", str(root))
+    with pytest.raises(IdentityError) as ei:
+        identities.load()
+    assert str(root / "identities.toml") in str(ei.value)
 
 
 def test_absent_file_synthesizes_default_mirroring_env(monkeypatch):

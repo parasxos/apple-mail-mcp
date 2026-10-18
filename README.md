@@ -163,7 +163,9 @@ If the benchmarks hold up on your mailbox, a ⭐ helps others find this.
 
 4. **Verify:** `uvx apple-mailbox-mcp status` prints one readiness screen —
    or just ask your client to run the `doctor` tool; every red line comes
-   with its exact fix. The first body-index build on a large mailbox runs in
+   with its exact fix. `uvx apple-mailbox-mcp --version` prints the installed
+   version (`apple-mailbox-mcp`, `apple-mail-mcp` and `email-mcp` are three
+   names for the same command). The first body-index build on a large mailbox runs in
    the background and can take a few minutes; search works immediately and
    completes as the index fills.
 

@@ -241,8 +241,8 @@ def main(argv: list[str] | None = None) -> int:
     )
     parser.add_argument(
         "--from-identity", default=None, metavar="NAME",
-        help="Identity to send --send-test as (from ~/.email-mcp/"
-             "identities.toml; default: the file's default identity).",
+        help="Identity to send --send-test as (from the identities file; "
+             "default: the file's default identity).",
     )
     parser.add_argument(
         "--doctor", action="store_true",

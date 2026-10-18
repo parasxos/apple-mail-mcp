@@ -1,6 +1,7 @@
 """Identity routing: the From: address decides the transport.
 
-`~/.email-mcp/identities.toml` (override: EMAIL_MCP_IDENTITIES) maps
+`identities.toml` in the state root (default ~/.email-mcp, moved by
+EMAIL_MCP_STATE_DIR; override the file with EMAIL_MCP_IDENTITIES) maps
 identity names to a From address, a transport driver, and that driver's
 parameters. Everything an identity implies follows from it — From: header,
 Message-ID domain, Bcc-to-self target, per-identity allowlist, driver.
@@ -95,7 +96,7 @@ def _synthesized() -> Identity:
     if not from_addr:
         raise IdentityError(
             "no sending identity configured — create "
-            "~/.email-mcp/identities.toml (see docs/reference.md, "
+            f"{config.identities_file()} (see docs/reference.md, "
             "'Identities & transports') or set EMAIL_MCP_FROM_ADDR."
         )
     return Identity(

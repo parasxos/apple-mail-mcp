@@ -102,7 +102,7 @@ def test_top_level_help_is_for_people_not_legacy_server_flags(
 
 @pytest.mark.parametrize("argv", [
     [], ["serve"], ["setup"], ["update"], ["uninstall", "--yes"],
-    ["version"], ["audit", "--status"], ["fts", "--status"], ["graph"],
+    ["audit", "--status"], ["fts", "--status"], ["graph"],
     ["dispatcher", "--status"],
 ])
 def test_refused_root_gates_every_verb_but_doctor(home, monkeypatch,
@@ -114,6 +114,19 @@ def test_refused_root_gates_every_verb_but_doctor(home, monkeypatch,
     assert cap.out == ""  # stdout may be the MCP wire — never touched
     assert reason in cap.err
     assert not (home / "old").exists()  # rejected, nothing created
+
+
+@pytest.mark.parametrize("argv", [["version"], ["--version"], ["-V"]])
+def test_version_answers_even_when_the_root_is_refused(home, monkeypatch,
+                                                       capsys, argv):
+    """What is installed is never hidden behind state: `--version` is the
+    first thing two of three 1.8.3 release testers typed, and it used to
+    fall through to the legacy server parser's 'unrecognized arguments'."""
+    monkeypatch.setenv("EMAIL_MCP_SPOOL_DIR", str(home / "old"))
+    assert isinstance(state.State.resolve(), state.Refused)
+    assert cli.main(argv) == 0
+    cap = capsys.readouterr()
+    assert cap.out.strip() == email_mcp.__version__ and cap.err == ""
 
 
 # ---------------------------------------------------------------------- #
@@ -256,13 +269,21 @@ def test_version_prints_the_single_source(home, capsys):
     assert capsys.readouterr().out.strip() == email_mcp.__version__
 
 
-def test_version_subprocess_round_trip(tmp_path):
+@pytest.mark.parametrize("flag", ["version", "--version", "-V"])
+def test_version_subprocess_round_trip(tmp_path, flag):
     proc = subprocess.run(
-        [sys.executable, "-m", "email_mcp.cli", "version"],
+        [sys.executable, "-m", "email_mcp.cli", flag],
         capture_output=True, text=True, timeout=60, env=_clean_env(tmp_path),
     )
     assert proc.returncode == 0
     assert proc.stdout.strip() == email_mcp.__version__
+
+
+def test_version_takes_no_arguments(home, capsys):
+    assert cli.main(["--version", "--json"]) == 2
+    assert cli.main(["version", "extra"]) == 2
+    cap = capsys.readouterr()
+    assert cap.out == "" and "usage: apple-mailbox-mcp version" in cap.err
 
 
 # ---------------------------------------------------------------------- #

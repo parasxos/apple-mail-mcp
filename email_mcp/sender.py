@@ -25,7 +25,7 @@ from email.message import EmailMessage
 from email.parser import BytesHeaderParser
 from email.utils import getaddresses
 
-from . import codes, identities, transports
+from . import codes, config, identities, transports
 from .addressing import (
     CONTROL_RE as _CTL_RE,
     bare_address as _bare,
@@ -310,7 +310,7 @@ def create_draft(
         raise SendError(
             f"create_draft is not available for identity [{ident.name}]: "
             f'drafts require drafts = "graph" and a [{ident.name}.graph] '
-            "block in ~/.email-mcp/identities.toml. Run `email-mcp setup` "
+            f"block in {config.identities_file()}. Run `email-mcp setup` "
             "(one browser sign-in) to enable it, or compose the text and "
             "paste it yourself — see docs/reference.md, 'Drafts'.",
             code=codes.DRAFT_UNSUPPORTED,

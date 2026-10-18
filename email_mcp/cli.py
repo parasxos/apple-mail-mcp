@@ -40,7 +40,7 @@ Maintain:
   update                         migrate an existing install forward
   uninstall [--purge] [--yes]    agents out, token caches removed;
                                  --purge also removes state + logs
-  version                        print the version
+  version / --version            print the version
   help / --help                  show this help
 
 Advanced:
@@ -118,6 +118,14 @@ def main(argv: list[str] | None = None) -> int:
             return 2
         print(_USAGE, end="")
         return 0
+    if argv and argv[0] in ("version", "--version", "-V"):
+        # The version answers before state resolves: a refused or
+        # missing state root must never hide what is installed.
+        if len(argv) > 1:
+            print("usage: apple-mailbox-mcp version", file=sys.stderr)
+            return 2
+        print(__version__)
+        return 0
     if argv and argv[0].startswith("-"):
         from . import server
 
@@ -144,10 +152,6 @@ def main(argv: list[str] | None = None) -> int:
         from . import server
 
         return server.main(rest)
-    if verb == "version":
-        _no_flags(verb, rest)
-        print(__version__)
-        return 0
     if verb == "setup":
         _no_flags(verb, rest)
         from . import lifecycle
