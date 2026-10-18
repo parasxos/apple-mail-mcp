@@ -720,6 +720,16 @@ def test_audit_leaf_is_a_regular_file(audit_dir_guard):
 
 
 def test_concurrent_query_while_appending(audit_dir_guard):
+    """A reader racing the writer sees complete lines only, except for the
+    one write in flight. Writers never interleave (one os.write per event
+    on an O_APPEND fd, under flock), so every line a reader can see torn
+    is the file's last one: Linux lets a read observe a buffered write
+    that crosses a page boundary half-way (macOS serializes the two), and
+    the reader counts that fragment as skipped, never as an event. Hence
+    at most one skipped line per poll, no complete line ever corrupt, and
+    nothing skipped once the writer is done (the v1.8.3 release run saw
+    skipped_lines == 1 once on ubuntu; 2 of 40 runs in a Linux container
+    reproduce it)."""
     ctx = multiprocessing.get_context("spawn")
     p = ctx.Process(target=_hammer,
                     args=(str(audit_dir_guard), "server", 800))
@@ -728,7 +738,7 @@ def test_concurrent_query_while_appending(audit_dir_guard):
         polls = 0
         while p.is_alive():
             out = audit.query(limit=500)
-            assert out["skipped_lines"] == 0  # atomic lines: never torn
+            assert out["skipped_lines"] <= 1  # only the write in flight
             for e in out["events"]:
                 assert e["v"] == 1 and e["outcome"] == "sent"
             polls += 1
@@ -736,6 +746,6 @@ def test_concurrent_query_while_appending(audit_dir_guard):
         p.join(timeout=120)
     assert p.exitcode == 0
     final = audit.query(limit=500)
-    assert final["skipped_lines"] == 0
-    assert len(_lines(audit_dir_guard)) == 800
+    assert final["skipped_lines"] == 0  # at rest, every line is whole
+    assert len(final["events"]) == 500 and len(_lines(audit_dir_guard)) == 800
     assert polls >= 1  # the race was actually exercised
