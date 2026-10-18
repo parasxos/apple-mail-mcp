@@ -40,7 +40,9 @@ jobs:
           skip-existing: true
 
       - name: write release checksums
-        run: sha256sum dist/*.whl dist/*.tar.gz > dist/SHA256SUMS
+        # Bare file names: `shasum -a 256 -c SHA256SUMS` must work in the
+        # directory the assets were downloaded to (1.8.3 shipped dist/ paths).
+        run: (cd dist && sha256sum *.whl *.tar.gz > SHA256SUMS)
       - name: attest release provenance
         uses: actions/attest@v4
         with:
