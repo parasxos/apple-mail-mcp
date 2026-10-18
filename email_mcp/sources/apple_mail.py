@@ -23,6 +23,7 @@ import urllib.parse
 from datetime import datetime, timezone
 from pathlib import Path
 
+from ..domain.mail import mailbox
 from ..config import (
     attach_dir,
     fts_enabled,
@@ -402,12 +403,7 @@ class AppleMailSource:
     def _row_to_ref(self, row: sqlite3.Row) -> EmailRef:
         # `row` must have: rowid, subject, sender_addr, sender_name,
         # date_unix, mailbox_url, read, has_attachment, conversation_id, snippet
-        sender = row["sender_addr"] or ""
-        sender_name = row["sender_name"] or ""
-        if sender_name and sender:
-            from_addr = f"{sender_name} <{sender}>"
-        else:
-            from_addr = sender or sender_name
+        from_addr = mailbox(row["sender_name"], row["sender_addr"])
 
         to_list, cc_list = self._recipients_for(row["rowid"])
         mbox_url = row["mailbox_url"] or ""
@@ -444,7 +440,7 @@ class AppleMailSource:
         to_list: list[str] = []
         cc_list: list[str] = []
         for r in rows:
-            display = f"{r['name']} <{r['addr']}>" if r["name"] else (r["addr"] or "")
+            display = mailbox(r["name"], r["addr"])
             if r["rtype"] == _RECIPIENT_CC:
                 cc_list.append(display)
             elif r["rtype"] == _RECIPIENT_BCC:
@@ -839,13 +835,7 @@ class AppleMailSource:
             }
 
         ts = datetime.fromtimestamp(int(newest["ts"]), tz=timezone.utc)
-        sender = newest["addr"] or ""
-        sender_name = newest["name"] or ""
-        from_addr = (
-            f"{sender_name} <{sender}>"
-            if sender_name and sender
-            else (sender or sender_name)
-        )
+        from_addr = mailbox(newest["name"], newest["addr"])
         return {
             "total": total,
             "newest_date": ts.isoformat(),

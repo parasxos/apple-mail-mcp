@@ -31,7 +31,9 @@ def validate_bare_addresses(field: str, addrs: list[str]) -> None:
                 or any(char.isspace() or ord(char) < 0x20 for char in address)):
             raise SendError(
                 f"invalid_recipient: {entry!r} in `{field}` is not a usable "
-                "address (want user@domain, optionally as 'Name <user@domain>').",
+                "address (want user@domain, optionally as 'Name <user@domain>'; "
+                "a display name holding a comma must be quoted: "
+                "'\"Last, First\" <user@domain>').",
                 code=codes.INVALID_RECIPIENT,
             )
 

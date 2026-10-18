@@ -3,6 +3,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime
+from email.utils import unquote
 from typing import Protocol
 
 
@@ -22,6 +23,29 @@ class AttachmentRef:
     mime: str | None
     size: int | None
     attachment_id: str
+
+
+_NAME_SPECIALS = frozenset('()<>[]:;@\\,."')
+
+
+def mailbox(name: str | None, address: str | None) -> str:
+    """One RFC 5322 mailbox from the display name and address a store
+    holds separately. A name carrying a special (a comma above all:
+    "Leung Yong Ting, Nicole") is quoted, so the string parses back to
+    the one recipient the store meant instead of splitting at the comma.
+    A stored name already wrapped in one quote pair is wire quoting the
+    store kept, not a second layer. A row with no address renders as
+    `Name <>`: the name is shown and no parser routes to it, so a display
+    name never stands in for a delivery address."""
+    name = name or ""
+    if len(name) >= 2 and name[0] == name[-1] == '"':
+        name = unquote(name)  # strips the pair and undoes its \" and \\ escapes
+    if not name:
+        return address or ""
+    if any(char in _NAME_SPECIALS for char in name):
+        escaped = name.replace("\\", "\\\\").replace('"', '\\"')
+        name = f'"{escaped}"'
+    return f"{name} <{address or ''}>"
 
 
 @dataclass(frozen=True)

@@ -524,6 +524,118 @@ def test_reply_all_ccs_original_recipients_minus_self(monkeypatch, mail_fixture,
     assert "paris.moschovakos@cern.ch" not in joined
 
 
+@pytest.mark.parametrize("field", ["to", "cc", "from"])
+@pytest.mark.parametrize("quoted", [False, True], ids=["unquoted", "quoted"])
+@pytest.mark.parametrize("name", [
+    "Leung Yong Ting, Nicole",
+    'Dœ, Nicole "N" (Lab\\One)',
+], ids=["reported", "unicode-escaped"])
+def test_reply_all_preserves_index_comma_names(
+    monkeypatch, mail_fixture, capture_delivery, field, quoted, name
+):
+    """Field case, 18 Oct 2026: Mail's index holds the display name and
+    the address apart; the envelope rebuilt from it must quote a name
+    that carries a special, whether the index kept the wire quotes or
+    not, in To, Cc and From alike. (Contributed by the Codex peer.)"""
+    import sqlite3
+    from email.utils import getaddresses
+
+    from email_mcp.sources.apple_mail import AppleMailSource
+
+    monkeypatch.setenv("EMAIL_MCP_SEND_ALLOW_ALL", "1")
+    address = "nicole.leung@u.nus.edu"
+    stored_name = ('"' + name.replace("\\", "\\\\").replace('"', '\\"') + '"'
+                   if quoted else name)
+    peers = [
+        ("SU CHENGXUN", "cx.su@nus.edu.sg"),
+        ("Nigel Foo Hon Wei", "nigel.foo@u.nus.edu"),
+    ]
+    conn = sqlite3.connect(mail_fixture / "MailData" / "Envelope Index")
+    try:
+        conn.executemany(
+            "INSERT INTO addresses(ROWID, address, comment) VALUES (?, ?, ?)",
+            [(901, address, stored_name)]
+            + [(902 + i, addr, display) for i, (display, addr) in enumerate(peers)],
+        )
+        conn.executemany(
+            "INSERT INTO recipients(message, address, type, position) "
+            "VALUES (101, ?, ?, ?)",
+            [(901 + i, 0 if field == "to" else 1, 2 + i) for i in range(3)],
+        )
+        if field == "from":
+            conn.execute("UPDATE messages SET sender=901 WHERE ROWID=101")
+        conn.commit()
+    finally:
+        conn.close()
+
+    source = AppleMailSource(mail_fixture)
+    original = source.get("101")
+    indexed = ([original.ref.from_addr] if field == "from"
+               else getattr(original.ref, field)[-3:])
+
+    result = sender.reply_email(source, id="101", body="Received", reply_all=True)
+
+    assert result.ok is True
+    assert getaddresses(indexed) == ([(name, address)] if field == "from"
+                                     else [(name, address)] + peers)
+    assert len(capture_delivery) == 1
+    message = capture_delivery[0]
+    sender_pair = ("DCS Ops", "ops-bot@cern.ch")
+    assert getaddresses([str(message["To"])]) == [
+        (name, address) if field == "from" else sender_pair,
+    ]
+    assert getaddresses([str(message["Cc"])]) == [
+        *([sender_pair] if field == "from" else [(name, address)]), *peers,
+    ]
+
+
+def test_reply_never_routes_to_an_addressless_sender_display_name(
+    monkeypatch, mail_fixture, capture_delivery
+):
+    """Sender row with a NULL address and an address-shaped comment: the
+    reply has no valid recipient and is refused, nothing is delivered."""
+    import sqlite3
+
+    from email_mcp.sources.apple_mail import AppleMailSource
+
+    monkeypatch.setenv("EMAIL_MCP_SEND_ALLOW_ALL", "1")
+    conn = sqlite3.connect(mail_fixture / "MailData" / "Envelope Index")
+    try:
+        conn.execute("UPDATE addresses SET address = NULL, "
+                     "comment = 'wrong-target@example.org' WHERE ROWID = 3")
+        conn.commit()
+    finally:
+        conn.close()
+    source = AppleMailSource(mail_fixture)
+    assert source.get("101").ref.from_addr == '"wrong-target@example.org" <>'
+
+    with pytest.raises(sender.SendError) as ei:
+        sender.reply_email(source, id="101", body="Received")
+    assert "no valid recipient" in str(ei.value)
+    assert capture_delivery == []
+
+
+def test_caller_supplied_comma_name_must_be_quoted(monkeypatch, capture_delivery):
+    """The recipient grammar stays RFC 5322: an unquoted comma in a typed
+    display name is two addresses, refused with the way to write it, and
+    the quoted form goes through as one recipient."""
+    from email.utils import getaddresses
+
+    monkeypatch.setenv("EMAIL_MCP_SEND_ALLOW_ALL", "1")
+    with pytest.raises(sender.SendError) as ei:
+        sender.send_email(to="Leung Yong Ting, Nicole <nicole.leung@u.nus.edu>",
+                          subject="s", body="b")
+    assert "invalid_recipient: 'Leung'" in str(ei.value)
+    assert "'\"Last, First\" <user@domain>'" in str(ei.value)
+    assert capture_delivery == []
+
+    res = sender.send_email(to='"Leung Yong Ting, Nicole" <nicole.leung@u.nus.edu>',
+                            subject="s", body="b")
+    assert res.ok is True
+    assert getaddresses([str(capture_delivery[0]["To"])]) == [
+        ("Leung Yong Ting, Nicole", "nicole.leung@u.nus.edu")]
+
+
 # --------------------------------------------------------------------- #
 # reply history quoting                                                 #
 # --------------------------------------------------------------------- #

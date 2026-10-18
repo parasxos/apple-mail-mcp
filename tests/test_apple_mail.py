@@ -3,6 +3,7 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 
+from email_mcp.domain.mail import mailbox
 from email_mcp.sources.apple_mail import AppleMailSource
 from email_mcp.sources.base import SearchQuery
 
@@ -39,6 +40,54 @@ def test_search_substring_matches_subject_or_snippet(mail_fixture):
     assert [r.id for r in hits] == ["101"]
     # No match
     assert src.search(SearchQuery(query="doesnotexist-zzz")) == []
+
+
+def test_mailbox_quotes_a_display_name_that_holds_a_special():
+    assert mailbox("Leung Yong Ting, Nicole", "n@x.sg") == '"Leung Yong Ting, Nicole" <n@x.sg>'
+    # one quote pair the index kept is wire quoting, not a second layer
+    assert mailbox('"Leung Yong Ting, Nicole"', "n@x.sg") == '"Leung Yong Ting, Nicole" <n@x.sg>'
+    assert mailbox('John "JJ" Doe', "jj@x.sg") == '"John \\"JJ\\" Doe" <jj@x.sg>'
+    # kept wire quotes come with their escapes, which are undone once
+    assert mailbox('"John \\"JJ\\" Doe"', "jj@x.sg") == '"John \\"JJ\\" Doe" <jj@x.sg>'
+    assert mailbox("Stefan Schlenker", "s@x.ch") == "Stefan Schlenker <s@x.ch>"
+    assert mailbox("Παρής Μοσχοβάκος", "p@x.ch") == "Παρής Μοσχοβάκος <p@x.ch>"
+    assert mailbox(None, "s@x.ch") == "s@x.ch"
+    assert mailbox('""', "s@x.ch") == "s@x.ch"
+    assert mailbox(None, None) == ""
+    # a row without an address shows its name and routes nowhere, even
+    # when the name is shaped like an address (quoted, so never routable)
+    assert mailbox("Only Name", None) == "Only Name <>"
+    assert mailbox("wrong-target@example.org", None) == '"wrong-target@example.org" <>'
+
+
+def test_mailbox_round_trips_through_the_stdlib_parser():
+    from email.utils import getaddresses
+
+    for name in ("Leung Yong Ting, Nicole", 'John "JJ" Doe', "C:\\path",
+                 "a (b) <c>; d", "Smith, J. @ CERN"):
+        assert getaddresses([mailbox(name, "a@b.c")]) == [(name, "a@b.c")]
+
+
+def test_recipient_names_holding_a_comma_stay_one_recipient_each(mail_fixture):
+    import sqlite3
+
+    conn = sqlite3.connect(mail_fixture / "MailData" / "Envelope Index")
+    try:
+        conn.execute("UPDATE addresses SET comment = 'Ops, DCS' WHERE ROWID = 3")
+        conn.execute(
+            "INSERT INTO addresses(ROWID, address, comment) VALUES "
+            "(903, 'nicole.leung@u.nus.edu', 'Leung Yong Ting, Nicole')")
+        conn.execute(
+            "INSERT INTO recipients(message, address, type, position) "
+            "VALUES (101, 903, 1, 2)")
+        conn.commit()
+    finally:
+        conn.close()
+    ref = AppleMailSource(mail_fixture).get("101").ref
+    assert ref.from_addr == '"Ops, DCS" <ops-bot@cern.ch>'
+    assert ref.to == ["Paris Moschovakos <paris.moschovakos@cern.ch>"]
+    assert ref.cc == ['"Ops, DCS" <ops-bot@cern.ch>',
+                      '"Leung Yong Ting, Nicole" <nicole.leung@u.nus.edu>']
 
 
 def test_search_from_filter(mail_fixture):
