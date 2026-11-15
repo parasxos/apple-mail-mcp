@@ -24,6 +24,7 @@ from .query import (
     empty_scope_note,
     search_query,
     shape_email,
+    unlisted_hits_note,
 )
 from .ports import ErrorClassifier, RefreshGateway, SourceProvider
 
@@ -90,8 +91,12 @@ class ReadUseCases:
                 **asdict(hit),
                 body_match=hit.id in hit_ids and not visible,
             ))
-        note = (empty_scope_note(source, mailbox, account)
-                if mailbox and not results else None)
+        notes = (
+            empty_scope_note(source, mailbox, account)
+            if mailbox and not results else None,
+            unlisted_hits_note(fts, page_empty=not results),
+        )
+        note = " ".join(text for text in notes if text) or None
         return SearchPage(fts=fts, results=results, note=note)
 
     def get_email(self, id: str, view: str = "full") -> OneEmail:

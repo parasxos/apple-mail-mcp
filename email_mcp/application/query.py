@@ -67,6 +67,39 @@ def empty_scope_note(
     )
 
 
+# The words for a reason a source gives in fts.hits_dropped. A reason not
+# listed is the search filter that excluded the hit, named by its parameter.
+_DROP_REASONS = {
+    "not_in_mail": "no longer in Mail (moved or deleted after indexing)",
+    "incomplete_row": "without a subject or mailbox record in Mail",
+    "deleted": "marked deleted in Mail",
+    "unclassified": "unclassified (the check failed, see the server log)",
+}
+
+
+def unlisted_hits_note(fts: dict, page_empty: bool) -> str | None:
+    """Why body matches counted in fts.hits are not in the results: given
+    when the source dropped any, and when an empty page had matches on
+    other pages, so an empty list never reads as "no mail"."""
+    dropped = fts.get("hits_dropped") or {}
+    other_pages = fts.get("hits_other_pages") or 0
+    if not dropped and not (page_empty and other_pages):
+        return None
+    parts = [
+        f"{count} " + _DROP_REASONS.get(reason, f"excluded by the {reason} filter")
+        for reason, count in dropped.items()
+    ]
+    if other_pages:
+        parts.append(f"{other_pages} on other pages of this search")
+    unlisted = sum(dropped.values()) + other_pages
+    hits = fts.get("hits", unlisted)
+    return (
+        f"{unlisted} of {hits} body match{'es' if hits != 1 else ''} "
+        f"{'is' if unlisted == 1 else 'are'} not in these results: "
+        + ", ".join(parts) + "."
+    )
+
+
 def check_view(view: str) -> None:
     if view not in VIEWS:
         raise InvalidInput(f"unknown view {view!r} (want one of {VIEWS})")

@@ -89,7 +89,7 @@ TOOL_SPECS: dict[str, ToolSpec] = {
 }
 
 _TOOL_DESCRIPTIONS = {
-    "search_emails": "Search local envelope data and indexed body content. Check the returned FTS coverage before treating no matches as proof that no email exists. Sender filters are case-insensitive substring matches.",
+    "search_emails": "Search local envelope data and indexed body content. Check the returned FTS coverage before treating no matches as proof that no email exists; the note names any body match a page leaves out. Sender filters are case-insensitive substring matches.",
     "get_email": "Read one email by envelope ID at full, metadata, or minimal detail.",
     "get_emails_batch": "Read up to 50 emails in one bounded request, with per-ID errors.",
     "get_thread": "Return the messages in one conversation in chronological order.",

@@ -466,6 +466,13 @@ gains an `audit` check (dir exists, perms, writability).
     implied. `search_emails.fts` gains `partial` (headers-only local
     files — the same coverage hole `missing` always reported) and
     `backfilled` (docs recovered by the Graph lane).
+  - *Additive growth 2026-11-15* (no snapshot change: `fts` is an open
+    dict and `note` was already `str|null`): `search_emails.fts` gains
+    `hits_returned`, `hits_other_pages` and `hits_dropped` (reason to
+    count), which together account for every one of `hits`; `note` also
+    names the body matches a page leaves out, whenever one was dropped or
+    an empty page's matches sit on other pages. `hits` keeps its meaning:
+    body matches for the query text before any filter.
   - *MCP declaration 2026-08-24:* the frozen typed success shapes are now
     emitted as standards-valid MCP `outputSchema` entries, paired with the
     common failure envelope. Previously they were enforced only by the local

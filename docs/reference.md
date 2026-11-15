@@ -530,6 +530,21 @@ uncrawled rows remain, `unknown` when backlog cannot be checked, and
 `no_known_gaps` when neither is observed. The last state does not prove an
 exhaustive search: document size and result limits still apply.
 
+`hits` counts the body matches for the query text before any filter, newest
+first, up to `EMAIL_MCP_FTS_MAX_HITS`. Every one of them is accounted for,
+once: `hits_returned` are in this page's results, `hits_other_pages` pass
+every filter but sit on another page, and `hits_dropped` maps the reason for
+each of the rest to a count. A reason is the search filter that excludes the
+match, cheapest check first (`after`, `before`, `unread_only`, `mailbox`,
+`account`, `from_addr`, `has_attachment`, `to_addr`), or `deleted` (marked
+deleted in Mail), `not_in_mail` (moved or deleted after its body was
+indexed, until reconciliation removes the record), `incomplete_row` (Mail's
+row lacks its subject or mailbox record) or `unclassified` (the accounting
+query failed and the server log says why). A match is never dropped for its
+body: results carry the envelope fields Mail holds. Any drop, and an empty
+page whose matches sit on other pages, sets `note`, so an empty `results`
+list with `hits` above zero always says why.
+
 `partial` documents may contain searchable text, but some body content may be
 absent. `missing` and extraction errors require different recovery steps
 from an uncrawled backlog. `docs.local_retry_exhausted` exposes documents

@@ -20,6 +20,7 @@ import re
 import sqlite3
 import threading
 import urllib.parse
+from collections import Counter
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -280,7 +281,9 @@ class AppleMailSource:
     def _fts_report(self, idx, rowids: list[int], capped: bool) -> dict:
         """The {state, indexed, missing, backlog, hits, hits_capped,
         remedy?} dict stashed per search. `rowids` rides along under its
-        own key for the server's body_match check — never in the envelope."""
+        own key for the server's body_match check — never in the envelope.
+        `hits` counts body matches before any filter; search() fills the
+        three hits_* keys so every one of them is accounted for."""
         out: dict = {
             "state": "disabled",
             "indexed": 0,
@@ -291,6 +294,9 @@ class AppleMailSource:
             "backlog": 0,
             "hits": len(rowids),
             "hits_capped": capped,
+            "hits_returned": 0,
+            "hits_other_pages": 0,
+            "hits_dropped": {},
             "rowids": rowids,
             "local_retry_exhausted": 0,
         }
@@ -453,6 +459,15 @@ class AppleMailSource:
     # base SQL builders                                                  #
     # ------------------------------------------------------------------ #
 
+    # The rows a read can list: a message without its subject or mailbox
+    # record is not one of them.
+    _BASE_FROM = """
+              FROM messages m
+              JOIN subjects s ON s.ROWID = m.subject
+              LEFT JOIN addresses a ON a.ROWID = m.sender
+              JOIN mailboxes mb ON mb.ROWID = m.mailbox
+    """
+
     def _base_select(self) -> str:
         # `summary` column (linked to summaries table) gives a free snippet.
         snippet_sql = (
@@ -474,11 +489,7 @@ class AppleMailSource:
                 EXISTS(SELECT 1 FROM attachments at WHERE at.message = m.ROWID) AS has_attachment,
                 m.{conv_col} AS conversation_id,
                 {snippet_sql} AS snippet
-              FROM messages m
-              JOIN subjects s ON s.ROWID = m.subject
-              LEFT JOIN addresses a ON a.ROWID = m.sender
-              JOIN mailboxes mb ON mb.ROWID = m.mailbox
-        """
+        """ + self._BASE_FROM
 
     # ------------------------------------------------------------------ #
     # EmailSource methods                                                #
@@ -518,7 +529,7 @@ class AppleMailSource:
 
     def search(self, q: SearchQuery) -> list[EmailRef]:
         sql = self._base_select()
-        where: list[str] = ["m.deleted = 0"] if self._have("messages", "deleted") else []
+        where: list[str] = []
         params: list[object] = []
 
         # FTS body hits fold into the query OR-group below. The inline
@@ -536,7 +547,8 @@ class AppleMailSource:
             cap = fts_max_hits()
             fts_rowids = idx.rowids_matching(q.query, cap)
             fts_capped = len(fts_rowids) >= cap
-        self._last_fts = self._fts_report(idx, fts_rowids, fts_capped)
+        report = self._fts_report(idx, fts_rowids, fts_capped)
+        self._last_fts = report
 
         if q.query:
             term = _like_escape(q.query)
@@ -552,57 +564,12 @@ class AppleMailSource:
                 params.extend(fts_rowids)
             where.append(clause + ")")
 
-        if q.from_addr:
-            if q.from_exact:
-                where.append("a.address = ? COLLATE NOCASE")
-                params.append(q.from_addr)
-            else:
-                where.append("(a.address LIKE ? ESCAPE '\\' OR a.comment LIKE ? ESCAPE '\\')")
-                esc = _like_escape(q.from_addr)
-                params.extend([f"%{esc}%", f"%{esc}%"])
-
-        if q.to_addr:
-            where.append(
-                "EXISTS(SELECT 1 FROM recipients r2 "
-                "JOIN addresses a2 ON a2.ROWID = r2.address "
-                "WHERE r2.message = m.ROWID "
-                "AND (a2.address LIKE ? ESCAPE '\\' OR a2.comment LIKE ? ESCAPE '\\'))"
-            )
-            esc = _like_escape(q.to_addr)
-            params.extend([f"%{esc}%", f"%{esc}%"])
-
-        if q.mailbox:
-            where.append("mb.url LIKE ?")
-            params.append(f"%/{urllib.parse.quote(q.mailbox)}%")
-
-        if q.account:
-            where.append("mb.url LIKE ?")
-            params.append(f"%//{q.account}/%")
+        filters = self._search_filters(q)
+        for _reason, clause, args in filters:
+            where.append(clause)
+            params.extend(args)
 
         date_col = "date_sent" if self._have("messages", "date_sent") else "date_received"
-        if q.after:
-            where.append(f"m.{date_col} >= ?")
-            params.append(int(q.after.timestamp()))
-        if q.before:
-            where.append(f"m.{date_col} < ?")
-            params.append(int(q.before.timestamp()))
-
-        if q.has_attachment is True:
-            where.append("EXISTS(SELECT 1 FROM attachments at2 WHERE at2.message = m.ROWID)")
-        elif q.has_attachment is False:
-            where.append("NOT EXISTS(SELECT 1 FROM attachments at2 WHERE at2.message = m.ROWID)")
-
-        if q.unread_only:
-            where.append("m.read = 0")
-
-        if q.exclude_trash:
-            trash_ids = self._trash_mailbox_ids()
-            if trash_ids:
-                where.append(
-                    f"m.mailbox NOT IN ({','.join('?' * len(trash_ids))})"
-                )
-                params.extend(trash_ids)
-
         if where:
             sql += " WHERE " + " AND ".join(where)
         sql += f" ORDER BY m.{date_col} DESC LIMIT ? OFFSET ?"
@@ -612,7 +579,142 @@ class AppleMailSource:
 
         cur = self._conn.cursor()
         rows = cur.execute(sql, params).fetchall()
+        if fts_rowids:
+            report.update(self._account_hits(
+                fts_rowids, {int(r["rowid"]) for r in rows}, filters))
         return [self._row_to_ref(r) for r in rows]
+
+    def _search_filters(self, q: SearchQuery) -> list[tuple[str, str, list]]:
+        """search()'s AND filters as (reason, SQL clause, params), cheapest
+        first: row columns, then joined columns, then subqueries. A reason
+        is the SearchQuery field the clause enforces, or `deleted` (Apple's
+        purge flag) and `trash` (delete planning). search() ANDs the
+        clauses; _account_hits() runs the same clauses in this order and
+        names a dropped body hit by the first one it fails."""
+        out: list[tuple[str, str, list]] = []
+        if self._have("messages", "deleted"):
+            out.append(("deleted", "m.deleted = 0", []))
+
+        date_col = "date_sent" if self._have("messages", "date_sent") else "date_received"
+        if q.after:
+            out.append(("after", f"m.{date_col} >= ?",
+                        [int(q.after.timestamp())]))
+        if q.before:
+            out.append(("before", f"m.{date_col} < ?",
+                        [int(q.before.timestamp())]))
+
+        if q.unread_only:
+            out.append(("unread_only", "m.read = 0", []))
+
+        if q.exclude_trash:
+            trash_ids = self._trash_mailbox_ids()
+            if trash_ids:
+                out.append((
+                    "trash",
+                    f"m.mailbox NOT IN ({','.join('?' * len(trash_ids))})",
+                    list(trash_ids),
+                ))
+
+        if q.mailbox:
+            out.append(("mailbox", "mb.url LIKE ?",
+                        [f"%/{urllib.parse.quote(q.mailbox)}%"]))
+
+        if q.account:
+            out.append(("account", "mb.url LIKE ?", [f"%//{q.account}/%"]))
+
+        if q.from_addr:
+            if q.from_exact:
+                out.append(("from_addr", "a.address = ? COLLATE NOCASE",
+                            [q.from_addr]))
+            else:
+                esc = _like_escape(q.from_addr)
+                out.append((
+                    "from_addr",
+                    "(a.address LIKE ? ESCAPE '\\' OR a.comment LIKE ? ESCAPE '\\')",
+                    [f"%{esc}%", f"%{esc}%"],
+                ))
+
+        if q.has_attachment is True:
+            out.append(("has_attachment",
+                        "EXISTS(SELECT 1 FROM attachments at2 WHERE at2.message = m.ROWID)",
+                        []))
+        elif q.has_attachment is False:
+            out.append(("has_attachment",
+                        "NOT EXISTS(SELECT 1 FROM attachments at2 WHERE at2.message = m.ROWID)",
+                        []))
+
+        if q.to_addr:
+            esc = _like_escape(q.to_addr)
+            out.append((
+                "to_addr",
+                "EXISTS(SELECT 1 FROM recipients r2 "
+                "JOIN addresses a2 ON a2.ROWID = r2.address "
+                "WHERE r2.message = m.ROWID "
+                "AND (a2.address LIKE ? ESCAPE '\\' OR a2.comment LIKE ? ESCAPE '\\'))",
+                [f"%{esc}%", f"%{esc}%"],
+            ))
+        return out
+
+    def _account_hits(self, rowids: list[int], page: set[int],
+                      filters: list[tuple[str, str, list]]) -> dict:
+        """Where every body hit went, so the counts sum to `hits`: on this
+        page, on another page (it passes every filter), or dropped for one
+        named reason: the first filter it fails, `incomplete_row` (Mail's
+        row lacks its subject or mailbox record), `not_in_mail` (Mail no
+        longer holds the row: moved or deleted since its body was indexed,
+        until reconcile prunes it) or `unclassified` (the check itself
+        failed; logged). A hit is never dropped for its body: results carry
+        Mail's envelope fields only, and a hit's body is in the index."""
+        rest = [rowid for rowid in rowids if rowid not in page]
+        other_pages = 0
+        dropped: Counter[str] = Counter()
+        try:
+            failed, present = (self._first_failed_filter(rest, filters)
+                               if rest else ({}, set()))
+        except sqlite3.Error as e:
+            get_logger().warning("search: body-hit accounting failed: %s", e)
+            dropped["unclassified"] = len(rest)
+        else:
+            for rowid in rest:
+                if rowid not in failed:
+                    dropped["incomplete_row" if rowid in present
+                            else "not_in_mail"] += 1
+                elif failed[rowid] < 0:
+                    other_pages += 1
+                else:
+                    dropped[filters[failed[rowid]][0]] += 1
+        order = ("not_in_mail", "incomplete_row",
+                 *(reason for reason, _, _ in filters), "unclassified")
+        return {
+            "hits_returned": len(rowids) - len(rest),
+            "hits_other_pages": other_pages,
+            "hits_dropped": {reason: dropped[reason]
+                             for reason in dict.fromkeys(order)
+                             if dropped[reason]},
+        }
+
+    def _first_failed_filter(
+            self, rowids: list[int], filters: list[tuple[str, str, list]],
+    ) -> tuple[dict[int, int], set[int]]:
+        """({rowid: index of the first filter it fails, -1 for none} for the
+        hits a read can list, {hits whose message row exists at all}). The
+        clauses run verbatim over search()'s joins, nested so each row
+        stops at its first failure; NULL fails, as it does in a WHERE."""
+        verdict = "-1"
+        for i in range(len(filters) - 1, -1, -1):
+            verdict = f"CASE WHEN ({filters[i][1]}) THEN {verdict} ELSE {i} END"
+        args = [arg for _, _, clause_args in filters for arg in clause_args]
+        marks = ",".join("?" * len(rowids))
+        failed = {int(row[0]): int(row[1]) for row in self._conn.execute(
+            f"SELECT m.ROWID, {verdict} {self._BASE_FROM} "
+            f"WHERE m.ROWID IN ({marks})", args + rowids)}
+        unlisted = [rowid for rowid in rowids if rowid not in failed]
+        present: set[int] = set()
+        if unlisted:
+            present = {int(row[0]) for row in self._conn.execute(
+                f"SELECT ROWID FROM messages WHERE ROWID IN "
+                f"({','.join('?' * len(unlisted))})", unlisted)}
+        return failed, present
 
     def recent(
         self,
